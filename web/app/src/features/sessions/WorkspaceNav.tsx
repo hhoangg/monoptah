@@ -1,7 +1,7 @@
 // F-12: the workspace list, laid out as a messaging app's chat list (ported from
 // mobile/src/features/workspace/WorkspaceDrawer.tsx): Monos with their latest line and when, then
 // Projects, narrowed by the filter (All, Unread, Working now) and the search. It is the content of the
-// vaul drawer on the mobile layout and of the persistent sidebar from 768 px up. The desktop nav entries
+// vaul drawer on the mobile layout and of the persistent sidebar from 640 px up (design-system 11). The desktop nav entries
 // (`desktop-nav-items` slot, Settings, Desktops) sit at the foot.
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
@@ -33,7 +33,9 @@ const SHOWS: ReadonlyArray<{ value: DrawerShow; label: string }> = [
 
 /** The start of a message as one plain line: markdown marks dropped, a reaction shown as its emoji. */
 export function oneLine(text: string): string {
-  const reaction = /^<reaction>\s*(.{1,16}?)\s*<\/reaction>$/su.exec(text.trim());
+  // The pattern backtracks on a long run of spaces, so only a short message (a reaction is) is matched.
+  const head = text.trim();
+  const reaction = head.length <= 64 ? /^<reaction>\s*(.{1,16}?)\s*<\/reaction>$/su.exec(head) : null;
   if (reaction) return `Reacted ${reaction[1]}`;
   return text
     .slice(0, 600)

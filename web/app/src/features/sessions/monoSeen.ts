@@ -2,8 +2,11 @@
 // For each desktop it keeps a Mono's activity as of when the user last saw it, so a reply that came after
 // reads as new. Phone-local: stored in IndexedDB on this device (its own small database, as the link's
 // database has a fixed set of stores) and never synced; the desktop sends no count of its own.
+// What is stored is a marker of the activity (timestamp, length and a hash), never the Mono's text, and a
+// revoked or forgotten desktop loses its entry (architecture.md: no conversation content at rest in clear).
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useCatalog } from "@/data";
+import { getLinkStore } from "@/link";
 import type { CatalogMono } from "./workspaceFilter";
 
 export const MONO_SEEN_DB = "monoptah-mono-seen";
@@ -69,7 +72,7 @@ export function loadMonoSeen(desktopId: string | undefined): void {
   publish({ desktopId, loaded: !hasIdb(), seen: {} });
   if (!hasIdb()) return;
   void withStore<unknown>("readonly", (store) => store.get(desktopId))
-    .then((stored) => (stored && typeof stored === "object" ? (stored as Seen) : {}))
+    .then((stored) => (stored && typeof stored === "object" ? onlyMarkers(stored as Seen) : {}))
     .catch(() => ({}) as Seen)
     .then((stored) => {
       if (state.desktopId !== desktopId) return;
@@ -79,14 +82,39 @@ export function loadMonoSeen(desktopId: string | undefined): void {
 
 function save(desktopId: string, seen: Seen): void {
   publish({ ...state, seen });
-  if (!hasIdb()) return;
+  // A revoked link keeps nothing on disk.
+  const link = getLinkStore(desktopId).getState();
+  if (!hasIdb() || link.revoked || link.blocked === "revoked") return;
   // Storage blocked or full: the map lasts until the page reloads.
   void withStore("readwrite", (store) => store.put(seen, desktopId)).catch(() => undefined);
 }
 
-/** A Mono's last reply as far as the browser can tell; null when it cannot. */
+const MARKER_PREFIX = "m1:";
+
+/** cyrb53: a fast 53-bit string hash. Not a secret: it only has to tell two messages apart without keeping either. */
+function hashText(text: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+}
+
+/** A Mono's last reply as far as the browser can tell, as a marker that cannot be turned back into the text; null when it cannot. */
 function activity(mono: UnreadSource): string | null {
-  return mono.lastMessage || mono.lastActiveAt ? `${mono.lastActiveAt}\n${mono.lastMessage}` : null;
+  if (!mono.lastMessage && !mono.lastActiveAt) return null;
+  const message = mono.lastMessage ?? "";
+  return `${MARKER_PREFIX}${mono.lastActiveAt}:${message.length}:${hashText(message)}`;
+}
+
+/** Keeps the entries that are markers (or the "unread" empty mark); entries of an older format held message text and are dropped. */
+function onlyMarkers(stored: Seen): Seen {
+  return Object.fromEntries(Object.entries(stored).filter(([, value]) => typeof value === "string" && (value === "" || value.startsWith(MARKER_PREFIX))));
 }
 
 /** Marks the Mono's latest as seen, as its chat shows it. */
@@ -102,6 +130,17 @@ export function markMonoUnread(desktopId: string | undefined, mono: UnreadSource
   if (desktopId && state.seen[mono.id] !== "") save(desktopId, { ...state.seen, [mono.id]: "" });
 }
 
+/** Deletes everything kept for a desktop, in memory and in IndexedDB (forget, revoke). */
+export async function forgetMonoSeen(desktopId: string): Promise<void> {
+  if (state.desktopId === desktopId) publish({ ...state, seen: {} });
+  if (!hasIdb()) return;
+  try {
+    await withStore("readwrite", (store) => store.delete(desktopId));
+  } catch {
+    // Storage blocked: nothing was kept that could be removed.
+  }
+}
+
 /** Forgets what is in memory. For tests. */
 export function resetMonoSeen(): void {
   publish({ desktopId: null, loaded: false, seen: {} });
@@ -114,6 +153,16 @@ export function resetMonoSeen(): void {
  */
 export function useUnreadMonos(desktopId: string | undefined, monos: readonly UnreadSource[]): Set<string> {
   useEffect(() => loadMonoSeen(desktopId), [desktopId]);
+  // A revoked link takes the desktop's entry with it (read-only look at the link store).
+  useEffect(() => {
+    if (!desktopId) return;
+    const store = getLinkStore(desktopId);
+    const check = (link: { revoked: boolean; blocked: string | null }) => {
+      if (link.revoked || link.blocked === "revoked") void forgetMonoSeen(desktopId);
+    };
+    check(store.getState());
+    return store.subscribe(check);
+  }, [desktopId]);
   const current = useSyncExternalStore(subscribe, () => state);
   const ready = current.desktopId === desktopId && current.loaded;
   useEffect(() => {

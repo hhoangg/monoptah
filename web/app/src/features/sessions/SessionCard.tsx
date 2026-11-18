@@ -99,7 +99,6 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
     setConfirming(false);
     refresh();
   };
-  const readOnlyReason = readOnly ? "This device is read-only" : undefined;
   const params = { desktopId, projectId: session.projectId };
 
   return (
@@ -146,17 +145,22 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
             </DropdownMenuItem>
           ) : null}
           <SessionMenuItemsSlot desktopId={desktopId} session={session} />
-          <DropdownMenuSeparator />
-          <DropdownMenuItem disabled={readOnly} title={readOnlyReason} onSelect={() => setRenaming(true)}>
-            <Icon name="edit" size={18} />
-            Rename
-          </DropdownMenuItem>
-          <DropdownMenuItem disabled={readOnly} title={readOnlyReason} onSelect={() => setArchiving(true)}>
-            <Icon name="archive" size={18} />
-            Archive
-          </DropdownMenuItem>
-          {canDelete ? (
-            <DropdownMenuItem destructive disabled={readOnly} title={readOnlyReason} onSelect={() => setConfirming(true)}>
+          {/* A read-only device does not see the actions that change the session (F-25). */}
+          {readOnly ? null : (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => setRenaming(true)}>
+                <Icon name="edit" size={18} />
+                Rename
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setArchiving(true)}>
+                <Icon name="archive" size={18} />
+                Archive
+              </DropdownMenuItem>
+            </>
+          )}
+          {canDelete && !readOnly ? (
+            <DropdownMenuItem destructive onSelect={() => setConfirming(true)}>
               <Icon name="trash" size={18} />
               Delete
             </DropdownMenuItem>

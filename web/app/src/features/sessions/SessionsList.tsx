@@ -35,15 +35,17 @@ export function SessionsList({ desktopId, data, filter, worktree, readOnly }: Se
   const [listRef, list] = useWindowedList(sessions.length, SESSION_ROW_HEIGHT);
 
   // The next page is asked for when the window reaches the last rows.
-  const { loadMore } = pages;
-  const nearEnd = pages.hasMore && list.end >= sessions.length - 5;
+  // After a failed page it waits for the Retry button instead of asking again (no request loop).
+  const { loadMore, nextError, loadingMore } = pages;
+  const nearEnd = pages.hasMore && !nextError && list.end >= sessions.length - 5;
   useEffect(() => {
     if (nearEnd) loadMore();
-  }, [nearEnd, loadMore, sessions.length]);
+  }, [nearEnd, loadMore, sessions.length, loadingMore]);
 
   if (sessions.length === 0) {
     if (pages.loading && !pages.error) return <p role="status" className="px-3.5 pt-2 text-label text-muted-text">Loading sessions…</p>;
     if (pages.error && !catalog.data) return <Notice variant="error">Could not load the sessions.</Notice>;
+    if (pages.nextError) return <MoreError onRetry={pages.retryMore} />;
     if (pages.hasMore) return <p role="status" className="px-3.5 pt-2 text-label text-muted-text">Loading sessions…</p>;
     const narrowed = isFilterOn(filter) || !!worktree;
     return <p className="px-3.5 pt-2 text-label text-muted-text">{needle ? "No matching sessions." : narrowed ? "No sessions match the filter." : "No sessions yet."}</p>;
@@ -59,6 +61,18 @@ export function SessionsList({ desktopId, data, filter, worktree, readOnly }: Se
         ))}
       </ul>
       {pages.loadingMore ? <p role="status" className="px-3.5 py-3 text-meta text-muted-text">Loading more…</p> : null}
+      {pages.nextError ? <MoreError onRetry={pages.retryMore} /> : null}
     </div>
+  );
+}
+
+function MoreError({ onRetry }: { onRetry: () => void }) {
+  return (
+    <p role="alert" className="px-3.5 py-3 text-meta text-muted-text">
+      Could not load more sessions.{" "}
+      <button type="button" onClick={onRetry} className="font-semibold text-content underline">
+        Retry
+      </button>
+    </p>
   );
 }

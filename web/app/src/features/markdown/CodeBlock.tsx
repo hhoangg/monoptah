@@ -13,6 +13,7 @@ import { Icon } from "@/ui/Icon";
 import "@/styles/markdown.css";
 import { requestCodeHighlight } from "./highlight/plugin";
 import type { CodeToken, HighlightResult } from "./highlight/types";
+import { safeClipboardText } from "@/lib/clipboardText";
 
 type Line = CodeToken[];
 
@@ -164,7 +165,7 @@ function CopyButton({ text }: { text: string }) {
   useEffect(() => () => clearTimeout(timer.current), []);
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(safeClipboardText(text));
     } catch {
       return;
     }

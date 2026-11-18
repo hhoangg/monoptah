@@ -33,7 +33,7 @@ export const BUSY_PLACEHOLDER = "Send a follow-up...";
 export const OFFLINE_PLACEHOLDER = "Reconnecting to desktop...";
 export const READ_ONLY_REASON = "Read-only: this device can read sessions but not send messages.";
 /** A wide screen with a mouse or trackpad: Enter sends there, and only there. */
-export const DESKTOP_LAYOUT_QUERY = "(min-width: 768px) and (pointer: fine)";
+export const DESKTOP_LAYOUT_QUERY = "(min-width: 640px) and (pointer: fine)";
 const INPUT_MIN_PX = 64;
 const INPUT_MAX_PX = 160;
 
@@ -110,7 +110,11 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
     setError(null);
     let picked: ComposerAttachment[] = [];
     try {
-      picked = await Promise.all(files.slice(0, room).map(attachmentFromFile));
+      // Settle every file first: when one fails, the previews of the others are still revoked.
+      const settled = await Promise.allSettled(files.slice(0, room).map(attachmentFromFile));
+      picked = settled.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed) throw (failed as PromiseRejectedResult).reason;
       setAttachments(mergeAttachments(held.current, picked));
       area.current?.focus();
     } catch (reason) {
@@ -132,7 +136,8 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
     setError(null);
     try {
       await onSubmit(message, files);
-      setText("");
+      // Text typed while the send was in flight (or in the send-guard dialog) belongs to the next message.
+      setText((current) => (current.trim() === message ? "" : current));
       setAttachments([]);
       files.forEach(revokeAttachment);
     } catch (reason) {

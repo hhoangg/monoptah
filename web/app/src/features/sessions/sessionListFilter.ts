@@ -3,6 +3,7 @@
 import { useCallback, useState } from "react";
 import { HARNESS_IDS, type Harness, type SessionCard } from "@monoptah/protocol";
 import { DEFAULT_SESSION_STATUS_FILTER, filterSessionsByHarness, filterSessionsByStatus } from "./sessionFilters";
+import { trimSlashes } from "@/lib/trimSlashes";
 
 export const SESSION_FILTER_KEY = "monoptah.sessions.filter";
 
@@ -81,7 +82,6 @@ export interface Worktree {
   name: string;
 }
 
-const trimSlashes = (path: string) => path.replace(/\/+$/, "");
 
 /**
  * Whether a session works in `worktree`; any does without one. An older desktop does not say where a

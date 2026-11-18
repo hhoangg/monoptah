@@ -22,7 +22,7 @@ import { OPEN_AFTER_STARTING_KEY } from "./openAfterStarting";
 
 beforeAll(() => {
   window.matchMedia = ((query: string) => ({
-    matches: query.includes("min-width: 768px") && query.includes("pointer: fine"),
+    matches: query.includes("min-width: 640px") && query.includes("pointer: fine"),
     media: query,
     onchange: null,
     addEventListener() {},
@@ -260,11 +260,27 @@ describe("session header menu (F-25, F-40)", () => {
     expect(screen.queryByRole("menuitem", { name: "Delete" })).toBeNull();
   });
 
-  it("disables every action for a read-only device", async () => {
+  it("hides the actions that change the session for a read-only device", async () => {
     const user = userEvent.setup();
     mount(`/s/${SESSION}`, { permission: "read" });
     await user.click(await screen.findByRole("button", { name: "Session actions" }));
-    for (const name of ["Rename", "Archive", "Delete"]) expect(screen.getByRole("menuitem", { name })).toHaveAttribute("aria-disabled", "true");
+    for (const name of ["Rename", "Archive", "Delete"]) expect(screen.queryByRole("menuitem", { name })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Copy Session ID" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Settings" })).toBeInTheDocument();
+  });
+
+  it("copies the session ID on a user click and links to the desktop's settings", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(`/s/${SESSION}`);
+    await user.click(await screen.findByRole("button", { name: "Session actions" }));
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    await user.click(screen.getByRole("menuitem", { name: "Copy Session ID" }));
+    expect(writeText).toHaveBeenCalledWith(SESSION);
+    await user.click(await screen.findByRole("button", { name: "Session actions" }));
+    expect(screen.getByRole("menuitem", { name: "Settings" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/settings`);
+    await user.click(screen.getByRole("menuitem", { name: "Settings" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/settings`));
   });
 });
 
@@ -298,6 +314,18 @@ describe("new session page (F-30, F-31)", () => {
     const user = userEvent.setup();
     const { router } = mount(NEW);
     await user.type(await field(), "Quietly{Enter}");
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/p/proj-alpha`));
+  });
+
+  it("the new-session page has a control for Open after starting that is stored and used", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(NEW);
+    const toggle = await screen.findByRole("switch", { name: "Open after starting" });
+    expect(toggle).toBeChecked();
+    await user.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(OPEN_AFTER_STARTING_KEY)).toBe("false");
+    await user.type(await field(), "From the toggle{Enter}");
     await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/p/proj-alpha`));
   });
 

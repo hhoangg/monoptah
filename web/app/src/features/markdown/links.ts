@@ -14,6 +14,25 @@ export type LinkTarget =
 const SAFE_CHARS = /^[\x21-\x7e]+$/;
 const MAX_HREF = 2000;
 
+/**
+ * An in-app `/d/...` path as the browser will resolve it, or null. Resolving first catches the encoded dot
+ * segments (`%2e%2e`, `.%2E`) that the URL parser treats as `..` and that would leave `/d/`.
+ */
+function internalPath(href: string): string | null {
+  if (!href.startsWith("/d/") || href.includes("..") || href.includes("//")) return null;
+  let url: URL;
+  try {
+    url = new URL(href, "https://app.invalid");
+  } catch {
+    return null;
+  }
+  if (url.origin !== "https://app.invalid" || !url.pathname.startsWith("/d/")) return null;
+  // Encoded separators or dots stay in the path as text: refuse them rather than decode.
+  if (/%(2e|2f|5c)/i.test(url.pathname)) return null;
+  if (url.pathname.split("/").some((segment) => segment === "." || segment === "..")) return null;
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
 export function classifyLink(rawHref: string): LinkTarget | null {
   if (rawHref.length === 0 || rawHref.length > MAX_HREF) return null;
   const href = rawHref;
@@ -22,9 +41,8 @@ export function classifyLink(rawHref: string): LinkTarget | null {
   if (href.startsWith("//")) return null;
 
   if (href.startsWith("/")) {
-    if (href.startsWith("/d/") && !href.includes("..") && !href.includes("//")) {
-      return { kind: "internal", href };
-    }
+    const internal = internalPath(href);
+    if (internal) return { kind: "internal", href: internal };
     // An absolute file path such as /home/me/app.ts:12 is a file link, never a navigation.
     const file = resolveFileReference(href);
     return file ? { kind: "file", ...file } : null;

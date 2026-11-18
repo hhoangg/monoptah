@@ -93,3 +93,20 @@ describe("web additions", () => {
     expect(plainText("# A\n\n**b** `c`")).toBe("A b c");
   });
 });
+
+describe("hostile input stays fast", () => {
+  it("reads a long backtick run in linear time (no close found)", () => {
+    const started = performance.now();
+    const nodes = parseInline("x" + "`".repeat(80_000));
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(nodes.map((node) => (node.type === "text" ? node.text.length : 0)).reduce((a, b) => a + b, 0)).toBe(80_001);
+    const cell = performance.now();
+    parseMarkdown("| a | " + "`".repeat(80_000) + "\n| - | - |\n| b | c |");
+    expect(performance.now() - cell).toBeLessThan(500);
+  });
+
+  it("does not nest a link inside a link label", () => {
+    const [link] = parseInline("[https://a.dev](https://b.dev)");
+    expect(link).toMatchObject({ type: "link", href: "https://b.dev", children: [{ type: "text", text: "https://a.dev" }] });
+  });
+});

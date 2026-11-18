@@ -44,7 +44,7 @@ export interface TranscriptProps {
   hasOlder?: boolean;
   loadingOlder?: boolean;
   olderError?: string | null;
-  loadOlder?: () => Promise<void>;
+  loadOlder?: () => Promise<boolean | void>;
   /** "Not sent, retry": sends the message again. Call it from the user's press only. */
   onRetry?: (optimisticId: string) => void;
   agent?: TranscriptAgent;
@@ -169,14 +169,23 @@ export function Transcript({
 
   // Older turns: capture the reader's row before asking, restore it once the rows above landed.
   const pending = useRef<{ anchor: ScrollAnchor; firstKey: string | undefined } | null>(null);
-  const requestOlder = useCallback(() => {
+  // After a failed page nothing asks again by itself: only the Retry button (`manual`) does (no request loop).
+  const requestOlder = useCallback((manual = false) => {
     if (!scroller || !loadOlder || !hasOlder || loadingOlder || !revealed || pending.current) return;
+    if (olderError && !manual) return;
     const measured = virtualizer.measurementsCache.map((item) => ({ key: String(item.key), start: item.start }));
     const anchor = captureAnchor(measured, (index) => virtualizer.measurementsCache[index]?.size ?? 0, scroller.scrollTop);
     if (!anchor) return;
-    pending.current = { anchor, firstKey: rows[0]?.key };
-    void loadOlder().catch(() => undefined);
-  }, [scroller, loadOlder, hasOlder, loadingOlder, revealed, virtualizer, rows]);
+    const waiting = { anchor, firstKey: rows[0]?.key };
+    pending.current = waiting;
+    // `false`: nothing was asked (the link is not ready), so no anchor is left waiting.
+    void loadOlder().then(
+      (asked) => {
+        if (asked === false && pending.current === waiting) pending.current = null;
+      },
+      () => undefined,
+    );
+  }, [scroller, loadOlder, hasOlder, loadingOlder, olderError, revealed, virtualizer, rows]);
 
   useLayoutEffect(() => {
     const waiting = pending.current;
@@ -203,8 +212,8 @@ export function Transcript({
 
   // The history of a short transcript may not fill the viewport: ask for more without a scroll.
   useEffect(() => {
-    if (revealed && scroller && scroller.scrollTop < OLDER_TRIGGER_PX && hasOlder && !loadingOlder) requestOlder();
-  }, [revealed, scroller, hasOlder, loadingOlder, requestOlder, rows.length]);
+    if (revealed && scroller && scroller.scrollTop < OLDER_TRIGGER_PX && hasOlder && !loadingOlder && !olderError) requestOlder();
+  }, [revealed, scroller, hasOlder, loadingOlder, olderError, requestOlder, rows.length]);
 
   useReplyReflowAnchor(scroller, true, following, rememberNothing, adjustments);
 
@@ -227,7 +236,7 @@ export function Transcript({
         aria-label="Conversation"
         data-testid="transcript-scroller"
         className={cn(
-          "absolute inset-0 overflow-y-auto overscroll-contain [overflow-anchor:none] focus-visible:outline-none",
+          "absolute inset-0 overflow-y-auto overscroll-contain [overflow-anchor:none]",
           "transition-[opacity,translate] duration-[280ms] ease-out motion-reduce:transition-none",
           revealed || rows.length === 0 ? "translate-y-0 opacity-100" : "translate-y-[10px] opacity-0",
         )}
@@ -277,7 +286,7 @@ export function Transcript({
           ) : (
             <span role="alert" className="pointer-events-auto inline-flex items-center gap-2 rounded-pill bg-surface px-3 py-1 text-caption text-muted-text">
               Could not load earlier messages.
-              <button type="button" onClick={() => void loadOlder?.()} className="font-semibold text-content underline">
+              <button type="button" onClick={() => requestOlder(true)} className="font-semibold text-content underline">
                 Retry
               </button>
             </span>

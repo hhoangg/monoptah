@@ -16,10 +16,10 @@ import { DESKTOP_ID, connectMockDesktop, emptyWorkspace, seedWorkspace, type Moc
 import { DRAWER_FILTER_KEY } from "./drawerFilter";
 import { lastPlaceKey } from "./lastPlace";
 
-/** A matchMedia stub: `wide` makes the 768 px query match. */
+/** A matchMedia stub: `wide` makes the 640 px query match. */
 function stubMatchMedia(wide: boolean) {
   window.matchMedia = ((query: string) => ({
-    matches: wide && query.includes("min-width: 768px"),
+    matches: wide && query.includes("min-width: 640px"),
     media: query,
     onchange: null,
     addEventListener: () => {},
@@ -160,7 +160,7 @@ describe("workspace drawer (F-12)", () => {
     expect(within(nav).getByRole("button", { name: "Filter, on" })).toBeInTheDocument();
   });
 
-  it("is a persistent sidebar from 768 px up, with no drawer button", async () => {
+  it("is a persistent sidebar from 640 px up, with no drawer button", async () => {
     stubMatchMedia(true);
     mount("");
     const nav = await screen.findByRole("navigation", { name: "Workspace" });

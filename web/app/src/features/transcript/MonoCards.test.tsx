@@ -88,6 +88,25 @@ describe("LaunchedSessions (F-72)", () => {
     expect(screen.queryByRole("button")).toBeNull();
   });
 
+  it("turns into the not-available state when the desktop answers not_selected", async () => {
+    const refusal = Object.assign(new Error("not selected"), { code: "not_selected" });
+    const onOpenSession = vi.fn().mockRejectedValue(refusal);
+    const user = userEvent.setup();
+    wrap({ onOpenSession }, <LaunchedSessions sessions={[session]} />);
+    await user.click(screen.getByRole("button", { name: "Open session Fix the parser, working" }));
+    expect(await screen.findByTestId("launched-session-unavailable")).toHaveTextContent("Not on this device's projects");
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("keeps the card openable after another kind of error", async () => {
+    const onOpenSession = vi.fn().mockRejectedValue(Object.assign(new Error("x"), { code: "desktop_offline" }));
+    const user = userEvent.setup();
+    wrap({ onOpenSession }, <LaunchedSessions sessions={[session]} />);
+    await user.click(screen.getByRole("button", { name: "Open session Fix the parser, working" }));
+    expect(screen.queryByTestId("launched-session-unavailable")).toBeNull();
+    expect(screen.getByRole("button", { name: "Open session Fix the parser, working" })).toBeInTheDocument();
+  });
+
   it("labels each state", () => {
     const states = ["input", "draft", "failed", "stopped", "done"] as const;
     wrap(

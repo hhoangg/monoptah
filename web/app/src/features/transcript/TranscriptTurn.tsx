@@ -17,6 +17,7 @@ import { Shimmer } from "./Shimmer";
 import { CopyFallbackDialog, TurnMetricsDialog } from "./TurnDialogs";
 import { useCollapsedToolCalls } from "./toolCallsSetting";
 import { readItems, readMetrics, type HeaderItem, type NoticeItem, type UserItem, type WorkKind, type WorkPhase } from "./turnItems";
+import { safeClipboardText } from "@/lib/clipboardText";
 
 const WORK_TEXT = "text-body";
 
@@ -128,7 +129,7 @@ function CopyButton({ text }: { text: string }) {
   useEffect(() => () => clearTimeout(timer.current), []);
   const copy = () => {
     // Called inside the click handler: the clipboard needs the user gesture. A refusal opens the text to select.
-    const write = globalThis.navigator?.clipboard?.writeText(text);
+    const write = globalThis.navigator?.clipboard?.writeText(safeClipboardText(text));
     if (!write) {
       setFallback(true);
       return;

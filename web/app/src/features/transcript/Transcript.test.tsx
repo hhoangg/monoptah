@@ -137,7 +137,41 @@ describe("older turns (F-32, N-16)", () => {
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("Could not load earlier messages.");
     await user.click(within(alert).getByRole("button", { name: "Retry" }));
-    expect(loadOlder).toHaveBeenCalled();
+    expect(loadOlder).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not ask again by itself after a failed page, only the Retry button does", async () => {
+    const user = userEvent.setup();
+    const loadOlder = vi.fn();
+    function Failing() {
+      const [state, setState] = useState<{ loading: boolean; error: string | null }>({ loading: false, error: null });
+      return (
+        <Transcript
+          turns={turns(0, 3)}
+          hasOlder
+          loadingOlder={state.loading}
+          olderError={state.error}
+          loadOlder={async () => {
+            loadOlder();
+            setState({ loading: true, error: null });
+            await Promise.resolve();
+            setState({ loading: false, error: "offline" });
+          }}
+        />
+      );
+    }
+    render(<Failing />);
+    await screen.findByRole("alert");
+    // A short transcript sits at the top: without the guard this spins. Give it time to loop.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    });
+    expect(loadOlder).toHaveBeenCalledTimes(1);
+    await user.click(within(screen.getByRole("alert")).getByRole("button", { name: "Retry" }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+    expect(loadOlder).toHaveBeenCalledTimes(2);
   });
 });
 

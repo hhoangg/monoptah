@@ -1,7 +1,9 @@
-// F-25, F-40: the menu in the session header: Rename, Archive and Delete, plus the items WS-C adds through the
-// `session-menu-items` slot. Delete is hidden when `session-capabilities` says the session cannot be deleted (a
-// cloud session); every item is disabled for a read-only device. It reuses the dialogs of the lists.
-import { useNavigate } from "@tanstack/react-router";
+// F-25, F-40: the menu in the session header: Changes, Rename, Copy Session ID, Settings, Archive and Delete,
+// plus the items WS-C adds through the `session-menu-items` slot. Delete is hidden when `session-capabilities`
+// says the session cannot be deleted (a cloud session); a read-only device does not see Rename, Archive or
+// Delete. The Changes entry has no count: the session data carries no changed-file count. It reuses the
+// dialogs of the lists.
+import { Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import type { SessionCard } from "@monoptah/protocol";
 import { useLinkMutation } from "@/data";
@@ -11,6 +13,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { sessionCan } from "@/ui/hooks";
 import { useCollapsedToolCalls } from "@/features/transcript/toolCallsSetting";
 import { Icon } from "@/ui/Icon";
+import { toast } from "@/ui/sonner";
 import { ArchiveSessionDialog, RenameSessionDialog, useRefreshSessions } from "./SessionActionDialogs";
 import { SessionMenuItemsSlot } from "./slots";
 
@@ -24,7 +27,19 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
   const [collapsedCalls, setCollapsedCalls] = useCollapsedToolCalls();
   const remove = useLinkMutation("session.delete");
   const refresh = useRefreshSessions(desktopId);
-  const reason = readOnly ? "This device is read-only" : undefined;
+  const canChanges = sessionCan("changes", { target: session.target ?? null, desktopCapabilities: capabilities });
+  // The click of the menu item is the user gesture the clipboard needs.
+  const copyId = () => {
+    const write = globalThis.navigator?.clipboard?.writeText(session.id);
+    if (!write) {
+      toast.error("Could not copy the session ID");
+      return;
+    }
+    write.then(
+      () => toast.success("Session ID copied"),
+      () => toast.error("Could not copy the session ID"),
+    );
+  };
 
   return (
     <>
@@ -40,14 +55,36 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
           <SessionMenuItemsSlot desktopId={desktopId} session={session} />
-          <DropdownMenuItem disabled={readOnly} title={reason} onSelect={() => setRenaming(true)}>
-            <Icon name="edit" size={18} />
-            Rename
+          {canChanges ? (
+            <DropdownMenuItem asChild>
+              <Link to="/d/$desktopId/p/$projectId/changes/$" params={{ desktopId, projectId: session.projectId, _splat: "" }}>
+                <Icon name="list" size={18} />
+                Changes
+              </Link>
+            </DropdownMenuItem>
+          ) : null}
+          {readOnly ? null : (
+            <DropdownMenuItem onSelect={() => setRenaming(true)}>
+              <Icon name="edit" size={18} />
+              Rename
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem onSelect={copyId}>
+            <Icon name="copy" size={18} />
+            Copy Session ID
           </DropdownMenuItem>
-          <DropdownMenuItem disabled={readOnly} title={reason} onSelect={() => setArchiving(true)}>
-            <Icon name="archive" size={18} />
-            Archive
+          <DropdownMenuItem asChild>
+            <Link to="/d/$desktopId/settings" params={{ desktopId }}>
+              <Icon name="settings" size={18} />
+              Settings
+            </Link>
           </DropdownMenuItem>
+          {readOnly ? null : (
+            <DropdownMenuItem onSelect={() => setArchiving(true)}>
+              <Icon name="archive" size={18} />
+              Archive
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem
             role="menuitemcheckbox"
             aria-checked={collapsedCalls}
@@ -56,10 +93,10 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
             <Icon name="check" size={18} className={collapsedCalls ? undefined : "opacity-0"} />
             Collapse tool calls
           </DropdownMenuItem>
-          {canDelete ? (
+          {canDelete && !readOnly ? (
             <>
               <DropdownMenuSeparator />
-              <DropdownMenuItem destructive disabled={readOnly} title={reason} onSelect={() => setConfirming(true)}>
+              <DropdownMenuItem destructive onSelect={() => setConfirming(true)}>
                 <Icon name="trash" size={18} />
                 Delete
               </DropdownMenuItem>

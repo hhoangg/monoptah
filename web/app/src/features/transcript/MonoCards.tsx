@@ -159,7 +159,17 @@ export function LaunchedSessions({ sessions }: { sessions: LaunchedSession[] }) 
 export function LaunchedSessionCard({ session }: { session: LaunchedSession }) {
   const { onOpenSession, isProjectAvailable } = useTranscriptActions();
   const status = STATUS[session.state] ?? STATUS.done;
-  const available = isProjectAvailable ? isProjectAvailable(session.projectId) : true;
+  // The desktop can refuse a session of a project outside this device's selection (`not_selected`) even when the
+  // catalog did not say so: the card then reads the same as one whose project is not available.
+  const [refused, setRefused] = useState(false);
+  const available = !refused && (isProjectAvailable ? isProjectAvailable(session.projectId) : true);
+  const open = async () => {
+    try {
+      await onOpenSession?.(session.projectId, session.id);
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && (error as { code: unknown }).code === "not_selected") setRefused(true);
+    }
+  };
   const body = (
     <>
       <Icon name={status.icon} size={16} className={cn("shrink-0", status.className)} />
@@ -188,7 +198,7 @@ export function LaunchedSessionCard({ session }: { session: LaunchedSession }) {
       type="button"
       disabled={!onOpenSession}
       aria-label={`Open session ${session.title}, ${status.label.toLowerCase()}`}
-      onClick={() => onOpenSession?.(session.projectId, session.id)}
+      onClick={() => void open()}
       className={cn(shell, "text-left hover:bg-[var(--content-a07)]")}
     >
       {body}

@@ -1,10 +1,13 @@
 // Copied from src/features/files/editor/codeHighlightPlugin.ts at ca73ac2b
-// Adapted: tokens instead of streamdown results; small blocks highlight inline (the engine
-// is a lazy chunk), large ones in the Worker; no Worker (tests, old browsers) falls back inline.
+// Adapted: tokens instead of streamdown results. Agent text is untrusted and a grammar can backtrack for
+// seconds, so blocks highlight in the Worker with a time limit (the Worker is terminated and the block stays
+// plain text). With no Worker (tests, old browsers) only tiny blocks highlight inline.
 import { normalizeLanguage } from "./languages";
 import {
   INLINE_MAX_CHARS,
   MAX_HIGHLIGHT_CHARS,
+  WORKER_JOB_TIMEOUT_MS,
+  WORKER_START_TIMEOUT_MS,
   type HighlightRequest,
   type HighlightResult,
 } from "./types";
@@ -26,6 +29,10 @@ let chars = 0;
 let sequence = 0;
 let active: Job | undefined;
 let worker: Worker | undefined;
+let workerReady = false;
+/** Blocks whose job hit the time limit: they stay plain text and are not tried again. */
+const timedOut = new Set<string>();
+let watchdog: ReturnType<typeof setTimeout> | undefined;
 let cancellationScheduled = false;
 
 function keyFor(request: HighlightRequest) {
@@ -55,10 +62,31 @@ export function cachedHighlight(request: HighlightRequest): HighlightResult | un
   return results.get(keyFor(request));
 }
 
+function clearWatchdog() {
+  if (watchdog !== undefined) clearTimeout(watchdog);
+  watchdog = undefined;
+}
+
 function resetWorker() {
+  clearWatchdog();
   worker?.terminate();
   worker = undefined;
+  workerReady = false;
   active = undefined;
+}
+
+/** Gives up on the job the Worker is running: the Worker goes, the block stays plain text, the next job starts. */
+function armWatchdog(job: Job, limit: number) {
+  clearWatchdog();
+  watchdog = setTimeout(() => {
+    watchdog = undefined;
+    if (active !== job) return;
+    resetWorker();
+    jobs.delete(job.key);
+    if (timedOut.size >= MAX_RESULTS) timedOut.clear();
+    timedOut.add(job.key);
+    pump();
+  }, limit);
 }
 
 function finish(job: Job, result: HighlightResult | null | undefined) {
@@ -76,8 +104,14 @@ function pump() {
     .sort((a, b) => a.priority - b.priority || a.id - b.id)[0];
   if (!next) return;
   active = next;
-  const inline = next.request.code.length <= INLINE_MAX_CHARS || typeof Worker === "undefined";
-  if (inline) {
+  if (typeof Worker === "undefined") {
+    if (next.request.code.length > INLINE_MAX_CHARS) {
+      // No Worker to stop a runaway grammar: a block this size stays plain text.
+      active = undefined;
+      jobs.delete(next.key);
+      pump();
+      return;
+    }
     void import("./engine")
       .then(({ highlightInline }) => highlightInline(next.request))
       .then(
@@ -97,9 +131,17 @@ function pump() {
       });
       created.onmessage = ({
         data,
-      }: MessageEvent<{ id: number; result?: HighlightResult | null; error?: string }>) => {
+      }: MessageEvent<{ ready?: boolean; id?: number; result?: HighlightResult | null; error?: string }>) => {
+        if (worker !== created) return;
+        if (data.ready) {
+          workerReady = true;
+          // The engine is loaded: from here the job has its own time limit.
+          if (active) armWatchdog(active, WORKER_JOB_TIMEOUT_MS);
+          return;
+        }
         const job = active;
         if (!job || data.id !== job.id) return;
+        clearWatchdog();
         active = undefined;
         finish(job, data.result);
         pump();
@@ -113,6 +155,7 @@ function pump() {
       };
       worker = created;
     }
+    armWatchdog(next, workerReady ? WORKER_JOB_TIMEOUT_MS : WORKER_START_TIMEOUT_MS);
     worker.postMessage({ id: next.id, request: next.request });
   } catch {
     const failed = active;
@@ -159,6 +202,7 @@ export function requestCodeHighlight(
     return () => {};
   }
   const key = keyFor(request);
+  if (timedOut.has(key)) return () => {};
   const cached = results.get(key);
   if (cached) {
     results.delete(key);
@@ -180,4 +224,13 @@ export function requestCodeHighlight(
     if (!owned.callbacks.size && active !== owned) jobs.delete(key);
     cancelAbandonedWork();
   };
+}
+
+/** Forgets the results, the queue and the Worker. For tests. */
+export function resetHighlighting() {
+  resetWorker();
+  results.clear();
+  jobs.clear();
+  timedOut.clear();
+  chars = 0;
 }

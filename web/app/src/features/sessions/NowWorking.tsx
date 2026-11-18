@@ -13,7 +13,7 @@ import { Glass } from "@/ui/Glass";
 import { HarnessIcon } from "@/ui/HarnessIcon";
 import { Icon } from "@/ui/Icon";
 import { TerminalSpinner } from "@/features/transcript/TerminalSpinner";
-import { markStoppedHere, useSessionActivity } from "./activityStore";
+import { markStoppedHere, unmarkStoppedHere, useSessionActivity } from "./activityStore";
 import { FinishedDeck } from "./FinishedDeck";
 import { statusLabel } from "./SessionCard";
 import { Ticker } from "./Ticker";
@@ -36,7 +36,11 @@ function useStop(desktopId: string) {
       markStoppedHere(session.id);
       cancel.mutate(
         { conversationId: session.id },
-        { onSuccess: () => void queryClient.invalidateQueries({ queryKey: catalogKey(desktopId) }) },
+        {
+          onSuccess: () => void queryClient.invalidateQueries({ queryKey: catalogKey(desktopId) }),
+          // A failed stop leaves the session running: it must still reach the finished shelf when it ends.
+          onError: () => unmarkStoppedHere(session.id),
+        },
       );
     },
   };

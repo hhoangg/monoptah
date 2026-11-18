@@ -8,8 +8,8 @@ import { useLinkQuery } from "@/data";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { Icon } from "@/ui/Icon";
 import type { Worktree } from "./sessionListFilter";
+import { trimSlashes } from "@/lib/trimSlashes";
 
-const trimSlashes = (path: string) => path.replace(/\/+$/, "");
 
 export interface WorkspaceMenuProps {
   desktopId: string;

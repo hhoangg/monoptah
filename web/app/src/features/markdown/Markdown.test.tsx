@@ -125,11 +125,46 @@ describe("<CodeBlock>", () => {
     await screen.findByRole("button", { name: "Copied" });
   });
 
+  it("copies without control and bidi characters", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    render(<CodeBlock code={"ls\u001b[201~\n\u202erm -rf x"} language="sh" />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("ls[201~\nrm -rf x"));
+  });
+
   it("keeps a highlighted prefix while a fence grows", async () => {
     const { container, rerender } = render(<CodeBlock code={"let a = 1;\nlet b"} language="js" isIncomplete />);
     await waitFor(() => expect(container.querySelectorAll(".md-token").length).toBeGreaterThan(2));
     rerender(<CodeBlock code={"let a = 1;\nlet b = 2;\nlet c"} language="js" isIncomplete />);
     expect(container.querySelectorAll(".md-code-line")).toHaveLength(3);
     expect([...container.querySelectorAll(".md-code-line")].map((line) => line.textContent)).toEqual(["let a = 1;", "let b = 2;", "let c"]);
+  });
+});
+
+describe("external link confirm sheet (security.md 8, rule 2)", () => {
+  it("shows the real host, the full address and the link text before opening, and opens only on confirm", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const user = userEvent.setup();
+    render(<Markdown text="[https://github.com/hhoangg/monoptah](https://evil.example/login?x=1)" />);
+    await user.click(screen.getByRole("link"));
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.getByTestId("external-link-host")).toHaveTextContent("evil.example");
+    expect(screen.getByTestId("external-link-url")).toHaveTextContent("https://evil.example/login?x=1");
+    expect(screen.getByTestId("external-link-label")).toHaveTextContent("https://github.com/hhoangg/monoptah");
+    await user.click(screen.getByRole("button", { name: "Open link" }));
+    expect(open).toHaveBeenCalledWith("https://evil.example/login?x=1", "_blank", "noopener,noreferrer");
+    open.mockRestore();
+  });
+
+  it("does not open when cancelled, and warns about http", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const user = userEvent.setup();
+    render(<Markdown text="[docs](http://a.dev/x)" />);
+    await user.click(screen.getByRole("link"));
+    expect(screen.getByText("This address is not encrypted (http).")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
   });
 });

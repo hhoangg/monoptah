@@ -98,7 +98,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
 
       {state?.error && state.turns.length === 0 ? (
         <div className="mx-auto w-full max-w-[768px] px-5">
-          <Notice variant="error">{state.error}</Notice>
+          <Notice variant="error">{/not[_ ]selected/i.test(state.error) ? "Not on this device's projects" : state.error}</Notice>
         </div>
       ) : null}
 

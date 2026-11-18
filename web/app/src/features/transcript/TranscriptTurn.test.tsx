@@ -216,6 +216,15 @@ describe("footer (F-38)", () => {
     expect(screen.getByText(/9:41/)).toBeInTheDocument();
   });
 
+  it("copies the reply without control and bidi characters", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    show({ ...finished, copyText: "run\u001b[201~ this\u202e now" });
+    await user.click(screen.getByRole("button", { name: "Copy response" }));
+    expect(writeText).toHaveBeenCalledWith("run[201~ this now");
+  });
+
   it("falls back to selectable text when the clipboard refuses", async () => {
     const user = userEvent.setup();
     Object.defineProperty(navigator, "clipboard", { value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) }, configurable: true });

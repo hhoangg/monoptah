@@ -62,6 +62,11 @@ export function markStoppedHere(sessionId: string): void {
   stoppedHere.add(sessionId);
 }
 
+/** The stop did not go through after all: the session counts as stopped by nobody. */
+export function unmarkStoppedHere(sessionId: string): void {
+  stoppedHere.delete(sessionId);
+}
+
 /** A session's screen is up; until the returned function runs, its finish is no news. */
 export function markViewing(sessionId: string): () => void {
   viewing.set(sessionId, (viewing.get(sessionId) ?? 0) + 1);

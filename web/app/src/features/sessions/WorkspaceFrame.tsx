@@ -1,5 +1,5 @@
 // The frame of the WS-T screens (home and project): the workspace list as a persistent sidebar from
-// 768 px up and as a vaul drawer opened from the header below that, a header with the screen's only h1,
+// 640 px up and as a vaul drawer opened from the header below that, a header with the screen's only h1,
 // and the shared effects of a workspace screen (remember the place, track the working sessions).
 import { useEffect, useState, type ReactNode } from "react";
 import { Drawer as DrawerPrimitive } from "vaul";
@@ -28,7 +28,7 @@ export function useActivityTracking(desktopId: string): void {
   }, [desktopId, sessions]);
 }
 
-export const WIDE_QUERY = "(min-width: 768px)";
+export const WIDE_QUERY = "(min-width: 640px)";
 
 export interface WorkspaceFrameProps {
   desktopId: string;
@@ -53,7 +53,7 @@ export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, 
   return (
     <div className="mx-auto flex w-full max-w-[1280px]" data-testid={testId}>
       {wide ? (
-        <aside className="sticky top-14 h-[calc(100dvh-3.5rem)] w-80 shrink-0 border-r border-stroke">
+        <aside className="sticky top-[calc(2.75rem+env(safe-area-inset-top))] h-[calc(100dvh-2.75rem-env(safe-area-inset-top))] w-80 shrink-0 border-r border-stroke">
           <WorkspaceNav desktopId={desktopId} />
         </aside>
       ) : null}

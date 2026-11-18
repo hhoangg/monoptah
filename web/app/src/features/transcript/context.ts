@@ -20,7 +20,8 @@ export interface TranscriptActions {
   onChoose?: (text: string) => Promise<void>;
   onOpenDocument?: (document: DocumentItem) => void;
   /** Opens a session a Mono launched. */
-  onOpenSession?: (projectId: string, sessionId: string) => void;
+  /** May reject with a desktop error: `not_selected` turns the card into "Not on this device's projects" (U-09). */
+  onOpenSession?: (projectId: string, sessionId: string) => void | Promise<void>;
   /** False for a project outside this device's selection: the card shows "Not on this device's projects". */
   isProjectAvailable?: (projectId: string) => boolean;
 }

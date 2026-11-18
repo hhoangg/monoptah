@@ -18,6 +18,7 @@ import { useModelCatalog } from "@/features/models/hooks";
 import { toEmitted, type ModelSelection } from "@/features/models/modelSettings";
 import { buildStartModelParams } from "@/features/models/params";
 import { Icon } from "@/ui/Icon";
+import { Switch } from "@/ui/switch";
 import { toast } from "@/ui/sonner";
 import { useOpenAfterStarting } from "./openAfterStarting";
 import { ProjectMascot } from "./ProjectMascot";
@@ -46,7 +47,7 @@ export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; 
   const ready = useLinkReady();
   const guard = useSendGuard();
   const start = useLinkMutation("session.start");
-  const [openAfter] = useOpenAfterStarting();
+  const [openAfter, setOpenAfter] = useOpenAfterStarting();
   const catalog = useCatalog().data;
   const project = catalog?.projects.find((candidate) => candidate.id === projectId);
   const models = useModelCatalog({ projectId });
@@ -153,6 +154,11 @@ export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; 
         <h2 className="text-title font-semibold">{EMPTY_HEADLINE}</h2>
         {project ? <p className="text-body text-muted-text">{project.name}</p> : null}
         {catalog && !project ? <p className="text-body text-muted-text">This project is not on this device.</p> : null}
+        {/* F-20: mobile keeps this in its settings; the web puts it where the session starts. */}
+        <label className="mt-2 inline-flex min-h-11 items-center gap-3 text-label text-muted-text">
+          Open after starting
+          <Switch checked={openAfter} onCheckedChange={setOpenAfter} aria-label="Open after starting" />
+        </label>
       </main>
 
       <div className="mx-auto w-full max-w-[768px] shrink-0 px-2 pb-[env(safe-area-inset-bottom)] min-[24rem]:px-5">

@@ -7,7 +7,7 @@
 import { useState } from "react";
 import type { ModelCatalog } from "@monoptah/protocol";
 import { cn } from "@/lib/utils";
-import { HarnessIcon } from "@/ui/HarnessIcon";
+import { HarnessIcon, ProviderNotice } from "@/ui/HarnessIcon";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Search } from "@/ui/icons";
 import { Input } from "@/ui/input";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
@@ -233,6 +233,7 @@ function ModelList({
           );
         })}
       </div>
+      <ProviderNotice className="px-3" />
     </div>
   );
 }

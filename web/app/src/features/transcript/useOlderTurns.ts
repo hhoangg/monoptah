@@ -16,8 +16,11 @@ export interface OlderTurns {
   hasOlder: boolean;
   loading: boolean;
   error: string | null;
-  /** Fetches the page before the first turn held. Does nothing while one is in flight or there is no older page. */
-  loadOlder: () => Promise<void>;
+  /**
+   * Fetches the page before the first turn held. Does nothing (false) while one is in flight, while the link is
+   * not ready (a request then rejects at once) or when there is no older page.
+   */
+  loadOlder: () => Promise<boolean>;
 }
 
 /** Merges older pages in front of `turns`: a turn the watch also holds wins, ids are never repeated. */
@@ -71,20 +74,21 @@ export function useOlderTurns(conversationId: string, turns: Turn[], older: bool
   const firstId = merged[0]?.id;
 
   const loadOlder = useCallback(async () => {
-    if (inFlight.current === scope || !hasOlder || !firstId) return;
+    if (client.store.getState().status !== "ready" || inFlight.current === scope || !hasOlder || !firstId) return false;
     inFlight.current = scope;
     patch(scope, () => ({ loading: true, error: null }));
     try {
       const result = await client.request("conversation.older", { conversationId, before: firstId, limit: OLDER_PAGE_SIZE });
-      if (scopeRef.current !== scope) return;
+      if (scopeRef.current !== scope) return true;
       patch(scope, (state) => ({ pages: [...result.turns, ...state.pages], more: result.older && result.turns.length > 0 }));
     } catch (reason) {
-      if (scopeRef.current !== scope) return;
+      if (scopeRef.current !== scope) return true;
       patch(scope, () => ({ error: reason instanceof Error ? reason.message : String(reason) }));
     } finally {
       if (inFlight.current === scope) inFlight.current = null;
       if (scopeRef.current === scope) patch(scope, () => ({ loading: false }));
     }
+    return true;
   }, [client, conversationId, firstId, hasOlder, patch, scope]);
 
   return { turns: merged, hasOlder, loading: current.loading, error: current.error, loadOlder };

@@ -9,7 +9,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerPersistAdapter, MemoryPersistAdapter, type PersistAdapter } from "@/data";
 import { getLinkConnection, resetLinkConnections } from "@/link";
-import { clearLinkStores } from "@/link/store.ts";
+import { clearLinkStores, getLinkStore } from "@/link/store.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
@@ -168,11 +168,12 @@ describe("rename, archive and delete from the card menu (F-25, F-40)", () => {
     expect(within(menu).getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
   });
 
-  it("disables Rename, Archive and Delete for a read-only device", async () => {
+  it("hides Rename, Archive and Delete for a read-only device", async () => {
     const user = userEvent.setup();
     mount("/p/proj-alpha", { permission: "read" });
     const menu = await openCardMenu(user, "sess-local-1");
-    for (const name of ["Rename", "Archive", "Delete"]) expect(within(menu).getByRole("menuitem", { name })).toHaveAttribute("data-disabled");
+    for (const name of ["Rename", "Archive", "Delete"]) expect(within(menu).queryByRole("menuitem", { name })).toBeNull();
+    expect(within(menu).getByRole("menuitem", { name: "Open" })).toBeInTheDocument();
   });
 });
 
@@ -421,7 +422,7 @@ describe("Mono unread tracking (F-17)", () => {
   it("keeps what was seen in IndexedDB, per desktop, and reloads it", async () => {
     loadMonoSeen("desk-1");
     markMonoSeen("desk-1", mono);
-    await waitFor(async () => expect(await stored()).toEqual({ m1: "10\nhello" }));
+    await waitFor(async () => expect(await stored()).toEqual({ m1: expect.stringMatching(/^m1:10:5:[0-9a-f]+$/) }));
     markMonoUnread("desk-1", mono);
     await waitFor(async () => expect(await stored()).toEqual({ m1: "" }));
     // A new page load reads it back: the Mono is still marked unread.
@@ -431,12 +432,40 @@ describe("Mono unread tracking (F-17)", () => {
     await waitFor(() => expect(result.current.has("m1")).toBe(true));
   });
 
+  it("never keeps the text of a Mono message at rest", async () => {
+    loadMonoSeen("desk-5");
+    markMonoSeen("desk-5", { ...mono, lastMessage: "a private reply about the build" });
+    await waitFor(async () => expect(await stored("desk-5")).toBeDefined());
+    expect(JSON.stringify(await stored("desk-5"))).not.toContain("private");
+    // Entries of the older format held the text itself: they are dropped on load.
+    await new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open(MONO_SEEN_DB, 1);
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        const tx = open.result.transaction("seen", "readwrite");
+        tx.objectStore("seen").put({ m1: "10\nold clear text" }, "desk-6");
+        tx.oncomplete = () => resolve();
+      };
+    });
+    const { useUnreadMonos } = await import("./monoSeen");
+    renderHook(() => useUnreadMonos("desk-6", [{ ...mono, lastMessage: "newer" }]));
+    await waitFor(async () => expect(JSON.stringify(await stored("desk-6"))).not.toContain("old clear text"));
+  });
+
+  it("wipes a desktop's entry when its link is revoked", async () => {
+    const { useUnreadMonos } = await import("./monoSeen");
+    renderHook(() => useUnreadMonos("desk-7", [mono]));
+    await waitFor(async () => expect(await stored("desk-7")).toBeDefined());
+    act(() => getLinkStore("desk-7").setState({ revoked: true }));
+    await waitFor(async () => expect(await stored("desk-7")).toBeUndefined());
+  });
+
   it("a Mono seen for the first time counts as seen; a later reply is unread; working is not", async () => {
     const { useUnreadMonos } = await import("./monoSeen");
     const { result, rerender } = renderHook(({ monos }) => useUnreadMonos("desk-2", monos), { initialProps: { monos: [mono] } });
     // Size 0 also holds before the stored map has loaded, so wait until the first sighting is recorded:
     // a reply that arrives before then is itself a first sighting and would count as seen.
-    await waitFor(async () => expect(await stored("desk-2")).toEqual({ m1: "10\nhello" }));
+    await waitFor(async () => expect(await stored("desk-2")).toEqual({ m1: expect.stringMatching(/^m1:10:5:[0-9a-f]+$/) }));
     await waitFor(() => expect(result.current.size).toBe(0));
     rerender({ monos: [{ ...mono, lastMessage: "a new reply", lastActiveAt: 20 }] });
     await waitFor(() => expect(result.current.has("m1")).toBe(true));

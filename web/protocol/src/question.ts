@@ -1,6 +1,6 @@
+// Copied from src/features/sessions/model/userQuestion.ts at ca73ac2b
 // Question card types (W-17). The wire shapes are defined once in wire.ts and re-exported by
 // methods.ts; this file re-exports them and adds the element types the card uses.
-// Copied from src/features/sessions/model/userQuestion.ts at ca73ac2b
 // Types only.
 import type { QuestionPrompt, QuestionReply } from "./methods.ts";
 

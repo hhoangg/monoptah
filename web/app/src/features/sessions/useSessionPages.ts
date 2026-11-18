@@ -4,7 +4,7 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import type { SessionCard } from "@monoptah/protocol";
 import { LINK_QUERY_DEFAULTS } from "@/data";
 import { useLinkConnection, useLinkDesktopId } from "@/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 export const SESSION_PAGE = 30;
 /** Typing waits for a pause before it asks the desktop. */
@@ -62,13 +62,29 @@ export function useSessionPages(projectId: string, query: string, enabled = true
     staleTime: 0,
     enabled,
   });
+  // Callbacks stay the same across renders (they read the latest result), so an effect that calls them
+  // does not run again after every render.
+  const latest = useRef(result);
+  useEffect(() => {
+    latest.current = result;
+  });
+  /** Asks for the next page, unless one is in flight or the last ask failed (`retryMore` is the user's way out). */
+  const loadMore = useCallback(() => {
+    const current = latest.current;
+    if (current.hasNextPage && !current.isFetchingNextPage && !current.isFetchNextPageError) void current.fetchNextPage();
+  }, []);
+  const retryMore = useCallback(() => {
+    const current = latest.current;
+    if (current.hasNextPage && !current.isFetchingNextPage) void current.fetchNextPage();
+  }, []);
   const paged = result.data ? dedupeSessions(result.data.pages) : null;
   return {
     paged,
     hasMore: result.hasNextPage,
-    loadMore: () => {
-      if (result.hasNextPage && !result.isFetchingNextPage) void result.fetchNextPage();
-    },
+    loadMore,
+    retryMore,
+    /** The last request for a further page failed: nothing asks again until `retryMore`. */
+    nextError: result.isFetchNextPageError,
     loadingMore: result.isFetchingNextPage,
     loading: result.isPending,
     error: result.isError,

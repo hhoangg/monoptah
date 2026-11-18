@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Turn } from "@monoptah/protocol";
 
 const request = vi.fn();
-const client = { request };
+let linkStatus = "ready";
+const client = { request, store: { getState: () => ({ status: linkStatus }) } };
 vi.mock("@/link", () => ({ useLinkConnection: () => client }));
 
 import { mergeOlder, OLDER_PAGE_SIZE, useOlderTurns } from "./useOlderTurns";
@@ -11,7 +12,10 @@ import { mergeOlder, OLDER_PAGE_SIZE, useOlderTurns } from "./useOlderTurns";
 const turn = (id: string): Turn => ({ id, items: [] });
 const ids = (turns: Turn[]) => turns.map((t) => t.id);
 
-beforeEach(() => request.mockReset());
+beforeEach(() => {
+  request.mockReset();
+  linkStatus = "ready";
+});
 
 describe("mergeOlder", () => {
   it("puts older pages in front and never repeats an id", () => {
@@ -113,5 +117,22 @@ describe("useOlderTurns (conversation.older)", () => {
     expect(ids(result.current.turns)).toEqual(["t10"]);
     expect(result.current.loading).toBe(false);
     expect(result.current.hasOlder).toBe(true);
+  });
+
+  it("does not ask while the link is not ready, and asks once it is", async () => {
+    linkStatus = "reconnecting";
+    request.mockResolvedValue({ turns: [turn("t9")], older: true });
+    const held = [turn("t10")];
+    const { result, rerender } = renderHook(() => useOlderTurns("c1", held, true));
+    await act(async () => {
+      expect(await result.current.loadOlder()).toBe(false);
+    });
+    expect(request).not.toHaveBeenCalled();
+    linkStatus = "ready";
+    rerender();
+    await act(async () => {
+      expect(await result.current.loadOlder()).toBe(true);
+    });
+    expect(request).toHaveBeenCalledTimes(1);
   });
 });
