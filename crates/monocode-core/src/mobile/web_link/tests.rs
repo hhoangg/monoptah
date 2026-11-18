@@ -610,6 +610,41 @@ fn close_codes_follow_the_architecture_table() {
 }
 
 #[test]
+fn the_full_relay_url_is_used_and_a_bare_host_is_rebuilt() {
+    use super::relay::{connect_url, handshake_end};
+    let id = uuid::Uuid::parse_str("0b6a1c9e-5d7f-4f3a-9a52-3c1e8d2f7a10").unwrap();
+    let stored = format!("wss://relay.example.test:8443/relay/desktop/{id}");
+    assert_eq!(
+        connect_url(&stored, "https://relay.example.test:8443", &id).unwrap(),
+        stored
+    );
+    // A bare host (an older install) is rebuilt; so is a URL for another id.
+    let rebuilt = format!("wss://relay.example.test:8443/relay/desktop/{id}");
+    assert_eq!(
+        connect_url(
+            "https://relay.example.test:8443",
+            "https://relay.example.test:8443",
+            &id
+        )
+        .unwrap(),
+        rebuilt
+    );
+    let other = "wss://relay.example.test:8443/relay/desktop/someone-else?x=1";
+    assert_eq!(
+        connect_url(other, "https://relay.example.test:8443", &id).unwrap(),
+        rebuilt
+    );
+    // A refused handshake: 401 revokes, 429 is `slow_down` (a penalty wait).
+    assert_eq!(handshake_end(401), End::Unauthorized);
+    assert_eq!(handshake_end(429), End::Closed(Some(4008)));
+    assert_eq!(handshake_end(503), End::Lost);
+    assert!(matches!(
+        react(handshake_end(429), &mut Budget::new()),
+        Step::Penalty { .. }
+    ));
+}
+
+#[test]
 fn backoff_doubles_from_one_second_to_a_sixty_second_cap() {
     let timing = Timing::default();
     let seconds: Vec<u64> = (0..10)
@@ -1520,12 +1555,20 @@ mod seam {
         // is not paired yet.
         assert_eq!(world.host.web_pair_poll().unwrap(), PairPoll::Pending);
         assert!(!world.status().paired);
+        let log = tempfile::tempdir().unwrap();
+        let _turn = crate::mobile::audit::test_log(log.path());
         assert_eq!(
             world.host.web_pair_poll().unwrap(),
             PairPoll::Approved {
                 account: "alice".into()
             }
         );
+        let enrolled = crate::mobile::audit::read_recent(log.path(), 20)
+            .into_iter()
+            .find(|line| line["event"] == "enroll" && line["deviceId"] == DESKTOP_UUID)
+            .expect("the pairing is audited");
+        assert_eq!(enrolled["transport"], "web");
+        assert_eq!(enrolled["detail"], "pair");
         let poll = world.hub.requests("POST", "/api/pair/poll").remove(0).body;
         assert_eq!(poll["deviceCode"], "fake-device-code");
         let verifier = URL_SAFE_NO_PAD
@@ -1548,7 +1591,14 @@ mod seam {
         // The identity is sealed with the handle, and the host is stored bare.
         let identity = world.host.load_web_identity().unwrap().unwrap();
         assert_eq!(identity.account_handle.as_deref(), Some("alice"));
-        assert_eq!(identity.relay_url, host_url);
+        // The full address the server returned is kept, not rebuilt.
+        assert_eq!(
+            identity.relay_url,
+            format!(
+                "ws://127.0.0.1:{}/relay/desktop/{DESKTOP_UUID}",
+                world.hub.port
+            )
+        );
         assert_eq!(fingerprint(&identity.static_public), ticket.fingerprint);
         assert!(!format!("{identity:?}").contains(TOKEN));
         // The link started with the token, and a second pairing is refused.
@@ -1784,6 +1834,7 @@ mod seam {
             .host
             .set_device_access(
                 &device.id,
+                DeviceKind::Web,
                 Permission::Control,
                 Some(vec!["p".into()]),
                 None,
@@ -1844,6 +1895,108 @@ mod seam {
                 .iter()
                 .any(|r| r.body == json!({"state": "revoked"}))
         });
+    }
+
+    #[test]
+    fn device_lifecycle_moments_are_written_to_the_audit_log() {
+        use crate::mobile::audit;
+        let env = env(1);
+        let log = tempfile::tempdir().unwrap();
+        let (kept, denied) = ("a".repeat(64), "b".repeat(64));
+        let _turn = audit::test_log(log.path());
+        let events = {
+            let pending = env.host.web_link().pending();
+            pending.replace(vec![(kept.clone(), "Tab".into(), "srv-kept".into())]);
+            let device = env
+                .host
+                .web_confirm(&kept, Permission::Read, None, None)
+                .unwrap();
+            env.host
+                .set_device_access(&device.id, DeviceKind::Web, Permission::Control, None, None)
+                .unwrap();
+            env.host.web_revoke(&device.id).unwrap();
+            pending.replace(vec![(denied.clone(), "Tab".into(), "srv-denied".into())]);
+            env.host.web_deny(&denied).unwrap();
+            env.host.web_unpair().unwrap();
+            // Newest first; oldest first reads better.
+            let mut lines = audit::read_recent(log.path(), 50);
+            lines.reverse();
+            lines
+                .iter()
+                .map(|line| {
+                    (
+                        line["event"].as_str().unwrap_or_default().to_owned(),
+                        line["transport"].as_str().unwrap_or_default().to_owned(),
+                        line["detail"].as_str().map(str::to_owned),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let line = |event: &str, detail: Option<&str>| {
+            (
+                event.to_owned(),
+                "web".to_owned(),
+                detail.map(str::to_owned),
+            )
+        };
+        let expected = [
+            line("confirm", None),
+            line("permission", Some("control")),
+            line("revoke", None),
+            line("deny", None),
+            line("revoke", Some("unpair")),
+        ];
+        // Other tests may write here too: the moments of this one stay in order.
+        let mut next = expected.iter();
+        let mut want = next.next();
+        for event in &events {
+            if Some(event) == want {
+                want = next.next();
+            }
+        }
+        assert!(want.is_none(), "missing {want:?} in {events:?}");
+    }
+
+    #[test]
+    fn grant_sync_changes_are_audited() {
+        use crate::mobile::{audit, web_link::desktop_api::ServerGrant};
+        let env = env(1);
+        let fresh = Peer::new(9, env.peer.desktop_public);
+        let server_grant = |peer: &Peer, state: &str, requested| ServerGrant {
+            device_id: peer.relay_id(),
+            device_name: "Laptop".into(),
+            public_key: URL_SAFE_NO_PAD.encode(peer.public),
+            fingerprint: peer.fingerprint(),
+            state: state.into(),
+            requested,
+            permission: Some(Permission::Control),
+        };
+        let log = tempfile::tempdir().unwrap();
+        let _turn = audit::test_log(log.path());
+        let generation = env.host.web_link().generation();
+        // The server lowers the confirmed row and lists a new pending device.
+        env.host.apply_server_grants(
+            &[
+                server_grant(&env.peer, "confirmed", Some(Permission::Read)),
+                server_grant(&fresh, "pending", None),
+            ],
+            generation,
+        );
+        // The server then revokes the row.
+        env.host
+            .apply_server_grants(&[server_grant(&env.peer, "revoked", None)], generation);
+        let lines = audit::read_recent(log.path(), 50);
+        let has = |event: &str, id: &str, detail: &str| {
+            lines.iter().any(|line| {
+                line["event"] == event
+                    && line["deviceId"] == id
+                    && line["detail"] == detail
+                    && line["transport"] == "web"
+            })
+        };
+        assert!(has("permission", "web-1", "read"), "{lines:?}");
+        assert!(has("pending", &fresh.relay_id(), "server"), "{lines:?}");
+        assert!(has("revoke", "web-1", "server"), "{lines:?}");
     }
 
     #[test]
@@ -1913,7 +2066,13 @@ mod seam {
         let rt = runtime();
         let updated = env
             .host
-            .set_device_access("phone-1", Permission::Control, None, None)
+            .set_device_access(
+                "phone-1",
+                DeviceKind::Phone,
+                Permission::Control,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!((updated.projects, updated.kind), (None, DeviceKind::Phone));
         assert!(rt
@@ -1923,6 +2082,7 @@ mod seam {
             .host
             .set_device_access(
                 "phone-1",
+                DeviceKind::Phone,
                 Permission::Control,
                 Some(vec!["only".into()]),
                 Some(vec![]),
@@ -1950,8 +2110,25 @@ mod seam {
             .all(|d| d.id != "phone-1"));
         assert!(env
             .host
-            .set_device_access("nobody", Permission::Read, None, None)
+            .set_device_access("nobody", DeviceKind::Phone, Permission::Read, None, None)
             .is_err());
+        // A phone's id never reaches a web row and the other way round.
+        assert!(env
+            .host
+            .set_device_access("phone-1", DeviceKind::Web, Permission::Read, None, None)
+            .is_err());
+        assert!(env
+            .host
+            .set_device_access("web-1", DeviceKind::Phone, Permission::Read, None, None)
+            .is_err());
+        let still = env
+            .host
+            .status()
+            .devices
+            .into_iter()
+            .find(|d| d.id == "phone-1")
+            .unwrap();
+        assert_eq!(still.projects, Some(vec!["only".to_string()]));
     }
     #[test]
     fn a_relay_url_on_another_host_or_with_another_id_is_refused_and_given_back() {

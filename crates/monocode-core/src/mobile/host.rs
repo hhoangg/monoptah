@@ -591,10 +591,13 @@ impl MobileHost {
         }
         let mut inner = self.inner.lock().map_err(unavailable)?;
         let mut config = inner.config.clone();
-        let removed = config
+        let removed_row = config
             .devices
             .iter()
             .find(|v| v.id == device_id && v.kind == DeviceKind::Phone)
+            .cloned();
+        let removed = removed_row
+            .as_ref()
             .map(|device| (device.kind, device.fingerprint.clone()));
         if let Some((kind, peer)) = &removed {
             if *kind == DeviceKind::Phone {
@@ -611,6 +614,10 @@ impl MobileHost {
         }
         self.save(&config)?;
         inner.config = config;
+        drop(inner);
+        if let Some(device) = &removed_row {
+            audit_device(audit::Lifecycle::Revoke, device, None);
+        }
         Ok(())
     }
 
@@ -626,8 +633,16 @@ impl MobileHost {
         Ok(())
     }
 
-    /// The push tokens of paired phones that take `category`.
-    pub fn push_tokens(&self, category: &str) -> Vec<String> {
+    /// The push tokens of paired phones that take `category` and whose
+    /// selection covers the notice: a phone that narrowed its projects (or
+    /// Monos) gets no push about a project (or Mono) it did not select.
+    /// `project_id` and `mono_id` are the ones the notice is about, if any.
+    pub fn push_tokens(
+        &self,
+        category: &str,
+        project_id: Option<&str>,
+        mono_id: Option<&str>,
+    ) -> Vec<String> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
@@ -639,6 +654,14 @@ impl MobileHost {
             .devices
             .iter()
             .filter(|device| device.kind == DeviceKind::Phone)
+            .filter(|device| {
+                let covers =
+                    |selection: &Option<Vec<String>>, id: Option<&str>| match (selection, id) {
+                        (None, _) | (_, None) => true,
+                        (Some(list), Some(id)) => list.iter().any(|item| item == id),
+                    };
+                covers(&device.projects, project_id) && covers(&device.monos, mono_id)
+            })
             .filter_map(|device| device.push.as_ref())
             .filter(|push| !push.disabled.iter().any(|off| off == category))
             .map(|push| push.token.clone())
@@ -830,6 +853,13 @@ impl MobileHost {
             last_seen: None,
         });
         self.save(&config)?;
+        audit::record_lifecycle(
+            audit::Lifecycle::Enroll,
+            &id,
+            &fingerprint,
+            Transport::Quic,
+            None,
+        );
         inner.config = config;
         inner.invitations.remove(peer);
         self.gate.remove(peer);
@@ -1515,7 +1545,9 @@ impl MobileHost {
             static_public: pairing.public,
             desktop_id: approval.desktop_id.clone(),
             desktop_token: (*approval.desktop_token).clone(),
-            relay_url: relay_base.clone(),
+            // The full address the server returned (checked above to be on the
+            // typed host and this desktop's id), not one rebuilt from the host.
+            relay_url: approval.relay_url.trim().to_owned(),
             account_handle: Some(handle.clone()),
         };
         if let Err(error) = self.save_web_identity(&identity) {
@@ -1523,6 +1555,13 @@ impl MobileHost {
             return Err(error);
         }
         self.set_web_enabled(true)?;
+        audit::record_lifecycle(
+            audit::Lifecycle::Enroll,
+            &approval.desktop_id,
+            &super::web_link::noise::fingerprint(&identity.static_public),
+            Transport::Web,
+            Some("pair"),
+        );
         Ok(PairPoll::Approved { account: handle })
     }
 
@@ -1652,6 +1691,7 @@ impl MobileHost {
             self.web.pending().remove(fingerprint);
             device
         };
+        audit_device(audit::Lifecycle::Confirm, &device, None);
         self.web.command(LinkCommand::Confirm {
             fingerprint: fingerprint.to_owned(),
             device: Box::new(device.clone()),
@@ -1681,6 +1721,13 @@ impl MobileHost {
             inner.config = config;
             self.web.pending().remove(fingerprint);
         }
+        audit::record_lifecycle(
+            audit::Lifecycle::Deny,
+            &grant.server_device_id,
+            fingerprint,
+            Transport::Web,
+            None,
+        );
         self.web.command(LinkCommand::Deny {
             fingerprint: fingerprint.to_owned(),
         });
@@ -1708,6 +1755,7 @@ impl MobileHost {
             close_device_watches(&mut inner, &removed.fingerprint);
             removed
         };
+        audit_device(audit::Lifecycle::Revoke, &removed, None);
         self.web.drop_request(device_id);
         self.web.command(LinkCommand::Revoke {
             fingerprint: removed.fingerprint,
@@ -1716,13 +1764,15 @@ impl MobileHost {
         Ok(())
     }
 
-    /// Sets what a paired device may see and do, for a web device or a phone
-    /// ("Your phones": the project selection). Its watches end so the next
-    /// request is checked against the new access; a web device also gets a
-    /// fresh `state` and the server hears the permission.
+    /// Sets what a paired device of `kind` may see and do, for a web device or
+    /// a phone ("Your phones": the project selection). Only a row of that kind
+    /// is changed: ids of different kinds are unrelated. Its watches end so the
+    /// next request is checked against the new access; a web device also gets
+    /// a fresh `state` and the server hears the permission.
     pub fn set_device_access(
         &self,
         device_id: &str,
+        kind: DeviceKind,
         permission: Permission,
         projects: Option<Vec<String>>,
         monos: Option<Vec<String>>,
@@ -1733,7 +1783,7 @@ impl MobileHost {
             let device = config
                 .devices
                 .iter_mut()
-                .find(|device| device.id == device_id)
+                .find(|device| device.id == device_id && device.kind == kind)
                 .ok_or("Device revoked or not paired")?;
             device.permission = permission;
             device.projects = projects;
@@ -1744,6 +1794,11 @@ impl MobileHost {
             close_device_watches(&mut inner, &device.fingerprint);
             device
         };
+        audit_device(
+            audit::Lifecycle::PermissionChange,
+            &device,
+            Some(super::web_link::desktop_api::permission_name(permission)),
+        );
         if device.kind == DeviceKind::Web {
             self.web.drop_request(&device.id);
             self.web.command(LinkCommand::Resend {
@@ -1780,8 +1835,14 @@ impl MobileHost {
                 .ok_or("Unknown web device")?;
             (device.projects.clone(), device.monos.clone())
         };
-        self.set_device_access(device_id, request.requested, projects, monos)
-            .map(|_| ())
+        self.set_device_access(
+            device_id,
+            DeviceKind::Web,
+            request.requested,
+            projects,
+            monos,
+        )
+        .map(|_| ())
     }
 
     /// Unpairs the web link: tells the server (best effort, a few seconds at
@@ -1790,6 +1851,7 @@ impl MobileHost {
     /// confirmed row would otherwise skip the re-confirmation. Blocking.
     /// Safe to repeat.
     pub fn web_unpair(&self) -> Result<(), String> {
+        let mut unpaired = None;
         if let Ok(Some(identity)) = self.load_web_identity() {
             if let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) {
                 let _ = desktop_api::delete_me(
@@ -1798,6 +1860,10 @@ impl MobileHost {
                     desktop_api::UNPAIR_TIMEOUT,
                 );
             }
+            unpaired = Some((
+                identity.desktop_id.clone(),
+                super::web_link::noise::fingerprint(&identity.static_public),
+            ));
         }
         self.web.stop();
         identity_store::wipe_web(
@@ -1808,7 +1874,18 @@ impl MobileHost {
         // cannot refill the pending set after the wipe.
         let mut inner = self.inner.lock().map_err(unavailable)?;
         self.web.forget();
-        self.remove_web_rows_locked(&mut inner)
+        self.remove_web_rows_locked(&mut inner)?;
+        drop(inner);
+        if let Some((desktop_id, fingerprint)) = unpaired {
+            audit::record_lifecycle(
+                audit::Lifecycle::Revoke,
+                &desktop_id,
+                &fingerprint,
+                Transport::Web,
+                Some("unpair"),
+            );
+        }
+        Ok(())
     }
 
     /// Applies the server's grant list (grant sync): pending devices become
@@ -1822,6 +1899,9 @@ impl MobileHost {
     ) -> Vec<Report> {
         let mut reports: Vec<Report> = Vec::new();
         let mut commands: Vec<LinkCommand> = Vec::new();
+        // `(moment, device id, fingerprint, detail)`, written once the lock is
+        // released.
+        let mut audits: Vec<(audit::Lifecycle, String, String, &'static str)> = Vec::new();
         {
             let Ok(mut inner) = self.inner.lock() else {
                 return reports;
@@ -1847,6 +1927,12 @@ impl MobileHost {
             for row_id in &plan.revoked_rows {
                 if let Some(position) = config.devices.iter().position(|d| &d.id == row_id) {
                     let removed = config.devices.remove(position);
+                    audits.push((
+                        audit::Lifecycle::Revoke,
+                        removed.id.clone(),
+                        removed.fingerprint.clone(),
+                        "server",
+                    ));
                     closing.push(removed.fingerprint.clone());
                     commands.push(LinkCommand::Revoke {
                         fingerprint: removed.fingerprint,
@@ -1856,6 +1942,12 @@ impl MobileHost {
             for (row_id, permission) in &plan.lowered {
                 if let Some(row) = config.devices.iter_mut().find(|d| &d.id == row_id) {
                     row.permission = *permission;
+                    audits.push((
+                        audit::Lifecycle::PermissionChange,
+                        row.id.clone(),
+                        row.fingerprint.clone(),
+                        super::web_link::desktop_api::permission_name(*permission),
+                    ));
                     closing.push(row.fingerprint.clone());
                     commands.push(LinkCommand::Resend {
                         fingerprint: row.fingerprint.clone(),
@@ -1891,6 +1983,16 @@ impl MobileHost {
                 })
                 .collect();
             self.web.set_requests(requests);
+            for (fingerprint, _, server_id) in &plan.pending {
+                if self.web.pending().get(fingerprint).is_none() {
+                    audits.push((
+                        audit::Lifecycle::Pending,
+                        server_id.clone(),
+                        fingerprint.clone(),
+                        "server",
+                    ));
+                }
+            }
             // The pending set is replaced under the same lock that `web_confirm`
             // takes, so a device confirmed meanwhile is not listed again.
             self.web.pending().replace(plan.pending);
@@ -1905,6 +2007,9 @@ impl MobileHost {
                     reports.push((server_id, "confirmed", Some(permission)));
                 }
             }
+        }
+        for (kind, id, fingerprint, detail) in audits {
+            audit::record_lifecycle(kind, &id, &fingerprint, Transport::Web, Some(detail));
         }
         for command in commands {
             self.web.command(command);
@@ -2084,6 +2189,17 @@ impl MobileHost {
         let mut inner = self.inner.lock().unwrap();
         inner.config.devices.push(device);
     }
+}
+
+/// Writes a device's moment to the audit log (WS-D3). Never fails the caller.
+fn audit_device(kind: audit::Lifecycle, device: &Device, detail: Option<&str>) {
+    audit::record_lifecycle(
+        kind,
+        &device.id,
+        &device.fingerprint,
+        device.kind.into(),
+        detail,
+    );
 }
 
 /// The outcome to record once a call ended: a call that was admitted and then
@@ -2789,13 +2905,53 @@ mod tests {
         register(json!({"token":"ExponentPushToken[abc]","disabled":["agentFinished"]}))
             .await
             .unwrap();
-        assert_eq!(host.push_tokens("agentInput"), ["ExponentPushToken[abc]"]);
-        assert!(host.push_tokens("agentFinished").is_empty());
+        assert_eq!(
+            host.push_tokens("agentInput", None, None),
+            ["ExponentPushToken[abc]"]
+        );
+        assert!(host.push_tokens("agentFinished", None, None).is_empty());
         let saved = std::fs::read_to_string(&host.path).unwrap();
         assert!(saved.contains("ExponentPushToken[abc]"));
         host.forget_push_tokens(&["ExponentPushToken[abc]".into()])
             .unwrap();
-        assert!(host.push_tokens("agentInput").is_empty());
+        assert!(host.push_tokens("agentInput", None, None).is_empty());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_push_goes_only_to_phones_whose_selection_covers_it() {
+        let (host, _events, _peer) = paired();
+        let phone = |id: &str, token: &str, projects, monos| Device {
+            id: id.into(),
+            fingerprint: format!("fp-{id}"),
+            push: Some(PushRegistration {
+                token: token.into(),
+                disabled: Vec::new(),
+            }),
+            projects,
+            monos,
+            ..phone_row()
+        };
+        host.add_device_for_test(phone("all", "ExponentPushToken[all]", None, None));
+        host.add_device_for_test(phone(
+            "narrow",
+            "ExponentPushToken[narrow]",
+            Some(vec!["p1".into()]),
+            Some(vec!["m1".into()]),
+        ));
+        let tokens = |project, mono| host.push_tokens("agentInput", project, mono);
+        assert_eq!(
+            tokens(Some("p1"), None),
+            ["ExponentPushToken[all]", "ExponentPushToken[narrow]"]
+        );
+        assert_eq!(tokens(Some("p2"), None), ["ExponentPushToken[all]"]);
+        assert_eq!(tokens(None, Some("m2")), ["ExponentPushToken[all]"]);
+        assert_eq!(
+            tokens(None, Some("m1")),
+            ["ExponentPushToken[all]", "ExponentPushToken[narrow]"]
+        );
+        // A habit run names both: each must be selected.
+        assert_eq!(tokens(Some("p1"), Some("m2")), ["ExponentPushToken[all]"]);
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 
@@ -2878,7 +3034,7 @@ mod tests {
                 disabled: Vec::new(),
             });
         }
-        assert!(host.push_tokens("agentInput").is_empty());
+        assert!(host.push_tokens("agentInput", None, None).is_empty());
         // Forgetting a token never touches a web row either.
         host.forget_push_tokens(&["ExponentPushToken[web]".into()])
             .unwrap();
@@ -2896,7 +3052,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(host.push_tokens("agentInput"), ["ExponentPushToken[phone]"]);
+        assert_eq!(
+            host.push_tokens("agentInput", None, None),
+            ["ExponentPushToken[phone]"]
+        );
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

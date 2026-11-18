@@ -11,7 +11,7 @@ use super::session::{Action, Directory, Lookup, SendError, SessionTable, PROTO};
 use super::{LinkCommand, WebLink, WebState};
 use crate::mobile::host::{name as desktop_name, MobileHost};
 use crate::mobile::identity_store::WebIdentity;
-use crate::mobile::policy::{self, PolicyFlags};
+use crate::mobile::policy;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -230,6 +230,23 @@ pub(crate) fn react(end: End, budget: &mut Budget) -> Step {
     }
 }
 
+/// The WebSocket address to connect to: the full relay URL the server returned
+/// at pairing when it is for this desktop's id, else one built from the host
+/// (an identity stored before the full URL was kept). `base` is the checked
+/// HTTP base of `stored`.
+pub(crate) fn connect_url(
+    stored: &str,
+    base: &str,
+    desktop_uuid: &uuid::Uuid,
+) -> Result<String, String> {
+    let id = desktop_uuid.hyphenated().to_string();
+    let stored = stored.trim();
+    if desktop_api::relay_path_id(stored).is_some_and(|path| path.eq_ignore_ascii_case(&id)) {
+        return Ok(stored.to_owned());
+    }
+    relay_url(base, &id, cfg!(debug_assertions))
+}
+
 /// The client task: connect, serve, react to the close, repeat. Returns only
 /// when the relay refuses the desktop for good or the identity is unusable.
 pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, timing: Timing) {
@@ -237,8 +254,8 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
         link.set(WebState::Off, Some("The web identity is invalid".into()));
         return;
     };
-    // The stored address is a bare host; the full `.../relay/desktop/<id>`
-    // form the server hands out at pairing is reduced to its host too.
+    // The stored address is the full `.../relay/desktop/<id>` form the server
+    // returned at pairing (an older install stored the bare host).
     let base = match desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) {
         Ok(base) => base,
         Err(error) => {
@@ -246,11 +263,7 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
             return;
         }
     };
-    let url = match relay_url(
-        &base,
-        &desktop_uuid.hyphenated().to_string(),
-        cfg!(debug_assertions),
-    ) {
+    let url = match connect_url(&identity.relay_url, &base, &desktop_uuid) {
         Ok(url) => url,
         Err(error) => {
             link.set(WebState::Off, Some(error));
@@ -341,10 +354,19 @@ async fn connect(url: &str, token: &str) -> Result<Socket, End> {
     .await
     {
         Ok(Ok((socket, _))) => Ok(socket),
-        Ok(Err(WsError::Http(response))) if response.status().as_u16() == 401 => {
-            Err(End::Unauthorized)
-        }
+        Ok(Err(WsError::Http(response))) => Err(handshake_end(response.status().as_u16())),
         _ => Err(End::Lost),
+    }
+}
+
+/// How a refused WebSocket handshake ends the attempt: 401 is a revoked
+/// token, 429 is the relay's `slow_down` (the same wait as close 4008), any
+/// other status is a lost connection to retry with backoff.
+pub(crate) fn handshake_end(status: u16) -> End {
+    match status {
+        401 => End::Unauthorized,
+        429 => End::Closed(Some(4008)),
+        _ => End::Lost,
     }
 }
 
@@ -605,7 +627,7 @@ fn confirmed_state(permission: policy::Permission) -> Value {
         "state": "confirmed",
         "permission": desktop_api::permission_name(permission),
         "proto": PROTO,
-        "capabilities": policy::capabilities(&PolicyFlags::default()),
+        "capabilities": policy::capabilities(&policy::flags()),
         "desktop": { "name": desktop_name(), "version": env!("CARGO_PKG_VERSION") },
     })
 }

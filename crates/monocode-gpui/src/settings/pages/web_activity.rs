@@ -1,5 +1,6 @@
 //! Settings > Web app > Activity log: the newest lines of the desktop's audit
-//! log (`mobile-audit.jsonl`). The page that hosts it calls [`activity_log`].
+//! log (`mobile-audit.jsonl`). The Web app page loads it with [`load`] when the
+//! user opens it and draws it with [`activity_list`].
 use crate::{settings::widgets::note, theme::*};
 use gpui::{AnyElement, div, prelude::*, px};
 use monocode_core::mobile::audit;
@@ -122,10 +123,9 @@ pub(crate) fn activity_list(lines: &[Value]) -> AnyElement {
         .into_any_element()
 }
 
-/// The viewer for the audit log in the host's data directory `dir`.
-#[allow(dead_code)] // Called by the Web app page once it is registered.
-pub(crate) fn activity_log(dir: &Path) -> AnyElement {
-    activity_list(&audit::read_recent(dir, SHOWN))
+/// The newest audit lines in the host's data directory `dir`, newest first.
+pub(crate) fn load(dir: &Path) -> Vec<Value> {
+    audit::read_recent(dir, SHOWN)
 }
 
 #[cfg(test)]

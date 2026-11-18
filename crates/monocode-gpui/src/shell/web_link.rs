@@ -7,7 +7,7 @@ use crate::notifications::platform;
 use crate::settings::SettingsEvent;
 use gpui::{Global, Task};
 use monocode_core::mobile::{
-    WebStatus,
+    DeviceKind, WebStatus,
     host::MobileHost,
     web_link::{PairPoll, PairTicket, PendingDevice, attached_host},
 };
@@ -208,8 +208,14 @@ impl Shell {
                         .into_iter()
                         .find(|device| device.id == device_id)
                         .ok_or("That device is no longer paired")?;
-                    host.set_device_access(&device_id, permission, device.projects, device.monos)
-                        .map(|_| ())
+                    host.set_device_access(
+                        &device_id,
+                        DeviceKind::Web,
+                        permission,
+                        device.projects,
+                        device.monos,
+                    )
+                    .map(|_| ())
                 });
             }
             SettingsEvent::WebConfirmDevice {
@@ -235,10 +241,16 @@ impl Shell {
                         .status()
                         .devices
                         .into_iter()
-                        .find(|device| device.id == device_id)
+                        .find(|device| device.id == device_id && device.kind == DeviceKind::Phone)
                         .ok_or("That device is no longer paired")?;
-                    host.set_device_access(&device_id, device.permission, projects, device.monos)
-                        .map(|_| ())
+                    host.set_device_access(
+                        &device_id,
+                        DeviceKind::Phone,
+                        device.permission,
+                        projects,
+                        device.monos,
+                    )
+                    .map(|_| ())
                 });
             }
             SettingsEvent::WebRevokeDevice(device_id) => {

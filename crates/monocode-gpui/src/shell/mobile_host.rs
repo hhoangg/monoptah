@@ -484,24 +484,9 @@ impl Shell {
 
     pub(super) fn mobile_revoke(&mut self, device_id: &str, cx: &mut Context<Self>) {
         if let Some(host) = &self.mobile.host {
-            let device = host
-                .status()
-                .devices
-                .into_iter()
-                .find(|device| device.id == device_id);
-            match host.revoke(device_id) {
-                Ok(()) => audit::record_lifecycle(
-                    audit::Lifecycle::Revoke,
-                    device_id,
-                    device
-                        .as_ref()
-                        .map_or("", |device| device.fingerprint.as_str()),
-                    device
-                        .as_ref()
-                        .map_or(audit::Transport::Quic, |device| device.kind.into()),
-                    None,
-                ),
-                Err(error) => self.error = Some(format!("Mobile access: {error}")),
+            // The host writes the revoke to the audit log.
+            if let Err(error) = host.revoke(device_id) {
+                self.error = Some(format!("Mobile access: {error}"));
             }
         }
         self.sync_settings(cx);
@@ -2163,7 +2148,13 @@ impl Shell {
         let Some(host) = self.mobile.host.clone() else {
             return;
         };
-        let tokens = host.push_tokens(category);
+        // Only phones whose selection covers the project and Mono the notice
+        // is about get it.
+        let tokens = host.push_tokens(
+            category,
+            notice.data["projectId"].as_str(),
+            notice.data["monoId"].as_str(),
+        );
         if tokens.is_empty() {
             return;
         }

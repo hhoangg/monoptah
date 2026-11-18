@@ -396,6 +396,16 @@ pub fn record_lifecycle(
     }
 }
 
+/// Points the process-wide log at `dir` until the guard drops. Tests that read
+/// the log back take turns here, so one cannot redirect another's lines.
+#[cfg(test)]
+pub(crate) fn test_log(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    init(dir);
+    turn
+}
+
 /// The newest `limit` lines of the log in `dir`, newest first, across the
 /// current and rotated files. Lines that do not parse are skipped.
 pub fn read_recent(dir: &Path, limit: usize) -> Vec<Value> {

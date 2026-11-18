@@ -413,6 +413,8 @@ pub(crate) fn git(root: &Path) -> Result<Value, Failure> {
         "branch": index.branch.unwrap_or_default(),
         "files": index.files.len(),
         "remote": index.remote.is_some(),
+        // The name of the remote (`origin`), empty when the repository has none.
+        "remoteName": index.remote.clone().unwrap_or_default(),
         "upstream": index.upstream.is_some(),
         "defaultBranch": index.default_branch.unwrap_or_default(),
         "ahead": index.ahead,
@@ -1165,7 +1167,15 @@ mod tests {
         let status = git(root).unwrap();
         assert_eq!(status["files"], 1);
         assert_eq!(status["remote"], false);
+        assert_eq!(status["remoteName"], "");
         assert_eq!(status["canGenerate"], true);
+        run_git(
+            root,
+            &["remote", "add", "origin", "https://example.test/repo.git"],
+        );
+        let status = git(root).unwrap();
+        assert_eq!(status["remote"], true);
+        assert_eq!(status["remoteName"], "origin");
 
         git_action(
             root,
