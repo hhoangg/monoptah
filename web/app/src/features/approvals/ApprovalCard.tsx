@@ -3,9 +3,14 @@
 // Security (security.md section 7, U-13): `label` and `detail` are untrusted provider text. They are rendered
 // as plain React text nodes only: no markdown, no links, no HTML. The safe markdown renderer (W-07) has no
 // plain-text mode, and a command preview needs none of its features, so React's text escaping is the smallest
-// attack surface. There are exactly two actions, "Allow once" and "Deny"; nothing sends a mode, `runtimeMode`
-// or a "full-access" value, and the only request this card sends is `session.answerApproval`.
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+// attack surface. Hidden characters are shown as visible markers (text.ts). There are exactly two actions,
+// "Allow once" and "Deny"; nothing sends a mode, `runtimeMode` or a "full-access" value, and the only request
+// this card sends is `session.answerApproval`.
+//
+// One decision per request: an id stays locked from the click until it leaves the list (a later frame), whatever
+// else arrives meanwhile. A request that just appeared is armed only after ARM_DELAY_MS, and a press that began
+// on another request is ignored, so a tap meant for one request never decides the next.
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
 import type { Approval } from "@monoptah/protocol";
 import { useApprovals, useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
@@ -15,21 +20,46 @@ import { Glass } from "@/ui/Glass";
 import { Shield } from "@/ui/icons";
 import { cn } from "@/lib/utils";
 import { isApprovalCardEnabled } from "./flag";
+import { showDetail, showLabel, type TextSegment } from "./text";
 
 export const APPROVAL_READ_ONLY_REASON = "Approvals need a device with control access.";
+export const APPROVAL_CONNECTING_REASON = "Connecting. Approvals unlock once the link is ready.";
+export const APPROVAL_UNCONFIRMED = "Could not confirm the answer; it may have reached the desktop. Wait for the desktop to update.";
+export const APPROVAL_TRUNCATED_NOTICE = "Review the full request on the desktop. Allow once is off because the whole request cannot be shown here.";
 /** Longest label and detail shown; the desktop text is capped again here so a huge payload cannot flood the DOM. */
 export const MAX_LABEL_CHARS = 300;
 export const MAX_DETAIL_CHARS = 8000;
+/** A new request keeps both buttons off for this long, so a tap aimed at the previous one cannot decide it. */
+export const ARM_DELAY_MS = 700;
+/** Detail with more lines than fit the box shows a scroll cue. */
+export const SCROLL_CUE_LINES = 10;
+const MAX_ERROR_CHARS = 120;
 
 export type ApprovalDecision = "allow" | "deny";
 
-function cap(text: string, max: number): string {
-  return text.length > max ? `${text.slice(0, max)}...` : text;
+const isolate = { unicodeBidi: "isolate" } as const;
+
+function Segments({ segments }: { segments: TextSegment[] }): ReactNode {
+  return segments.map((segment, index) =>
+    segment.marker ? (
+      <span key={index} data-approval-marker className="rounded-sm bg-selection px-0.5 text-caution">
+        {segment.text}
+      </span>
+    ) : (
+      segment.text
+    ),
+  );
+}
+
+function errorDetail(reason: unknown): string {
+  if (!(reason instanceof Error)) return "";
+  const text = reason.message.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim();
+  return text.length > MAX_ERROR_CHARS ? `${text.slice(0, MAX_ERROR_CHARS)}...` : text;
 }
 
 export interface ApprovalCardViewProps {
   approvals: readonly Approval[];
-  /** Sends the decision (`session.answerApproval`). A rejection shows an error and allows a retry. */
+  /** Sends the decision (`session.answerApproval`). A rejection keeps the request locked (the answer may have landed). */
   onAnswer: (requestId: Approval["requestId"], decision: ApprovalDecision) => Promise<void>;
   /** When set the buttons are disabled and this text explains why. */
   disabledReason?: string;
@@ -39,53 +69,99 @@ export interface ApprovalCardViewProps {
 /** The card itself: one request at a time, two buttons, one decision per request id. */
 export function ApprovalCardView({ approvals, onAnswer, disabledReason, className }: ApprovalCardViewProps) {
   const current = approvals[0];
-  const [answered, setAnswered] = useState<Approval["requestId"] | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const currentId = current ? String(current.requestId) : null;
+  const [answered, setAnswered] = useState<ReadonlySet<string>>(() => new Set());
+  const [errors, setErrors] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const [armedFor, setArmedFor] = useState<string | null>(null);
   // Synchronous lock: two clicks in one tick must send once, before React re-renders the disabled state.
-  const locked = useRef(false);
+  const locked = useRef(new Set<string>());
+  // The request a press (pointer down or key down) began on; a click only counts for that same request.
+  const pressedOn = useRef<string | null>(null);
+  const section = useRef<HTMLElement>(null);
   const reasonId = useId();
   const titleId = useId();
   const readOnly = disabledReason != null;
 
-  // The list of ids is the watch frame's verdict: once it changes, the answered mark and the error are stale.
-  const signature = useMemo(() => approvals.map((approval) => String(approval.requestId)).join("\u0000"), [approvals]);
-  const seenSignature = useRef(signature);
+  // The ids in the list are the watch frame's verdict: an id that left it is settled, and only then forgotten.
+  const ids = useMemo(() => approvals.map((approval) => String(approval.requestId)), [approvals]);
+  const signature = ids.join("\u0000");
+  const [seenSignature, setSeenSignature] = useState(signature);
+  if (seenSignature !== signature) {
+    // Adjusted during render (not in an effect) so no frame is ever drawn with a stale lock.
+    const live = new Set(ids);
+    setSeenSignature(signature);
+    setAnswered((previous) => new Set([...previous].filter((id) => live.has(id))));
+    setErrors((previous) => new Map([...previous].filter(([id]) => live.has(id))));
+  }
   useEffect(() => {
-    if (seenSignature.current === signature) return;
-    seenSignature.current = signature;
-    locked.current = false;
-    setAnswered(null);
-    setError(null);
+    const live = new Set(signature === "" ? [] : signature.split("\u0000"));
+    for (const id of [...locked.current]) if (!live.has(id)) locked.current.delete(id);
   }, [signature]);
 
-  if (!current) return null;
-  const done = answered === current.requestId;
-  const busy = readOnly || done;
+  // Arm the buttons only a moment after a request appears; keep focus on the card if it was inside it.
+  useEffect(() => {
+    if (currentId === null) return;
+    const active = document.activeElement;
+    if (section.current && active && section.current.contains(active)) section.current.focus();
+    const timer = setTimeout(() => setArmedFor(currentId), ARM_DELAY_MS);
+    return () => {
+      clearTimeout(timer);
+      setArmedFor(null);
+    };
+  }, [currentId]);
+
+  const label = useMemo(() => showLabel(current?.label ?? "", MAX_LABEL_CHARS), [current?.label]);
+  const detail = useMemo(() => showDetail(current?.detail ?? "", MAX_DETAIL_CHARS), [current?.detail]);
+
+  if (!current || currentId === null) return null;
+  const done = answered.has(currentId);
+  const armed = armedFor === currentId;
+  const error = errors.get(currentId);
+  const busy = readOnly || done || !armed;
+  const labelText = label.map((segment) => segment.text).join("");
 
   const decide = async (decision: ApprovalDecision) => {
-    if (readOnly || locked.current || answered === current.requestId) return;
-    locked.current = true;
-    setAnswered(current.requestId);
-    setError(null);
+    const pressed = pressedOn.current;
+    pressedOn.current = null;
+    if (pressed !== null && pressed !== currentId) return;
+    if (readOnly || !armed || locked.current.has(currentId) || answered.has(currentId)) return;
+    if (decision === "allow" && detail.truncated) return;
+    const id = currentId;
+    locked.current.add(id);
+    setAnswered((previous) => new Set(previous).add(id));
+    setErrors((previous) => {
+      const next = new Map(previous);
+      next.delete(id);
+      return next;
+    });
+    // The pressed button turns disabled; keep keyboard focus on the card rather than lose it to the page.
+    section.current?.focus();
     try {
       await onAnswer(current.requestId, decision);
-      // Stay disabled: the result is shown from the next watch frame, never removed optimistically.
+      // Stay locked: the result is shown from the next watch frame, never removed optimistically.
     } catch (reason) {
-      locked.current = false;
-      setAnswered(null);
-      setError(reason instanceof Error && reason.message ? reason.message : "Answer not sent. Try again.");
+      // Stay locked too. The answer may have reached the desktop, and a second decision for the same request
+      // (a different one, even) must not be sent before the desktop's frame says what happened.
+      const extra = errorDetail(reason);
+      setErrors((previous) => new Map(previous).set(id, extra ? `${APPROVAL_UNCONFIRMED} (${extra})` : APPROVAL_UNCONFIRMED));
     }
   };
 
-  const label = cap(current.label.trim() || "Approval needed", MAX_LABEL_CHARS);
-  const detail = cap(current.detail, MAX_DETAIL_CHARS);
+  const press = (event: PointerEvent<HTMLButtonElement> | KeyboardEvent<HTMLButtonElement>) => {
+    if ("key" in event && event.key !== "Enter" && event.key !== " ") return;
+    pressedOn.current = currentId;
+  };
+  const overflows = detail.lines > SCROLL_CUE_LINES;
+  const announcement = done ? "Answer sent. Waiting for the desktop." : `New approval request: ${labelText}`;
 
   return (
     <section
+      ref={section}
+      tabIndex={-1}
       aria-labelledby={titleId}
       aria-describedby={readOnly ? reasonId : undefined}
       data-approval-card
-      className={cn("px-3 pb-2", className)}
+      className={cn("px-3 pb-2 outline-none", className)}
     >
       <Glass className="rounded-card">
         <div className="flex flex-col gap-2 px-4 py-3">
@@ -99,33 +175,48 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
             ) : null}
           </div>
 
-          {/* Announced when a new request arrives; keyed on the request so it is read again. */}
-          <div role="status" aria-live="polite" key={String(current.requestId)} className="min-w-0">
-            <p className="whitespace-pre-wrap break-words text-body font-medium text-content" data-approval-label>
-              {label}
+          {/* One live region for the card's life: a short announcement, never the whole detail. */}
+          <div role="status" aria-live="polite" className="sr-only">
+            {announcement}
+          </div>
+
+          <div className="min-w-0">
+            <p dir="ltr" style={isolate} className="whitespace-pre-wrap break-words text-body font-medium text-content" data-approval-label>
+              <Segments segments={label} />
             </p>
-            {detail ? (
-              <pre
-                tabIndex={0}
-                aria-label="Request details"
-                data-approval-detail
-                className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-row border border-stroke px-3 py-2 font-mono text-small text-muted-text outline-offset-2"
-              >
-                {detail}
-              </pre>
+            {detail.segments.length > 0 ? (
+              <>
+                <pre
+                  dir="ltr"
+                  style={isolate}
+                  tabIndex={0}
+                  aria-label="Request details"
+                  data-approval-detail
+                  className="mt-1.5 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-row border border-stroke px-3 py-2 font-mono text-small text-muted-text outline-offset-2"
+                >
+                  <Segments segments={detail.segments} />
+                </pre>
+                <p className="mt-1 text-caption text-muted-text" data-approval-meta>
+                  {detail.lines} {detail.lines === 1 ? "line" : "lines"}
+                  {overflows ? ". Scroll to see all." : ""}
+                </p>
+              </>
             ) : null}
           </div>
 
+          {detail.truncated ? (
+            <p role="alert" className="text-caption text-caution" data-approval-truncated>
+              Showing the first {MAX_DETAIL_CHARS.toLocaleString("en-US")} of {detail.total.toLocaleString("en-US")} characters. {APPROVAL_TRUNCATED_NOTICE}
+            </p>
+          ) : null}
           {readOnly ? (
             <p id={reasonId} className="text-caption text-muted-text">
               {disabledReason}
             </p>
+          ) : !armed && !done ? (
+            <p className="text-caption text-muted-text">New request. Buttons unlock in a moment.</p>
           ) : null}
-          {done ? (
-            <p role="status" className="text-caption text-muted-text">
-              Answer sent. Waiting for the desktop.
-            </p>
-          ) : null}
+          {done && !error ? <p className="text-caption text-muted-text">Answer sent. Waiting for the desktop.</p> : null}
           {error ? (
             <p role="alert" className="text-caption text-destructive">
               {error}
@@ -133,10 +224,10 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
           ) : null}
 
           <div className="mt-1 flex items-center justify-end gap-3">
-            <Button type="button" variant="outline" size="pill" disabled={busy} onClick={() => void decide("deny")}>
+            <Button type="button" onPointerDown={press} onKeyDown={press} onClick={() => void decide("deny")} variant="outline" size="pill" disabled={busy}>
               Deny
             </Button>
-            <Button type="button" size="pill" disabled={busy} onClick={() => void decide("allow")}>
+            <Button type="button" onPointerDown={press} onKeyDown={press} onClick={() => void decide("allow")} size="pill" disabled={busy || detail.truncated}>
               Allow once
             </Button>
           </div>
@@ -153,10 +244,13 @@ export function ApprovalCard({ sessionId, className }: { sessionId: string; clas
   const permission = useLinkState((state) => state.permission);
   const answer = useLinkMutation("session.answerApproval");
   if (!isApprovalCardEnabled() || !supported || approvals.length === 0) return null;
+  // Fail closed: nothing but an explicit `control` enables the buttons. `null` is a link that is still connecting.
+  const reason = permission === "control" ? undefined : permission === null ? APPROVAL_CONNECTING_REASON : APPROVAL_READ_ONLY_REASON;
   return (
     <ApprovalCardView
+      key={sessionId}
       approvals={approvals}
-      {...(permission !== "control" ? { disabledReason: APPROVAL_READ_ONLY_REASON } : {})}
+      {...(reason ? { disabledReason: reason } : {})}
       {...(className ? { className } : {})}
       onAnswer={async (requestId, decision) => {
         await answer.mutateAsync({ conversationId: sessionId, requestId, decision });

