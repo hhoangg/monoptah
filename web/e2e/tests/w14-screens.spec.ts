@@ -23,7 +23,9 @@ async function tabThrough(page: Page, path: string, primary: RegExp): Promise<vo
       const el = document.activeElement;
       if (!el || el === document.body) return null;
       const name = el.getAttribute("aria-label") ?? el.textContent?.trim() ?? "";
-      return { id: `${el.tagName}:${name}`.slice(0, 80), name };
+      // Form fields have no text, so the name and id attributes keep two inputs from looking like one element.
+      const field = el.getAttribute("name") ?? el.id;
+      return { id: `${el.tagName}:${name}:${field}`.slice(0, 80), name };
     });
     if (info === null) continue;
     expect(await focusIsVisible(page), `${path}: focus indicator on ${info.id}`).toBe(true);

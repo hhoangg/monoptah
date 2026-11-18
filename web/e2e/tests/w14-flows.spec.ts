@@ -159,7 +159,8 @@ test.describe("W-14 flows through the UI", () => {
       await expect(page.getByRole("heading", { level: 1, name: E2E_CATALOG.sessionTitle })).toBeVisible();
       await expect(page.getByText("Please look at the E2E task.")).toBeVisible();
       await expect(page.getByText("Canned E2E answer.")).toBeVisible();
-      expect(desktop.matching("request", { method: "conversation.read" }).length).toBeGreaterThan(0);
+      // The open path is the watch; `conversation.read` is only the app's fallback (dead watch, resync after a reconnect).
+      expect(desktop.matching("watch", { action: "start", conversationId: E2E_CATALOG.sessionId }).length).toBeGreaterThan(0);
       // Control: the composer is enabled and there is no read-only chip.
       await expect(message).toBeEnabled();
       await expect(page.getByTestId("read-only-chip")).toHaveCount(0);

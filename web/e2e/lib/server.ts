@@ -141,6 +141,9 @@ export async function startServer(logFile: string): Promise<RunningServer> {
       const args = [
         "dev", "--local", "--persist-to", persist, "--port", String(port), "--ip", "127.0.0.1", "-c", wranglerConfig,
         "--show-interactive-dev-session=false",
+        // wrangler.jsonc has a custom_domain route: without this, wrangler forwards to that zone's host and the Worker
+        // sees another Origin than RP_ORIGIN (every browser POST answers 403 bad_origin).
+        "--local-upstream", `localhost:${port}`,
         ...(assetsDir ? ["--assets", assetsDir] : []),
         "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:http://localhost:${port}`,
         ...Object.entries(fake).flatMap(([name, value]) => ["--var", `${name}:${value}`]),

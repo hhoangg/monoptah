@@ -1,6 +1,6 @@
 // W-14 helpers: UI registration, theme, viewports, overflow check, axe scan. Shared by tests/w14-*.spec.ts.
 import AxeBuilder from "@axe-core/playwright";
-import type { Locator, Page } from "@playwright/test";
+import type { CDPSession, Locator, Page } from "@playwright/test";
 import { expect } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -40,6 +40,9 @@ export async function setScheme(page: Page, scheme: Scheme): Promise<void> {
 /** Opens `path` in the given scheme and waits until the app set `data-scheme` and the network is idle. */
 export async function openIn(page: Page, path: string, scheme: Scheme): Promise<void> {
   await setScheme(page, scheme);
+  // Leave the page first: a goto to the same URL (or the same URL with another hash, as `/pair/CODE#fp=...`) is a
+  // same-document navigation, so the page would keep the scheme it was loaded with and theme-init.js would not run again.
+  await page.goto("about:blank");
   await page.goto(path, { waitUntil: "load" });
   await expect(page.locator("html")).toHaveAttribute("data-scheme", scheme);
   await page.waitForLoadState("networkidle");
@@ -67,11 +70,21 @@ export const VIEWPORTS: Viewport[] = [
   { name: "zoom-200", width: 640, height: 400, scale: 2 },
 ];
 
+/**
+ * One CDP session per page, kept attached. Chromium drops the emulation a session installed when that session detaches,
+ * so detaching right after the call loses the device scale factor on some platforms (the headless shell on macOS).
+ * The session ends with the page.
+ */
+const emulationSessions = new WeakMap<Page, CDPSession>();
+
 /** Applies a viewport through CDP so the device scale factor can change on a page that already exists. */
 export async function applyViewport(page: Page, viewport: Viewport): Promise<void> {
-  const cdp = await page.context().newCDPSession(page);
+  let cdp = emulationSessions.get(page);
+  if (!cdp) {
+    cdp = await page.context().newCDPSession(page);
+    emulationSessions.set(page, cdp);
+  }
   await cdp.send("Emulation.setDeviceMetricsOverride", { width: viewport.width, height: viewport.height, deviceScaleFactor: viewport.scale, mobile: false });
-  await cdp.detach().catch(() => undefined);
   const seen = await page.evaluate(() => ({ width: window.innerWidth, ratio: window.devicePixelRatio }));
   expect(seen).toEqual({ width: viewport.width, ratio: viewport.scale });
 }

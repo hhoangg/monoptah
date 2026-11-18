@@ -68,7 +68,7 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
   });
 
-  test("register, then approve the headless desktop's pairing code", async ({ newActor }) => {
+  test("register, then approve the headless desktop's pairing code", async ({ newSharedActor }) => {
     const pairing = await probePairing(origin());
     const headless = probePair();
     const reason = [pairing, headless].filter((p) => !p.run).map((p) => p.reason).join("; ");
@@ -76,7 +76,7 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
     test.skip(reason !== "", reason);
 
     // Own account from the second bootstrap invite (the first one is used by accounts.spec.ts).
-    owner = await newActor();
+    owner = await newSharedActor();
     expect((await owner.register(namedInvite("pairing"), "e2epair")).status).toBe(200);
     dataDir = mkdtempSync(join(tmpdir(), "monoptah-e2e-headless-"));
 
