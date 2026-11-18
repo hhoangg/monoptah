@@ -151,7 +151,7 @@ export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; 
         <h1 className="min-w-0 flex-1 truncate text-h font-semibold">New session</h1>
       </header>
 
-      <main className="mx-auto flex min-h-0 w-full max-w-[768px] flex-1 flex-col items-center justify-center gap-3 px-5 text-center">
+      <div className="mx-auto flex min-h-0 w-full max-w-[768px] flex-1 flex-col items-center justify-center gap-3 px-5 text-center">
         {project ? <ProjectMascot project={project.path} name={project.mascot} color={accentFor(project.name, project.color)} size={64} className="opacity-40" /> : null}
         <h2 className="text-title font-semibold">{EMPTY_HEADLINE}</h2>
         {project ? <p className="text-body text-muted-text">{project.name}</p> : null}
@@ -161,7 +161,7 @@ export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; 
           Open after starting
           <Switch checked={openAfter} onCheckedChange={setOpenAfter} aria-label="Open after starting" />
         </label>
-      </main>
+      </div>
 
       <div className="mx-auto w-full max-w-[768px] shrink-0 px-2 pb-[env(safe-area-inset-bottom)] min-[24rem]:px-5">
         <Composer

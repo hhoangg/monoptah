@@ -5,6 +5,9 @@ import { Glass } from "./Glass";
 import { Icon, type IconName } from "./Icon";
 import { useMediaQuery } from "./useMediaQuery";
 
+/** The one `main` landmark of the app: the skip link points at it. Screens never render their own `main`. */
+export const MAIN_ID = "main-content";
+
 /** Screens of a visitor who has no session yet: no app navigation. */
 const SIGN_IN_FAMILY: readonly string[] = ["/login", "/register", "/recover"];
 
@@ -26,6 +29,17 @@ export function Shell() {
   const phone = !useMediaQuery(TABLET_QUERY);
   return (
     <div className="flex min-h-dvh flex-col bg-background text-content">
+      {/* First focusable element (design-system.md 9): visible on focus only; moves focus to the main content. */}
+      <a
+        href={`#${MAIN_ID}`}
+        onClick={(event) => {
+          event.preventDefault();
+          document.getElementById(MAIN_ID)?.focus();
+        }}
+        className="sr-only z-20 rounded-pill bg-background px-4 py-2 text-small font-semibold text-content focus:not-sr-only focus:fixed focus:top-2 focus:left-2"
+      >
+        Skip to content
+      </a>
       <header className="sticky top-0 z-10 flex min-h-11 items-center gap-2 px-2 pt-[env(safe-area-inset-top)] min-[24rem]:px-5">
         <Glass className="flex min-h-11 min-w-0 flex-1 flex-wrap items-center gap-1 px-2">
           <Link to="/" className="rounded-pill px-3 py-2 text-small font-semibold">
@@ -58,7 +72,7 @@ export function Shell() {
         </Glass>
       </header>
       <OfflineBanner />
-      <main className="flex-1 pb-[calc(env(safe-area-inset-bottom)+2.5rem)]">
+      <main id={MAIN_ID} tabIndex={-1} className="flex-1 outline-none pb-[calc(env(safe-area-inset-bottom)+2.5rem)]">
         <Outlet />
       </main>
     </div>
