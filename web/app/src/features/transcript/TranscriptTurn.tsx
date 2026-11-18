@@ -116,7 +116,7 @@ function TurnFooter({ turn }: { turn: Turn }) {
           <span className="text-small text-[color:var(--content-a35)]">{formatClockTime(turn.completedAt)}</span>
         </>
       ) : null}
-      {shown ? <TurnMetricsDialog metrics={shown} elapsedMs={turn.durationMs ?? null} open={showMetrics} onOpenChange={setShowMetrics} /> : null}
+      {shown ? <TurnMetricsDialog metrics={shown} elapsedMs={turn.durationMs ?? null} completedAt={turn.completedAt} open={showMetrics} onOpenChange={setShowMetrics} /> : null}
     </div>
   );
 }

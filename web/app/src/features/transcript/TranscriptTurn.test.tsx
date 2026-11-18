@@ -240,6 +240,7 @@ describe("footer (F-38)", () => {
     const dialog = await screen.findByTestId("turn-metrics-dialog");
     expect(within(dialog).getByText("Cache hit")).toBeInTheDocument();
     expect(within(dialog).getByText("1,500")).toBeInTheDocument();
+    expect(within(dialog).getByText(/^Finished at /)).toBeInTheDocument();
   });
 
   it("has no footer on a turn without one, and no metrics button without metrics", () => {

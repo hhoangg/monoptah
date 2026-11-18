@@ -407,12 +407,12 @@ describe("finished deck (F-29)", () => {
 describe("Mono unread tracking (F-17)", () => {
   const mono = { id: "m1", name: "M", unread: 0, status: "idle", lastMessage: "hello", lastActiveAt: 10 };
 
-  async function stored(): Promise<Record<string, string> | undefined> {
+  async function stored(desktopId = "desk-1"): Promise<Record<string, string> | undefined> {
     return await new Promise((resolve, reject) => {
       const open = indexedDB.open(MONO_SEEN_DB, 1);
       open.onerror = () => reject(open.error);
       open.onsuccess = () => {
-        const request = open.result.transaction("seen").objectStore("seen").get("desk-1");
+        const request = open.result.transaction("seen").objectStore("seen").get(desktopId);
         request.onsuccess = () => resolve(request.result as Record<string, string> | undefined);
       };
     });
@@ -434,6 +434,9 @@ describe("Mono unread tracking (F-17)", () => {
   it("a Mono seen for the first time counts as seen; a later reply is unread; working is not", async () => {
     const { useUnreadMonos } = await import("./monoSeen");
     const { result, rerender } = renderHook(({ monos }) => useUnreadMonos("desk-2", monos), { initialProps: { monos: [mono] } });
+    // Size 0 also holds before the stored map has loaded, so wait until the first sighting is recorded:
+    // a reply that arrives before then is itself a first sighting and would count as seen.
+    await waitFor(async () => expect(await stored("desk-2")).toEqual({ m1: "10\nhello" }));
     await waitFor(() => expect(result.current.size).toBe(0));
     rerender({ monos: [{ ...mono, lastMessage: "a new reply", lastActiveAt: 20 }] });
     await waitFor(() => expect(result.current.has("m1")).toBe(true));

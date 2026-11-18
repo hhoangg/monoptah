@@ -2,7 +2,7 @@
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
-import { turnMetricsSheet } from "./format";
+import { formatClockTime, turnMetricsSheet } from "./format";
 import { sessionErrorContent } from "./sessionError";
 import type { TurnMetrics } from "./turnItems";
 
@@ -38,20 +38,23 @@ export function SessionErrorDialog({ message, open, onOpenChange }: { message: s
 export function TurnMetricsDialog({
   metrics,
   elapsedMs,
+  completedAt,
   open,
   onOpenChange,
 }: {
   metrics: TurnMetrics;
   elapsedMs: number | null;
+  completedAt?: number;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
   const { highlights, tokens } = turnMetricsSheet(metrics, elapsedMs);
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent aria-describedby={undefined} data-testid="turn-metrics-dialog">
+      <DialogContent {...(completedAt == null ? { "aria-describedby": undefined } : {})} data-testid="turn-metrics-dialog">
         <DialogHeader>
           <DialogTitle>Turn metrics</DialogTitle>
+          {completedAt != null ? <DialogDescription>{`Finished at ${formatClockTime(completedAt)}`}</DialogDescription> : null}
         </DialogHeader>
         {highlights.length > 0 ? (
           <dl className="grid grid-cols-3 gap-2">

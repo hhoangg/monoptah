@@ -4,6 +4,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { resetCollapsedToolCalls } from "@/features/transcript/toolCallsSetting";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FIXTURE_HANDLERS, type MockDesktop } from "@monoptah/mock-desktop";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
@@ -42,6 +43,7 @@ const original = { ...FIXTURE_HANDLERS };
 let previous: PersistAdapter;
 let link: MockLink;
 beforeEach(() => {
+  resetCollapsedToolCalls();
   localStorage.clear();
   previous = registerPersistAdapter(new MemoryPersistAdapter());
 });
@@ -227,6 +229,17 @@ describe("session header menu (F-25, F-40)", () => {
     await user.type(input, "Renamed from the header");
     await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(link.desktop.world.sessions.get(SESSION)!.title).toBe("Renamed from the header"));
+  });
+
+  it("toggles collapse tool calls from the menu and stores it", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await screen.findByRole("button", { name: "Session actions" }));
+    expect(screen.getByRole("menuitemcheckbox", { name: "Collapse tool calls" })).toHaveAttribute("aria-checked", "true");
+    await user.click(screen.getByRole("menuitemcheckbox", { name: "Collapse tool calls" }));
+    expect(localStorage.getItem("monoptah.toolCalls.collapsed")).toBe("false");
+    await user.click(await screen.findByRole("button", { name: "Session actions" }));
+    expect(screen.getByRole("menuitemcheckbox", { name: "Collapse tool calls" })).toHaveAttribute("aria-checked", "false");
   });
 
   it("archives through the archive-dialog slot when one is registered", async () => {

@@ -9,6 +9,7 @@ import { useLinkState } from "@/link";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { sessionCan } from "@/ui/hooks";
+import { useCollapsedToolCalls } from "@/features/transcript/toolCallsSetting";
 import { Icon } from "@/ui/Icon";
 import { ArchiveSessionDialog, RenameSessionDialog, useRefreshSessions } from "./SessionActionDialogs";
 import { SessionMenuItemsSlot } from "./slots";
@@ -20,6 +21,7 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
   const [renaming, setRenaming] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [collapsedCalls, setCollapsedCalls] = useCollapsedToolCalls();
   const remove = useLinkMutation("session.delete");
   const refresh = useRefreshSessions(desktopId);
   const reason = readOnly ? "This device is read-only" : undefined;
@@ -45,6 +47,14 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
           <DropdownMenuItem disabled={readOnly} title={reason} onSelect={() => setArchiving(true)}>
             <Icon name="archive" size={18} />
             Archive
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            role="menuitemcheckbox"
+            aria-checked={collapsedCalls}
+            onSelect={() => setCollapsedCalls(!collapsedCalls)}
+          >
+            <Icon name="check" size={18} className={collapsedCalls ? undefined : "opacity-0"} />
+            Collapse tool calls
           </DropdownMenuItem>
           {canDelete ? (
             <>
