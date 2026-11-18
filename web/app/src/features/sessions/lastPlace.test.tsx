@@ -1,11 +1,13 @@
 import { render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from "vitest";
+import { setApiTransport } from "@/features/accounts/api";
+import { createFakeServer, desktop } from "@/features/desktops/testServer";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { registerLastPlaceResolver, resolveLastPlace } from "@/data";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
-import { LAST_DESKTOP_KEY, forgetDesktop, lastPlaceKey, placeDesktop, readLastPlace, rememberPlace } from "./lastPlace";
+import { LAST_DESKTOP_KEY, forgetDesktop, lastPlaceKey, placeDesktop, readLastPlace, rememberDesktop, rememberPlace } from "./lastPlace";
 import "./register";
 
 beforeEach(() => localStorage.clear());
@@ -41,6 +43,15 @@ describe("last place (F-14)", () => {
     expect(readLastPlace()).toBe("/d/dk1");
   });
 
+  it("remembers a desktop from any of its screens, settings and cloud included (N-12)", () => {
+    rememberDesktop("dk1");
+    expect(localStorage.getItem(LAST_DESKTOP_KEY)).toBe("dk1");
+    expect(readLastPlace()).toBe("/d/dk1");
+    rememberPlace("/d/dk1/p/a");
+    rememberDesktop("dk1");
+    expect(readLastPlace()).toBe("/d/dk1/p/a");
+  });
+
   it("forgets a desktop", () => {
     rememberPlace("/d/dk1/p/a");
     forgetDesktop("dk1");
@@ -59,6 +70,8 @@ describe("last place (F-14)", () => {
   });
 
   it("`/` redirects to the last place", async () => {
+    const restore = setApiTransport(createFakeServer({ desktops: [desktop({ id: "dk1" })] }).transport);
+    onTestFinished(restore);
     rememberPlace("/d/dk1/p/proj-alpha");
     const router = createAppRouter({ history: createMemoryHistory({ initialEntries: ["/"] }) });
     render(
