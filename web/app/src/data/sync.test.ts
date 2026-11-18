@@ -7,6 +7,7 @@ import { openConversation } from "./conversation.ts";
 import { MemoryPersistAdapter, loadPersistedCatalog, loadPersistedTurns, persistTurns, persistCatalog, registerPersistAdapter, type PersistAdapter } from "./persist.ts";
 import { FakeClient, flush, requestError } from "./testing.ts";
 import { linkQueryOptions } from "./queries.ts";
+import { readNewSessionDraft, resetNewSessionDrafts, writeNewSessionDraft } from "@/features/sessions/newSessionDraft";
 
 let client: FakeClient;
 let queryClient: ReturnType<typeof createQueryClient>;
@@ -148,6 +149,19 @@ describe("persistence and revoked", () => {
     expect(await loadPersistedCatalog("dk1")).toBeUndefined();
     expect(queryClient.getQueryCache().findAll({ queryKey: desktopKey("dk1") })).toHaveLength(0);
     expect(queryClient.getQueryData(["me"])).toEqual({ id: "u" });
+  });
+
+  it("a revoke forgets the New session drafts of that desktop only", async () => {
+    writeNewSessionDraft("dk1", "p1", { text: "a" });
+    writeNewSessionDraft("dk2", "p1", { text: "c" });
+    stop = startLinkDataSync(client.asClient(), queryClient);
+    await flush();
+    expect(readNewSessionDraft("dk1", "p1").text).toBe("a");
+    client.store.setState({ revoked: true });
+    await flush();
+    expect(readNewSessionDraft("dk1", "p1").text).toBe("");
+    expect(readNewSessionDraft("dk2", "p1").text).toBe("c");
+    resetNewSessionDrafts();
   });
 
   it("an already revoked link clears at start", async () => {

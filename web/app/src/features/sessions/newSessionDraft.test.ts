@@ -1,11 +1,9 @@
 import { QueryClient } from "@tanstack/react-query";
-import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { clearAccountCache, signOut } from "@/features/accounts/queries";
-import { getLinkStore } from "@/link";
 import { clearLinkStores } from "@/link/store";
 import type { ModelSelection } from "@/features/models/modelSettings";
-import { clearNewSessionDraft, forgetNewSessionDrafts, useForgetDraftsWhenRevoked, readNewSessionDraft, resetNewSessionDrafts, writeNewSessionDraft } from "./newSessionDraft";
+import { clearNewSessionDraft, forgetNewSessionDrafts, readNewSessionDraft, resetNewSessionDrafts, writeNewSessionDraft } from "./newSessionDraft";
 
 afterEach(() => {
   resetNewSessionDrafts();
@@ -50,16 +48,6 @@ describe("new session draft store", () => {
     forgetNewSessionDrafts("d1");
     expect(readNewSessionDraft("d1", "p1").text).toBe("");
     expect(readNewSessionDraft("d1", "p2").text).toBe("");
-    expect(readNewSessionDraft("d2", "p1").text).toBe("c");
-  });
-
-  it("is dropped when the desktop's link is revoked", () => {
-    writeNewSessionDraft("d1", "p1", { text: "a" });
-    writeNewSessionDraft("d2", "p1", { text: "c" });
-    renderHook(() => useForgetDraftsWhenRevoked("d1"));
-    expect(readNewSessionDraft("d1", "p1").text).toBe("a");
-    act(() => getLinkStore("d1").setState({ revoked: true }));
-    expect(readNewSessionDraft("d1", "p1").text).toBe("");
     expect(readNewSessionDraft("d2", "p1").text).toBe("c");
   });
 });

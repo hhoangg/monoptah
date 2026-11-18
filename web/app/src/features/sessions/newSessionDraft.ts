@@ -1,9 +1,7 @@
 // What a person has typed or picked on the New session page, kept per project while the page is not on screen
 // (F-18: the wide side pane unmounts when the window narrows, and comes back when it widens). In memory only, for
 // the life of the tab: no secrets are stored, and attachments (files) are not kept.
-import { useEffect } from "react";
 import type { ModelSelection } from "@/features/models/modelSettings";
-import { getLinkStore } from "@/link";
 
 export interface NewSessionDraft {
   text: string;
@@ -36,16 +34,4 @@ export function resetNewSessionDrafts(): void {
 /** Drops every draft of one desktop (it was forgotten on this device or its link was revoked). */
 export function forgetNewSessionDrafts(desktopId: string): void {
   for (const key of [...drafts.keys()]) if (key.startsWith(`${desktopId}:`)) drafts.delete(key);
-}
-
-/** A revoked link takes the desktop's drafts with it (read-only look at the link store). */
-export function useForgetDraftsWhenRevoked(desktopId: string): void {
-  useEffect(() => {
-    const store = getLinkStore(desktopId);
-    const check = (link: { revoked: boolean; blocked: string | null }) => {
-      if (link.revoked || link.blocked === "revoked") forgetNewSessionDrafts(desktopId);
-    };
-    check(store.getState());
-    return store.subscribe(check);
-  }, [desktopId]);
 }

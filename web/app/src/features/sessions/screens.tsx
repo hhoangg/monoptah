@@ -18,7 +18,6 @@ import { useSessionFilter, type Worktree } from "./sessionListFilter";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 import { MonoRow, ProjectRow } from "./WorkspaceNav";
 import { NewSessionScreen } from "./NewSessionScreen";
-import { useForgetDraftsWhenRevoked } from "./newSessionDraft";
 import { MonoHome } from "@/features/monos/MonoHome";
 import { useMonoPrefs } from "@/features/monos/monoPrefs";
 import { WorkspaceFrame, useReadOnly } from "./WorkspaceFrame";
@@ -110,7 +109,6 @@ export const SPLIT_QUERY = "(min-width: 64rem)";
  */
 export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string; projectId: string; page: "sessions" | "new" }) {
   const split = useMediaQuery(SPLIT_QUERY);
-  useForgetDraftsWhenRevoked(desktopId);
   // The element of the host that holds focus. React removes the old slot (and the host with it) before the new slot's
   // ref runs, which drops the focus, so it is remembered here and given back once the host is placed again. A blur
   // while the host is still in the document is a real one and clears it.

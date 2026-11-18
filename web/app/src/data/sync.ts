@@ -7,6 +7,7 @@
 // - the catalog is written through the persist adapter, and a `revoked` link clears the persisted cache of that desktop only.
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
+import { forgetNewSessionDrafts } from "@/features/sessions/newSessionDraft";
 import { useLinkConnection } from "@/link";
 import type { LinkClient } from "./client.ts";
 import { openConversationWatchers } from "./conversation.ts";
@@ -47,6 +48,7 @@ export function startLinkDataSync(client: LinkClient, queryClient: QueryClient, 
   const clearForRevoked = (): void => {
     void clearPersistedCache(desktopId);
     queryClient.removeQueries({ queryKey: desktopKey(desktopId) });
+    forgetNewSessionDrafts(desktopId);
   };
   if (client.store.getState().revoked) clearForRevoked();
 
