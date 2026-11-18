@@ -52,7 +52,7 @@ function mount(url: string) {
 }
 
 function section(title: string): HTMLElement {
-  const heading = screen.getByRole("heading", { level: 2, name: title });
+  const heading = screen.getByRole("heading", { level: 3, name: title });
   return heading.closest("section") as HTMLElement;
 }
 
@@ -81,7 +81,8 @@ describe("/settings", () => {
     await screen.findByRole("heading", { level: 1, name: "Settings" });
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
     for (const title of ["Account", "Passkeys", "Recovery codes", "Signed-in browsers", "Invites", "Appearance"]) {
-      expect(screen.getByRole("heading", { level: 2, name: title })).toBeInTheDocument();
+      // Card titles are h3 under the h2 of their area.
+      expect(screen.getByRole("heading", { level: 3, name: title })).toBeInTheDocument();
     }
     expect(screen.getByText("Slot content")).toBeInTheDocument();
     expect(screen.getByText("@dev-user")).toBeInTheDocument();
@@ -104,7 +105,7 @@ describe("/settings", () => {
     install({ recoveryAckAt: null });
     mount("/settings");
     await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
-    expect(screen.queryByRole("heading", { level: 2, name: "Passkeys" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Passkeys" })).toBeNull();
   });
 });
 
@@ -413,10 +414,21 @@ describe("/install", () => {
     expect(screen.getByText(/install icon/)).toBeInTheDocument();
     expect(screen.queryByText("Installed")).toBeNull();
     // A-9: the header probes /api/me only to pick brand or nav. The page never redirects and the visitor gets the brand alone.
+    await waitFor(() => expect(calls.filter((c) => c.url === "/api/me").length).toBeGreaterThan(0));
     await waitFor(() => expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull());
     expect(screen.getByRole("link", { name: "Monoptah" })).toBeInTheDocument();
-    expect(calls.filter((c) => c.url === "/api/me").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("link", { name: "Account" })).toBeNull();
     expect(screen.queryByRole("heading", { name: /sign in/i })).toBeNull();
+  });
+
+  it("shows the nav once /api/me says the visitor is signed in", async () => {
+    install({ signedIn: true });
+    stubMedia(false);
+    mount("/install");
+    await screen.findByRole("heading", { level: 1, name: "Install Monoptah" });
+    const nav = await screen.findByRole("navigation", { name: "Main" });
+    expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("href", "/settings");
+    expect(within(nav).getByRole("link", { name: "Desktops" })).toBeInTheDocument();
   });
 
   it("shows the Installed state in standalone display mode", async () => {

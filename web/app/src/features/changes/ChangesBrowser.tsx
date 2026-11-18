@@ -7,7 +7,7 @@ import { DiffView } from "./DiffView";
 import { errorText } from "./gitModel";
 import { useChangesQuery } from "./useGit";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
-import { Icon } from "@/ui/Icon";
+import { EmptyState } from "@/ui/EmptyState";
 import { Notice } from "@/ui/Notice";
 import { useElementWidth } from "@/ui/useElementWidth";
 
@@ -47,13 +47,7 @@ export function ChangesBrowser({ projectId, path, onNavigate }: { projectId: str
 }
 
 function NoDiffOpen() {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center" data-testid="no-diff-open">
-      <Icon name="file" size={32} className="text-faint" />
-      <p className="text-title font-semibold">Choose a file</p>
-      <p className="text-small text-muted-text">Pick a changed file to see its diff here</p>
-    </div>
-  );
+  return <EmptyState data-testid="no-diff-open" icon="file" title="Choose a file" description="Pick a changed file to see its diff here" className="h-full justify-center" />;
 }
 
 function DiffOfPath({ desktopId, projectId, path, onBack }: { desktopId: string; projectId: string; path: string; onBack: (() => void) | null }) {

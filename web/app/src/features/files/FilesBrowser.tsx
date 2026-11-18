@@ -3,6 +3,7 @@
 //   stack  tree or viewer, one at a time, with a back button (the panel)
 //   auto   split when this pane is at least SPLIT_MIN_WIDTH wide, else stack (the route: the pane width decides, not the window)
 import { useRef, useState } from "react";
+import { EmptyState } from "@/ui/EmptyState";
 import { Icon } from "@/ui/Icon";
 import { useElementWidth } from "@/ui/useElementWidth";
 import { FileSearchPane } from "./FileSearchPane";
@@ -72,11 +73,5 @@ export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, l
 }
 
 function NoFileOpen() {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center" data-testid="no-file-open">
-      <Icon name="file" size={32} className="text-faint" />
-      <p className="text-title font-semibold">No file open</p>
-      <p className="text-small text-muted-text">Pick a file or press Cmd/Ctrl P</p>
-    </div>
-  );
+  return <EmptyState data-testid="no-file-open" icon="file" title="No file open" description="Pick a file or press Cmd/Ctrl P" className="h-full justify-center" />;
 }

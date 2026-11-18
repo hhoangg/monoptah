@@ -9,6 +9,7 @@ import { useFilePrefs } from "@/features/files/filePrefs";
 import { languageId } from "@/lib/fileKind";
 import { cn } from "@/lib/utils";
 import { Icon } from "@/ui/Icon";
+import { IconTip } from "@/ui/tooltip";
 import { PathLabel } from "@/ui/PathLabel";
 import { UNIFIED_FOLD_STEP, expandFold, foldUnifiedLines, revealedFold, type FoldReveal } from "./diffFold";
 import { STATUS_LABEL, formatCount, splitPath, type ChangedFile, type DiffLine } from "./gitModel";
@@ -83,15 +84,17 @@ export function DiffView({ file }: { file: ChangedFile }) {
         <span className="text-small text-muted-text">{STATUS_LABEL[file.status]}</span>
         {file.additions > 0 ? <span className="text-small text-additions tabular-nums">+{formatCount(file.additions)}</span> : null}
         {file.deletions > 0 ? <span className="text-small text-deletions tabular-nums">-{formatCount(file.deletions)}</span> : null}
-        <button
-          type="button"
-          aria-label="Wrap lines"
-          aria-pressed={wrap}
-          onClick={() => setWrap(!wrap)}
-          className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill hover:bg-selection pointer-fine:size-9", wrap ? "bg-selection text-content" : "text-muted-text")}
-        >
-          <Icon name="wrap" size={18} />
-        </button>
+        <IconTip label="Wrap lines">
+          <button
+            type="button"
+            aria-label="Wrap lines"
+            aria-pressed={wrap}
+            onClick={() => setWrap(!wrap)}
+            className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill hover:bg-selection pointer-fine:size-9", wrap ? "bg-selection text-content" : "text-muted-text")}
+          >
+            <Icon name="wrap" size={18} />
+          </button>
+        </IconTip>
       </header>
       <div role="list" aria-label="Changed lines" tabIndex={0} className="min-h-0 flex-1 overflow-auto font-mono text-small leading-5">
         <div className={wrap ? "" : "w-max min-w-full"}>

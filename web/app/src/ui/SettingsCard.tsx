@@ -1,7 +1,14 @@
 import { Link, type LinkProps } from "@tanstack/react-router";
-import type { ComponentProps, ReactNode } from "react";
+import { createContext, useContext, type ComponentProps, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./Icon";
+
+const CardHeadingLevel = createContext<"h2" | "h3">("h2");
+
+/** Cards inside render their title as h3: wrap the cards of a page area that has its own h2. */
+export function SettingsCardsUnderHeading({ children }: { children: ReactNode }) {
+  return <CardHeadingLevel.Provider value="h3">{children}</CardHeadingLevel.Provider>;
+}
 
 export interface SettingsCardProps extends Omit<ComponentProps<"section">, "title"> {
   /** Group heading above the card (muted 15). */
@@ -12,9 +19,11 @@ export interface SettingsCardProps extends Omit<ComponentProps<"section">, "titl
 
 /** Settings card (design-system.md section 8): bg surface, radius 22, padding 10/6, rows inside. */
 export function SettingsCard({ title, footnote, className, children, ...props }: SettingsCardProps) {
+  const level = useContext(CardHeadingLevel);
+  const headingClass = "px-1 text-label font-medium text-muted-text";
   return (
     <section className={cn("flex flex-col gap-1.5", className)} {...props}>
-      {title ? <h2 className="px-1 text-label font-medium text-muted-text">{title}</h2> : null}
+      {title ? level === "h3" ? <h3 className={headingClass}>{title}</h3> : <h2 className={headingClass}>{title}</h2> : null}
       <div data-slot="settings-card" className="rounded-card bg-surface px-2.5 py-1.5">
         {children}
       </div>

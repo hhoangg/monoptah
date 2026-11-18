@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
+import { IconTip } from "@/ui/tooltip";
 import { Notice } from "@/ui/Notice";
 import { PathLabel } from "@/ui/PathLabel";
 import { SegmentedControl } from "@/ui/SegmentedControl";
@@ -158,18 +159,20 @@ export function FileViewer({ projectId, path, onOpenPath }: FileViewerProps) {
             onChange={setMode}
           />
         ) : null}
-        <button
-          type="button"
-          aria-label="Wrap lines"
-          aria-pressed={wrap}
-          onClick={() => setWrap(!wrap)}
-          className={cn(
-            "inline-flex size-11 shrink-0 items-center justify-center rounded-pill hover:bg-selection pointer-fine:size-9",
-            wrap ? "bg-selection text-content" : "text-muted-text",
-          )}
-        >
-          <Icon name="wrap" size={18} />
-        </button>
+        <IconTip label="Wrap lines">
+          <button
+            type="button"
+            aria-label="Wrap lines"
+            aria-pressed={wrap}
+            onClick={() => setWrap(!wrap)}
+            className={cn(
+              "inline-flex size-11 shrink-0 items-center justify-center rounded-pill hover:bg-selection pointer-fine:size-9",
+              wrap ? "bg-selection text-content" : "text-muted-text",
+            )}
+          >
+            <Icon name="wrap" size={18} />
+          </button>
+        </IconTip>
       </header>
       {file.data?.truncated ? (
         <Notice className="m-3 shrink-0" title="Large file">

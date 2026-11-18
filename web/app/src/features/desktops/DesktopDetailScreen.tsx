@@ -36,7 +36,7 @@ import {
 import { DESKTOP_COLORS, findDesktopColor } from "./colors";
 import { grantStateLabel, lastSeenLabel, permissionLabel, safeName, versionLabel } from "./format";
 import { useKeyStatus } from "./keyStatus";
-import { ColorDot, desktopErrorMessage, Fingerprint, PresenceBadge } from "./parts";
+import { ColorDot, desktopErrorMessage, Fingerprint, FingerprintLines, PresenceBadge } from "./parts";
 import { useThisDevice } from "./thisDevice";
 
 export function DesktopDetailScreen({ id }: { id: string }) {
@@ -126,11 +126,11 @@ function KeyDetail({ desktop }: { desktop: DesktopDirectory }) {
       return (
         <>
           <Detail label="Pinned on this device">
-            <Fingerprint hex={status.pinned} />
+            <FingerprintLines hex={status.pinned} />
           </Detail>
           <Notice variant="error" title="Key changed since this device pinned it">
             The directory now serves a different key, with this fingerprint:
-            <Fingerprint hex={status.directory} className="mt-1 block text-body" />
+            <FingerprintLines hex={status.directory} className="mt-1" />
             Do not trust it yet. On your desktop, open Settings, then Web app, then "Verify on another device", and open that link on this device.
           </Notice>
         </>

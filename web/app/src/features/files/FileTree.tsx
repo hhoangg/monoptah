@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
+import { IconTip } from "@/ui/tooltip";
 import { Notice } from "@/ui/Notice";
 import { FileTypeIcon } from "./FileTypeIcon";
 import { ancestorsOf, folderParams } from "./filePaths";
@@ -213,14 +214,16 @@ export function FileTree({ projectId, selected, onOpenFile, className }: FileTre
   return (
     <div className={cn("flex min-h-0 flex-col", className)} data-testid="file-tree">
       <div className="flex items-center justify-end gap-2 px-3 pt-1">
-        <button
-          type="button"
-          aria-label="Refresh files"
-          onClick={refresh}
-          className="inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection pointer-fine:size-9"
-        >
-          <Icon name="refresh" size={18} />
-        </button>
+        <IconTip label="Refresh files">
+          <button
+            type="button"
+            aria-label="Refresh files"
+            onClick={refresh}
+            className="inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection pointer-fine:size-9"
+          >
+            <Icon name="refresh" size={18} />
+          </button>
+        </IconTip>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-1 pb-3">
         {root.isError ? (

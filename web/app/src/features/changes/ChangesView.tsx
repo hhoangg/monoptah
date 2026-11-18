@@ -5,6 +5,7 @@ import { useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
+import { IconTip } from "@/ui/tooltip";
 import { Notice } from "@/ui/Notice";
 import { FileTypeIcon } from "@/features/files/FileTypeIcon";
 import { GitActionBar } from "./GitActionBar";
@@ -117,15 +118,17 @@ export function ChangesView({ projectId, selectedPath, onOpenFile }: ChangesView
             <span className="rounded-pill bg-fill px-2 text-small text-muted-text tabular-nums">{formatCount(list.length)}</span>
           </button>
           {readOnly ? null : (
-            <button
-              type="button"
-              aria-label={id === "staged" ? "Unstage All" : "Stage All"}
-              disabled={stagingAll}
-              onClick={() => void stageAll(id !== "staged")}
-              className={cn("inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection disabled:opacity-40 disabled:hover:bg-transparent pointer-fine:size-9", INSET_FOCUS)}
-            >
-              <Icon name={id === "staged" ? "minus" : "add"} size={18} />
-            </button>
+            <IconTip label={id === "staged" ? "Unstage All" : "Stage All"}>
+              <button
+                type="button"
+                aria-label={id === "staged" ? "Unstage All" : "Stage All"}
+                disabled={stagingAll}
+                onClick={() => void stageAll(id !== "staged")}
+                className={cn("inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection disabled:opacity-40 disabled:hover:bg-transparent pointer-fine:size-9", INSET_FOCUS)}
+              >
+                <Icon name={id === "staged" ? "minus" : "add"} size={18} />
+              </button>
+            </IconTip>
           )}
         </div>
         {collapsed.has(id) ? null : (

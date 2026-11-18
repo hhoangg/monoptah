@@ -6,7 +6,7 @@ import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SettingsCard, SettingsCardsUnderHeading, SettingsRow } from "@/ui/SettingsCard";
 import { Slot } from "@/ui/slots";
 import { AccountSection } from "./AccountSection";
 import { AppearanceSection } from "./AppearanceSection";
@@ -91,9 +91,9 @@ const AREAS: readonly SectionLink[] = [
 /** A headed area of the page: the target of one index link, holding several cards. */
 function Area({ id, title, children }: { id: string; title: string; children: ReactNode }) {
   return (
-    <div id={id} className="flex scroll-mt-6 flex-col gap-6">
+    <div id={id} className="flex scroll-mt-[calc(env(safe-area-inset-top)+3.5rem)] flex-col gap-6">
       <h2 className="border-b border-stroke px-1 pb-2 text-h font-semibold text-content">{title}</h2>
-      {children}
+      <SettingsCardsUnderHeading>{children}</SettingsCardsUnderHeading>
     </div>
   );
 }

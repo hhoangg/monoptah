@@ -55,9 +55,16 @@ export function NotificationsCard() {
       </p>
       {desktops.data && desktops.data.desktops.length > 0 ? (
         <ul className="m-0 flex list-none flex-col p-0" aria-label="Notification settings per desktop">
-          {desktops.data.desktops.map((desktop) => (
-            <li key={desktop.id} className="contents">
-              <SettingsRow icon="computer" title={safeName(desktop.name, "Unnamed desktop")} description="Choose notification categories" to="/d/$desktopId/settings" params={{ desktopId: desktop.id }} />
+          {desktops.data.desktops.map((desktop, index) => (
+            <li key={desktop.id}>
+              <SettingsRow
+                icon="computer"
+                title={safeName(desktop.name, "Unnamed desktop")}
+                description="Choose notification categories"
+                to="/d/$desktopId/settings"
+                params={{ desktopId: desktop.id }}
+                className={index > 0 ? "before:block!" : undefined}
+              />
             </li>
           ))}
         </ul>

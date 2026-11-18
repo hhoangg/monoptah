@@ -1,5 +1,5 @@
 // Persisted preference of the file viewer: wrap long lines (`monoptah.files.wrap`, shared by the file viewer and the diff).
-// Until the user chooses, wrap is off, except on a phone-width window (below 640px) where it is on..
+// Until the user chooses, wrap is off, except on a phone-width window (below 640px) where it is on.
 import { create } from "zustand";
 
 export const WRAP_KEY = "monoptah.files.wrap";
