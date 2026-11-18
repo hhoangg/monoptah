@@ -61,6 +61,12 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
     fullPath: "/d/$desktopId/s/$sessionId",
   },
   {
+    url: "/d/dk1/monos",
+    route: "/d/:desktopId/monos",
+    params: { desktopId: "dk1" },
+    fullPath: "/d/$desktopId/monos/",
+  },
+  {
     url: "/d/dk1/monos/m1",
     route: "/d/:desktopId/monos/:monoId",
     params: { desktopId: "dk1", monoId: "m1" },
@@ -153,6 +159,30 @@ const SCREENS: Record<string, string> = {
   // U-17 (WS-C): the cloud instance list, framed by the workspace with its "Cloud" h1.
   "/d/dk1/cloud": "Cloud",
   "/d/:desktopId/cloud": "Cloud",
+  // U-05 (WS-P): the file browser, with its "Files" h1 (the splat stays in the route params).
+  "/d/dk1/p/p1/files/src/main.rs": "Files",
+  "/d/:desktopId/p/:projectId/files/*": "Files",
+  // U-06 (WS-P): the changes list or diff and the git status, each with its own h1.
+  "/d/dk1/p/p1/changes/src/lib.rs": "Changes",
+  "/d/:desktopId/p/:projectId/changes/*": "Changes",
+  "/d/dk1/p/p1/git": "Git",
+  "/d/:desktopId/p/:projectId/git": "Git",
+  // U-09 (WS-P): the Mono home list and the Mono chat (its title is "Mono" until the catalog names it).
+  "/d/dk1/monos": "Monos",
+  "/d/:desktopId/monos": "Monos",
+  "/d/dk1/monos/m1": "Mono",
+  "/d/:desktopId/monos/:monoId": "Mono",
+  // U-09 (WS-P, P2): the Mono profile pages. Without a connected desktop they show their loading state.
+  "/d/dk1/monos/m1/profile": "Profile",
+  "/d/:desktopId/monos/:monoId/profile": "Profile",
+  "/d/dk1/monos/m1/profile/edit": "Edit Mono",
+  "/d/:desktopId/monos/:monoId/profile/edit": "Edit Mono",
+  "/d/dk1/monos/m1/profile/habit/h3": "Habit",
+  "/d/:desktopId/monos/:monoId/profile/habit/:id": "Habit",
+  "/d/dk1/monos/m1/profile/documents": "Documents",
+  "/d/:desktopId/monos/:monoId/profile/documents": "Documents",
+  "/d/dk1/monos/m1/profile/file/notes.md": "Document",
+  "/d/:desktopId/monos/:monoId/profile/file/:name": "Document",
   // The default test account is a member, so the admin routes show their guard screen (U-04).
   "/admin": "Not available",
   "/admin/users": "Not available",

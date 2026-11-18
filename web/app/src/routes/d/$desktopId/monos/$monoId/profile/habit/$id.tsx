@@ -1,12 +1,12 @@
-// Route stub of /d/:desktopId/monos/:monoId/profile/habit/:id. Owner: WS-P (workstreams.md 3.1).
+// `/d/:desktopId/monos/:monoId/profile/habit/:id`: one habit of a Mono (F-77, U-09). Owner: WS-P (workstreams.md 3.1).
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { MonoHabitScreen } from "@/features/monos/MonoHabitScreen";
 
 export const Route = createFileRoute("/d/$desktopId/monos/$monoId/profile/habit/$id")({
   component: Page,
 });
 
 function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/d/:desktopId/monos/:monoId/profile/habit/:id" purpose="One habit of the Mono profile." params={params} />;
+  const { desktopId, monoId, id } = Route.useParams();
+  return <MonoHabitScreen key={`${desktopId}/${monoId}/${id}`} desktopId={desktopId} monoId={monoId} habitId={id} />;
 }

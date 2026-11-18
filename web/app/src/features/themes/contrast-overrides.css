@@ -1,0 +1,12 @@
+/* Contrast overrides per theme and accent (design-system.md section 9). Imported after the token CSS
+   by register.ts; contrast.test.ts measures tokens.css plus this file for every theme, scheme and accent.
+
+   Measured gaps in tokens.css (see contrast.test.ts):
+   - Dark: the content alpha .50 step (the floor that .35/.40/.45 are raised to) is 4.4 on `surface`
+     in 5 of 6 themes, under the 4.5 text minimum. Raise the floor to .55 (>= 5.0 everywhere). Because
+     --content-a35/40/45 point at --content-a50, they follow.
+   No theme or accent combination needs an override of its own: every accent-text is >= 4.5 and every
+   accent-color >= 3 on background and surface. Mobile has no per-theme contrast overrides. */
+:root[data-scheme="dark"] {
+  --content-a50: var(--content-a55);
+}
