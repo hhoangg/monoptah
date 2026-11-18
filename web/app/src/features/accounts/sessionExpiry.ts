@@ -5,6 +5,7 @@
 // a navigation; this handler skips that case (the router is already resolving a location).
 import type { QueryClient } from "@tanstack/react-query";
 import { onSessionExpired } from "./api";
+import { releaseDevice } from "./deviceBinding";
 import { isPublicPath } from "./authGuard";
 import { clearAccountCache } from "./queries";
 import { loginRedirectTarget, saveFingerprintFragment } from "./redirect";
@@ -27,6 +28,7 @@ export function installSessionExpiryHandler(queryClient: QueryClient, router: Ex
     // Clear after the failing call has finished reporting.
     queueMicrotask(() => {
       clearAccountCache(queryClient);
+      void releaseDevice();
       void Promise.resolve(router.navigate({ to: "/login", search: { redirect: loginRedirectTarget(pathname, searchStr) }, replace: true })).finally(() => {
         leaving = false;
       });

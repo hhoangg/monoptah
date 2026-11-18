@@ -1,4 +1,4 @@
-// Every `/api/*` route the account screens (W-02, W-10, W-11) call, typed once.
+// Every `/api/*` route the account screens (W-02, W-03, W-10, W-11) call, typed once.
 import {
   AddPasskeyOptionsResponse,
   AddPasskeyVerifyBody,
@@ -11,6 +11,9 @@ import {
   LoginVerifyBody,
   LoginVerifyResponse,
   MeResponse,
+  PairApproveBody,
+  PairApproveResponse,
+  PairInfoResponse,
   PasskeyResponse,
   PasskeysResponse,
   PatchMeBody,
@@ -64,5 +67,9 @@ export const endpoints = {
   revokeInvite: endpoint("DELETE", "/api/invites/:id", Ok),
 
   desktops: endpoint("GET", "/api/desktops", DesktopsResponse),
+  pairInfo: endpoint("GET", "/api/pair/:userCode", PairInfoResponse),
+  pairApprove: endpoint("POST", "/api/pair/:userCode/approve", PairApproveResponse, PairApproveBody),
+  pairDeny: endpoint("POST", "/api/pair/:userCode/deny", Ok),
+
   putPushPrefs: endpoint("PUT", "/api/push/prefs/:desktopId", PushPrefsResponse, PushPrefsBody),
 } as const;

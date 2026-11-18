@@ -126,6 +126,9 @@ const SCREENS: Record<string, string> = {
   "/recover": "Recover your account",
   "/settings": "Settings",
   "/install": "Install Monoptah",
+  // An unknown code (the mock knows only its own pairing codes) shows the expired screen.
+  "/pair/c0de": "Code expired",
+  "/pair/:code": "Code expired",
   "/d/dk1/settings": "Desktop settings",
   "/d/:desktopId/settings": "Desktop settings",
   // W-06 (WS-T): the catalog home and the project screen. Without a connected desktop they show their loading state.
@@ -139,6 +142,10 @@ const SCREENS: Record<string, string> = {
   // W-08 (WS-T): the new-session page.
   "/d/dk1/p/p1/new": "New session",
   "/d/:desktopId/p/:projectId/new": "New session",
+  // The default test account is a member, so the admin routes show their guard screen (U-04).
+  "/admin": "Not available",
+  "/admin/users": "Not available",
+  "/admin/invites": "Not available",
 };
 
 async function renderAt(url: string) {

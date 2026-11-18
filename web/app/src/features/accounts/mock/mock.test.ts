@@ -4,7 +4,7 @@ import { ApiError, apiFetch, setApiTransport } from "../api";
 import { endpoints } from "../endpoints";
 import { seedFromQuery } from "./index";
 import { createMockServer, type MockTransportOptions } from "./transport";
-import { SEED_HANDLE, SEED_INVITE_CODE } from "./state";
+import { MOCK_PAIR_CODE, MOCK_PAIR_EXPIRED_CODE, MOCK_PAIR_FINGERPRINT, SEED_HANDLE, SEED_INVITE_CODE } from "./state";
 
 let restore: (() => void) | undefined;
 afterEach(() => {
@@ -239,6 +239,66 @@ describe("dev presets", () => {
     setup({ signedIn: true, passkeyCount: 1, recoveryAckAt: null });
     expect((await apiFetch(endpoints.passkeys)).passkeys).toHaveLength(1);
     expect((await apiFetch(endpoints.me)).recoveryAckAt).toBeNull();
+  });
+});
+
+describe("mock server: pairing (R-03, R-14)", () => {
+  const params = { userCode: MOCK_PAIR_CODE };
+
+  it("reads a pending request by code in any case, with or without the dash", async () => {
+    setup();
+    for (const code of [MOCK_PAIR_CODE, MOCK_PAIR_CODE.toLowerCase(), MOCK_PAIR_CODE.replace("-", "")]) {
+      const info = await apiFetch(endpoints.pairInfo, { params: { userCode: code } });
+      expect(info).toMatchObject({ fingerprint: MOCK_PAIR_FINGERPRINT, machineName: "Ada's MacBook Pro" });
+    }
+  });
+
+  it("answers 404 for an unknown, malformed or expired code and needs a session", async () => {
+    setup();
+    for (const code of ["QQQQ-2222", "c0de", MOCK_PAIR_EXPIRED_CODE]) {
+      expect(await apiFetch(endpoints.pairInfo, { params: { userCode: code } }).catch((e: unknown) => e)).toMatchObject({ status: 404, code: "not_found" });
+    }
+    restore?.();
+    setup({ signedIn: false });
+    expect(await apiFetch(endpoints.pairInfo, { params }).catch((e: unknown) => e)).toMatchObject({ status: 401 });
+  });
+
+  it("needs a fresh session to approve, creates a desktop and is single use", async () => {
+    const server = setup();
+    expect(await apiFetch(endpoints.pairApprove, { params, body: {} }).catch((e: unknown) => e)).toMatchObject({ status: 403, code: "fresh_required" });
+    await reauth();
+    const approved = await apiFetch(endpoints.pairApprove, { params, body: {} });
+    expect(approved.name).toBe("Ada's MacBook Pro");
+    expect(server.state.desktops).toHaveLength(3);
+    expect(await apiFetch(endpoints.pairApprove, { params, body: {} }).catch((e: unknown) => e)).toMatchObject({ status: 409, code: "conflict" });
+    expect(await apiFetch(endpoints.pairInfo, { params }).catch((e: unknown) => e)).toMatchObject({ status: 404 });
+  });
+
+  it("replaces an own desktop without a new row, and 404s for a foreign one", async () => {
+    const server = setup();
+    await reauth();
+    expect(await apiFetch(endpoints.pairApprove, { params, body: { replaces: "someone-elses" } }).catch((e: unknown) => e)).toMatchObject({ status: 404 });
+    const approved = await apiFetch(endpoints.pairApprove, { params, body: { replaces: "desktop-dev-2" } });
+    expect(approved).toEqual({ desktopId: "desktop-dev-2", name: "Fake Linux box" });
+    expect(server.state.desktops).toHaveLength(2);
+  });
+
+  it("refuses a new desktop at the limit with 409 quota_exceeded and keeps the request pending", async () => {
+    setup({ signedIn: true, desktopCount: 5 });
+    await reauth();
+    expect(await apiFetch(endpoints.pairApprove, { params, body: {} }).catch((e: unknown) => e)).toMatchObject({ status: 409, code: "quota_exceeded" });
+    expect(await apiFetch(endpoints.pairInfo, { params })).toMatchObject({ machineName: "Ada's MacBook Pro" });
+  });
+
+  it("denies a pending request once, without a fresh session", async () => {
+    setup();
+    expect(await apiFetch(endpoints.pairDeny, { params })).toEqual({ ok: true });
+    expect(await apiFetch(endpoints.pairDeny, { params }).catch((e: unknown) => e)).toMatchObject({ status: 404 });
+  });
+
+  it("seeds the desktop presets from the query", () => {
+    expect(seedFromQuery("?mock=nodesktops", false)).toMatchObject({ desktopCount: 0 });
+    expect(seedFromQuery("?mock=fivedesktops", false)).toMatchObject({ desktopCount: 5 });
   });
 });
 

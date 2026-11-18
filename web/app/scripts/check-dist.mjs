@@ -1,6 +1,6 @@
 // Run after `vite build` (see the `build` script). Fails when the Worker assets directory
 // (app/dist/client, the `assets.directory` of web/wrangler.jsonc) lacks `_headers` or the default
-// CSP, or holds a Worker bundle, a sourcemap or the dev mock API marker that would be served to the public.
+// CSP, lacks a sound sw.js, or holds a Worker bundle, a sourcemap or the dev mock API marker that would be served to the public.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,6 +38,28 @@ for (const entry of readdirSync(client, { recursive: true, withFileTypes: true }
   }
   if (name === "wrangler.json" || name === "index.js") problems.push(`Worker bundle file in the assets directory: ${join(dir, name)}`);
 }
+
+// The service worker (W-12): it must exist, keep the navigation denylist for /api and /relay, and precache nothing under /api or /relay.
+const sw = join(client, "sw.js");
+if (!existsSync(sw)) {
+  problems.push("dist/client/sw.js is missing");
+} else {
+  const text = readFileSync(sw, "utf8");
+  if (!text.includes("workbox:precaching")) problems.push("sw.js does not use Workbox precaching");
+  if (!text.includes("/^\\/api\\//") || !text.includes("/^\\/relay\\//")) problems.push("sw.js lacks the navigation denylist for /api and /relay");
+  if (/url:\s*[`"']\/?(api|relay)\//.test(text) || /["'`]\/?(api|relay)\/[^"'`]*["'`]\s*,\s*revision/.test(text)) {
+    problems.push("sw.js precaches a path under /api or /relay");
+  }
+}
+
+// vaul and Sonner insert their CSS with a <style> element at runtime, which style-src 'self' blocks. Their stylesheets
+// must be bundled into a served .css file instead (ui/drawer.tsx, ui/sonner.tsx).
+const cssText = readdirSync(client, { recursive: true, withFileTypes: true })
+  .filter((entry) => entry.isFile() && entry.name.endsWith(".css"))
+  .map((entry) => readFileSync(join(entry.parentPath, entry.name), "utf8"))
+  .join("\n");
+if (!cssText.includes("data-vaul-drawer")) problems.push("the vaul stylesheet is not bundled into a served .css file");
+if (!cssText.includes("data-sonner-toaster")) problems.push("the Sonner stylesheet is not bundled into a served .css file");
 
 if (problems.length > 0) {
   console.error(problems.map((problem) => `check-dist: ${problem}`).join("\n"));
