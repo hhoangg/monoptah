@@ -4,8 +4,12 @@
 // accepted. The `#fp=<hex>` fragment (desktop key fingerprint, read by W-03) is public data, but it
 // must not travel in the `redirect` query, so it is parked in sessionStorage while the user signs in.
 
+import { canonicalFingerprint, fingerprintFromHash } from "./pair/fingerprint";
+
 const FP_STORAGE_KEY = "monoptah.fp";
-const FP_PATTERN = /^#?fp=([0-9a-f]{16,128})$/i;
+const FP_HEX_64 = /^[0-9a-f]{64}$/;
+/** What a present but malformed `fp` comes back as: it is not hex, so it can never equal a fingerprint and shows the mismatch block. */
+export const MALFORMED_FP = "invalid";
 /** Resolved against this base to prove a target stays on the current origin. */
 const BASE = "https://app.invalid";
 
@@ -37,24 +41,36 @@ export function loginRedirectTarget(pathname: string, searchStr: string): string
   return safeRedirectTarget(`${pathname}${searchStr}`) ?? "/";
 }
 
-/** Parks `#fp=<hex>` (with the path it belongs to) before a redirect to /login. */
+/**
+ * Parks the `fp` of the hash (with the path it belongs to) before a redirect to /login. A valid value is saved
+ * as lowercase hex. A present but malformed value (not 64 hex after the same clean-up the page does) is saved
+ * only as a flag, never as the raw text, so the hard mismatch block survives the sign-in instead of
+ * downgrading to "missing" (security review 2, L1).
+ */
 export function saveFingerprintFragment(pathname: string, hash: string): void {
-  const match = FP_PATTERN.exec(hash);
-  if (!match) return;
+  const raw = fingerprintFromHash(hash);
+  if (raw === null) return;
+  const canonical = canonicalFingerprint(raw);
+  const entry = FP_HEX_64.test(canonical) ? { path: pathname, fp: canonical } : { path: pathname, malformed: true };
   try {
-    sessionStorage.setItem(FP_STORAGE_KEY, JSON.stringify({ path: pathname, fp: (match[1] ?? "").toLowerCase() }));
+    sessionStorage.setItem(FP_STORAGE_KEY, JSON.stringify(entry));
   } catch {
     // Private mode or quota: the page then shows its "key cannot be checked" warning.
   }
 }
 
-/** Returns `#fp=<hex>` once when it was saved for `pathname`, and forgets it. */
+/** Returns `#fp=<value>` once when it was saved for `pathname`, and forgets it. */
 export function restoreFingerprintFragment(pathname: string): string | null {
   try {
     const raw = sessionStorage.getItem(FP_STORAGE_KEY);
     if (!raw) return null;
-    const saved = JSON.parse(raw) as { path?: unknown; fp?: unknown };
-    if (saved.path !== pathname || typeof saved.fp !== "string" || !/^[0-9a-f]{16,128}$/.test(saved.fp)) return null;
+    const saved = JSON.parse(raw) as { path?: unknown; fp?: unknown; malformed?: unknown };
+    if (saved.path !== pathname) return null;
+    if (saved.malformed === true) {
+      sessionStorage.removeItem(FP_STORAGE_KEY);
+      return `#fp=${MALFORMED_FP}`;
+    }
+    if (typeof saved.fp !== "string" || !FP_HEX_64.test(saved.fp)) return null;
     sessionStorage.removeItem(FP_STORAGE_KEY);
     return `#fp=${saved.fp}`;
   } catch {

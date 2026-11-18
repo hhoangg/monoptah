@@ -6,5 +6,6 @@
     "types": ["vite/client", "node", "@testing-library/jest-dom"],
     "paths": { "@/*": ["./src/*"] }
   },
-  "include": ["src", "vite-plugins", "vite.config.ts", "vitest.config.ts", "eslint.config.js"]
+  "include": ["src", "vite-plugins", "vite.config.ts", "vitest.config.ts", "eslint.config.js"],
+  "exclude": ["src/sw.ts"]
 }

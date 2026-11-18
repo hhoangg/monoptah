@@ -41,7 +41,7 @@ describe("last place registry", () => {
 describe("/ redirect", () => {
   it("goes to /desktops when there is no last place", async () => {
     const router = renderAt("/");
-    await screen.findByTestId("route-stub");
+    await screen.findByRole("heading", { level: 1, name: "Desktops" });
     expect(router.state.location.pathname).toBe("/desktops");
   });
 

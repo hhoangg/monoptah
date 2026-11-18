@@ -3,9 +3,12 @@
 // `cancelled` result when the user dismisses the browser prompt instead of throwing.
 import { queryOptions, type QueryClient } from "@tanstack/react-query";
 import type { MeResponse, PushPrefsResponse, User } from "@monoptah/protocol";
+import { forgetAccountSnapshots } from "@/features/offline/snapshots";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
+import { releaseDevice } from "./deviceBinding";
 import { clearLowCodes } from "./lowCodes";
+import { unsubscribeFromPush } from "@/features/push/subscribe";
 import { createPasskey, getPasskey } from "./webauthn";
 
 type Me = ReturnType<typeof MeResponse.parse>;
@@ -98,6 +101,8 @@ export async function withFreshAuth<T>(fn: () => Promise<T>, reauthFn: typeof re
  */
 export function clearAccountCache(queryClient: QueryClient): void {
   queryClient.clear();
+  // The offline snapshots of the previous session must not outlive it (features/offline/accountCache.ts).
+  void forgetAccountSnapshots();
 }
 
 export interface RegisterInput {
@@ -140,10 +145,15 @@ export async function recoverAccount(queryClient: QueryClient, input: { handle: 
 export async function signOut(queryClient: QueryClient, options: { keepLowCodes?: boolean } = {}): Promise<void> {
   // The reminder belongs to the account that recovered; it survives only the recover flow's own sign-out.
   if (!options.keepLowCodes) clearLowCodes();
+  // The subscription belongs to this browser and this account: remove it while the session still works.
+  // A failure here must not keep the user signed in.
+  await unsubscribeFromPush().catch(() => undefined);
   try {
     await apiFetch(endpoints.logout);
   } finally {
     queryClient.clear();
+    // The encrypted content cache, the snapshots and any push subscription left behind go with the session.
+    await releaseDevice();
   }
 }
 

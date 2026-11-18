@@ -17,6 +17,15 @@
   box-shadow: none !important;
 }
 
+/* Toast actions (Reload on the update toast) are 24px in sonner's stylesheet; touch targets are 44px (checklist 12). */
+@media (pointer: coarse) {
+  [data-sonner-toaster] [data-sonner-toast] [data-button] {
+    height: auto;
+    min-height: 2.75rem;
+    padding-inline: 0.75rem;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   @keyframes dialog-in {
     from { opacity: 0; }

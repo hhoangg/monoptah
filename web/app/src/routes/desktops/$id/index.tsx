@@ -1,12 +1,12 @@
-// Route stub of /desktops/:id. Owner: WS-M (workstreams.md 3.1).
+// Route of /desktops/:id. Owner: WS-M (workstreams.md 3.1). Manage one desktop: rename, color, devices and grants, revoke.
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { DesktopDetailScreen } from "@/features/desktops/DesktopDetailScreen";
 
 export const Route = createFileRoute("/desktops/$id/")({
   component: Page,
 });
 
 function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/desktops/:id" purpose="Manage one desktop: rename, color, devices and grants, revoke." params={params} />;
+  const { id } = Route.useParams();
+  return <DesktopDetailScreen id={id} />;
 }
