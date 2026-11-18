@@ -850,7 +850,8 @@
       "starting",
       "too_large",
       "unsupported",
-      "unsupported_target"
+      "unsupported_target",
+      "wake_required"
     ],
     "relay": [
       "desktop_offline",

@@ -22,6 +22,7 @@ export const DESKTOP_ERROR_CODES = [
   "starting",
   "auto_stopping",
   "instance_busy",
+  "wake_required",
 ] as const;
 export type DesktopErrorCode = (typeof DESKTOP_ERROR_CODES)[number];
 export const DesktopErrorCodeSchema = z.enum(DESKTOP_ERROR_CODES);

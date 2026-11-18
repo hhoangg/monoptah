@@ -72,6 +72,7 @@ describe("error codes", () => {
         "starting",
         "auto_stopping",
         "instance_busy",
+        "wake_required",
       ].sort(),
     );
   });

@@ -185,6 +185,7 @@ codes! {
     Starting => "starting",
     AutoStopping => "auto_stopping",
     InstanceBusy => "instance_busy",
+    WakeRequired => "wake_required",
 }
 
 impl Code {
@@ -210,6 +211,7 @@ impl Code {
             Code::Starting => "The cloud instance is still starting",
             Code::AutoStopping => "The cloud instance is stopping on its own",
             Code::InstanceBusy => "The cloud instance is busy with another operation",
+            Code::WakeRequired => "Sending wakes the stopped cloud instance; confirm to continue",
         }
     }
 }

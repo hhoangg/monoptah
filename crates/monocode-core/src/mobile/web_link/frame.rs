@@ -479,7 +479,7 @@ impl CloseCode {
 }
 
 /// The desktop `code` values (the same names as `mobile::policy::Code`).
-pub const DESKTOP_ERROR_CODES: [&str; 13] = [
+pub const DESKTOP_ERROR_CODES: [&str; 14] = [
     "auto_stopping",
     "busy",
     "disabled",
@@ -493,6 +493,7 @@ pub const DESKTOP_ERROR_CODES: [&str; 13] = [
     "too_large",
     "unsupported",
     "unsupported_target",
+    "wake_required",
 ];
 
 /// Capability names a desktop may advertise in the `state` message

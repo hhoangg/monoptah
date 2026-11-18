@@ -310,6 +310,11 @@ export const METHODS = {
       conversationId: ConversationId,
       text: z.string().max(MAX_MESSAGE_CHARS),
       attachments: AttachmentsSchema.optional(),
+      /**
+       * Consent to wake a stopped cloud instance (billable). Without it a send to a session whose
+       * instance would be woken is refused with `wake_required` (architecture.md 6.6).
+       */
+      wake: z.literal(true).optional(),
     }),
     /** `wake` and `queued`: the send woke a stopped cloud instance (web transport, architecture.md 6.6). */
     result: z.looseObject({ sessionId: z.string().optional(), wake: z.boolean().optional(), queued: z.boolean().optional() }),
