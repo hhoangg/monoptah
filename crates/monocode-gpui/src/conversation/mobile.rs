@@ -132,6 +132,7 @@ impl Conversation {
         attachments: Vec<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        self.mobile_send_begins();
         if !self.history_ready() {
             self.defer_history_action(
                 move |this, cx| this.mobile_submit(prompt, attachments, cx),

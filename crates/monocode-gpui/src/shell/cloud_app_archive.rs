@@ -6,6 +6,7 @@ use super::cloud::{
     WORKSPACE_BUSY, archive_groups, group_by_codespace,
 };
 use super::*;
+use monocode_core::cloud_sessions::{CloudBackendKind, CloudRef, CloudState};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -321,5 +322,310 @@ fn archive_report(
                 failed(format!("{error}.{nothing} {kept}"))
             }
         }
+    }
+}
+
+// MARK: remote devices (WS-D4, H-10, H-12)
+//
+// What `mobile/cloud/*` needs from the shell, so those modules read no private field: plain
+// answers from cached state and the one place each worker is started. Nothing here calls out
+// on the UI thread.
+
+/// How many seconds before an idle stop the `cloud` field of a session announces it.
+pub(crate) const AUTO_STOP_NOTICE_SECS: u64 = 5 * 60;
+
+impl Shell {
+    /// The local database, for a worker.
+    pub(crate) fn mobile_database(&self) -> crate::runtime::Database {
+        self.store.clone()
+    }
+
+    /// The cloud session a request names with `sessionId`, and its instance. The selection
+    /// applies as for every other request; a session that is not on a codespace or sandbox
+    /// answers `unsupported_target`.
+    pub(crate) fn mobile_cloud_session_of(
+        &self,
+        params: &Value,
+        device: &monocode_core::mobile::DeviceContext,
+        cx: &App,
+    ) -> Result<(i64, CloudRef), monocode_core::mobile::policy::Failure> {
+        use monocode_core::mobile::policy::{Code, Failure};
+        let text = params["sessionId"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| Failure::from("Name a session"))?;
+        let id = self.mobile_cloud_session(text, device, cx)?;
+        let mark = self
+            .cloud_marks
+            .get(&id)
+            .ok_or_else(|| Code::UnsupportedTarget.failure())?;
+        Ok((id, mark.cloud()))
+    }
+
+    /// The instance a `cloud.stop` names: a session's, or `kind` and `instance`. A device
+    /// that does not see every project may stop only an instance one of its selected
+    /// projects' sessions uses. The project is where the instance is listed from, when a
+    /// session is known.
+    pub(crate) fn mobile_cloud_subject(
+        &self,
+        params: &Value,
+        device: &monocode_core::mobile::DeviceContext,
+        cx: &App,
+    ) -> Result<(CloudRef, Option<String>), monocode_core::mobile::policy::Failure> {
+        use monocode_core::mobile::policy::{Code, Failure};
+        if params.get("sessionId").is_some() {
+            let (id, cloud) = self.mobile_cloud_session_of(params, device, cx)?;
+            let project = self.cloud_marks.get(&id).map(|m| m.local_project.clone());
+            return Ok((cloud, project));
+        }
+        let kind = params["kind"]
+            .as_str()
+            .and_then(CloudBackendKind::from_api_name)
+            .ok_or_else(|| Failure::from("Name a session, or a kind and an instance"))?;
+        let name = params["instance"]
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 200)
+            .ok_or_else(|| Failure::from("Name a session, or a kind and an instance"))?;
+        let cloud = CloudRef {
+            kind,
+            name: name.to_owned(),
+        };
+        let users: Vec<&super::cloud::CloudMark> = self
+            .cloud_marks
+            .values()
+            .filter(|mark| mark.cloud() == cloud)
+            .collect();
+        let allowed = device.projects.is_none()
+            || users.iter().any(|mark| {
+                super::mobile_host::in_selection(
+                    &device.projects,
+                    &super::mobile_host::project_id(&mark.local_project),
+                )
+            });
+        if !allowed {
+            return Err(Code::NotSelected.failure());
+        }
+        Ok((cloud, users.first().map(|mark| mark.local_project.clone())))
+    }
+
+    /// The cloud instance of session `id`, if it runs on one.
+    pub(crate) fn mobile_cloud_ref_of(&self, id: i64) -> Option<CloudRef> {
+        self.cloud_marks.get(&id).map(|mark| mark.cloud())
+    }
+
+    /// The desktop is stopping this instance on its own now (the auto-stop worker runs).
+    pub(crate) fn mobile_auto_stopping(&self, cloud: &CloudRef) -> bool {
+        self.auto_stop_running.contains(&cloud.key())
+    }
+
+    /// The desktop archives, converts or stops on this instance now.
+    pub(crate) fn mobile_instance_busy(&self, cloud: &CloudRef) -> bool {
+        self.cloud_workspaces_busy.contains(&cloud.key())
+            || self.auto_stop_running.contains(&cloud.key())
+            || self.cloud_marks.iter().any(|(id, mark)| {
+                mark.cloud() == *cloud
+                    && (self.cloud_busy.contains(id) || self.archiving.contains(id))
+            })
+    }
+
+    /// An archive of session `id` runs, or another cloud archive is open, so a new one is
+    /// refused ([`Self::app_archive_cloud`] checks the same).
+    pub(crate) fn mobile_archive_busy(&self, id: i64) -> bool {
+        self.cloud_busy.contains(&id)
+            || self.archiving.contains(&id)
+            || self.cloud_archive.is_some()
+            || self.workspace_busy_of(id)
+    }
+
+    /// Why a send to a session whose start has not finished is refused: the start in progress
+    /// or its failure. `None` when the session is not starting.
+    pub(crate) fn mobile_start_refusal(&self, id: i64) -> Option<String> {
+        let store = locked(&self.store).ok()?;
+        monocode_core::cloud_sessions::starting_refusal(&store, id)
+    }
+
+    /// The start of session `id` failed and waits for a retry.
+    pub(crate) fn mobile_start_failed(&self, id: i64) -> bool {
+        self.cloud_start_failed(id)
+            || locked(&self.store)
+                .ok()
+                .and_then(|store| monocode_core::cloud_sessions::start_record(&store, id))
+                .is_some_and(|record| record.is_failed())
+    }
+
+    /// Follows the start of session `id` again, as the Retry button does.
+    pub(crate) fn mobile_retry_start(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.register_cloud_start(id);
+        self.track_cloud_start(id, cx);
+    }
+
+    /// Whether the start worker of session `id` is still running.
+    pub(crate) fn mobile_start_running(&self, id: i64) -> bool {
+        self.cloud_start_snapshot(id)
+            .is_some_and(|snapshot| snapshot.running)
+    }
+
+    /// What `cloud.instances` says of session `id`: its catalog id, whether its project is in
+    /// the device's selection and whether it is busy; `None` when the session is unknown.
+    pub(crate) fn mobile_session_use(
+        &mut self,
+        id: i64,
+        device: &monocode_core::mobile::DeviceContext,
+        cx: &App,
+    ) -> Option<(String, bool, bool)> {
+        let cwd = self.session_summaries.get(&id)?.cwd.clone();
+        let project = self.project_of(id, &cwd).to_owned();
+        let busy = self.session_metadata(id, cx).busy;
+        Some((
+            self.mobile_session_id(id),
+            self.mobile_project_selected(device, &project),
+            busy,
+        ))
+    }
+
+    /// The project path is in the device's selection (all when it has none).
+    pub(crate) fn mobile_project_selected(
+        &self,
+        device: &monocode_core::mobile::DeviceContext,
+        project: &str,
+    ) -> bool {
+        super::mobile_host::in_selection(&device.projects, &super::mobile_host::project_id(project))
+    }
+
+    /// The local projects whose cloud instances a device may list: selected, and with a cloud
+    /// setting or session. A store read, no network.
+    pub(crate) fn mobile_cloud_projects(
+        &self,
+        device: &monocode_core::mobile::DeviceContext,
+        cx: &App,
+    ) -> Vec<String> {
+        self.mobile_projects(cx)
+            .into_iter()
+            .filter(|path| !path.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX))
+            .filter(|path| self.mobile_project_selected(device, path))
+            .filter(|path| self.cloud.project_uses_cloud(path))
+            .collect()
+    }
+
+    /// Every local project that uses a cloud, selected or not (where an instance a device
+    /// named by kind and name is listed from).
+    pub(crate) fn mobile_all_cloud_projects(&self, cx: &App) -> Vec<String> {
+        self.mobile_projects(cx)
+            .into_iter()
+            .filter(|path| !path.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX))
+            .filter(|path| self.cloud.project_uses_cloud(path))
+            .collect()
+    }
+
+    /// The cached state of `cloud` is stale after a stop: read it again.
+    pub(crate) fn mobile_cloud_changed(&mut self, cloud: &CloudRef, cx: &mut Context<Self>) {
+        self.cloud_states.remove(&cloud.key());
+        self.refresh_cloud(cx);
+        cx.notify();
+    }
+
+    /// The conversation of a cloud session, opened if need be (it does not load a history
+    /// and never wakes anything by itself).
+    pub(crate) fn mobile_open_cloud_session(
+        &mut self,
+        id: i64,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<crate::conversation::Conversation>> {
+        self.ensure_session(id, cx)
+    }
+
+    /// How the wake of session `id` stands: `(waking, failed)`. A session that is gone has
+    /// failed. See `Conversation::is_waking`.
+    pub(crate) fn mobile_wake_progress(&self, id: i64, cx: &App) -> (bool, bool) {
+        self.sessions.get(&id).map_or((false, true), |view| {
+            let view = view.read(cx);
+            (view.is_waking(), view.wake_failed())
+        })
+    }
+
+    /// Archives cloud session `id` with `choice` ("keep" or "stop") like the app API, and
+    /// tells the desktop user how it ended: a failure on the error line, a warning as a
+    /// notice. The remote device is answered at once; the archive takes minutes.
+    pub(crate) fn mobile_archive_cloud(
+        &mut self,
+        id: i64,
+        choice: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (reply, answer) = async_channel::bounded(1);
+        self.app_archive_cloud(id, choice, true, reply, window, cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = answer.recv().await;
+            let _ = this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(Err(failure)) => this.error = Some(failure.message),
+                    Ok(Ok(report)) => {
+                        if let Some(warning) = report["warning"].as_str() {
+                            this.notice = Some(warning.to_owned());
+                        }
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The announced auto-stop of the instance of session `id` as `(at in ms, reason)`: the
+    /// stop is running now, or the idle stop is at most [`AUTO_STOP_NOTICE_SECS`] away and
+    /// nothing is keeping the instance busy. Memory only. Typing in a session counts as
+    /// activity (it moves the idle stop away); watching never does.
+    pub(crate) fn mobile_auto_stop(&self, id: i64, cx: &App) -> Option<(u64, &'static str)> {
+        let mark = self.cloud_marks.get(&id)?;
+        let cloud = mark.cloud();
+        let now_ms = monocode_core::time::now_ms();
+        if self.auto_stop_running.contains(&cloud.key()) {
+            return Some((now_ms, "idle"));
+        }
+        if self.cloud_states.get(&cloud.key()) != Some(&CloudState::Available) {
+            return None;
+        }
+        let minutes = self
+            .workspace
+            .preferences
+            .cloud_auto_stop
+            .policy(cloud.kind)
+            .idle_minutes?;
+        let facts = self.auto_stop_facts(cx);
+        let workspace = facts.iter().find(|w| w.cloud == cloud)?;
+        let active = workspace.app_working
+            || workspace.sessions.is_empty()
+            || workspace
+                .sessions
+                .iter()
+                .any(|s| s.busy || s.pending || s.unknown);
+        if active {
+            return None;
+        }
+        let now = self.auto_stop_now();
+        let last_input = workspace
+            .sessions
+            .iter()
+            .filter_map(|s| s.last_input)
+            .max()
+            .unwrap_or(0);
+        let since = self
+            .auto_stop
+            .idle_since(&cloud)
+            .unwrap_or(now)
+            .max(last_input);
+        let remaining = (since + u64::from(minutes) * 60).saturating_sub(now);
+        (remaining <= AUTO_STOP_NOTICE_SECS).then_some((now_ms + remaining * 1000, "idle"))
+    }
+
+    /// `cloud.keepRunning`: starts a fresh idle window for the instance and exempts it from
+    /// being stopped for having no session left, so the announced stop does not happen.
+    /// There is no standing "never auto-stop"; the next idle window can stop it again.
+    pub(crate) fn mobile_keep_running(&mut self, cloud: &CloudRef) {
+        let now = self.auto_stop_now();
+        self.auto_stop.resumed(cloud, now);
+        self.auto_stop.keep_running(cloud);
     }
 }

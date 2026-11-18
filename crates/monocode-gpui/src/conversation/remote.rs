@@ -69,6 +69,10 @@ impl Conversation {
     pub(crate) fn cloud_start(&self) -> Option<&Arc<crate::cloud_start_view::CloudStartSnapshot>> {
         self.cloud_start.as_ref()
     }
+    /// The last connection to the workspace failed and the view shows the error.
+    pub(crate) fn remote_connection_failed(&self) -> bool {
+        self.remote_state.error.is_some()
+    }
     /// The message typed while the codespace started, not sent yet.
     #[cfg(test)]
     pub(crate) fn cloud_queued(&self) -> Option<&str> {
