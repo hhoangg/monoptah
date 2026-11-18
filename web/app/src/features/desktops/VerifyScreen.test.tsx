@@ -22,10 +22,17 @@ const OTHER_KEY = new Uint8Array(32).fill(3);
 const NEW_FP = fingerprint(NEW_KEY);
 let server: FakeServer;
 let restore: (() => void) | undefined;
+let keys: Record<string, string> = {};
 
 function install(serverKey: Uint8Array) {
-  server = createFakeServer({ desktops: [desktop({ id: "d1", name: "Studio Mac" })], publicKeys: { d1: base64UrlEncode(serverKey) } });
+  keys = { d1: base64UrlEncode(serverKey) };
+  server = createFakeServer({ desktops: [desktop({ id: "d1", name: "Studio Mac" })], publicKeys: keys });
   restore = setApiTransport(server.transport);
+}
+
+async function trust() {
+  await userEvent.click(await screen.findByRole("checkbox", { name: /matches Settings > Web app on my desktop/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Trust this key" }));
 }
 
 async function pinnedFingerprint(): Promise<string | undefined> {
@@ -44,10 +51,27 @@ afterEach(() => {
 });
 
 describe("/desktops/:id/verify", () => {
-  it("re-pins on a full fingerprint match, reconnects and offers Open desktop", async () => {
+  it("does not re-pin on load: it shows the fingerprint and waits for an explicit confirmation", async () => {
+    install(NEW_KEY);
+    mountApp(`/desktops/d1/verify#fp=${NEW_FP}`);
+    await screen.findByText("Check the fingerprint");
+    expect(screen.getByText(displayFingerprint(NEW_FP))).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Trust this key" })).toBeDisabled();
+    expect(await pinnedFingerprint()).toBe(fingerprint(OLD_KEY));
+    expect(h.reconnect).not.toHaveBeenCalled();
+    // Ticking the comparison alone changes nothing.
+    await userEvent.click(screen.getByRole("checkbox"));
+    expect(await pinnedFingerprint()).toBe(fingerprint(OLD_KEY));
+    expect(h.reconnect).not.toHaveBeenCalled();
+  });
+
+  it("re-pins on a full fingerprint match only after the click, reconnects and offers Open desktop", async () => {
     install(NEW_KEY);
     mountApp(`/desktops/d1/verify#fp=${NEW_FP}`);
     await screen.findByRole("heading", { level: 1, name: "Verify desktop" });
+    await screen.findByText("Check the fingerprint");
+    expect(await pinnedFingerprint()).toBe(fingerprint(OLD_KEY));
+    await trust();
     expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
     expect(screen.getByText(displayFingerprint(NEW_FP))).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Open desktop" })).toHaveAttribute("href", "/d/d1");
@@ -58,6 +82,7 @@ describe("/desktops/:id/verify", () => {
   it("accepts the fingerprint in upper case", async () => {
     install(NEW_KEY);
     mountApp(`/desktops/d1/verify#fp=${NEW_FP.toUpperCase()}`);
+    await trust();
     expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
     expect(await pinnedFingerprint()).toBe(NEW_FP);
   });
@@ -69,6 +94,27 @@ describe("/desktops/:id/verify", () => {
     expect(alert).toHaveTextContent("This link does not match the desktop's key. Do not continue.");
     expect(screen.queryByRole("link", { name: "Open desktop" })).toBeNull();
     expect(screen.queryByRole("button", { name: /trust/i })).toBeNull();
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(await pinnedFingerprint()).toBe(fingerprint(OLD_KEY));
+    expect(h.reconnect).not.toHaveBeenCalled();
+  });
+
+  it("cannot be accepted silently when the link fingerprint differs from the served key", async () => {
+    install(OTHER_KEY);
+    mountApp(`/desktops/d1/verify#fp=${NEW_FP}`);
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Trust this key" })).toBeNull();
+    expect(await pinnedFingerprint()).toBe(fingerprint(OLD_KEY));
+  });
+
+  it("refuses at the click when the served key changed after the fingerprint was shown", async () => {
+    install(NEW_KEY);
+    mountApp(`/desktops/d1/verify#fp=${NEW_FP}`);
+    await screen.findByText("Check the fingerprint");
+    keys.d1 = base64UrlEncode(OTHER_KEY);
+    await trust();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Do not continue");
     expect(await pinnedFingerprint()).toBe(fingerprint(OLD_KEY));
     expect(h.reconnect).not.toHaveBeenCalled();
   });
@@ -95,7 +141,7 @@ describe("/desktops/:id/verify", () => {
     install(NEW_KEY);
     const replace = vi.spyOn(window.history, "replaceState");
     mountApp(`/desktops/d1/verify#fp=${NEW_FP}`);
-    await screen.findByText("Desktop verified");
+    await screen.findByText("Check the fingerprint");
     expect(replace).toHaveBeenCalled();
     for (const call of replace.mock.calls) expect(String(call[2])).not.toContain("#");
   });
@@ -113,6 +159,7 @@ describe("/desktops/:id/verify", () => {
     await screen.findByText(/could not be loaded/);
     failing = false;
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await trust();
     expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
     expect(await pinnedFingerprint()).toBe(NEW_FP);
   });
@@ -130,6 +177,7 @@ describe("/desktops/:id/verify", () => {
     install(NEW_KEY);
     sessionStorage.setItem("monoptah.fp", JSON.stringify({ path: "/desktops/d1/verify", fp: NEW_FP }));
     mountApp("/desktops/d1/verify");
+    await trust();
     expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
     expect(sessionStorage.getItem("monoptah.fp")).toBeNull();
   });
@@ -138,6 +186,7 @@ describe("/desktops/:id/verify", () => {
     install(NEW_KEY);
     sessionStorage.setItem("monoptah.fp", JSON.stringify({ path: "/desktops/d1/verify", fp: fingerprint(OTHER_KEY) }));
     mountApp(`/desktops/d1/verify#fp=${NEW_FP}`);
+    await trust();
     expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
     // The address wins, and the parked value of an older link is gone.
     expect(await pinnedFingerprint()).toBe(NEW_FP);
@@ -148,8 +197,12 @@ describe("/desktops/:id/verify", () => {
     install(NEW_KEY);
     sessionStorage.setItem("monoptah.fp", JSON.stringify({ path: "/desktops/d1/verify", fp: NEW_FP }));
     mountApp("/desktops/d1/verify", { strict: true });
-    expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
+    await screen.findByText("Check the fingerprint");
     expect(server.calls.filter((call) => call.path === "/api/desktops/d1")).toHaveLength(1);
+    await trust();
+    expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
+    // One more fetch: the click re-reads the key.
+    expect(server.calls.filter((call) => call.path === "/api/desktops/d1")).toHaveLength(2);
     expect(sessionStorage.getItem("monoptah.fp")).toBeNull();
   });
 });

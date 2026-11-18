@@ -18,7 +18,7 @@ export type MarkdownBlock =
   | { type: "code"; lang: string; text: string }
   | { type: "list"; ordered: boolean; start: number; items: MarkdownBlock[][] }
   | { type: "quote"; children: MarkdownBlock[] }
-  | { type: "table"; rows: Inline[][][] }
+  | { type: "table"; rows: Inline[][][]; truncated?: boolean }
   | { type: "rule" };
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})\s*([\w+-]*)/;
@@ -28,6 +28,9 @@ const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 const QUOTE = /^ {0,3}>\s?(.*)$/;
 /** Lines longer than this never start a table (the divider pattern is not linear on long runs of space). */
 const MAX_TABLE_LINE = 2000;
+/** A table keeps at most this many rows and columns; the rest is dropped and the table says so (W13-6). */
+export const MAX_TABLE_ROWS = 200;
+export const MAX_TABLE_COLUMNS = 50;
 /** Block and inline nesting past this depth is read as plain text. */
 const MAX_DEPTH = 24;
 /** How far an emphasis, code or link scan looks ahead. */
@@ -151,13 +154,19 @@ function parseBlocks(lines: string[], depth: number): MarkdownBlock[] {
 
     const divider = lines[index + 1] ?? "";
     if (line.includes("|") && divider.length <= MAX_TABLE_LINE && TABLE_DIVIDER.test(divider)) {
-      const rows = [cells(line)];
+      const header = cells(line);
+      const rows = [header.cells];
+      let truncated = header.truncated;
       index += 2;
       while (index < lines.length && (lines[index] ?? "").includes("|") && (lines[index] ?? "").trim()) {
-        rows.push(cells(lines[index] ?? ""));
+        if (rows.length < MAX_TABLE_ROWS) {
+          const row = cells(lines[index] ?? "");
+          rows.push(row.cells);
+          truncated ||= row.truncated;
+        } else truncated = true;
         index += 1;
       }
-      blocks.push({ type: "table", rows });
+      blocks.push({ type: "table", rows, ...(truncated ? { truncated: true } : {}) });
       continue;
     }
 
@@ -253,13 +262,13 @@ function parseList(lines: string[], from: number, depth: number): [MarkdownBlock
   ];
 }
 
-function cells(row: string): Inline[][] {
-  return row
+function cells(row: string): { cells: Inline[][]; truncated: boolean } {
+  const all = row
     .trim()
     .replace(/^\|/, "")
     .replace(/\|$/, "")
-    .split("|")
-    .map((cell) => parseInline(cell.trim()));
+    .split("|");
+  return { cells: all.slice(0, MAX_TABLE_COLUMNS).map((cell) => parseInline(cell.trim())), truncated: all.length > MAX_TABLE_COLUMNS };
 }
 
 const DELIMITERS: [string, "strong" | "em" | "strike"][] = [
@@ -274,9 +283,58 @@ const DELIMITERS: [string, "strong" | "em" | "strike"][] = [
 const MAX_SCAN_STEPS = 100_000;
 let scanBudget = MAX_SCAN_STEPS;
 
-// The destination allows one level of balanced parentheses, as in `[x](https://a.dev/f_(1))`.
-const LINK = /\[([^\]]{1,500})\]\(((?:[^()\s]|\([^()\s]{0,200}\)){1,2000})(?:\s+"[^"]{0,500}")?\)/y;
-const IMAGE = /!\[([^\]]{0,500})\]\(((?:[^()\s]|\([^()\s]{0,200}\)){1,2000})(?:\s+"[^"]{0,500}")?\)/y;
+const MAX_LABEL = 500;
+const MAX_DESTINATION = 2000;
+const MAX_GROUP = 200;
+const MAX_TITLE = 500;
+
+/** Per `parseInline` call: the start of the last destination scan that failed (every `[` of a run shares one `](`). */
+interface LinkMemo {
+  failed: number;
+}
+
+/**
+ * `[label](destination "title")` at `open` (the index of `[`), without a backtracking regex (W13-6 / N1). The
+ * destination allows one level of balanced parentheses, as in `[x](https://a.dev/f_(1))`. Every step is a forward scan
+ * bounded by the limits above, so a hostile input cannot make it quadratic. Returns the label, the destination and
+ * the end index, or null.
+ */
+function matchLink(text: string, open: number, minLabel: number, memo: LinkMemo): { label: string; href: string; end: number } | null {
+  const close = text.indexOf("]", open + 1);
+  if (close === -1 || close - open - 1 < minLabel || close - open - 1 > MAX_LABEL || text[close + 1] !== "(") return null;
+  const start = close + 2;
+  if (start === memo.failed) return null;
+  let at = start;
+  let units = 0;
+  while (at < text.length && units < MAX_DESTINATION) {
+    const char = text[at] as string;
+    if (char === "(") {
+      let inner = at + 1;
+      while (inner < text.length && inner - at - 1 <= MAX_GROUP && !/[()\s]/.test(text[inner] as string)) inner += 1;
+      if (text[inner] !== ")" || inner - at - 1 > MAX_GROUP) break;
+      at = inner + 1;
+    } else if (char === ")" || /\s/.test(char)) break;
+    else at += 1;
+    units += 1;
+  }
+  const fail = (): null => {
+    memo.failed = start;
+    return null;
+  };
+  if (units === 0) return fail();
+  const href = text.slice(start, at);
+  let end = at;
+  if (/\s/.test(text[end] ?? "")) {
+    let quote = end;
+    while (/\s/.test(text[quote] ?? "")) quote += 1;
+    if (text[quote] !== '"') return fail();
+    const closeQuote = text.indexOf('"', quote + 1);
+    if (closeQuote === -1 || closeQuote - quote - 1 > MAX_TITLE) return fail();
+    end = closeQuote + 1;
+  }
+  if (text[end] !== ")") return fail();
+  return { label: text.slice(open + 1, close), href, end: end + 1 };
+}
 const BARE_URL = /https?:\/\/[^\s<>()]{1,2000}/y;
 
 function sticky(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
@@ -295,6 +353,15 @@ export function parseInline(text: string, depth = 0, inLink = false): Inline[] {
     plain = "";
   };
   let index = 0;
+  // Next `]` at or after the last look-up: a link or image label is at most 500 characters, so a `[` whose next `]`
+  // is farther away (or missing) cannot start one. Without this a run of `[` costs 500 steps each (W13-6).
+  const memo: LinkMemo = { failed: -1 };
+  let nextClose = -2;
+  const labelCanClose = (from: number): boolean => {
+    if (nextClose !== -1 && nextClose < from) nextClose = text.indexOf("]", from);
+    else if (nextClose === -2) nextClose = text.indexOf("]", from);
+    return nextClose !== -1 && nextClose - from <= 501;
+  };
   while (index < text.length) {
     const char = text[index];
     if (char === "\\" && index + 1 < text.length && /[\\`*_~[\]()#>+-.!|]/.test(text[index + 1] ?? "")) {
@@ -318,21 +385,21 @@ export function parseInline(text: string, depth = 0, inLink = false): Inline[] {
       index = run;
       continue;
     }
-    if (char === "[") {
-      const link = sticky(LINK, text, index);
+    if (char === "[" && labelCanClose(index + 1)) {
+      const link = matchLink(text, index, 1, memo);
       if (link) {
         flush();
-        out.push({ type: "link", href: link[2] ?? "", children: parseInline(link[1] ?? "", depth + 1, true) });
-        index += link[0].length;
+        out.push({ type: "link", href: link.href, children: parseInline(link.label, depth + 1, true) });
+        index = link.end;
         continue;
       }
     }
-    if (char === "!" && text[index + 1] === "[") {
+    if (char === "!" && text[index + 1] === "[" && labelCanClose(index + 2)) {
       // Images are never loaded: the alt text is shown instead.
-      const image = sticky(IMAGE, text, index);
+      const image = matchLink(text, index + 1, 0, memo);
       if (image) {
-        plain += image[1] || "image";
-        index += image[0].length;
+        plain += image.label || "image";
+        index = image.end;
         continue;
       }
     }

@@ -36,7 +36,8 @@ function logFailure(operation: string, error: unknown): void {
 
 /** `room.revoke(target, code)` on each desktop, in parallel, best effort (failures are logged, never thrown). */
 export async function revokeInRooms(env: Pick<Env, "ROOM">, desktopIds: readonly string[], target: RevokeTarget, code: number): Promise<void> {
-  const settled = await Promise.allSettled(desktopIds.map((id) => roomOf(env, id).revoke(target, code)));
+  // One retry per room: the room remembers the revocation, so a repeat is harmless (R13B-1).
+  const settled = await Promise.allSettled(desktopIds.map((id) => roomOf(env, id).revoke(target, code).catch(() => roomOf(env, id).revoke(target, code))));
   for (const result of settled) if (result.status === "rejected") logFailure("revoke", result.reason);
   for (const id of desktopIds) invalidatePresence(id);
 }

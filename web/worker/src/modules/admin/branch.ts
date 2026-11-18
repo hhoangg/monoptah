@@ -3,7 +3,6 @@
 // of a batch. The CTE reads only `invited_by`, which the batch never changes, so each statement sees the same
 // members. Bind order of every statement: the root user id (inside the CTE), then the statement's own values, then
 // the acting admin id (inside `MEMBERS`, which excludes the admin).
-import { MAX_REVOKE_CALLS } from "../sessions/session.ts";
 
 /**
  * `WITH` clause naming the branch: the root and, with `cascade`, every descendant (a user invited by a member, at any
@@ -18,9 +17,9 @@ export function branchCte(cascade: boolean): string {
 /** The members of the branch except the acting admin, who is never blocked. One `?`, the admin id. */
 export const MEMBERS = "(SELECT id FROM branch WHERE id <> ?)";
 
-/** Live desktops of the members, for `room.revoke`, at most `MAX_REVOKE_CALLS` (the subrequest cap). Binds root, admin. */
+/** Every live desktop of the members, for `room.revoke` (no cap: the handler calls the rooms in batches). Binds root, admin. */
 export const listDesktopsSql = (cascade: boolean): string =>
-  `${branchCte(cascade)} SELECT id FROM desktops WHERE revoked_at IS NULL AND user_id IN ${MEMBERS} LIMIT ${MAX_REVOKE_CALLS}`;
+  `${branchCte(cascade)} SELECT id FROM desktops WHERE revoked_at IS NULL AND user_id IN ${MEMBERS}`;
 
 /** Marks the active members blocked. A member that is already blocked keeps its own reason and `blocked_via`. Binds root, at, reason, via, admin. */
 export const blockUsersSql = (cascade: boolean): string =>

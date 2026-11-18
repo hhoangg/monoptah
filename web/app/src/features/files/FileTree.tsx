@@ -128,7 +128,7 @@ function Folder({ path, depth, context }: { path: string; depth: number; context
             >
               {entry.isDir ? <Icon name="chevronRight" size={14} className={cn("shrink-0 text-muted-text transition-transform motion-reduce:transition-none", open && "rotate-90")} /> : <span className="w-3.5 shrink-0" />}
               <FileTypeIcon name={entry.name} isDir={entry.isDir} isOpen={open} />
-              <span className="min-w-0 flex-1 truncate">{entry.name}</span>
+              <span className="min-w-0 flex-1 truncate [unicode-bidi:isolate]">{entry.name}</span>
             </button>
             {open ? (
               <ul role="group">

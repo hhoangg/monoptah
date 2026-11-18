@@ -3,6 +3,7 @@
 // app types in mobile/src/features/workspace/types.ts and models/types.ts).
 // Results are typed for the fields the web needs and stay open (looseObject) so
 // a newer desktop can add fields without breaking an older web build.
+import "./zod-config.ts";
 import { z } from "zod";
 import { MAX_ATTACHMENTS } from "./limits.ts";
 

@@ -6,6 +6,7 @@
 //   2      2    channel   u16 big-endian
 //   4      16   deviceId  UUID bytes (the relay overwrites it on device -> desktop frames)
 //   20     N    body      N <= 65,535
+import "./zod-config.ts";
 import { z } from "zod";
 import { FRAME_HEADER_SIZE, FRAME_VERSION, MAX_FRAME_BODY, MAX_FRAME_SIZE, MIN_FRAME_SIZE } from "./limits.ts";
 

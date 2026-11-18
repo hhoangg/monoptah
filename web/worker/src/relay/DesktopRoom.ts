@@ -36,6 +36,8 @@ interface Attachment {
   channels: number[];
   /** Grant state of a device socket (`pending` sockets are capped per room); a missing header means `pending`. */
   grantState?: "pending" | "confirmed";
+  /** Absolute expiry of the cookie session behind a device socket, in ms; the room closes the socket past it (4001). */
+  expiresAt?: number;
   /** Random id keying the in-memory rate limiter. */
   sid: string;
   /** Set once the socket is closed or closing; every later effect is skipped. */
@@ -43,6 +45,28 @@ interface Attachment {
 }
 
 const MAX_CHANNELS = 32;
+/** Storage key of the revocation list (R13B-1): refuses a join that races a revocation, whatever order the calls arrive in. */
+const REVOKED_KEY = "revoked";
+/** How long a revoked device id or session hash is remembered: the absolute session lifetime (30 days). */
+export const REVOCATION_TTL_MS = 30 * 86_400_000;
+/** Entries kept per list; when full, the entries closest to expiry go first. */
+export const REVOCATION_LIST_LIMIT = 256;
+/** The expiry sweep over all device sockets runs at most this often (ms). */
+const SWEEP_INTERVAL_MS = 1000;
+
+/** Revoked device ids and session hashes with their expiry (ms). Lives in the room's storage, so it survives eviction. */
+interface RevokedList {
+  devices: Record<string, number>;
+  sessions: Record<string, number>;
+}
+
+function prune(list: Record<string, number>, now: number): void {
+  for (const key of Object.keys(list)) if ((list[key] as number) <= now) delete list[key];
+  const keys = Object.keys(list);
+  if (keys.length <= REVOCATION_LIST_LIMIT) return;
+  keys.sort((a, b) => (list[a] as number) - (list[b] as number));
+  for (const key of keys.slice(0, keys.length - REVOCATION_LIST_LIMIT)) delete list[key];
+}
 /** Device sockets of devices whose grant is still `pending`, per room; a new one closes 4010. */
 export const PENDING_DEVICE_SOCKETS_PER_ROOM = 4;
 /** `last_seen_at` is only rewritten when the stored value is at least this many seconds old. */
@@ -72,6 +96,7 @@ function logClose(role: string, code: number): void {
 export class DesktopRoom extends DurableObject<Env> {
   /** Rate limiters by socket id; lost on hibernation (best effort). */
   readonly #limiters = new Map<string, SocketLimiter>();
+  #lastSweep = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -103,6 +128,10 @@ export class DesktopRoom extends DurableObject<Env> {
       channels: [],
       sid: crypto.randomUUID(),
     };
+    if (role === "device") {
+      const expires = Number(request.headers.get("x-session-expires-at"));
+      if (Number.isFinite(expires) && expires > 0) attachment.expiresAt = expires * 1000;
+    }
 
     if (role === "desktop") {
       for (const old of this.#live("desktop")) {
@@ -116,6 +145,14 @@ export class DesktopRoom extends DurableObject<Env> {
       this.#sendCtrl(server, { t: "grants" }, ZERO_UUID);
     } else {
       const id = deviceId as string;
+      const refusal = await this.#joinRefusal(id, attachment);
+      if (refusal !== null) {
+        server.accept();
+        server.close(refusal, "refused");
+        logClose("device", refusal);
+        return new Response(null, { status: 101, webSocket: client });
+      }
+      this.#sweepExpired(true);
       const all = this.#devices();
       const same = all.filter((ws) => this.#att(ws)?.deviceId === id).length;
       const pendingSockets = all.filter((ws) => this.#att(ws)?.grantState === "pending").length;
@@ -140,6 +177,12 @@ export class DesktopRoom extends DurableObject<Env> {
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const att = this.#att(ws);
     if (!att || att.gone) return;
+    if (att.role === "device" && att.expiresAt !== undefined && Date.now() >= att.expiresAt) {
+      this.#expire(ws, att);
+      return;
+    }
+    // Synchronous: no await between the sweep and forwarding, so frames keep their order (N4).
+    this.#sweepExpired(false);
     if (typeof message === "string") {
       if (message === ROOM_QUOTAS.textFramePing) {
         ws.send(ROOM_QUOTAS.textFramePong);
@@ -215,6 +258,7 @@ export class DesktopRoom extends DurableObject<Env> {
 
   /** Closes the matching sockets with `code` (4001, 4003 or 4011). */
   async revoke(target: RevokeTarget, code: number): Promise<void> {
+    await this.#remember(target);
     const all = "all" in target;
     const sessions = "sessionIdHash" in target ? new Set([target.sessionIdHash]) : "sessionIdHashes" in target ? new Set(target.sessionIdHashes) : null;
     const wantedDevice = "deviceId" in target ? target.deviceId.toLowerCase() : null;
@@ -226,14 +270,7 @@ export class DesktopRoom extends DurableObject<Env> {
       if (!att?.deviceId) continue;
       const match = all || att.deviceId === wantedDevice || (sessions !== null && att.sessionIdHash !== null && sessions.has(att.sessionIdHash));
       if (!match) continue;
-      if (desktop && !all) {
-        for (const channel of att.channels) {
-          const key = `${att.deviceId}:${channel}`;
-          if (byes.has(key)) continue;
-          byes.add(key);
-          this.#send(desktop, encodeFrame({ type: FrameType.BYE, channel, deviceId: att.deviceId }));
-        }
-      }
+      if (desktop && !all) this.#sendByes(desktop, att, byes);
       this.#markGone(ws);
       this.#close(ws, code);
       logClose("device", code);
@@ -266,6 +303,74 @@ export class DesktopRoom extends DurableObject<Env> {
   async notifyGrants(): Promise<void> {
     const desktop = this.#desktop();
     if (desktop) this.#sendCtrl(desktop, { t: "grants" }, ZERO_UUID);
+  }
+
+  // --- Revocation memory and expiry (R13B-1) ---
+
+  async #loadRevoked(now: number): Promise<RevokedList> {
+    const stored = await this.ctx.storage.get<RevokedList>(REVOKED_KEY);
+    const list: RevokedList = { devices: { ...(stored?.devices ?? {}) }, sessions: { ...(stored?.sessions ?? {}) } };
+    prune(list.devices, now);
+    prune(list.sessions, now);
+    return list;
+  }
+
+  /** Writes the target of a revoke into storage before any socket is touched, so a join that raced the revoke is refused. Idempotent. */
+  async #remember(target: RevokeTarget): Promise<void> {
+    if ("all" in target) return;
+    const now = Date.now();
+    const list = await this.#loadRevoked(now);
+    const expiry = now + REVOCATION_TTL_MS;
+    if ("deviceId" in target) list.devices[target.deviceId.toLowerCase()] = expiry;
+    else for (const hash of "sessionIdHash" in target ? [target.sessionIdHash] : target.sessionIdHashes) list.sessions[hash] = expiry;
+    prune(list.devices, now);
+    prune(list.sessions, now);
+    await this.ctx.storage.put(REVOKED_KEY, list);
+  }
+
+  /** The close code for a join that must be refused (revoked device 4003, revoked or expired session 4001), else null. */
+  async #joinRefusal(deviceId: string, att: Attachment): Promise<number | null> {
+    const now = Date.now();
+    if (att.expiresAt !== undefined && now >= att.expiresAt) return CloseCodes.UNAUTHORIZED;
+    const list = await this.#loadRevoked(now);
+    if (list.devices[deviceId] !== undefined) return CloseCodes.REVOKED;
+    if (att.sessionIdHash !== null && list.sessions[att.sessionIdHash] !== undefined) return CloseCodes.UNAUTHORIZED;
+    return null;
+  }
+
+  /** BYE to the desktop for each channel the device used, once per device and channel. */
+  #sendByes(desktop: WebSocket, att: Attachment, seen: Set<string>): void {
+    for (const channel of att.channels) {
+      const key = `${att.deviceId}:${channel}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      this.#send(desktop, encodeFrame({ type: FrameType.BYE, channel, deviceId: att.deviceId as string }));
+    }
+  }
+
+  /**
+   * Closes one device socket whose session expired (4001), with BYE per channel. No timer: runs on a message or a join.
+   * Everything here is synchronous; the departure effects (CTRL left, a D1 write) run afterwards without being awaited,
+   * so a sweep never opens the input gate between a join check and `acceptWebSocket`, and never delays a frame (N4).
+   */
+  #expire(ws: WebSocket, att: Attachment): void {
+    const desktop = this.#desktop();
+    if (desktop) this.#sendByes(desktop, att, new Set());
+    this.#markGone(ws);
+    this.#close(ws, CloseCodes.UNAUTHORIZED);
+    logClose("device", CloseCodes.UNAUTHORIZED);
+    void this.#deviceLeft(att).catch(() => undefined);
+  }
+
+  /** Closes every device socket past its session expiry; throttled unless `force`. Synchronous. */
+  #sweepExpired(force: boolean): void {
+    const now = Date.now();
+    if (!force && now - this.#lastSweep < SWEEP_INTERVAL_MS) return;
+    this.#lastSweep = now;
+    for (const ws of this.#devices()) {
+      const att = this.#att(ws);
+      if (att?.expiresAt !== undefined && now >= att.expiresAt) this.#expire(ws, att);
+    }
   }
 
   // --- Internals ---

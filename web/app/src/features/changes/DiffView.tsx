@@ -75,7 +75,7 @@ export function DiffView({ file }: { file: ChangedFile }) {
   return (
     <section aria-label={`Diff of ${file.relative}`} data-testid="diff-view" className="flex min-h-0 flex-1 flex-col">
       <header className="flex min-h-11 shrink-0 items-center gap-2 border-b border-stroke px-3">
-        <span className="min-w-0 flex-1 truncate text-label font-medium" title={file.relative}>
+        <span className="min-w-0 flex-1 truncate [unicode-bidi:isolate] text-label font-medium" title={file.relative}>
           {file.relative}
         </span>
         <span className="text-small text-muted-text">{STATUS_LABEL[file.status]}</span>

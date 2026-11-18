@@ -23,8 +23,8 @@ export interface ExternalLinkProps {
   children: ReactNode;
 }
 
-export function ExternalLink({ href, insecure, label, children }: ExternalLinkProps) {
-  const [open, setOpen] = useState(false);
+/** The confirm sheet of an external link: the real host, the full address and the text it was written with. */
+export function ExternalLinkSheet({ href, insecure, label, onOpenChange }: { href: string; insecure: boolean; label: string; onOpenChange: (open: boolean) => void }) {
   let host = href;
   try {
     host = new URL(href).host;
@@ -32,6 +32,38 @@ export function ExternalLink({ href, insecure, label, children }: ExternalLinkPr
     // classifyLink only passes parseable addresses; keep the whole address if that ever changes.
   }
   const shownLabel = label.length > 200 ? `${label.slice(0, 200)}...` : label;
+  return (
+    <ConfirmDialog
+      open
+      onOpenChange={onOpenChange}
+      title="Open this link?"
+      confirmLabel="Open link"
+      description={
+        <span className="block space-y-2 text-left">
+          <span className="block">
+            It goes to <strong data-testid="external-link-host">{host}</strong>
+          </span>
+          <span className="block break-all font-mono text-caption" data-testid="external-link-url">
+            {href}
+          </span>
+          {shownLabel && shownLabel !== href ? (
+            <span className="block text-muted-text">
+              The link says: <bdi data-testid="external-link-label">{shownLabel}</bdi>
+            </span>
+          ) : null}
+          {insecure ? <span className="block text-deletions">This address is not encrypted (http).</span> : null}
+        </span>
+      }
+      onConfirm={() => {
+        onOpenChange(false);
+        window.open(href, "_blank", "noopener,noreferrer");
+      }}
+    />
+  );
+}
+
+export function ExternalLink({ href, insecure, label, children }: ExternalLinkProps) {
+  const [open, setOpen] = useState(false);
   return (
     <>
       <a
@@ -50,34 +82,7 @@ export function ExternalLink({ href, insecure, label, children }: ExternalLinkPr
       >
         {children}
       </a>
-      {open ? (
-        <ConfirmDialog
-          open
-          onOpenChange={setOpen}
-          title="Open this link?"
-          confirmLabel="Open link"
-          description={
-            <span className="block space-y-2 text-left">
-              <span className="block">
-                It goes to <strong data-testid="external-link-host">{host}</strong>
-              </span>
-              <span className="block break-all font-mono text-caption" data-testid="external-link-url">
-                {href}
-              </span>
-              {shownLabel && shownLabel !== href ? (
-                <span className="block text-muted-text">
-                  The link says: <span data-testid="external-link-label">{shownLabel}</span>
-                </span>
-              ) : null}
-              {insecure ? <span className="block text-deletions">This address is not encrypted (http).</span> : null}
-            </span>
-          }
-          onConfirm={() => {
-            setOpen(false);
-            window.open(href, "_blank", "noopener,noreferrer");
-          }}
-        />
-      ) : null}
+      {open ? <ExternalLinkSheet href={href} insecure={insecure} label={label} onOpenChange={setOpen} /> : null}
     </>
   );
 }

@@ -137,7 +137,8 @@ export const putGrant: Handler<AppEnv> = async (c) => {
       c.env.DB.prepare(REVOKE_GRANT_SQL).bind(now, deviceId, desktopId),
       auditStatement(c.env, { action: "grant.change", actorUserId: user.id, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId, state: "revoked" } }, PREVIOUS_CHANGED),
     ]);
-    if (revoked?.meta.changes === 1) await revokeInRooms(c.env, [desktopId], { deviceId }, REVOKED);
+    // Also when D1 already shows the revocation: the room call of the first request may have failed (idempotent, R13B-1).
+    if (revoked?.meta.changes === 1 || before.state === "revoked") await revokeInRooms(c.env, [desktopId], { deviceId }, REVOKED);
   } else {
     if (before.state === "revoked") return apiError(c, 409, "conflict", "Grant is revoked");
     const requested = body.data.requestedPermission as "read" | "control";

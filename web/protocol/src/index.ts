@@ -1,6 +1,7 @@
 // @monoptah/protocol: the wire contracts of the Monoptah web app.
 // Source of truth for frames, chunking, close and error codes, limits, the state
 // message, the JSON envelope, desktop methods, watch fields and the `/api` types.
+import "./zod-config.ts";
 export * from "./limits.ts";
 export * from "./frame.ts";
 export * from "./chunk.ts";

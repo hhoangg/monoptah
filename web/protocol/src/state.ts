@@ -1,6 +1,7 @@
 // The `state` message: first encrypted message from the desktop on a channel,
 // re-sent on a permission, selection or capability change
 // (architecture.md 3.3 step 4, 5.5).
+import "./zod-config.ts";
 import { z } from "zod";
 
 /** Capability names a desktop advertises today. Unknown names are accepted (the web ignores them). */

@@ -1,7 +1,10 @@
-import { render } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { Markdown } from "./Markdown";
-import { parseMarkdown } from "./parser";
+import { MAX_TABLE_COLUMNS, MAX_TABLE_ROWS, parseMarkdown } from "./parser";
 
 // The renderer only ever creates elements from a fixed set. Raw HTML in the input must stay text.
 const ALLOWED_TAGS = new Set([
@@ -119,6 +122,56 @@ describe("XSS corpus", () => {
   });
 });
 
+describe("Unicode link tricks (W13-5)", () => {
+  it.each([
+    "[x](https://a.dev/\u202Egpj.exe)",
+    "[x](https://\u0430pple.com/)",
+    "[x](https://\uFF41pple.com/)",
+    "[x](https://\u202Eevil.test/)",
+  ])("renders %j as plain text, no anchor", (payload) => {
+    const { container } = render(<Markdown text={payload} />);
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).toBe("x");
+  });
+
+  it("shows a punycode host as ASCII in the sheet, never as the Unicode lookalike", async () => {
+    const user = userEvent.setup();
+    render(<Markdown text="[https://apple.com](https://xn--pple-43d.com/login)" />);
+    await user.click(screen.getByRole("link"));
+    expect(screen.getByTestId("external-link-host")).toHaveTextContent("xn--pple-43d.com");
+    expect(screen.getByTestId("external-link-label")).toHaveTextContent("https://apple.com");
+  });
+
+  it("keeps an RLO in the link text inside the link: the text stays, the sheet isolates it and still shows the true host", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Markdown text={"before [\u202Egpj.exe](https://evil.example/a) after"} />);
+    const anchor = container.querySelector("a");
+    expect(anchor?.textContent).toBe("\u202Egpj.exe");
+    expect(anchor?.className).toContain("md-link");
+    await user.click(screen.getByRole("link"));
+    expect(screen.getByTestId("external-link-host")).toHaveTextContent("evil.example");
+    expect(screen.getByTestId("external-link-label").tagName).toBe("BDI");
+  });
+
+  it("keeps a zero-width space in link text visible to the sheet: the label differs from the address and the host stays true", async () => {
+    const user = userEvent.setup();
+    render(<Markdown text={"[https://git\u200Bhub.com/x](https://evil.example/x)"} />);
+    await user.click(screen.getByRole("link"));
+    expect(screen.getByTestId("external-link-host")).toHaveTextContent("evil.example");
+    expect(screen.getByTestId("external-link-label").textContent).toContain("\u200B");
+  });
+
+  it("isolates file names in the stylesheet too", () => {
+    const css = readFileSync(join(__dirname, "../../styles/markdown.css"), "utf8");
+    expect(css).toMatch(/\.md-file-name[^{]*\{[^}]*unicode-bidi:\s*isolate/);
+  });
+
+  it("isolates link text from the surrounding text in the stylesheet", () => {
+    const css = readFileSync(join(__dirname, "../../styles/markdown.css"), "utf8");
+    expect(css).toMatch(/\.md-link[^{]*\{[^}]*unicode-bidi:\s*isolate/);
+  });
+});
+
 describe("hostile sizes", () => {
   const bound = (name: string, input: string, ms = 1500) => {
     const started = performance.now();
@@ -145,6 +198,48 @@ describe("hostile sizes", () => {
     bound("bare urls", "https://a.dev/x ".repeat(50_000));
     bound("urls glued", "https://".repeat(50_000));
     bound("rules", "- ".repeat(50_000) + "\n");
+  });
+
+  it("parses 1 MB of open brackets in linear time (W13-6)", () => {
+    // Quadratic parsing took 500 regex steps per bracket; the bound is generous for a slow CI machine.
+    bound("1 MB of [", "[".repeat(1_000_000), 2000);
+    bound("1 MB of [ then one ]", `${"[".repeat(1_000_000)}]`, 2000);
+    bound("1 MB of ![", "![".repeat(500_000), 2000);
+    bound("1 MB of [[ ]] pairs", "[[".repeat(250_000) + "]]".repeat(250_000), 3000);
+  });
+
+  it("parses a backtracking-shaped link input in bounded time (N1)", () => {
+    bound("498 [ then ]( x 2000", ("[".repeat(498) + "](").repeat(2000), 1500);
+    bound("[ x 498, ](, long destination", ("[".repeat(498) + "](" + "a".repeat(1990)).repeat(500), 1500);
+    bound("![ variants", ("![".repeat(249) + "](").repeat(2000), 1500);
+  });
+
+  it("caps a table at 200 rows and 50 columns and says so (1M cells)", () => {
+    const columns = 999;
+    const header = `|${Array.from({ length: columns }, (_, i) => `h${i}`).join("|")}|`;
+    const divider = `|${Array.from({ length: columns }, () => "-").join("|")}|`;
+    const row = `|${Array.from({ length: columns }, () => "c").join("|")}|`;
+    const text = [header, divider, ...Array.from({ length: 1001 }, () => row)].join("\n");
+    const started = performance.now();
+    const blocks = parseMarkdown(text);
+    expect(performance.now() - started).toBeLessThan(3000);
+    const table = blocks.find((block) => block.type === "table");
+    expect(table?.type === "table" && table.rows.length).toBe(MAX_TABLE_ROWS);
+    expect(table?.type === "table" && table.rows.every((r) => r.length === MAX_TABLE_COLUMNS)).toBe(true);
+    expect(table?.type === "table" && table.truncated).toBe(true);
+    const { container } = render(<Markdown text={text} />);
+    expect(container.querySelectorAll("tr")).toHaveLength(MAX_TABLE_ROWS);
+    expect(container.textContent).toContain("This table is cut off");
+  });
+
+  it("does not mark a small table as cut off", () => {
+    const { container } = render(<Markdown text={"|a|b|\n|-|-|\n|1|2|"} />);
+    expect(container.textContent).not.toContain("cut off");
+  });
+
+  it("still parses a link after many brackets", () => {
+    const { container } = render(<Markdown text={`${"[".repeat(5000)} [ok](https://a.dev)`} />);
+    expect(container.querySelector("a")?.getAttribute("href")).toBe("https://a.dev/");
   });
 
   it("renders a deeply nested input without overflowing the stack", () => {

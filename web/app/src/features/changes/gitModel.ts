@@ -2,6 +2,7 @@
 // and PR URL validation. The bottom action follows mobile/src/features/changes/ChangesView.tsx `barAction`.
 import type { ResultOf } from "@monoptah/protocol";
 import { leafName } from "@/lib/fileKind";
+import { classifyLink } from "@/features/markdown/links";
 
 export type ChangedFile = ResultOf<"project.changes">["files"][number];
 export type GitStatus = ResultOf<"project.git">;
@@ -95,23 +96,15 @@ export function nextSteps(input: { changed: number; status: GitStatus | undefine
   return steps;
 }
 
-/** The URL when it is an https URL, else null (a desktop reply is data, never trusted to be a safe link). */
+/**
+ * The URL when it passes the same link allowlist as agent text (`classifyLink`: https, no userinfo, no whitespace or
+ * non-ASCII characters), else null. A desktop reply is data, never trusted to be a safe link. Opening goes through
+ * the confirm sheet (`usePullRequestOpener`), never straight to `window.open` (W13-7).
+ */
 export function safePrUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" && url.hostname !== "" ? url.href : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Opens a validated URL in a new tab; true when it was allowed. Call it from a click handler. */
-export function openPullRequest(value: unknown): boolean {
-  const url = safePrUrl(value);
-  if (!url) return false;
-  window.open(url, "_blank", "noopener,noreferrer");
-  return true;
+  const target = classifyLink(value);
+  return target?.kind === "external" && !target.insecure ? target.href : null;
 }
 
 export function formatCount(value: number): string {

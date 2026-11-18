@@ -6,6 +6,7 @@
 //  - mobile/src/features/** (read only, for the result shapes)
 // Results type the fields the web needs and stay open (`z.looseObject`) so a newer
 // desktop can add fields. `methods.json` is generated from METHODS (scripts/gen-vectors.ts).
+import "./zod-config.ts";
 import { z } from "zod";
 import { MAX_MESSAGE_CHARS } from "./limits.ts";
 import {

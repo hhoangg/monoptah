@@ -27,5 +27,8 @@ export const securityHeaders: MiddlewareHandler<AppEnv> = async (c, next) => {
   if ((headers.get("Content-Type") ?? "").toLowerCase().startsWith("text/html")) {
     headers.set("Content-Security-Policy", buildCsp(url.host));
   }
+  // Hono's `c.res` setter merges the headers of the previous response over the new one (hono dist/context.js),
+  // so an ASSETS response would keep its own CSP (W13-1). Clearing it first makes the headers set here win.
+  c.res = undefined as unknown as Response;
   c.res = new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 };

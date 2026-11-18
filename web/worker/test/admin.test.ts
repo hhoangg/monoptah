@@ -277,7 +277,7 @@ describe("POST /api/admin/users/:id/block", () => {
     expect(await audits("user.block")).toHaveLength(0);
   });
 
-  it("caps the room.revoke calls and still commits when a room fails", async () => {
+  it("calls room.revoke on every desktop (no 40 cap) and still commits when a room fails", async () => {
     const { session, root } = await tree();
     for (let i = 0; i < 45; i += 1) await createTestDesktop(env, root.id);
     const fake = fakeRoomNamespace();
@@ -289,7 +289,9 @@ describe("POST /api/admin/users/:id/block", () => {
     const other = await seedUser("many");
     for (let i = 0; i < 45; i += 1) await createTestDesktop(env, other.id);
     expect((await block(session, other.id, { cascade: false, reason: "r" }, withRoom(env, capped))).status).toBe(200);
-    expect(capped.calls).toHaveLength(40);
+    expect(capped.calls).toHaveLength(46);
+    expect(new Set(capped.calls.map((call) => call.desktopId)).size).toBe(46);
+    expect(capped.calls.every((call) => call.code === 4011)).toBe(true);
   });
 });
 

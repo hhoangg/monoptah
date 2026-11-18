@@ -8,8 +8,9 @@ import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Icon, type IconName } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { CommitDialog } from "./CommitDialog";
-import { barAction, canGenerate, nextSteps, errorText, openPullRequest, safePrUrl, sections, type BarAction, type BarKind, type ChangedFile, type GitStatus } from "./gitModel";
+import { barAction, canGenerate, nextSteps, errorText, safePrUrl, sections, type BarAction, type BarKind, type ChangedFile, type GitStatus } from "./gitModel";
 import { useRunGitAction } from "./useGit";
+import { usePullRequestOpener } from "./usePullRequestOpener";
 
 const ICONS: Record<BarKind, IconName> = { commit: "check", stageAll: "add", publish: "send", sync: "send", viewPr: "branch", createPr: "branch" };
 
@@ -51,6 +52,7 @@ export function GitActionBar({ projectId, files, status, canPush, onStageAll, st
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState<string | null>(null);
+  const pullRequest = usePullRequestOpener();
 
   const { staged } = sections(files);
   const bar = barAction({ changed: files.length, staged: staged.length, status, canPush });
@@ -76,7 +78,7 @@ export function GitActionBar({ projectId, files, status, canPush, onStageAll, st
     }
     else if (action.kind === "commit") setCommitOpen(true);
     else if (action.kind === "viewPr") {
-      if (!openPullRequest(status?.pr?.url)) setError("This pull request link is not a safe https address.");
+      if (!pullRequest.open(status?.pr?.url)) setError("This pull request link is not a safe https address.");
     } else ask({ kind: action.kind });
   };
 
@@ -123,10 +125,11 @@ export function GitActionBar({ projectId, files, status, canPush, onStageAll, st
 
   return (
     <div className="flex flex-col gap-3" data-testid="git-action-bar">
+      {pullRequest.sheet}
       {error && !push ? <Notice variant="error">{error}</Notice> : null}
       {prUrl ? (
         <Notice title="Pull request ready">
-          <Button type="button" variant="outline" size="sm" className="mt-2" onClick={() => openPullRequest(prUrl)}>
+          <Button type="button" variant="outline" size="sm" className="mt-2" onClick={() => pullRequest.open(prUrl)}>
             <Icon name="externalLink" size={16} />
             Open pull request
           </Button>

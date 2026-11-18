@@ -16,6 +16,7 @@ import type { Env } from "../../env.ts";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
+import { MAX_REVOKE_CALLS } from "../sessions/session.ts";
 import { auditStatement, auditStatementCounted, PREVIOUS_CHANGED } from "../audit/audit.ts";
 import { decodeCursor, DEFAULT_PAGE_SIZE, encodeCursor } from "../audit/handlers.ts";
 import { INVITES_PAUSED_SQL, maxUsers, USER_COUNT_SQL } from "../invites/gate.ts";
@@ -92,8 +93,8 @@ export const listUsers: Handler<AppEnv> = async (c) => {
  * blocked is left as it was. The acting admin is never a member: when the admin sits inside the branch, the admin
  * is skipped and the admin's own descendants are still blocked. Blocking yourself is `409 conflict`, an unknown id `404`.
  *
- * After the commit, `room.revoke({all: true}, 4011)` runs on the live desktops of the members (at most
- * `MAX_REVOKE_CALLS`, the subrequest cap). `all` covers every socket of those rooms, so no per-session call is
+ * After the commit, `room.revoke({all: true}, 4011)` runs on every live desktop of the members, in batches of
+ * `MAX_REVOKE_CALLS` so no room is skipped (R13B-1). `all` covers every socket of those rooms, so no per-session call is
  * needed. A member's device that is connected to someone else's desktop is not closed here; the relay re-checks the
  * user `status` and the session when a socket joins (WS-R), and the sessions are already deleted. Best effort: a
  * failing room is logged without ids and skipped, the block itself has committed. The room is a stub until R-02.
@@ -124,10 +125,15 @@ export const blockUser: Handler<AppEnv> = async (c) => {
     db.prepare(revokeInvitesSql(cascade)).bind(targetId, now, admin.id),
   ]);
 
-  const calls = desktops.results.map((desktop) => c.env.ROOM.get(c.env.ROOM.idFromName(desktop.id)).revoke({ all: true }, CloseCodes.BLOCKED));
-  const settled = await Promise.allSettled(calls);
-  const failed = settled.filter((r) => r.status === "rejected").length;
-  if (failed > 0) console.error(`room.revoke failed on block: calls=${calls.length} failed=${failed}`);
+  let total = 0;
+  let failed = 0;
+  for (let i = 0; i < desktops.results.length; i += MAX_REVOKE_CALLS) {
+    const batch = desktops.results.slice(i, i + MAX_REVOKE_CALLS);
+    const settled = await Promise.allSettled(batch.map((desktop) => c.env.ROOM.get(c.env.ROOM.idFromName(desktop.id)).revoke({ all: true }, CloseCodes.BLOCKED)));
+    total += settled.length;
+    failed += settled.filter((r) => r.status === "rejected").length;
+  }
+  if (failed > 0) console.error(`room.revoke failed on block: calls=${total} failed=${failed}`);
 
   return respond(c, AdminBlockResponse, { blocked: results[0]?.meta.changes ?? 0 });
 };

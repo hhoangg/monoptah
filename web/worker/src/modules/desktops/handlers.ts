@@ -33,6 +33,7 @@ export const PATCH_DESKTOP_SQL =
 const LIVE_OWN = "EXISTS (SELECT 1 FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL)";
 export const REVOKE_DESKTOP_TOKENS_SQL = `UPDATE desktop_tokens SET revoked_at = ? WHERE desktop_id = ? AND revoked_at IS NULL AND ${LIVE_OWN}`;
 export const REVOKE_DESKTOP_GRANTS_SQL = `UPDATE device_grants SET state = 'revoked', updated_at = ? WHERE desktop_id = ? AND state != 'revoked' AND ${LIVE_OWN}`;
+export const REVOKED_OWN_SQL = "SELECT 1 FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NOT NULL";
 export const REVOKE_DESKTOP_SQL = "UPDATE desktops SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL";
 export const DESKTOP_ME_SQL = "SELECT d.id, d.name, u.handle FROM desktops d JOIN users u ON u.id = d.user_id WHERE d.id = ?";
 /** Denies the approved, not yet consumed pairing requests of a desktop (they could still mint a token). Index `pairing_requests_desktop_id_idx`. */
@@ -123,7 +124,12 @@ export const deleteDesktop: Handler<AppEnv> = async (c) => {
     // After the audit row, which reads `changes()` of the revoke above.
     c.env.DB.prepare(DELETE_DENY_APPROVED_SQL).bind(id, id, user.id, now),
   ]);
-  if (results[2]?.meta.changes !== 1) return notFound(c);
+  if (results[2]?.meta.changes !== 1) {
+    // Already revoked by this user: close the room again, the first call may have failed (idempotent, R13B-1).
+    const revoked = await c.env.DB.prepare(REVOKED_OWN_SQL).bind(id, user.id).first();
+    if (revoked) await revokeInRooms(c.env, [id], { all: true }, REVOKED);
+    return notFound(c);
+  }
   await revokeInRooms(c.env, [id], { all: true }, REVOKED);
   return c.json({ ok: true as const });
 };

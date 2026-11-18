@@ -190,6 +190,7 @@ const BlockView = memo(function BlockView({ block, fade, handlers, streamingTail
               ))}
             </tbody>
           </table>
+          {block.truncated ? <p className="text-meta text-muted-text">This table is cut off: only the first rows and columns are shown.</p> : null}
         </div>
       );
     case "rule":

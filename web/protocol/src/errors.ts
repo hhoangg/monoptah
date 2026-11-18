@@ -4,6 +4,7 @@
 //    `code` gives the web client a stable key.
 //  - ApiErrorCode: the `{error, code}` body of Worker `/api/*` failures
 //    (architecture.md 4, security.md 3-4).
+import "./zod-config.ts";
 import { z } from "zod";
 
 // --- Desktop link ---

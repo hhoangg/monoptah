@@ -18,7 +18,7 @@ export const DEVICE_JOIN_SQL =
   "SELECT g.state AS state FROM device_grants g JOIN devices v ON v.id = g.device_id JOIN desktops d ON d.id = g.desktop_id WHERE g.device_id = ? AND g.desktop_id = ? AND g.state != 'revoked' AND v.user_id = ? AND v.revoked_at IS NULL AND d.user_id = ? AND d.revoked_at IS NULL";
 
 /** Headers only the Worker may set; client copies are removed before forwarding. */
-const INTERNAL_HEADERS = ["x-role", "x-desktop-id", "x-device-id", "x-user-id", "x-session-id-hash", "x-grant-state"];
+const INTERNAL_HEADERS = ["x-role", "x-desktop-id", "x-device-id", "x-user-id", "x-session-id-hash", "x-session-expires-at", "x-grant-state"];
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -72,7 +72,7 @@ const deviceUpgrade: Handler<AppEnv> = async (c) => {
   if (!UUID_RE.test(deviceId)) return refuse(CloseCodes.REVOKED);
   const row = await c.env.DB.prepare(DEVICE_JOIN_SQL).bind(deviceId, desktopId, user.id, user.id).first<{ state: "pending" | "confirmed" }>();
   if (!row) return refuse(CloseCodes.REVOKED);
-  return forward(c, desktopId, { "x-role": "device", "x-device-id": deviceId, "x-user-id": user.id, "x-session-id-hash": session.idHash, "x-grant-state": row.state });
+  return forward(c, desktopId, { "x-role": "device", "x-device-id": deviceId, "x-user-id": user.id, "x-session-id-hash": session.idHash, "x-session-expires-at": String(session.expiresAt), "x-grant-state": row.state });
 };
 
 export const routes = defineModule("relay", {

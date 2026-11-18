@@ -340,6 +340,10 @@ describe("push controls (H-06)", () => {
     await user.click(await screen.findByRole("button", { name: "Create PR" }));
     await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Create PR" }));
     await user.click(await screen.findByRole("button", { name: "Open pull request" }));
+    // The confirm sheet of external links comes first (W13-7): nothing opens until "Open link".
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.getByTestId("external-link-host")).toHaveTextContent("github.com");
+    await user.click(screen.getByRole("button", { name: "Open link" }));
     expect(open).toHaveBeenCalledWith("https://github.com/o/r/pull/9", "_blank", "noopener,noreferrer");
   });
 
@@ -366,8 +370,8 @@ describe("push controls (H-06)", () => {
 describe("safePrUrl", () => {
   it("accepts https only", () => {
     expect(safePrUrl("https://github.com/o/r/pull/1")).toBe("https://github.com/o/r/pull/1");
-    for (const bad of ["http://github.com/x", "javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "//evil.test", "", "not a url", undefined, 5]) {
-      expect(safePrUrl(bad)).toBeNull();
+    for (const bad of ["http://github.com/x", "javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "//evil.test", "", "not a url", undefined, 5, "https://user:pw@github.com/o/r/pull/1", "https://github.com/o/r/pull/1\u202E", "https://\u0430pple.com/pull/1", "https://github.com/o r/1"]) {
+      expect(safePrUrl(bad), String(bad)).toBeNull();
     }
   });
 });
@@ -649,6 +653,8 @@ describe("next steps with a dirty tree (F-66)", () => {
     const open = vi.spyOn(window, "open").mockReturnValue(null);
     mount("changes/");
     await user.click(await screen.findByRole("button", { name: "View PR #7" }));
+    expect(open).not.toHaveBeenCalled();
+    await user.click(await screen.findByRole("button", { name: "Open link" }));
     expect(open).toHaveBeenCalledWith("https://github.com/o/r/pull/7", "_blank", "noopener,noreferrer");
     expect(screen.queryByRole("button", { name: "Create PR" })).toBeNull();
   });

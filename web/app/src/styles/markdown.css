@@ -31,6 +31,8 @@
 .agent-markdown strong { font-weight: 600; }
 .agent-markdown del { color: var(--muted); }
 
+/* An RLO or other bidi control inside link text must not reorder the text around the link (W13-5). */
+.agent-markdown .md-link, .agent-markdown .md-link-blocked, .agent-markdown .md-file-name { unicode-bidi: isolate; }
 .agent-markdown .md-link { color: var(--accent-color); text-decoration: none; }
 .agent-markdown .md-link:hover { text-decoration: underline; }
 .agent-markdown .md-link[data-insecure] { text-decoration: underline dotted; }

@@ -5,7 +5,8 @@ import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { GitActionBar } from "./GitActionBar";
-import { errorText, openPullRequest, safePrUrl } from "./gitModel";
+import { errorText, safePrUrl } from "./gitModel";
+import { usePullRequestOpener } from "./usePullRequestOpener";
 import { useCanPush, useChangesQuery, useGitQuery, useReadOnlyDevice } from "./useGit";
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
@@ -22,6 +23,7 @@ export function GitStatusView({ projectId }: { projectId: string }) {
   const changes = useChangesQuery(projectId);
   const readOnly = useReadOnlyDevice();
   const canPush = useCanPush();
+  const pullRequest = usePullRequestOpener();
 
   if (git.isError && !git.data) {
     return (
@@ -36,6 +38,7 @@ export function GitStatusView({ projectId }: { projectId: string }) {
 
   return (
     <div className="flex flex-col gap-4 p-4" data-testid="git-status">
+      {pullRequest.sheet}
       <dl className="overflow-hidden rounded-card border border-stroke">
         <Row label="Branch">
           <span className="inline-flex items-center gap-2">
@@ -53,7 +56,7 @@ export function GitStatusView({ projectId }: { projectId: string }) {
         <Row label="Pull request">
           {status.pr ? (
             prUrl ? (
-              <Button type="button" variant="link" size="sm" onClick={() => openPullRequest(prUrl)}>
+              <Button type="button" variant="link" size="sm" onClick={() => pullRequest.open(prUrl)}>
                 PR #{status.pr.number}
               </Button>
             ) : (

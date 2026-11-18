@@ -115,10 +115,13 @@ describe("DELETE /api/desktops/:id (revoke)", () => {
     expect(await env.DB.prepare("SELECT COUNT(*) AS n FROM device_grants WHERE desktop_id = ? AND state != 'revoked'").bind(paired.desktopId).first()).toEqual({ n: 0 });
     expect((await tokenCall("/api/desktop/me", paired.token)).status).toBe(403);
     expect((await auditActions(mine.user.id)).filter((a) => a === "desktop.revoke")).toEqual(["desktop.revoke"]);
-    // Gone from the list, and a second delete is 404 without a second audit row or room call.
+    // Gone from the list, and a second delete is 404 without a second audit row, but the room is told again (R13B-1: the first call may have failed).
     expect(((await (await authedCall(mine.session, "/api/desktops")).json()) as { desktops: unknown[] }).desktops).toEqual([]);
     expect((await authedCall(mine.session, `/api/desktops/${paired.desktopId}`, { method: "DELETE" }, roomEnv)).status).toBe(404);
-    expect(room.calls.revokes).toHaveLength(1);
+    expect(room.calls.revokes).toEqual([
+      { desktopId: paired.desktopId, target: { all: true }, code: 4003 },
+      { desktopId: paired.desktopId, target: { all: true }, code: 4003 },
+    ]);
     expect((await auditActions(mine.user.id)).filter((a) => a === "desktop.revoke")).toHaveLength(1);
   });
 
