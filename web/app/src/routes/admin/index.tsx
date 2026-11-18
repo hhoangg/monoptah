@@ -1,12 +1,12 @@
-// Route stub of /admin. Owner: WS-S (workstreams.md 3.1).
+// Route of /admin. Owner: WS-S (workstreams.md 3.1). Needs role admin (AdminGuard) and a fresh session.
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { AdminGuard } from "@/features/admin/AdminGuard";
+import { AdminHome } from "@/features/admin/AdminHome";
 
 export const Route = createFileRoute("/admin/")({
   component: Page,
 });
 
 function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/admin" purpose="Minimal admin overview (role admin, fresh sign-in)." params={params} />;
+  return <AdminGuard>{() => <AdminHome />}</AdminGuard>;
 }

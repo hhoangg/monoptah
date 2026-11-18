@@ -16,5 +16,5 @@ function Page() {
   if (!me.data) return <DelayedSpinner label="Loading" className="m-5" />;
   // The auth guard sends every route here while the recovery codes are unconfirmed (Task 3 gate).
   if (me.data.recoveryAckAt === null || hasLowCodes(me.data.user.handle)) return <ForcedRegenerate handle={me.data.user.handle} />;
-  return <SettingsScreen handle={me.data.user.handle} displayName={me.data.user.displayName} />;
+  return <SettingsScreen handle={me.data.user.handle} displayName={me.data.user.displayName} role={me.data.user.role} />;
 }

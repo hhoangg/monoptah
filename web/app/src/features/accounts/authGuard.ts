@@ -12,7 +12,9 @@
 // a redirect to /login and restored by `postSignInTarget` after sign-in.
 import type { QueryClient } from "@tanstack/react-query";
 import { redirect, type ParsedLocation } from "@tanstack/react-router";
+import { restoreAccountSnapshots } from "@/features/offline/accountCache";
 import { ApiError } from "./api";
+import { releaseDevice } from "./deviceBinding";
 import { hasLowCodes } from "./lowCodes";
 import { meQuery } from "./queries";
 import { loginRedirectTarget, saveFingerprintFragment } from "./redirect";
@@ -46,6 +48,8 @@ export const authGuard: AuthGuard = async ({ location, context }) => {
     me = await context.queryClient.ensureQueryData(meQuery);
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) {
+      // The session is over: the encrypted cache, the snapshots and the push subscription go with it.
+      void releaseDevice();
       saveFingerprintFragment(pathname, location.hash);
       throw redirect({
         to: "/login",
@@ -58,7 +62,12 @@ export const authGuard: AuthGuard = async ({ location, context }) => {
     if (error instanceof ApiError && error.status === 403 && error.code === "recovery_only") {
       throw redirect({ to: RECOVERY_ADD_PASSKEY_PATH, replace: true });
     }
-    throw error;
+    // No network at all (offline start, F-05): the last account answer, if one was saved, keeps the app
+    // usable on cached data. Only `network` does this: a 401 or any answer of the server never does.
+    if (error instanceof ApiError && error.status === 0 && error.code === "network") {
+      me = await restoreAccountSnapshots(context.queryClient);
+    }
+    if (!me) throw error;
   }
 
   if (me.recoveryOnly) {

@@ -82,6 +82,8 @@ afterEach(() => {
 
 describe("/d/:desktopId/settings", () => {
   it("renders one h1, the groups and the desktop-settings-sections slot with the desktop id", async () => {
+    // The router imports features/sessions/register, which registers the default-model row (U-07): replace it.
+    clearSlots();
     registerSlot("desktop-settings-sections", ({ desktopId }) => <p>Slot for {desktopId}</p>);
     const link = provideMockLink();
     mount(SETTINGS);

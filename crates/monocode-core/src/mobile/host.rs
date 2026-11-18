@@ -5,6 +5,7 @@ use super::audit::{self, AuditEvent, Outcome, Transport};
 use super::catalog::{recent_sessions, session_page};
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
 use super::policy::{self, DeviceContext, DeviceKind, Permission};
+use super::web_link::{desktop_api, LinkCommand, PairPoll, PairTicket, PermissionRequest};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::oneshot;
+use zeroize::Zeroizing;
 
 /// Methods the app answers. Pairing, leaving and the catalog are the host's.
 pub(super) const APP_METHODS: &[&str] = &[
@@ -147,6 +149,23 @@ struct Config {
     /// while off, so a phone-only file is unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     web_enabled: bool,
+    /// Server device ids the user revoked or denied on this desktop. The grant
+    /// sync reports each as `revoked` until the server lists it so, even when
+    /// the first report was lost offline. Capped at `MAX_REVOKED_IDS` (the
+    /// oldest are dropped) and cleared on Unpair and on a new pairing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    web_revoked: Vec<String>,
+}
+/// How many revoked server ids are remembered.
+const MAX_REVOKED_IDS: usize = 256;
+/// Remembers `id` as revoked by the user (no duplicates, oldest dropped).
+fn note_revoked(config: &mut Config, id: &str) {
+    config
+        .web_revoked
+        .retain(|old| !old.eq_ignore_ascii_case(id));
+    config.web_revoked.push(id.to_owned());
+    let extra = config.web_revoked.len().saturating_sub(MAX_REVOKED_IDS);
+    config.web_revoked.drain(..extra);
 }
 fn is_false(value: &bool) -> bool {
     !*value
@@ -159,6 +178,7 @@ impl Default for Config {
             remote_address: String::new(),
             devices: Vec::new(),
             web_enabled: false,
+            web_revoked: Vec::new(),
         }
     }
 }
@@ -448,6 +468,7 @@ impl MobileHost {
                 remote_address: remote_address.into(),
                 devices: inner.config.devices.clone(),
                 web_enabled: inner.config.web_enabled,
+                web_revoked: inner.config.web_revoked.clone(),
             };
             self.save(&config)?;
             inner.config = config;
@@ -511,12 +532,29 @@ impl MobileHost {
     }
 
     pub fn revoke(&self, device_id: &str) -> Result<(), String> {
+        // A web row has more to end than a phone: its live channel (BYE) and
+        // the durable `revoked` report. Never remove it by the phone path.
+        // Ids of different kinds are unrelated: a phone with that id wins.
+        let is_web = {
+            let inner = self.inner.lock().map_err(unavailable)?;
+            let kinds = |kind| {
+                inner
+                    .config
+                    .devices
+                    .iter()
+                    .any(|device| device.id == device_id && device.kind == kind)
+            };
+            kinds(DeviceKind::Web) && !kinds(DeviceKind::Phone)
+        };
+        if is_web {
+            return self.web_revoke(device_id);
+        }
         let mut inner = self.inner.lock().map_err(unavailable)?;
         let mut config = inner.config.clone();
         let removed = config
             .devices
             .iter()
-            .find(|v| v.id == device_id)
+            .find(|v| v.id == device_id && v.kind == DeviceKind::Phone)
             .map(|device| (device.kind, device.fingerprint.clone()));
         if let Some((kind, peer)) = &removed {
             if *kind == DeviceKind::Phone {
@@ -1183,6 +1221,22 @@ impl MobileHost {
 
     /// The web link's sealed identity. `Ok(None)` means none was saved.
     pub(crate) fn load_web_identity(&self) -> Result<Option<identity_store::WebIdentity>, String> {
+        let identity = identity_store::load_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+        )?;
+        match &identity {
+            Some(identity) => self.web.remember(identity),
+            None => self.web.forget_facts(),
+        }
+        Ok(identity)
+    }
+
+    /// Like `load_web_identity`, but leaves the cached facts alone, so a
+    /// background reader cannot bring back what Unpair wiped meanwhile.
+    pub(crate) fn read_web_identity_quietly(
+        &self,
+    ) -> Result<Option<identity_store::WebIdentity>, String> {
         identity_store::load_web(
             &self.web_database()?,
             &identity_store::web_account_for(&self.path),
@@ -1190,7 +1244,6 @@ impl MobileHost {
     }
 
     /// Seals the web identity. Its token never goes to `mobile-access.json`.
-    #[allow(dead_code)] // Used by the web link pairing once it lands.
     pub(crate) fn save_web_identity(
         &self,
         identity: &identity_store::WebIdentity,
@@ -1199,16 +1252,599 @@ impl MobileHost {
             &self.web_database()?,
             &identity_store::web_account_for(&self.path),
             identity,
-        )
+        )?;
+        self.web.remember(identity);
+        Ok(())
     }
 
-    /// Unpairs the web link by wiping its sealed identity. Safe to repeat.
+    /// Reads the sealed web identity once into the facts `web_status` shows.
+    /// Blocking (a database read): call it off the UI thread. The app does so
+    /// at start through `web_link::start`.
+    pub fn web_refresh_identity(&self) -> Result<(), String> {
+        self.load_web_identity().map(|_| ())
+    }
+}
+
+/// The server-side id of the grant behind a row, as reported back.
+type Report = (String, &'static str, Option<Permission>);
+
+impl MobileHost {
+    /// Starts a pairing with the web server at `host_url`: shows a user code
+    /// and a link whose `#fp=` fragment carries this desktop's key fingerprint.
+    /// Blocking (an HTTP call). Refused while a web identity exists.
+    pub fn web_pair_start(&self, host_url: &str, machine_name: &str) -> Result<PairTicket, String> {
+        self.web_pair_start_with(host_url, machine_name, cfg!(debug_assertions))
+    }
+
+    pub(super) fn web_pair_start_with(
+        &self,
+        host_url: &str,
+        machine_name: &str,
+        allow_insecure_localhost: bool,
+    ) -> Result<PairTicket, String> {
+        use rand::RngCore;
+        use sha2::{Digest, Sha256};
+        let base = desktop_api::base_url(host_url, allow_insecure_localhost)?;
+        if self.web.is_paired() {
+            return Err("Unpair first".into());
+        }
+        match self.load_web_identity() {
+            Ok(Some(_)) => return Err("Unpair first".into()),
+            Ok(None) => {}
+            // A damaged identity counts as a reinstall: pairing replaces it.
+            Err(error) if error == identity_store::WEB_UNREADABLE => {}
+            Err(error) => return Err(error),
+        }
+        let (private, public) = super::web_link::noise::generate_static()?;
+        let private = Zeroizing::new(private);
+        let mut verifier = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(&mut *verifier);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(*verifier));
+        let machine_name: String = machine_name.trim().chars().take(64).collect();
+        let machine_name = if machine_name.is_empty() {
+            "Desktop".to_owned()
+        } else {
+            machine_name
+        };
+        let started = desktop_api::pair_start(
+            &base,
+            &URL_SAFE_NO_PAD.encode(public),
+            &machine_name,
+            &challenge,
+        )?;
+        let code_ok = !started.user_code.is_empty()
+            && started.user_code.len() <= 16
+            && started
+                .user_code
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        // The confirmation code is shown to the user: plain short text only.
+        let confirmation_ok = !started.confirmation_code.is_empty()
+            && started.confirmation_code.len() <= 16
+            && started
+                .confirmation_code
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !code_ok || !confirmation_ok {
+            return Err("The web server sent an invalid pairing code".into());
+        }
+        let fingerprint = super::web_link::noise::fingerprint(&public);
+        let ticket = PairTicket {
+            link: format!("{base}/pair/{}#fp={fingerprint}", started.user_code),
+            user_code: started.user_code,
+            confirmation_code: started.confirmation_code,
+            fingerprint,
+            expires_at: now().saturating_add(started.expires_in),
+            interval: started.interval,
+        };
+        *self.web.pairing() = Some(super::web_link::Pairing {
+            id: self.web.next_pairing_id(),
+            device_code: started.device_code,
+            verifier,
+            private,
+            public,
+            base,
+            not_before: None,
+        });
+        Ok(ticket)
+    }
+
+    /// Asks the web server whether the pairing was approved. Blocking; call
+    /// it every `PairTicket::interval` seconds. On approval the identity is
+    /// sealed, the web link is switched on and started.
+    pub fn web_pair_poll(&self) -> Result<PairPoll, String> {
+        use super::web_link::desktop_api::PollOutcome;
+        let (id, base, device_code, verifier) = {
+            let guard = self.web.pairing();
+            let pairing = guard.as_ref().ok_or("No pairing in progress")?;
+            if pairing
+                .not_before
+                .is_some_and(|until| std::time::Instant::now() < until)
+            {
+                return Ok(PairPoll::Pending);
+            }
+            (
+                pairing.id,
+                pairing.base.clone(),
+                pairing.device_code.clone(),
+                Zeroizing::new(URL_SAFE_NO_PAD.encode(*pairing.verifier)),
+            )
+        };
+        let outcome = desktop_api::pair_poll(&base, &device_code, &verifier)?;
+        let still_current = |pairing: &Option<super::web_link::Pairing>| {
+            pairing.as_ref().is_some_and(|p| p.id == id)
+        };
+        match outcome {
+            PollOutcome::Pending => Ok(PairPoll::Pending),
+            PollOutcome::SlowDown { retry_after } => {
+                if let Some(pairing) = self.web.pairing().as_mut().filter(|p| p.id == id) {
+                    let wait = retry_after.unwrap_or(3).clamp(1, 60);
+                    pairing.not_before =
+                        Some(std::time::Instant::now() + Duration::from_secs(wait));
+                }
+                Ok(PairPoll::Pending)
+            }
+            PollOutcome::Denied | PollOutcome::Expired => {
+                let mut guard = self.web.pairing();
+                if still_current(&guard) {
+                    *guard = None;
+                }
+                Ok(if matches!(outcome, PollOutcome::Denied) {
+                    PairPoll::Denied
+                } else {
+                    PairPoll::Expired
+                })
+            }
+            PollOutcome::Approved(approval) => self.finish_pairing(id, &base, approval),
+        }
+    }
+
+    fn finish_pairing(
+        &self,
+        id: u64,
+        typed_base: &str,
+        approval: super::web_link::desktop_api::Approval,
+    ) -> Result<PairPoll, String> {
+        let dev = cfg!(debug_assertions);
+        let pairing = {
+            let mut guard = self.web.pairing();
+            if guard.as_ref().is_some_and(|p| p.id == id) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        // The server made a desktop for this pairing. If it cannot be used
+        // (cancelled, or the answer names another host), give it back to the
+        // host the user typed instead of leaving it behind.
+        let undo = |base: &str| {
+            let _ = desktop_api::delete_me(base, &approval.desktop_token, Duration::from_secs(8));
+        };
+        let Some(pairing) = pairing else {
+            // Cancelled while the answer was on its way: give the desktop back
+            // to the host the user typed, never to the one the answer names.
+            undo(typed_base);
+            return Err("The pairing was cancelled".into());
+        };
+        // The relay must be on the host the user typed, and its path id must be
+        // this desktop's id: the server cannot move the token elsewhere.
+        let relay_base = pairing.base.clone();
+        let same_host = desktop_api::base_url(&approval.relay_url, dev)
+            .is_ok_and(|base| base.eq_ignore_ascii_case(&relay_base));
+        let same_id = desktop_api::relay_path_id(&approval.relay_url)
+            .is_none_or(|id| id.eq_ignore_ascii_case(&approval.desktop_id));
+        let valid_id = uuid::Uuid::parse_str(&approval.desktop_id).is_ok();
+        if !(same_host && same_id && valid_id) {
+            undo(&relay_base);
+            return Err("The web server sent an invalid pairing".into());
+        }
+        // A new pairing starts every device over: old web rows would skip the
+        // re-confirmation a replaced pairing needs.
+        if let Err(error) = self.remove_web_rows() {
+            undo(&relay_base);
+            return Err(error);
+        }
+        let handle = super::web_link::session::clean_name(&approval.handle);
+        let identity = identity_store::WebIdentity {
+            static_private: *pairing.private,
+            static_public: pairing.public,
+            desktop_id: approval.desktop_id.clone(),
+            desktop_token: (*approval.desktop_token).clone(),
+            relay_url: relay_base.clone(),
+            account_handle: Some(handle.clone()),
+        };
+        if let Err(error) = self.save_web_identity(&identity) {
+            undo(&relay_base);
+            return Err(error);
+        }
+        self.set_web_enabled(true)?;
+        Ok(PairPoll::Approved { account: handle })
+    }
+
+    /// Drops a pairing in progress. Nothing is sent: the server forgets it.
+    pub fn web_pair_cancel(&self) {
+        *self.web.pairing() = None;
+    }
+
+    /// Removes every web device row and its watches.
+    fn remove_web_rows(&self) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        self.remove_web_rows_locked(&mut inner)
+    }
+
+    fn remove_web_rows_locked(&self, inner: &mut Inner) -> Result<(), String> {
+        let mut config = inner.config.clone();
+        config
+            .devices
+            .retain(|device| device.kind != DeviceKind::Web);
+        config.web_revoked.clear();
+        if config.devices.len() != inner.config.devices.len()
+            || !inner.config.web_revoked.is_empty()
+        {
+            self.save(&config)?;
+            inner.config = config;
+        }
+        inner
+            .watches
+            .retain(|_, watch| watch.via != DeviceKind::Web);
+        Ok(())
+    }
+
+    /// Reports a grant state to the server on a background thread, so the
+    /// desktop's own action works while the server is offline. A report that
+    /// fails is repeated by the next grant sync, which compares the server's
+    /// state with the rows (`grants::plan`, `reconfirm`).
+    fn report_async(
+        &self,
+        server_device_id: Option<String>,
+        state: &'static str,
+        permission: Option<Permission>,
+    ) {
+        let Some(server_device_id) = server_device_id else {
+            return;
+        };
+        let host = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("monocode-web-report".into())
+            .spawn(move || {
+                // Read the store directly: this must not bring back the cached
+                // facts of an identity that Unpair wipes meanwhile.
+                let Ok(database) = host.web_database() else {
+                    return;
+                };
+                let Ok(Some(identity)) = identity_store::load_web(
+                    &database,
+                    &identity_store::web_account_for(&host.path),
+                ) else {
+                    return;
+                };
+                let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions))
+                else {
+                    return;
+                };
+                let _ = desktop_api::report_grant_state(
+                    &base,
+                    &identity.desktop_token,
+                    &server_device_id,
+                    state,
+                    permission,
+                );
+            });
+    }
+
+    /// Confirms the pending device with this fingerprint: writes its web row,
+    /// moves its live session to ready and tells the server.
+    pub fn web_confirm(
+        &self,
+        fingerprint: &str,
+        permission: Permission,
+        projects: Option<Vec<String>>,
+        monos: Option<Vec<String>>,
+    ) -> Result<Device, String> {
+        let device = {
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            let grant = self
+                .web
+                .pending()
+                .get(fingerprint)
+                .ok_or("Unknown device: it is not waiting for confirmation")?;
+            if inner
+                .config
+                .devices
+                .iter()
+                .any(|device| device.fingerprint == fingerprint)
+            {
+                return Err("This device is already paired".into());
+            }
+            // One relay device id belongs to one row.
+            let taken = inner.config.devices.iter().any(|device| {
+                device.kind == DeviceKind::Web
+                    && device
+                        .server_device_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&grant.server_device_id))
+            });
+            if taken {
+                return Err("Another paired device already uses this web device id".into());
+            }
+            let device = Device {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: super::web_link::session::clean_name(&grant.name),
+                fingerprint: fingerprint.to_owned(),
+                push: None,
+                kind: DeviceKind::Web,
+                permission,
+                projects,
+                monos,
+                server_device_id: Some(grant.server_device_id),
+                created_at: Some(now()),
+                last_seen: None,
+            };
+            let mut config = inner.config.clone();
+            config.devices.push(device.clone());
+            self.save(&config)?;
+            inner.config = config;
+            self.web.pending().remove(fingerprint);
+            device
+        };
+        self.web.command(LinkCommand::Confirm {
+            fingerprint: fingerprint.to_owned(),
+            device: Box::new(device.clone()),
+        });
+        self.report_async(
+            device.server_device_id.clone(),
+            "confirmed",
+            Some(permission),
+        );
+        Ok(device)
+    }
+
+    /// Refuses the pending device: its live session ends and the server hears
+    /// `revoked`.
+    pub fn web_deny(&self, fingerprint: &str) -> Result<(), String> {
+        let grant = self
+            .web
+            .pending()
+            .get(fingerprint)
+            .ok_or("Unknown device: it is not waiting for confirmation")?;
+        {
+            // Durable first: a lost report is repeated by the grant sync.
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            let mut config = inner.config.clone();
+            note_revoked(&mut config, &grant.server_device_id);
+            self.save(&config)?;
+            inner.config = config;
+            self.web.pending().remove(fingerprint);
+        }
+        self.web.command(LinkCommand::Deny {
+            fingerprint: fingerprint.to_owned(),
+        });
+        self.report_async(Some(grant.server_device_id), "revoked", None);
+        Ok(())
+    }
+
+    /// Removes a paired web device: its watches and live sessions end, and the
+    /// server hears `revoked` (best effort, so it works offline).
+    pub fn web_revoke(&self, device_id: &str) -> Result<(), String> {
+        let removed = {
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            let mut config = inner.config.clone();
+            let position = config
+                .devices
+                .iter()
+                .position(|device| device.id == device_id && device.kind == DeviceKind::Web)
+                .ok_or("Unknown web device")?;
+            let removed = config.devices.remove(position);
+            if let Some(id) = &removed.server_device_id {
+                note_revoked(&mut config, id);
+            }
+            self.save(&config)?;
+            inner.config = config;
+            close_device_watches(&mut inner, &removed.fingerprint);
+            removed
+        };
+        self.web.drop_request(device_id);
+        self.web.command(LinkCommand::Revoke {
+            fingerprint: removed.fingerprint,
+        });
+        self.report_async(removed.server_device_id, "revoked", None);
+        Ok(())
+    }
+
+    /// Sets what a paired device may see and do, for a web device or a phone
+    /// ("Your phones": the project selection). Its watches end so the next
+    /// request is checked against the new access; a web device also gets a
+    /// fresh `state` and the server hears the permission.
+    pub fn set_device_access(
+        &self,
+        device_id: &str,
+        permission: Permission,
+        projects: Option<Vec<String>>,
+        monos: Option<Vec<String>>,
+    ) -> Result<Device, String> {
+        let device = {
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            let mut config = inner.config.clone();
+            let device = config
+                .devices
+                .iter_mut()
+                .find(|device| device.id == device_id)
+                .ok_or("Device revoked or not paired")?;
+            device.permission = permission;
+            device.projects = projects;
+            device.monos = monos;
+            let device = device.clone();
+            self.save(&config)?;
+            inner.config = config;
+            close_device_watches(&mut inner, &device.fingerprint);
+            device
+        };
+        if device.kind == DeviceKind::Web {
+            self.web.drop_request(&device.id);
+            self.web.command(LinkCommand::Resend {
+                fingerprint: device.fingerprint.clone(),
+            });
+            self.report_async(
+                device.server_device_id.clone(),
+                "confirmed",
+                Some(permission),
+            );
+        }
+        Ok(device)
+    }
+
+    /// Answers a confirmed device's request for another permission. Approving
+    /// applies it; denying keeps the permission and hides the request until
+    /// the server's `requestedPermission` changes.
+    pub fn web_answer_request(&self, device_id: &str, approve: bool) -> Result<(), String> {
+        let request = self
+            .web
+            .request_for(device_id)
+            .ok_or("There is no such permission request")?;
+        if !approve {
+            self.web.hide_request(&request);
+            return Ok(());
+        }
+        let (projects, monos) = {
+            let inner = self.inner.lock().map_err(unavailable)?;
+            let device = inner
+                .config
+                .devices
+                .iter()
+                .find(|device| device.id == device_id && device.kind == DeviceKind::Web)
+                .ok_or("Unknown web device")?;
+            (device.projects.clone(), device.monos.clone())
+        };
+        self.set_device_access(device_id, request.requested, projects, monos)
+            .map(|_| ())
+    }
+
+    /// Unpairs the web link: tells the server (best effort, a few seconds at
+    /// most), stops the link, wipes the sealed identity and every web device
+    /// row. A re-pair resets the grants on the server to pending, so a stale
+    /// confirmed row would otherwise skip the re-confirmation. Blocking.
+    /// Safe to repeat.
     pub fn web_unpair(&self) -> Result<(), String> {
+        if let Ok(Some(identity)) = self.load_web_identity() {
+            if let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) {
+                let _ = desktop_api::delete_me(
+                    &base,
+                    &identity.desktop_token,
+                    desktop_api::UNPAIR_TIMEOUT,
+                );
+            }
+        }
         self.web.stop();
         identity_store::wipe_web(
             &self.web_database()?,
             &identity_store::web_account_for(&self.path),
-        )
+        )?;
+        // Under the same lock the grant sync applies with, so a late sync
+        // cannot refill the pending set after the wipe.
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        self.web.forget();
+        self.remove_web_rows_locked(&mut inner)
+    }
+
+    /// Applies the server's grant list (grant sync): pending devices become
+    /// the pending set, revoked ones lose their row, a lowered permission is
+    /// applied and a raised one becomes a request. Live sessions are told
+    /// through the link. Returns what to report to the server.
+    pub(super) fn apply_server_grants(
+        &self,
+        grants: &[desktop_api::ServerGrant],
+        generation: u64,
+    ) -> Vec<Report> {
+        let mut reports: Vec<Report> = Vec::new();
+        let mut commands: Vec<LinkCommand> = Vec::new();
+        {
+            let Ok(mut inner) = self.inner.lock() else {
+                return reports;
+            };
+            // Checked under the lock Unpair also takes: a sync of an unpaired
+            // link applies nothing.
+            if self.web.generation() != generation {
+                return reports;
+            }
+            let plan = super::web_link::grants::plan(
+                grants,
+                &inner.config.devices,
+                &inner.config.web_revoked,
+            );
+            let mut config = inner.config.clone();
+            config.web_revoked.retain(|id| {
+                !plan
+                    .settled
+                    .iter()
+                    .any(|settled| settled.eq_ignore_ascii_case(id))
+            });
+            let mut closing: Vec<String> = Vec::new();
+            for row_id in &plan.revoked_rows {
+                if let Some(position) = config.devices.iter().position(|d| &d.id == row_id) {
+                    let removed = config.devices.remove(position);
+                    closing.push(removed.fingerprint.clone());
+                    commands.push(LinkCommand::Revoke {
+                        fingerprint: removed.fingerprint,
+                    });
+                }
+            }
+            for (row_id, permission) in &plan.lowered {
+                if let Some(row) = config.devices.iter_mut().find(|d| &d.id == row_id) {
+                    row.permission = *permission;
+                    closing.push(row.fingerprint.clone());
+                    commands.push(LinkCommand::Resend {
+                        fingerprint: row.fingerprint.clone(),
+                    });
+                    if let Some(server_id) = row.server_device_id.clone() {
+                        reports.push((server_id, "confirmed", Some(*permission)));
+                    }
+                }
+            }
+            if config.devices != inner.config.devices
+                || config.web_revoked != inner.config.web_revoked
+            {
+                if self.save(&config).is_err() {
+                    return Vec::new();
+                }
+                inner.config = config;
+                for fingerprint in &closing {
+                    close_device_watches(&mut inner, fingerprint);
+                }
+            }
+            let requests = plan
+                .raised
+                .iter()
+                .filter_map(|(row_id, server_id, requested)| {
+                    let row = inner.config.devices.iter().find(|d| &d.id == row_id)?;
+                    Some(PermissionRequest {
+                        device_id: row.id.clone(),
+                        server_device_id: server_id.clone(),
+                        name: row.name.clone(),
+                        current: row.permission,
+                        requested: *requested,
+                    })
+                })
+                .collect();
+            self.web.set_requests(requests);
+            // The pending set is replaced under the same lock that `web_confirm`
+            // takes, so a device confirmed meanwhile is not listed again.
+            self.web.pending().replace(plan.pending);
+            for server_id in plan.rerevoke {
+                reports.push((server_id, "revoked", None));
+            }
+            for server_id in plan.orphaned {
+                reports.push((server_id, "pending", None));
+            }
+            for (server_id, permission) in plan.reconfirm {
+                if !reports.iter().any(|r| r.0 == server_id) {
+                    reports.push((server_id, "confirmed", Some(permission)));
+                }
+            }
+        }
+        for command in commands {
+            self.web.command(command);
+        }
+        reports
     }
 }
 
@@ -1248,10 +1884,59 @@ impl MobileHost {
         Ok(())
     }
 
+    /// The project id of a session in the last published catalog, for the
+    /// web push notice. One lock, no I/O.
+    pub(crate) fn catalog_session_project(&self, session_id: &str) -> Option<String> {
+        let inner = self.inner.lock().ok()?;
+        inner.catalog["sessions"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(session_id))
+            .and_then(|entry| entry["projectId"].as_str())
+            .map(str::to_owned)
+    }
+
+    /// The projects and Monos of the last published catalog as `(id, name)`
+    /// pairs in catalog order (the `id` and `name` fields the app writes in
+    /// `shell/mobile_host.rs`; the ids are what `Device.projects` and
+    /// `Device.monos` hold). Empty before anything was published. One lock.
+    #[allow(clippy::type_complexity)] // the pair of (id, name) lists is the API
+    pub fn catalog_choices(&self) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        let Ok(inner) = self.inner.lock() else {
+            return Default::default();
+        };
+        let pairs = |key: &str| -> Vec<(String, String)> {
+            inner.catalog[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let id = entry["id"].as_str()?;
+                    let name = entry["name"].as_str().unwrap_or(id);
+                    Some((id.to_owned(), name.to_owned()))
+                })
+                .collect()
+        };
+        (pairs("projects"), pairs("monos"))
+    }
+
     /// What Settings shows about the web link.
     pub fn web_status(&self) -> super::web_link::WebStatus {
-        let enabled = self.web_enabled();
-        self.web.status(enabled)
+        let (enabled, devices) = self
+            .inner
+            .lock()
+            .map(|inner| {
+                let web = inner
+                    .config
+                    .devices
+                    .iter()
+                    .filter(|device| device.kind == DeviceKind::Web)
+                    .cloned()
+                    .collect();
+                (inner.config.web_enabled, web)
+            })
+            .unwrap_or_default();
+        self.web.status(enabled, devices)
     }
 
     pub(super) fn web_link(&self) -> &super::web_link::WebLink {
@@ -1261,6 +1946,24 @@ impl MobileHost {
     /// What the web link knows of a device fingerprint, for a handshake.
     /// Never blocks: one short lock, no I/O.
     pub(super) fn web_lookup(&self, fingerprint: &str) -> super::web_link::session::Lookup {
+        self.lookup(fingerprint, None)
+    }
+
+    /// `web_lookup` for a handshake: a pending device must also come in under
+    /// the relay device id its grant named.
+    pub(super) fn web_lookup_for(
+        &self,
+        fingerprint: &str,
+        relay_id: &str,
+    ) -> super::web_link::session::Lookup {
+        self.lookup(fingerprint, Some(relay_id))
+    }
+
+    fn lookup(
+        &self,
+        fingerprint: &str,
+        relay_id: Option<&str>,
+    ) -> super::web_link::session::Lookup {
         use super::web_link::session::Lookup;
         if let Ok(inner) = self.inner.lock() {
             if let Some(device) = inner
@@ -1278,7 +1981,10 @@ impl MobileHost {
                 };
             }
         }
-        if self.web.pending().contains(fingerprint) {
+        let pending = self.web.pending().get(fingerprint).is_some_and(|grant| {
+            relay_id.is_none_or(|id| grant.server_device_id.eq_ignore_ascii_case(id))
+        });
+        if pending {
             Lookup::Pending
         } else {
             Lookup::Unknown
@@ -1482,6 +2188,7 @@ mod tests {
             desktop_id: "desktop-9".into(),
             desktop_token: "test-token-not-real".into(),
             relay_url: "wss://relay.example.test/ws".into(),
+            account_handle: None,
         }
     }
 
@@ -1917,6 +2624,28 @@ mod tests {
             assert_eq!(inner.watches.keys().collect::<Vec<_>>(), ["w3"]);
         }
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn catalog_choices_lists_published_projects_and_monos_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        assert_eq!(host.catalog_choices(), (vec![], vec![]));
+        host.publish(json!({
+            "projects":[{"id":"p2","name":"Beta"},{"id":"p1","name":"Alpha"},{"name":"no id"}],
+            "monos":[{"id":"m1","name":"Fox"}],
+            "sessions":[]
+        }))
+        .unwrap();
+        let (projects, monos) = host.catalog_choices();
+        assert_eq!(
+            projects,
+            [
+                ("p2".to_string(), "Beta".to_string()),
+                ("p1".to_string(), "Alpha".to_string())
+            ]
+        );
+        assert_eq!(monos, [("m1".to_string(), "Fox".to_string())]);
     }
 
     #[tokio::test]

@@ -101,3 +101,11 @@ describe("static asset headers (generated at build time, see vite-plugins/header
     expect(headers).toMatch(/\/assets\/\*\n {2}! Cache-Control\n {2}Cache-Control: public, max-age=31536000, immutable/);
   });
 });
+
+describe("vaul stylesheet", () => {
+  it("matches the installed vaul style.css (bar the one stray colon fix), so an upgrade cannot drift", () => {
+    const installed = readFileSync(path.resolve(import.meta.dirname, "../../node_modules/vaul/style.css"), "utf8");
+    const copy = readFileSync(path.join(src, "styles", "vaul.css"), "utf8").replace(/^\/\*[\s\S]*?\*\/\n/, "");
+    expect(copy).toBe(installed.replace("[data-vaul-handle-hitarea]: {", "[data-vaul-handle-hitarea] {"));
+  });
+});

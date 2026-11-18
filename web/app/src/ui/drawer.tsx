@@ -1,4 +1,7 @@
 import type { ComponentProps } from "react";
+// vaul injects its stylesheet with a <style> element at runtime, which the production CSP (style-src 'self')
+// blocks: sheets lose drag, animation and the backdrop extension. Its CSS is bundled from styles/vaul.css instead.
+import "@/styles/vaul.css";
 import { Drawer as DrawerPrimitive } from "vaul";
 import { cn } from "@/lib/utils";
 

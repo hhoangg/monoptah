@@ -16,6 +16,8 @@ mod pages;
 mod palettes;
 mod preferences;
 mod skill_document;
+#[cfg(test)]
+mod web_app_tests;
 pub(crate) use palettes::{PALETTES, palette};
 pub(crate) mod widgets;
 
@@ -74,6 +76,19 @@ pub(crate) struct SettingsContext {
     pub mobile: Option<monocode_core::mobile::Status>,
     /// The pairing code on show.
     pub mobile_invite: Option<monocode_core::mobile::Invite>,
+    /// The web app link, or `None` when this desktop cannot offer it.
+    pub web: Option<monocode_core::mobile::WebStatus>,
+    /// The web pairing on show: the code and link the browser needs.
+    pub web_pairing: Option<monocode_core::mobile::web_link::PairTicket>,
+    /// The last web action's error, or a result worth showing, from the shell.
+    pub web_notice: Option<String>,
+    /// The projects and Monos the host publishes, as (id, name) pairs in
+    /// catalog order: what a device can be given access to.
+    pub web_projects: Vec<(String, String)>,
+    pub web_monos: Vec<(String, String)>,
+    /// The desktop toggles that gate remote Git push and cloud start. They
+    /// have no storage yet, so the page shows them off and disabled.
+    pub web_policy: monocode_core::mobile::policy::PolicyFlags,
     /// Minutes after midnight when the Today work day starts; `None` until Today has loaded it.
     pub today_rollover_minutes: Option<u32>,
     /// The native store, for the Cloud page's Docker accounts. `None` without one.
@@ -102,6 +117,12 @@ impl PartialEq for SettingsContext {
             && self.inbox_connections == other.inbox_connections
             && self.mobile == other.mobile
             && self.mobile_invite == other.mobile_invite
+            && self.web == other.web
+            && self.web_pairing == other.web_pairing
+            && self.web_notice == other.web_notice
+            && self.web_projects == other.web_projects
+            && self.web_monos == other.web_monos
+            && self.web_policy == other.web_policy
             && self.today_rollover_minutes == other.today_rollover_minutes
             && self.store == other.store
     }
@@ -153,6 +174,53 @@ pub(crate) enum SettingsEvent {
     MobilePair,
     MobileCancelInvite,
     MobileRevoke(String),
+    /// Start pairing with the web server at `host_url` (already validated).
+    WebPair {
+        host_url: String,
+    },
+    /// Close the pairing code and stop waiting for the browser.
+    WebCancelPair,
+    /// Revoke the desktop token and remove every web device.
+    WebUnpair,
+    /// Refuse a device that waits for confirmation, by key fingerprint.
+    WebDenyDevice(String),
+    WebSetPermission {
+        device_id: String,
+        permission: monocode_core::mobile::Permission,
+    },
+    WebRevokeDevice(String),
+    /// Confirm a pending device by key fingerprint, with what the user
+    /// ticked. `projects` / `monos` of `None` mean all of them.
+    WebConfirmDevice {
+        fingerprint: String,
+        permission: monocode_core::mobile::Permission,
+        projects: Option<Vec<String>>,
+        monos: Option<Vec<String>>,
+    },
+    /// The projects a paired phone may see (`None` is all), permission kept.
+    PhoneSetProjects {
+        device_id: String,
+        projects: Option<Vec<String>>,
+    },
+    /// Switch a remote-action toggle (H-06, H-11) on or off.
+    WebSetPolicyFlag {
+        flag: WebPolicyFlag,
+        on: bool,
+    },
+    /// Approve or refuse a confirmed device's request for more permission.
+    WebAnswerRequest {
+        device_id: String,
+        approve: bool,
+    },
+}
+
+/// The desktop toggles that gate a remote capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebPolicyFlag {
+    /// "Remote push in Git" (capability `gitPush`).
+    GitPush,
+    /// "Remote cloud start" (capability `cloudStart`).
+    CloudStart,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -282,6 +350,7 @@ pub(crate) struct SettingsView {
     accent_custom_open: bool,
     accent_anchor: AnchorSlot,
     mobile: pages::MobileState,
+    web_app: pages::WebAppState,
     ticket_scoring: pages::ScoringState,
     cloud: pages::CloudState,
     /// The emoji library page of the Monos section, once the app has installed the library.
@@ -440,6 +509,7 @@ impl SettingsView {
             accent_custom_open: false,
             accent_anchor: AnchorSlot::default(),
             mobile: pages::MobileState::default(),
+            web_app: pages::WebAppState::default(),
             ticket_scoring: pages::ScoringState::default(),
             cloud: pages::CloudState::default(),
             emoji_library,
@@ -497,6 +567,7 @@ impl SettingsView {
             };
             self.ctx = ctx;
             self.mobile_context_changed(cx);
+            self.web_context_changed(cx);
             if remote_changed {
                 self.leave_connections(cx);
                 self.watch_connections(cx);
@@ -976,6 +1047,7 @@ pub(crate) fn nav(
     search: AnyElement,
     select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     back: impl Fn(&mut Window, &mut App) + 'static,
+    web_waiting: usize,
 ) -> AnyElement {
     let row = |id: SharedString, label: &'static str, path: &'static str, active: bool| {
         div()
@@ -1077,6 +1149,24 @@ pub(crate) fn nav(
                                         item.icon(),
                                         item == section,
                                     )
+                                    .when(item == Section::Connections && web_waiting > 0, |d| {
+                                        d.child(
+                                            div()
+                                                .id("settings-nav-connections-badge")
+                                                .debug_selector(|| {
+                                                    "settings-nav-connections-badge".into()
+                                                })
+                                                .aria_label(format!("{web_waiting} waiting"))
+                                                .flex_shrink_0()
+                                                .rounded_full()
+                                                .bg(accent_color())
+                                                .px(px(6.))
+                                                .text_size(px(11.))
+                                                .line_height(px(16.))
+                                                .text_color(gpui::white())
+                                                .child(web_waiting.to_string()),
+                                        )
+                                    })
                                     .on_click(move |_, window, cx| select(item, window, cx))
                                 }),
                         )

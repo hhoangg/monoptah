@@ -54,10 +54,25 @@ describe("fingerprint fragment", () => {
     expect(restoreFingerprintFragment("/pair/c0de")).toBeNull();
   });
 
-  it("ignores a hash that is not a fingerprint", () => {
+  it("ignores a hash that has no fp", () => {
     saveFingerprintFragment("/pair/c0de", "#invite=X");
-    saveFingerprintFragment("/pair/c0de", "#fp=<script>");
+    saveFingerprintFragment("/pair/c0de", "#fp=");
     expect(sessionStorage.length).toBe(0);
+  });
+
+  it("keeps a malformed or truncated fp as a flag (never the raw text) that restores as an unmatchable value", () => {
+    for (const hash of ["#fp=<script>", "#fp=abcd1234abcd1234", `#fp=${FP}x&x=1`, `#x=1&fp=${"zz".repeat(32)}`]) {
+      sessionStorage.clear();
+      saveFingerprintFragment("/pair/c0de", hash);
+      expect(sessionStorage.getItem("monoptah.fp")).not.toContain("script");
+      expect(restoreFingerprintFragment("/pair/c0de")).toBe("#fp=invalid");
+      expect(restoreFingerprintFragment("/pair/c0de")).toBeNull();
+    }
+  });
+
+  it("parks a colon or dash formatted full fingerprint as lowercase hex", () => {
+    saveFingerprintFragment("/pair/c0de", `#fp=${FP.toUpperCase().replace(/(.{2})/g, "$1:").slice(0, -1)}`);
+    expect(restoreFingerprintFragment("/pair/c0de")).toBe(`#fp=${FP}`);
   });
 
   it("postSignInTarget restores #fp on the redirect target and falls back to /", () => {

@@ -9,6 +9,7 @@ import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { Slot } from "@/ui/slots";
 import { AccountSection } from "./AccountSection";
 import { AppearanceSection } from "./AppearanceSection";
+import { NotificationsCard } from "./NotificationsCard";
 import { InvitesSection } from "./InvitesSection";
 import { PasskeysSection } from "./PasskeysSection";
 import { RecoveryCodesSection } from "./RecoveryCodesSection";
@@ -19,13 +20,15 @@ import { useAction } from "./useAction";
 export interface SettingsScreenProps {
   handle: string;
   displayName: string;
+  /** Only admins get the link to /admin. */
+  role?: "user" | "admin";
 }
 
 /**
  * Account settings (W-11). One centered column of SettingsCard groups on every width (see the layout
  * note in SettingsLayout). `settings-sections` is the slot WS-P fills with its notification group.
  */
-export function SettingsScreen({ handle, displayName }: SettingsScreenProps) {
+export function SettingsScreen({ handle, displayName, role }: SettingsScreenProps) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const logout = useAction();
@@ -42,9 +45,15 @@ export function SettingsScreen({ handle, displayName }: SettingsScreenProps) {
       <PasskeysSection />
       <RecoveryCodesSection handle={handle} />
       <SessionsSection />
+      <NotificationsCard />
       <InvitesSection />
       <AppearanceSection />
       <Slot name="settings-sections" />
+      {role === "admin" ? (
+        <SettingsCard title="Administration">
+          <SettingsRow icon="admin" title="Admin" description="Users, invites and the audit log" to="/admin" />
+        </SettingsCard>
+      ) : null}
       <SettingsCard title="App">
         <SettingsRow icon="download" title="Install Monoptah" description="Add it to your home screen or desktop" to="/install" />
       </SettingsCard>

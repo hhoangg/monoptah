@@ -126,8 +126,37 @@ const SCREENS: Record<string, string> = {
   "/recover": "Recover your account",
   "/settings": "Settings",
   "/install": "Install Monoptah",
+  // An unknown code (the mock knows only its own pairing codes) shows the expired screen.
+  "/pair/c0de": "Code expired",
+  "/pair/:code": "Code expired",
   "/d/dk1/settings": "Desktop settings",
   "/d/:desktopId/settings": "Desktop settings",
+  // W-06 (WS-T): the catalog home and the project screen. Without a connected desktop they show their loading state.
+  "/d/dk1": "Workspace",
+  "/d/:desktopId": "Workspace",
+  "/d/dk1/p/proj%201": "Project",
+  "/d/:desktopId/p/:projectId": "Project",
+  // W-07 (WS-T): the session screen. Without a connected desktop its title is "Session".
+  "/d/dk1/s/s9": "Session",
+  "/d/:desktopId/s/:sessionId": "Session",
+  // W-08 (WS-T): the new-session page.
+  "/d/dk1/p/p1/new": "New session",
+  "/d/:desktopId/p/:projectId/new": "New session",
+  // W-04 (WS-M): the desktops list, a desktop the account does not have, and the key verify page.
+  // `/` redirects to the desktops list when there is no last place.
+  "/": "Desktops",
+  "/desktops": "Desktops",
+  "/desktops/dk1": "Desktop not found",
+  "/desktops/:id": "Desktop not found",
+  "/desktops/dk1/verify": "Verify desktop",
+  "/desktops/:id/verify": "Verify desktop",
+  // U-17 (WS-C): the cloud instance list, framed by the workspace with its "Cloud" h1.
+  "/d/dk1/cloud": "Cloud",
+  "/d/:desktopId/cloud": "Cloud",
+  // The default test account is a member, so the admin routes show their guard screen (U-04).
+  "/admin": "Not available",
+  "/admin/users": "Not available",
+  "/admin/invites": "Not available",
 };
 
 async function renderAt(url: string) {

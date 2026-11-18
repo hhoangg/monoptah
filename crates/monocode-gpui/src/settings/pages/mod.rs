@@ -11,13 +11,13 @@ mod general;
 mod inbox;
 mod keybindings;
 mod mcp;
-mod mobile;
+pub(super) mod mobile;
 mod monos;
 mod providers;
 mod skills;
 mod ticket_scoring;
 mod web_activity;
-mod web_app;
+pub(super) mod web_app;
 mod worktrees;
 
 pub(super) use appearance::parse_hex;
@@ -30,6 +30,7 @@ pub(crate) use keybindings::command_shortcut;
 pub(super) use mobile::MobileState;
 pub(super) use monos::EMOJI_LIBRARY;
 pub(super) use ticket_scoring::ScoringState;
+pub(super) use web_app::WebAppState;
 
 use super::{Section, SettingsView};
 use gpui::{AnyElement, Context, Window};
@@ -43,6 +44,7 @@ impl SettingsView {
                 // Settings → Connections holds both machines and phones.
                 let mut page = self.connections_page(cx);
                 page.extend(self.mobile_page(cx));
+                page.extend(self.web_app_page(cx));
                 page
             }
             Section::Appearance => self.appearance_page(window, cx),

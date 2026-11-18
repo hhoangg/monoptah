@@ -1,4 +1,7 @@
 import type { CSSProperties } from "react";
+// Sonner injects its stylesheet with a <style> element at runtime, which the production CSP (style-src 'self')
+// blocks, leaving toasts unstyled. The same file is bundled here as a normal stylesheet instead.
+import "sonner/dist/styles.css";
 import { Toaster as Sonner, type ToasterProps } from "sonner";
 import { useAppearance } from "@/lib/appearance";
 
@@ -10,6 +13,9 @@ export function Toaster(props: ToasterProps) {
     <Sonner
       theme={scheme}
       position="top-center"
+      // Below the header pill, which the default offset would cover on phones.
+      offset={{ top: "4.5rem" }}
+      mobileOffset={{ top: "4.5rem" }}
       style={
         {
           "--normal-bg": "color-mix(in srgb, var(--surface) 92%, transparent)",

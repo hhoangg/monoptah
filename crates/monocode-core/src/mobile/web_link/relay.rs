@@ -5,13 +5,16 @@
 //! session table, and reconnects with exponential backoff and full jitter. It
 //! binds no port. Nothing here logs frame bytes, plaintext or the token.
 use super::channel::{Out, Requests};
+use super::desktop_api;
 use super::frame::{CloseCode, Frame, FrameType, RELAY_ERROR_CODES};
-use super::session::{Action, Directory, SendError, SessionTable};
-use super::{grants, WebLink, WebState};
+use super::session::{Action, Directory, Lookup, SendError, SessionTable, PROTO};
+use super::{LinkCommand, WebLink, WebState};
 use crate::mobile::host::{name as desktop_name, MobileHost};
 use crate::mobile::identity_store::WebIdentity;
+use crate::mobile::policy::{self, PolicyFlags};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{sync::mpsc, time::Instant};
 use tokio_tungstenite::tungstenite::{
@@ -234,8 +237,17 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
         link.set(WebState::Off, Some("The web identity is invalid".into()));
         return;
     };
+    // The stored address is a bare host; the full `.../relay/desktop/<id>`
+    // form the server hands out at pairing is reduced to its host too.
+    let base = match desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) {
+        Ok(base) => base,
+        Err(error) => {
+            link.set(WebState::Off, Some(error));
+            return;
+        }
+    };
     let url = match relay_url(
-        &identity.relay_url,
+        &base,
         &desktop_uuid.hyphenated().to_string(),
         cfg!(debug_assertions),
     ) {
@@ -246,6 +258,13 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
         }
     };
     let token = Zeroizing::new(identity.desktop_token.clone());
+    let sync = GrantSync {
+        host: host.clone(),
+        link: link.clone(),
+        base,
+        token: Arc::new(token.clone()),
+        generation: link.generation(),
+    };
     // Our own copy of the desktop key, wiped when the client ends. snow keeps
     // further copies it does not wipe (see `SessionTable`).
     let static_private = Zeroizing::new(identity.static_private);
@@ -261,6 +280,8 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
                 let end = serve_socket(
                     socket,
                     &host,
+                    &link,
+                    &sync,
                     &static_private,
                     *desktop_uuid.as_bytes(),
                     &timing,
@@ -327,9 +348,57 @@ async fn connect(url: &str, token: &str) -> Result<Socket, End> {
     }
 }
 
+/// Fetches `GET /api/desktop/grants` and applies it, off the async workers.
+/// One sync runs at a time; a request that arrives meanwhile repeats it.
+#[derive(Clone)]
+struct GrantSync {
+    host: MobileHost,
+    link: WebLink,
+    base: String,
+    token: Arc<Zeroizing<String>>,
+    /// The link generation this client belongs to: a sync that finishes after
+    /// an unpair or a restart applies nothing.
+    generation: u64,
+}
+
+impl GrantSync {
+    fn trigger(&self) {
+        if !self.link.sync_gate().enter() {
+            return;
+        }
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || loop {
+            this.once();
+            if !this.link.sync_gate().again_or_leave() {
+                break;
+            }
+        });
+    }
+
+    fn once(&self) {
+        let Ok(grants) = desktop_api::desktop_grants(&self.base, &self.token) else {
+            return;
+        };
+        for (device_id, state, permission) in
+            self.host.apply_server_grants(&grants, self.generation)
+        {
+            // Best effort: the next sync repeats what the server still lacks.
+            let _ = desktop_api::report_grant_state(
+                &self.base,
+                &self.token,
+                &device_id,
+                state,
+                permission,
+            );
+        }
+    }
+}
+
 async fn serve_socket(
     socket: Socket,
     host: &MobileHost,
+    link: &WebLink,
+    sync: &GrantSync,
     static_private: &Zeroizing<[u8; 32]>,
     desktop_id: [u8; 16],
     timing: &Timing,
@@ -337,7 +406,7 @@ async fn serve_socket(
     let (mut sink, mut stream) = socket.split();
     let directory_host = host.clone();
     let directory: Directory =
-        Box::new(move |fingerprint, _relay_id| directory_host.web_lookup(fingerprint));
+        Box::new(move |fingerprint, relay_id| directory_host.web_lookup_for(fingerprint, relay_id));
     let mut table = SessionTable::new(
         static_private.clone(),
         desktop_id,
@@ -347,6 +416,9 @@ async fn serve_socket(
     );
     let (out_tx, mut out_rx) = mpsc::channel::<Out>(256);
     let mut requests = Requests::new(host.clone(), out_tx);
+    let mut commands = link.install_commands(sync.generation);
+    // Every connect fetches the grants: the pending ones live in memory only.
+    sync.trigger();
     let started = Instant::now();
     let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let mut ping = tokio::time::interval_at(started + timing.ping, timing.ping);
@@ -368,7 +440,7 @@ async fn serve_socket(
                 }
                 Some(Ok(Message::Binary(bytes))) => {
                     last_read = Instant::now();
-                    on_binary(&bytes, &mut table, &mut requests, now_ms(), &mut frames);
+                    on_binary(&bytes, &mut table, &mut requests, link, sync, now_ms(), &mut frames);
                 }
                 // Text other than `pong`, and control frames, carry nothing
                 // but they prove the relay is there.
@@ -380,6 +452,9 @@ async fn serve_socket(
             Some(out) = out_rx.recv() => {
                 reply(&mut table, &mut requests, out, now_ms(), &mut frames);
             }
+            Some(command) = commands.recv() => {
+                run_command(command, host, link, &mut table, &mut requests, now_ms(), &mut frames);
+            }
             _ = ping.tick() => {
                 if sink.send(Message::text("ping")).await.is_err() {
                     break End::Lost;
@@ -387,7 +462,7 @@ async fn serve_socket(
             }
             _ = tick.tick() => {
                 let actions = table.tick(now_ms());
-                collect(actions, &mut requests, &mut frames);
+                collect(actions, &mut requests, link, &mut frames);
             }
         }
         if flush(&mut sink, &mut frames).await.is_err() {
@@ -396,7 +471,8 @@ async fn serve_socket(
     };
     // The socket is gone: end every session without sending anything.
     let actions = table.close_all();
-    collect(actions, &mut requests, &mut Vec::new());
+    collect(actions, &mut requests, link, &mut Vec::new());
+    link.end_run(sync.generation);
     end
 }
 
@@ -414,7 +490,7 @@ where
 }
 
 /// Turns the table's actions into frames to send and requests to serve.
-fn collect(actions: Vec<Action>, requests: &mut Requests, frames: &mut Vec<Frame>) {
+fn collect(actions: Vec<Action>, requests: &mut Requests, link: &WebLink, frames: &mut Vec<Frame>) {
     for action in actions {
         match action {
             Action::Send(frame) => frames.push(frame),
@@ -424,9 +500,12 @@ fn collect(actions: Vec<Action>, requests: &mut Requests, frames: &mut Vec<Frame
                 envelope,
                 ..
             } => requests.deliver(key, peer, envelope),
-            Action::Closed { key } => requests.closed(key),
-            // The pending approval prompt belongs to the UI (R-15).
-            Action::Pending { .. } => {}
+            Action::Closed { key } => {
+                link.live_remove(&key);
+                requests.closed(key);
+            }
+            // Settings lists the device as online while its session is open.
+            Action::Pending { key, peer, .. } => link.live_insert(key, peer),
         }
     }
 }
@@ -435,6 +514,8 @@ fn on_binary(
     bytes: &[u8],
     table: &mut SessionTable,
     requests: &mut Requests,
+    link: &WebLink,
+    sync: &GrantSync,
     now: u64,
     frames: &mut Vec<Frame>,
 ) {
@@ -443,18 +524,18 @@ fn on_binary(
         return;
     };
     let actions = match frame.kind {
-        FrameType::Ctrl => control(&frame.body, table),
+        FrameType::Ctrl => control(&frame.body, table, sync),
         FrameType::Error => {
             relay_error(&frame.body);
             Vec::new()
         }
         _ => table.on_frame(frame, now),
     };
-    collect(actions, requests, frames);
+    collect(actions, requests, link, frames);
 }
 
 /// Relay control frames: a device left, or the grants changed.
-fn control(body: &[u8], table: &mut SessionTable) -> Vec<Action> {
+fn control(body: &[u8], table: &mut SessionTable, sync: &GrantSync) -> Vec<Action> {
     let Ok(message) = serde_json::from_slice::<Value>(body) else {
         return Vec::new();
     };
@@ -465,7 +546,7 @@ fn control(body: &[u8], table: &mut SessionTable) -> Vec<Action> {
             .map(|id| table.close_device(id.as_bytes()))
             .unwrap_or_default(),
         Some("grants") => {
-            grants::resync();
+            sync.trigger();
             Vec::new()
         }
         _ => Vec::new(),
@@ -514,5 +595,90 @@ fn reply(
             requests.cancel(out.key, &rid);
         }
         Err(SendError::UnknownSession | SendError::NotReady) => {}
+    }
+}
+
+/// The `state` message of a confirmed session, as `SessionTable` sends it.
+fn confirmed_state(permission: policy::Permission) -> Value {
+    json!({
+        "type": "state",
+        "state": "confirmed",
+        "permission": desktop_api::permission_name(permission),
+        "proto": PROTO,
+        "capabilities": policy::capabilities(&PolicyFlags::default()),
+        "desktop": { "name": desktop_name(), "version": env!("CARGO_PKG_VERSION") },
+    })
+}
+
+/// Ends every session of the relay devices behind `fingerprint` with a BYE.
+fn close_fingerprint(
+    fingerprint: &str,
+    table: &mut SessionTable,
+    requests: &mut Requests,
+    link: &WebLink,
+    frames: &mut Vec<Frame>,
+) {
+    let mut devices: Vec<[u8; 16]> = table
+        .live_channels(fingerprint)
+        .iter()
+        .map(|key| key.device_id)
+        .collect();
+    devices.dedup();
+    for device in devices {
+        let actions = table.close_device(&device);
+        collect(actions, requests, link, frames);
+    }
+}
+
+/// A desktop action on the live sessions (confirm, deny, revoke, resend).
+fn run_command(
+    command: LinkCommand,
+    host: &MobileHost,
+    link: &WebLink,
+    table: &mut SessionTable,
+    requests: &mut Requests,
+    now: u64,
+    frames: &mut Vec<Frame>,
+) {
+    match command {
+        LinkCommand::Confirm {
+            fingerprint,
+            device,
+        } => {
+            // Only a session under the relay id the grant named becomes ready:
+            // any other of this key is ended.
+            let bound = device.server_device_id.clone().unwrap_or_default();
+            for key in table.live_channels(&fingerprint) {
+                link.live_remove(&key);
+                let id = uuid::Uuid::from_bytes(key.device_id)
+                    .hyphenated()
+                    .to_string();
+                let actions = if id.eq_ignore_ascii_case(&bound) {
+                    table.confirm(key, (*device).clone(), now)
+                } else {
+                    table.close_device(&key.device_id)
+                };
+                collect(actions, requests, link, frames);
+            }
+        }
+        LinkCommand::Deny { fingerprint } | LinkCommand::Revoke { fingerprint } => {
+            close_fingerprint(&fingerprint, table, requests, link, frames);
+        }
+        LinkCommand::Resend { fingerprint } => {
+            let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
+                return;
+            };
+            let state = confirmed_state(device.permission);
+            for key in table.live_channels(&fingerprint) {
+                match table.send(key, &state, now) {
+                    Ok(sent) => frames.extend(sent),
+                    Err(SendError::Encrypt) => {
+                        frames.push(SessionTable::bye_frame(key));
+                        requests.closed(key);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
     }
 }
