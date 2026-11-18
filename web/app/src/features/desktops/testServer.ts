@@ -4,12 +4,16 @@
 // `fresh_required` until the re-auth verify call went through.
 import { createMockServer } from "@/features/accounts/mock/transport";
 import type { ApiTransport } from "@/features/accounts/api";
+import { base64UrlDecode } from "@/link/base64url";
+import { fingerprint } from "@/link/fingerprint";
 import type { DesktopSummary, DeviceSummary, Grant } from "./api";
 
 export interface FakeServerOptions {
   desktops?: DesktopSummary[];
   devices?: DeviceSummary[];
   grants?: Record<string, Grant[]>;
+  /** Directory public keys (base64url, 32 bytes) per desktop id, for the verify page. Others get a fixed short key. */
+  publicKeys?: Record<string, string>;
   /** Revoke and revoked-grant calls need a re-auth first. Default true (the real routes are fresh). */
   requireFresh?: boolean;
 }
@@ -95,7 +99,10 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       const target = server.desktops.find((item) => item.id === id);
       if (!target) return error(404, "not_found");
       if (parts.length === 3) {
-        if (method === "GET") return json(200, { ...target, publicKey: "cHVibGljLWtleQ", fingerprint: FP_B });
+        if (method === "GET") {
+          const key = options.publicKeys?.[id];
+          return json(200, { ...target, publicKey: key ?? "cHVibGljLWtleQ", fingerprint: key ? fingerprint(base64UrlDecode(key)) : FP_B });
+        }
         if (method === "PATCH") {
           const patch = body as { name?: string; color?: string | null };
           Object.assign(target, patch.name !== undefined ? { name: patch.name.trim() } : {}, patch.color !== undefined ? { color: patch.color } : {});
