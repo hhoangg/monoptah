@@ -103,25 +103,44 @@ export const SPLIT_QUERY = "(min-width: 64rem)";
  * The two project routes, `/p/:projectId` (sessions) and `/p/:projectId/new` (New session). Below 1024 px each is
  * its own page; from 1024 px both show side by side (list left, New session right) on either URL.
  *
- * The New session page is rendered once, through a portal into a host element that is moved between the
+ * The New session page is rendered once, always, through a portal into a host element that is moved between the
  * full-page slot and the split pane. React sees the same element in the same place on both sides of 1024 px, so
  * a rotation or a window resize keeps the typed draft, the attachments and the chosen model.
  */
 export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string; projectId: string; page: "sessions" | "new" }) {
   const split = useMediaQuery(SPLIT_QUERY);
-  const [host] = useState(() => document.createElement("div"));
+  // The element of the host that holds focus. React removes the old slot (and the host with it) before the new slot's
+  // ref runs, which drops the focus, so it is remembered here and given back once the host is placed again. A blur
+  // while the host is still in the document is a real one and clears it.
+  const [state] = useState(() => {
+    const element = document.createElement("div");
+    const created = { host: element, focused: null as HTMLElement | null };
+    element.addEventListener("focusin", (event) => {
+      created.focused = event.target instanceof HTMLElement ? event.target : null;
+    });
+    element.addEventListener("focusout", () => {
+      queueMicrotask(() => {
+        if (element.isConnected) created.focused = null;
+      });
+    });
+    return created;
+  });
+  const host = state.host;
   const place = useCallback(
     (element: HTMLElement | null) => {
-      if (element && host.parentElement !== element) element.appendChild(host);
+      if (!element || host.parentElement === element) return;
+      element.appendChild(host);
+      const target = state.focused;
+      if (target && host.contains(target) && (document.activeElement === null || document.activeElement === document.body)) target.focus();
     },
-    [host],
+    [host, state],
   );
-  const showNew = split || page === "new";
   return (
     <>
       {page === "new" && !split ? null : <ProjectScreen desktopId={desktopId} projectId={projectId} split={split} detailRef={place} />}
       {split ? null : page === "new" ? <div ref={place} /> : null}
-      {showNew ? createPortal(<NewSessionScreen desktopId={desktopId} projectId={projectId} embedded={split} />, host) : null}
+      {/* Always mounted: on the sessions page below 1024 px it stays in the detached host, so a draft typed in the wide side pane survives going narrow and wide again. */}
+      {createPortal(<NewSessionScreen desktopId={desktopId} projectId={projectId} embedded={split || page === "sessions"} />, host)}
     </>
   );
 }

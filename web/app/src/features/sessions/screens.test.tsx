@@ -436,3 +436,62 @@ describe("New session survives crossing 1024 px (F-18)", () => {
     expect(within(split).getByRole("textbox", { name: "Message" })).not.toHaveFocus();
   });
 });
+
+describe("New session draft on the sessions URL across 1024 px (F-18)", () => {
+  function flippable(initial: boolean) {
+    let wide = initial;
+    const listeners = new Set<() => void>();
+    window.matchMedia = ((query: string) => ({
+      get matches() {
+        return query === "(min-width: 64rem)" ? wide : query === "(min-width: 640px)";
+      },
+      media: query,
+      onchange: null,
+      addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+    return (next: boolean) => {
+      wide = next;
+      act(() => listeners.forEach((listener) => listener()));
+    };
+  }
+
+  it("keeps a draft typed in the side pane through wide, narrow, wide", async () => {
+    const setWide = flippable(true);
+    const user = userEvent.setup();
+    mount("/p/proj-alpha");
+    const split = await screen.findByTestId("project-split");
+    await within(split).findByText("Example Alpha");
+    const field = within(split).getByRole("textbox", { name: "Message" });
+    await user.type(field, "side pane draft");
+
+    setWide(false);
+    await waitFor(() => expect(screen.queryByTestId("project-split")).toBeNull());
+    expect(screen.queryByTestId("new-session-screen")).toBeNull();
+
+    setWide(true);
+    const again = await screen.findByTestId("project-split");
+    const back = within(again).getByRole("textbox", { name: "Message" });
+    expect(back).toBe(field);
+    expect(back).toHaveValue("side pane draft");
+  });
+
+  it("restores focus to the field after the host moves between the page and the pane", async () => {
+    const setWide = flippable(false);
+    const user = userEvent.setup();
+    mount("/p/proj-alpha/new");
+    const field = await screen.findByRole("textbox", { name: "Message" });
+    await screen.findByText("Example Alpha");
+    await user.click(field);
+    expect(document.activeElement).toBe(field);
+    setWide(true);
+    await screen.findByTestId("project-split");
+    expect(document.activeElement).toBe(field);
+    setWide(false);
+    await waitFor(() => expect(screen.queryByTestId("project-split")).toBeNull());
+    expect(document.activeElement).toBe(field);
+  });
+});

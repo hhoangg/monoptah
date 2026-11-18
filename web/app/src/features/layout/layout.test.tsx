@@ -8,6 +8,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 
 vi.mock("@/features/backgrounds", () => ({
   BackgroundControls: ({ projectName }: { projectName: string }) => <p>Background controls of {projectName}</p>,
+  BACKGROUND_CONTAINER_CLASS: "relative isolate",
+  EmptySessionBackground: () => null,
 }));
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
 import { resetLinkConnections } from "@/link";
