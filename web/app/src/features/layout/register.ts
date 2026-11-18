@@ -5,5 +5,7 @@
 // build them (U-05, U-06) through `registerPanel` (./panels) and `registerShortcut` (./shortcuts).
 import { registerSlot } from "@/ui/slots";
 import { AppShell } from "./AppShell";
+// The WS-P settings groups (themes and accents, U-03) fill `settings-sections` from their own register.
+import "@/features/themes/register";
 
 registerSlot("app-shell", AppShell);
