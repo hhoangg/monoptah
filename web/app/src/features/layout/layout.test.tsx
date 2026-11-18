@@ -14,7 +14,7 @@ import { resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
-import { DESKTOP_ID, connectMockDesktop, seedWorkspace } from "@/features/sessions/dev/mockLink";
+import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLinkOptions } from "@/features/sessions/dev/mockLink";
 import { resetSessionActivity } from "@/features/sessions/activityStore";
 import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
@@ -22,6 +22,7 @@ import { AppShell } from "./AppShell";
 import { PANEL_WIDTH_KEY, SIDEBAR_COLLAPSED_KEY, SIDEBAR_WIDTH_KEY, dockedPanelMax, reloadLayoutPrefs, useLayoutPrefs } from "./layoutPrefs";
 import { closeCommandPalette, isCommandPaletteOpen, openCommandPalette } from "./palette";
 import { clearPanels, closePanel, openPanel, registerPanel, usePanels } from "./panels";
+import { clearCreateMonoRequest } from "@/features/monos/createRequest";
 import { closeBackgroundDialog } from "./projectTools";
 import { clearShortcuts, isMod, registerShortcut } from "./shortcuts";
 
@@ -91,13 +92,14 @@ afterEach(() => {
   clearShortcuts();
   closeCommandPalette();
   closeBackgroundDialog();
+  clearCreateMonoRequest();
   localStorage.clear();
   stubViewport(1280);
 });
 
-function mount(width: number, path = "/settings") {
+function mount(width: number, path = "/settings", options: MockLinkOptions = {}) {
   stubViewport(width);
-  connectMockDesktop({ seed: seedWorkspace });
+  connectMockDesktop({ ...options, seed: seedWorkspace });
   const queryClient = createQueryClient();
   const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [`/d/${DESKTOP_ID}${path}`] }), queryClient });
   const view = render(
@@ -526,6 +528,44 @@ describe("shortcuts and palette", () => {
     expect(first).toHaveAttribute("aria-selected", "true");
     await user.keyboard("{ArrowDown}{ArrowUp}{Enter}");
     await waitFor(() => expect(router.state.location.pathname).toMatch(/\/monos\//));
+  });
+
+  it("offers Monos and New Mono, and New Mono opens the create dialog on the Mono list (F-13, F-75)", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(1280);
+    await screen.findByTestId("app-sidebar");
+    await user.keyboard("{Control>}k{/Control}");
+    const box = await screen.findByRole("combobox");
+    await user.type(box, "new mono");
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(1));
+    expect(screen.getByRole("option")).toHaveTextContent("New Mono");
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/monos`));
+    expect(await screen.findByTestId("create-mono")).toBeInTheDocument();
+  });
+
+  it("opens the Mono list from the Monos action without opening the dialog", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(1280);
+    await screen.findByTestId("app-sidebar");
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(await screen.findByRole("combobox"), "monos");
+    const goTo = await screen.findByRole("group", { name: "Go to" });
+    await user.click(within(goTo).getByRole("option", { name: "Monos" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/monos`));
+    await screen.findByTestId("mono-home");
+    expect(screen.queryByTestId("create-mono")).toBeNull();
+  });
+
+  it("does not offer New Mono to a read-only device, or when the desktop has no Mono tools", async () => {
+    const user = userEvent.setup();
+    mount(1280, "/settings", { permission: "read" });
+    await screen.findByTestId("app-sidebar");
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(await screen.findByRole("combobox"), "mono");
+    await waitFor(() => expect(screen.getAllByRole("option").length).toBeGreaterThan(0));
+    expect(screen.queryByRole("option", { name: "New Mono" })).toBeNull();
+    expect(screen.getByRole("option", { name: "Monos", description: "" })).toBeInTheDocument();
   });
 
   it("Esc closes the palette, and a second Mod+K closes it too", async () => {

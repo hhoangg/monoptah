@@ -2,10 +2,10 @@
 // wired to the mock desktop. `mono.*` handlers are replaced by fixtures that record every call.
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { FIXTURE_HANDLERS } from "@monoptah/mock-desktop";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { FIXTURE_HANDLERS, FixtureError } from "@monoptah/mock-desktop";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
 import { resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
@@ -18,6 +18,7 @@ import { createAppRouter } from "@/router";
 import { clearHooks } from "@/ui/hooks";
 import { clearSlots } from "@/ui/slots";
 import { MONO_ACCENTS_KEY, reloadMonoAccents } from "./monoAccent";
+import { MONO_MASCOT_NAMES } from "./monoLook";
 import { reloadMonoPrefs } from "./monoPrefs";
 import { NAME_AUTOSAVE_MS } from "./MonoEditScreen";
 
@@ -180,7 +181,7 @@ describe("document page (F-76) and Soul and Memory viewer (F-79)", () => {
   });
 
   it("shows Soul as read-only text with no Save and never calls mono.saveFile", async () => {
-    mount(`/monos/${MONO}/profile/file/soul`);
+    mount(`/monos/${MONO}/profile/file/soul?mind=soul`);
     const field = await screen.findByRole("textbox", { name: "Soul" });
     expect(field).toHaveValue("Text of soul");
     expect(field).toHaveAttribute("readonly");
@@ -188,8 +189,20 @@ describe("document page (F-76) and Soul and Memory viewer (F-79)", () => {
     expect(called("mono.saveFile")).toHaveLength(0);
   });
 
+  it.each(["soul", "memory", "Memory.md"])("treats a document called %s as a document, not the Mind viewer", async (name) => {
+    mount(`/monos/${MONO}/profile/file/${name}`);
+    expect(await screen.findByRole("heading", { level: 1, name: "Notes" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: /Soul|Memory/ })).toBeNull();
+  });
+
+  it("opens the Mind viewer from the profile's Soul and Memory links", async () => {
+    mount(`/monos/${MONO}/profile`);
+    const soul = await screen.findByRole("link", { name: /Soul/ });
+    expect(soul).toHaveAttribute("href", `/d/${DESKTOP_ID}/monos/${MONO}/profile/file/soul?mind=soul`);
+  });
+
   it("shows Memory the same way, also for a read-only device", async () => {
-    mount(`/monos/${MONO}/profile/file/memory`, { permission: "read" });
+    mount(`/monos/${MONO}/profile/file/memory?mind=memory`, { permission: "read" });
     expect(await screen.findByRole("textbox", { name: "Memory" })).toHaveValue("Text of memory");
     expect(screen.queryByRole("button", { name: /save/i })).toBeNull();
   });
@@ -197,24 +210,122 @@ describe("document page (F-76) and Soul and Memory viewer (F-79)", () => {
 
 describe("edit (F-78)", () => {
   it("autosaves the name 600 ms after typing stops with mono.update", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      mount(`/monos/${MONO}/profile/edit`);
+      const field = await screen.findByRole("textbox", { name: "Name" });
+      await user.clear(field);
+      await user.type(field, "Renamed");
+      expect(NAME_AUTOSAVE_MS).toBe(600);
+      // Not yet: 300 ms is shorter than the debounce.
+      await act(async () => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(called("mono.update")).toHaveLength(0);
+      await act(async () => {
+        vi.advanceTimersByTime(NAME_AUTOSAVE_MS);
+      });
+      await waitFor(() => expect(called("mono.update")).toHaveLength(1));
+      expect(called("mono.update")[0]?.params).toEqual({ monoId: MONO, name: "Renamed" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tries a name again after a failed save instead of treating it as saved", async () => {
     const user = userEvent.setup();
+    let first = true;
+    handlers["mono.update"] = (p: never, c: never) => {
+      calls.push({ method: "mono.update", params: p as Record<string, unknown> });
+      if (first) {
+        first = false;
+        throw new FixtureError("Could not reach the desktop");
+      }
+      return (original as unknown as Record<string, (p: never, c: never) => unknown>)["mono.update"]!(p, c);
+    };
     mount(`/monos/${MONO}/profile/edit`);
     const field = await screen.findByRole("textbox", { name: "Name" });
     await user.clear(field);
     await user.type(field, "Renamed");
-    expect(NAME_AUTOSAVE_MS).toBe(600);
-    // Not yet: the pause is shorter than the debounce.
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(called("mono.update")).toHaveLength(0);
-    await waitFor(() => expect(called("mono.update")).toHaveLength(1), { timeout: 2000 });
-    expect(called("mono.update")[0]?.params).toEqual({ monoId: MONO, name: "Renamed" });
+    await waitFor(() => expect(called("mono.update")).toHaveLength(1), { timeout: 3000 });
+    expect(await screen.findByText(/Could not reach the desktop|Could not save/)).toBeInTheDocument();
+    // The same name typed again is saved: the failed one was never counted as saved.
+    await user.clear(field);
+    await user.type(field, "Renamed");
+    await waitFor(() => expect(called("mono.update")).toHaveLength(2), { timeout: 3000 });
+    expect(called("mono.update")[1]?.params).toEqual({ monoId: MONO, name: "Renamed" });
+  });
+
+  it("undoes only the project whose save failed when two toggles overlap", async () => {
+    const user = userEvent.setup();
+    handlers["mono.update"] = (p: never, c: never) => {
+      calls.push({ method: "mono.update", params: p as Record<string, unknown> });
+      if ((p as { addProject?: string }).addProject === "proj-gamma") throw new FixtureError("nope");
+      return (original as unknown as Record<string, (p: never, c: never) => unknown>)["mono.update"]!(p, c);
+    };
+    mount(`/monos/${MONO}/profile/edit`);
+    const gamma = await screen.findByRole("checkbox", { name: "Gamma Service" });
+    const beta = screen.getByRole("checkbox", { name: "Example Beta" });
+    await user.click(gamma);
+    await user.click(beta);
+    await waitFor(() => expect(called("mono.update")).toHaveLength(2));
+    await waitFor(() => expect(gamma).not.toBeChecked());
+    expect(beta).toBeChecked();
+  });
+
+  it("moves between the mascots with the arrow keys", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}/profile/edit`);
+    const group = await screen.findByRole("radiogroup", { name: "Mascot" });
+    const radios = within(group).getAllByRole("radio");
+    const selected = radios.findIndex((radio) => radio.getAttribute("aria-checked") === "true");
+    expect(selected).toBeGreaterThanOrEqual(0);
+    // One tab stop: the selected radio.
+    expect(radios.filter((radio) => radio.tabIndex === 0)).toEqual([radios[selected]]);
+    radios[selected]!.focus();
+    await user.keyboard("{ArrowRight}");
+    const expected = MONO_MASCOT_NAMES[(selected + 1) % MONO_MASCOT_NAMES.length]!;
+    await waitFor(() => expect(called("mono.update").map((call) => call.params)).toEqual([{ monoId: MONO, mascot: expected }]));
+    expect(within(group).getByRole("radio", { name: expected })).toHaveFocus();
+  });
+
+  it("names the colours and moves between them with the arrow keys", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}/profile/edit`);
+    const group = await screen.findByRole("radiogroup", { name: "Color" });
+    const radios = within(group).getAllByRole("radio");
+    expect(radios.map((radio) => radio.getAttribute("aria-label"))).toEqual(["Blue", "Red", "Yellow", "Green", "Pink", "Purple", "Teal", "Orange", "Violet"]);
+    // The desktop's own colour is not one of the swatches: the first radio is then the one tab stop.
+    expect(radios.filter((radio) => radio.tabIndex === 0)).toEqual([radios[0]]);
+    radios[0]!.focus();
+    await user.keyboard("{End}");
+    await waitFor(() => expect(radios[radios.length - 1]).toHaveAttribute("aria-checked", "true"));
+  });
+
+  it("offers Same as the Mono for the sessions it starts, saved as null", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}/profile/edit`, {
+      seed: (desktop) => void ((desktop.world.monos() as unknown as Array<Record<string, unknown>>)[0]!.subsessions = { harness: "codex", model: "example-model-2" }),
+    });
+    const same = await screen.findByRole("button", { name: "Same as Example Mono" });
+    expect(same).toHaveAttribute("aria-pressed", "false");
+    expect(await screen.findByRole("button", { name: /Sessions it starts: Example Model Two/ })).toBeInTheDocument();
+    await user.click(same);
+    await waitFor(() => expect(called("mono.update").map((call) => call.params)).toEqual([{ monoId: MONO, subsessions: null }]));
+  });
+
+  it("shows Same as the Mono as the choice while no model is set, not the app's current model", async () => {
+    mount(`/monos/${MONO}/profile/edit`);
+    expect(await screen.findByRole("button", { name: "Same as Example Mono" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Choose a model for sessions it starts" })).toBeInTheDocument();
   });
 
   it("saves the mascot, the colour and an assigned project one change at a time", async () => {
     const user = userEvent.setup();
     mount(`/monos/${MONO}/profile/edit`);
     await user.click(await screen.findByRole("radio", { name: "robot" }));
-    await user.click(screen.getByRole("radio", { name: "#ea603e" }));
+    await user.click(within(screen.getByRole("radiogroup", { name: "Color" })).getByRole("radio", { name: "Red" }));
     await user.click(screen.getByRole("checkbox", { name: "Gamma Service" }));
     await waitFor(() => expect(called("mono.update")).toHaveLength(3));
     expect(called("mono.update").map((call) => call.params)).toEqual([
@@ -228,7 +339,7 @@ describe("edit (F-78)", () => {
   it("keeps the chat colour on this device only", async () => {
     const user = userEvent.setup();
     mount(`/monos/${MONO}/profile/edit`);
-    await user.click(await screen.findByRole("radio", { name: "Violet" }));
+    await user.click(within(await screen.findByRole("radiogroup", { name: "Chat color" })).getByRole("radio", { name: "Violet" }));
     expect(JSON.parse(localStorage.getItem(MONO_ACCENTS_KEY) ?? "{}")).toEqual({ [`${DESKTOP_ID}:${MONO}`]: "violet" });
     expect(called("mono.update")).toHaveLength(0);
   });
@@ -248,13 +359,16 @@ describe("create Mono (F-75)", () => {
     const { router } = mount("/monos");
     await user.click(await screen.findByRole("button", { name: "New Mono" }));
     const dialog = await screen.findByTestId("create-mono");
-    // Ten mascots and nine colours.
+    // Ten mascots and nine colours, the colours named and not labelled by their hex.
     expect(within(dialog).getAllByRole("radio").length).toBe(10 + 9);
+    expect(within(dialog).getAllByRole("radio").every((radio) => !/^#/.test(radio.getAttribute("aria-label") ?? ""))).toBe(true);
+    // A sheet below 640px (the test viewport matches no min-width query).
+    expect(dialog.closest("[data-vaul-drawer]")).not.toBeNull();
     const create = within(dialog).getByRole("button", { name: "Create" });
     expect(create).toBeDisabled();
     await user.type(within(dialog).getByRole("textbox", { name: "Name" }), "Scout");
     await user.click(within(dialog).getByRole("radio", { name: "ghost" }));
-    await user.click(within(dialog).getByRole("radio", { name: "#39c363" }));
+    await user.click(within(dialog).getByRole("radio", { name: "Green" }));
     await user.click(create);
     await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/monos/mono-created`));
     expect(called("mono.create")).toHaveLength(1);
@@ -266,13 +380,34 @@ describe("create Mono (F-75)", () => {
     await screen.findAllByTestId("mono-row");
     expect(screen.queryByRole("button", { name: "New Mono" })).toBeNull();
   });
+
+  it("is not offered when the desktop does not advertise monoTools", async () => {
+    const list = original["workspace.list"] as unknown as (p: never, c: never) => Record<string, unknown>;
+    handlers["workspace.list"] = (p: never, c: never) => ({ ...list(p, c), monoTools: false });
+    mount("/monos");
+    await screen.findAllByTestId("mono-row");
+    expect(screen.queryByRole("button", { name: "New Mono" })).toBeNull();
+    expect(called("mono.create")).toHaveLength(0);
+  });
 });
 
 describe("denied methods (security.md section 7)", () => {
-  it("never calls mono.reset, mono.delete or mono.saveFile from any Mono screen", async () => {
-    mount(`/monos/${MONO}/profile`);
-    await screen.findByText("PRs merged");
-    expect(screen.queryByText(/reset|delete/i)).toBeNull();
+  const PAGES: Array<[string, string, string | RegExp]> = [
+    ["chat", `/monos/${MONO}`, "Example Mono"],
+    ["profile", `/monos/${MONO}/profile`, "Profile"],
+    ["edit", `/monos/${MONO}/profile/edit`, "Edit Mono"],
+    ["file", `/monos/${MONO}/profile/file/soul?mind=soul`, "Soul"],
+    ["document", `/monos/${MONO}/profile/file/doc-0`, "Notes"],
+    ["habit", `/monos/${MONO}/profile/habit/h1`, "Morning digest"],
+    ["documents", `/monos/${MONO}/profile/documents`, "Documents"],
+    ["list", "/monos", "Monos"],
+  ];
+
+  it.each(PAGES)("never calls mono.reset, mono.delete or mono.saveFile from the %s page", async (_name, path, heading) => {
+    mount(path);
+    await screen.findByRole("heading", { level: 1, name: heading });
+    expect(screen.queryByText(/reset conversation|delete mono|\bsave\b/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /reset|delete|save/i })).toBeNull();
     for (const method of ["mono.reset", "mono.delete", "mono.saveFile"]) expect(called(method)).toHaveLength(0);
   });
 });

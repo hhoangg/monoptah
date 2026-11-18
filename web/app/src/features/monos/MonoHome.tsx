@@ -3,7 +3,7 @@
 // hide). "Reset" and "Delete" are denied for web (security.md section 7) and not offered. Hiding is
 // device-local and can be undone from the "Hidden" line at the foot.
 import { Link } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useCatalog } from "@/data";
 import { markMonoSeen, markMonoUnread, useUnreadMonos } from "@/features/sessions/monoSeen";
 import { oneLine } from "@/features/sessions/WorkspaceNav";
@@ -17,6 +17,7 @@ import { Notice } from "@/ui/Notice";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "./contextMenu";
 import { CreateMonoDialog } from "./CreateMonoDialog";
+import { clearCreateMonoRequest, useCreateMonoRequest } from "./createRequest";
 import { MonoMascot } from "./MonoMascot";
 import { useMonoPrefs } from "./monoPrefs";
 
@@ -32,6 +33,14 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
   const hidden = useMemo(() => new Set(hiddenIds ?? []), [hiddenIds]);
   const sorted = useMemo(() => [...(monos ?? [])].sort((a, b) => (b.lastActiveAt ?? 0) - (a.lastActiveAt ?? 0)), [monos]);
   const canCreate = catalog.data?.monoTools === true && !readOnly;
+  // "New Mono" asked for from the command palette: the dialog opens once the catalog says this device may create.
+  const createRequested = useCreateMonoRequest((state) => state.requested);
+  const catalogLoaded = !!catalog.data;
+  useEffect(() => {
+    // A device that may not create drops the request, so it does not wait for a later list to act on it.
+    if (createRequested && catalogLoaded && !canCreate) clearCreateMonoRequest();
+  }, [createRequested, catalogLoaded, canCreate]);
+  const dialogOpen = creating || (createRequested && canCreate);
   const shown = sorted.filter((mono) => !hidden.has(mono.id));
   const hiddenMonos = sorted.filter((mono) => hidden.has(mono.id));
 
@@ -63,7 +72,7 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
       )}
       {hiddenMonos.length > 0 ? (
         <div className="px-2">
-          <button type="button" className="text-small text-muted-text underline-offset-2 hover:underline" aria-expanded={showHidden} onClick={() => setShowHidden(!showHidden)}>
+          <button type="button" className="inline-flex min-h-11 items-center text-small text-muted-text underline-offset-2 hover:underline pointer-fine:min-h-9" aria-expanded={showHidden} onClick={() => setShowHidden(!showHidden)}>
             Hidden ({hiddenMonos.length})
           </button>
           {showHidden ? (
@@ -80,13 +89,21 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
           ) : null}
         </div>
       ) : null}
-      {canCreate ? <CreateMonoDialog desktopId={desktopId} open={creating} onOpenChange={setCreating} /> : null}
+      {canCreate ? <CreateMonoDialog
+          desktopId={desktopId}
+          open={dialogOpen}
+          onOpenChange={(next) => {
+            setCreating(next);
+            if (!next) clearCreateMonoRequest();
+          }}
+        /> : null}
     </section>
   );
 }
 
 function MonoRow({ desktopId, mono, unread, onHide }: { desktopId: string; mono: CatalogMono; unread: boolean; onHide: () => void }) {
-  const working = !!mono.status && mono.status !== "idle";
+  const working = mono.status === "working";
+  const needsYou = mono.status === "needs-you";
   const preview = mono.lastMessage ? oneLine(mono.lastMessage) : "";
   return (
     <ContextMenu>
@@ -104,7 +121,7 @@ function MonoRow({ desktopId, mono, unread, onHide }: { desktopId: string; mono:
               <span className={cn("min-w-0 flex-1 truncate text-row", unread ? "font-semibold" : "font-medium")}>{mono.name}</span>
               {mono.lastActiveAt ? <span className="shrink-0 text-meta text-muted-text">{chatListTime(mono.lastActiveAt)}</span> : null}
             </span>
-            <span className="block truncate text-small text-muted-text">{working ? "Working..." : preview || "No messages yet"}</span>
+            <span className={cn("block truncate text-small text-muted-text", needsYou && "text-caution")}>{working ? "Working..." : needsYou ? "Needs you" : preview || "No messages yet"}</span>
           </span>
           {unread ? <span role="img" aria-label="Unread" className="size-2.5 shrink-0 rounded-pill bg-[var(--accent-color)]" /> : null}
         </Link>

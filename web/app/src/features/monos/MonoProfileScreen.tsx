@@ -73,7 +73,7 @@ export function MonoProfileScreen({ desktopId, monoId }: { desktopId: string; mo
           <ul>
             {(["soul", "memory"] as const).map((file) => (
               <li key={file}>
-                <Link to="/d/$desktopId/monos/$monoId/profile/file/$name" params={{ desktopId, monoId, name: file }} className="flex min-h-12 items-center gap-3 rounded-row px-2 hover:bg-selection">
+                <Link to="/d/$desktopId/monos/$monoId/profile/file/$name" params={{ desktopId, monoId, name: file }} search={{ mind: file }} className="flex min-h-12 items-center gap-3 rounded-row px-2 hover:bg-selection">
                   <Icon name={file === "soul" ? "sparkle" : "note"} size={18} />
                   <span className="min-w-0 flex-1 truncate text-row">{file === "soul" ? "Soul" : "Memory"}</span>
                   <Icon name="chevronRight" size={16} className="text-muted-text" />

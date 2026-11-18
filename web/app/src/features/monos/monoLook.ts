@@ -4,6 +4,19 @@ import { PROJECT_MASCOTS } from "@/features/sessions/projectMascots";
 
 export const MONO_SWATCHES = ["#459cf7", "#ea603e", "#f4bf25", "#39c363", "#e45a9f", "#b168d4", "#37beb4", "#ef8c39", "#8b63e9"] as const;
 
+/** What each swatch is called, for the screen reader and the tooltip (the radios are not labelled by their hex). */
+export const MONO_SWATCH_NAMES: Record<(typeof MONO_SWATCHES)[number], string> = {
+  "#459cf7": "Blue",
+  "#ea603e": "Red",
+  "#f4bf25": "Yellow",
+  "#39c363": "Green",
+  "#e45a9f": "Pink",
+  "#b168d4": "Purple",
+  "#37beb4": "Teal",
+  "#ef8c39": "Orange",
+  "#8b63e9": "Violet",
+};
+
 export const MONO_MASCOT_NAMES: readonly string[] = PROJECT_MASCOTS.map((mascot) => mascot.name);
 
 export const MONO_NAME_MAX = 40;

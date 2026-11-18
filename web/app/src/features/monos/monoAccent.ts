@@ -54,7 +54,14 @@ export function useMonoAccentStyle(desktopId: string, monoId: string): Record<st
   const accent = useMonoAccent(desktopId, monoId);
   const scheme = useAppearance((state) => state.scheme);
   if (accent === "theme") return undefined;
-  return { "--accent-color": ACCENT_COLORS[accent][scheme === "dark" ? 0 : 1] };
+  const color = ACCENT_COLORS[accent][scheme === "dark" ? 0 : 1];
+  // `--accent-text` and `--ring` are derived on :root (tokens.css), so they do not follow `--accent-color` into this
+  // subtree on their own. Light text on the page uses the accessibility override of design-system.md section 9.
+  return {
+    "--accent-color": color,
+    "--accent-text": scheme === "dark" ? color : `color-mix(in srgb, ${color} 85%, black)`,
+    "--ring": color,
+  };
 }
 
 /** Re-reads the stored values (for tests). */

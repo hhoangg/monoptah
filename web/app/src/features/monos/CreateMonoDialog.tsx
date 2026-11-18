@@ -8,24 +8,21 @@ import { useRef, useState } from "react";
 import { catalogKey, useLinkMutation } from "@/data";
 import { cn } from "@/lib/utils";
 import { Button } from "@/ui/button";
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { Icon } from "@/ui/Icon";
 import { Input } from "@/ui/input";
 import { Notice } from "@/ui/Notice";
-import { MONO_MASCOT_NAMES, MONO_NAME_MAX, MONO_SWATCHES, randomLook } from "./monoLook";
+import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
+import { MONO_MASCOT_NAMES, MONO_NAME_MAX, MONO_SWATCHES, MONO_SWATCH_NAMES, randomLook } from "./monoLook";
 import { MonoMascot } from "./MonoMascot";
+import { RadioGroup, radioTabIndex } from "./RadioGroup";
 
 export function CreateMonoDialog({ desktopId, open, onOpenChange }: { desktopId: string; open: boolean; onOpenChange: (open: boolean) => void }) {
+  // A bottom sheet below 640px, a dialog from 640px.
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent aria-describedby={undefined} className="max-h-[90dvh] max-w-md overflow-y-auto" data-testid="create-mono">
-        <DialogHeader>
-          <DialogTitle>New Mono</DialogTitle>
-        </DialogHeader>
-        {/* Mounted only while open, so every opening starts from a fresh look. */}
-        {open ? <Form desktopId={desktopId} onClose={() => onOpenChange(false)} /> : null}
-      </DialogContent>
-    </Dialog>
+    <ResponsiveOverlay open={open} onOpenChange={onOpenChange} title="New Mono">
+      {/* Mounted only while open, so every opening starts from a fresh look. */}
+      {open ? <Form desktopId={desktopId} onClose={() => onOpenChange(false)} /> : null}
+    </ResponsiveOverlay>
   );
 }
 
@@ -61,6 +58,7 @@ function Form({ desktopId, onClose }: { desktopId: string; onClose: () => void }
   return (
     <form
       className="flex flex-col gap-4"
+      data-testid="create-mono"
       onSubmit={(event) => {
         event.preventDefault();
         void submit();
@@ -70,14 +68,15 @@ function Form({ desktopId, onClose }: { desktopId: string; onClose: () => void }
         <MonoMascot monoId="new" mascot={look.mascot} color={look.color} size={96} />
       </div>
       <Input aria-label="Name" value={name} maxLength={MONO_NAME_MAX} placeholder="Name your Mono" autoFocus disabled={busy} onChange={(event) => setName(event.target.value)} />
-      <div role="radiogroup" aria-label="Mascot" className="grid grid-cols-5 gap-2">
-        {MONO_MASCOT_NAMES.map((option) => (
+      <RadioGroup aria-label="Mascot" className="grid grid-cols-5 gap-2">
+        {MONO_MASCOT_NAMES.map((option, index) => (
           <button
             key={option}
             type="button"
             role="radio"
             aria-checked={option === look.mascot}
             aria-label={option}
+            tabIndex={radioTabIndex(option === look.mascot, index, MONO_MASCOT_NAMES.includes(look.mascot))}
             disabled={busy}
             onClick={() => setLook({ ...look, mascot: option })}
             className={cn("grid aspect-square place-items-center rounded-card border-2 border-transparent hover:bg-selection", option === look.mascot && "border-[var(--accent-color)]")}
@@ -85,9 +84,9 @@ function Form({ desktopId, onClose }: { desktopId: string; onClose: () => void }
             <MonoMascot monoId="new" mascot={option} color={look.color} size={36} />
           </button>
         ))}
-      </div>
-      <div role="radiogroup" aria-label="Color" className="flex flex-wrap justify-center gap-2">
-        {MONO_SWATCHES.map((swatch) => {
+      </RadioGroup>
+      <RadioGroup aria-label="Color" className="flex flex-wrap justify-center gap-2">
+        {MONO_SWATCHES.map((swatch, index) => {
           const selected = swatch === look.color;
           return (
             <button
@@ -95,28 +94,30 @@ function Form({ desktopId, onClose }: { desktopId: string; onClose: () => void }
               type="button"
               role="radio"
               aria-checked={selected}
-              aria-label={swatch}
+              aria-label={MONO_SWATCH_NAMES[swatch]}
+              title={MONO_SWATCH_NAMES[swatch]}
+              tabIndex={radioTabIndex(selected, index, (MONO_SWATCHES as readonly string[]).includes(look.color))}
               disabled={busy}
               onClick={() => setLook({ ...look, color: swatch })}
               className="grid size-11 place-items-center rounded-pill border-2 border-transparent pointer-fine:size-9"
               style={selected ? { borderColor: swatch } : undefined}
             >
-              <span className="grid size-7 place-items-center rounded-pill text-white" style={{ background: swatch }}>
+              <span className="grid size-7 place-items-center rounded-pill text-inverse" style={{ background: swatch }}>
                 {selected ? <Icon name="check" size={14} /> : null}
               </span>
             </button>
           );
         })}
-      </div>
+      </RadioGroup>
       {error ? <Notice variant="error">{error}</Notice> : null}
-      <DialogFooter>
+      <div className="flex flex-col-reverse gap-2 min-[40rem]:flex-row min-[40rem]:justify-end">
         <Button type="button" variant="ghost" disabled={busy} onClick={onClose}>
           Cancel
         </Button>
         <Button type="submit" disabled={!ready} aria-busy={busy}>
           Create
         </Button>
-      </DialogFooter>
+      </div>
     </form>
   );
 }

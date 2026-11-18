@@ -26,9 +26,10 @@ import { Icon } from "@/ui/Icon";
 import { Input } from "@/ui/input";
 import { Notice } from "@/ui/Notice";
 import { setMonoAccent, useMonoAccent } from "./monoAccent";
-import { MONO_MASCOT_NAMES, MONO_NAME_MAX, MONO_SWATCHES } from "./monoLook";
+import { MONO_MASCOT_NAMES, MONO_NAME_MAX, MONO_SWATCHES, MONO_SWATCH_NAMES } from "./monoLook";
 import { MonoMascot } from "./MonoMascot";
 import { BACK_LINK_CLASS, BackIcon, Group, MonoPage } from "./MonoPage";
+import { RadioGroup, radioTabIndex } from "./RadioGroup";
 
 export const NAME_AUTOSAVE_MS = 600;
 
@@ -71,16 +72,20 @@ function Editor({ desktopId, monoId, mono, projects }: { desktopId: string; mono
   const [look, setLook] = useState({ mascot: mono.mascot ?? "ghost", color: safeHexColor(mono.color, MONO_SWATCHES[0]) });
   const [assigned, setAssigned] = useState<readonly string[]>(mono.projectIds ?? []);
 
-  const save = (change: Omit<Update, "monoId">, onFail?: () => void) => {
+  const save = (change: Omit<Update, "monoId">, hooks: { onOk?: () => void; onFail?: () => void; onSettled?: () => void } = {}) => {
     setError(null);
     update.mutate(
       { monoId, ...change },
       {
-        onSuccess: () => void queryClient.invalidateQueries({ queryKey: catalogKey(desktopId) }),
+        onSuccess: () => {
+          hooks.onOk?.();
+          void queryClient.invalidateQueries({ queryKey: catalogKey(desktopId) });
+        },
         onError: (failure) => {
-          onFail?.();
+          hooks.onFail?.();
           setError(failure.message || "Could not save.");
         },
+        onSettled: () => hooks.onSettled?.(),
       },
     );
   };
@@ -96,8 +101,19 @@ function Editor({ desktopId, monoId, mono, projects }: { desktopId: string; mono
       const next = pending.current;
       pending.current = null;
       if (next === null) return;
-      saved.current = next;
-      save({ name: next });
+      // `saved` moves only once the desktop took the name, so a failed save is tried again: when the page closes,
+      // or on the next edit.
+      save(
+        { name: next },
+        {
+          onOk: () => {
+            saved.current = next;
+          },
+          onFail: () => {
+            if (pending.current === null) pending.current = next;
+          },
+        },
+      );
     };
   });
   useEffect(() => {
@@ -116,18 +132,26 @@ function Editor({ desktopId, monoId, mono, projects }: { desktopId: string; mono
     if (mascot === look.mascot) return;
     const previous = look;
     setLook({ ...look, mascot });
-    save({ mascot }, () => setLook(previous));
+    save({ mascot }, { onFail: () => setLook(previous) });
   };
   const pickColor = (color: string) => {
     if (color === look.color.toLowerCase()) return;
     const previous = look;
     setLook({ ...look, color });
-    save({ color }, () => setLook(previous));
+    save({ color }, { onFail: () => setLook(previous) });
   };
+  // Each project saves on its own: a project with a save in flight is locked, and a failure undoes only that project,
+  // never another one toggled meanwhile.
+  const [saving, setSaving] = useState<readonly string[]>([]);
   const toggleProject = (projectId: string, on: boolean) => {
-    const previous = assigned;
-    setAssigned(on ? [...assigned, projectId] : assigned.filter((id) => id !== projectId));
-    save(on ? { addProject: projectId } : { removeProject: projectId }, () => setAssigned(previous));
+    if (saving.includes(projectId)) return;
+    const apply = (add: boolean) => setAssigned((list) => (add ? (list.includes(projectId) ? list : [...list, projectId]) : list.filter((id) => id !== projectId)));
+    apply(on);
+    setSaving((list) => [...list, projectId]);
+    save(on ? { addProject: projectId } : { removeProject: projectId }, {
+      onFail: () => apply(!on),
+      onSettled: () => setSaving((list) => list.filter((id) => id !== projectId)),
+    });
   };
 
   return (
@@ -147,29 +171,30 @@ function Editor({ desktopId, monoId, mono, projects }: { desktopId: string; mono
         </div>
       </Group>
 
-      <SubsessionsGroup monoId={monoId} subsessions={mono.subsessions ?? null} onSave={(subsessions) => save({ subsessions })} />
+      <SubsessionsGroup monoId={monoId} monoName={mono.name} subsessions={mono.subsessions ?? null} onSave={(subsessions) => save({ subsessions })} />
 
       <Group title="Mascot">
-        <div role="radiogroup" aria-label="Mascot" className="grid grid-cols-5 gap-2 p-1.5">
-          {MONO_MASCOT_NAMES.map((option) => (
+        <RadioGroup aria-label="Mascot" className="grid grid-cols-5 gap-2 p-1.5">
+          {MONO_MASCOT_NAMES.map((option, index) => (
             <button
               key={option}
               type="button"
               role="radio"
               aria-checked={option === look.mascot}
               aria-label={option}
+              tabIndex={radioTabIndex(option === look.mascot, index, MONO_MASCOT_NAMES.includes(look.mascot))}
               onClick={() => pickMascot(option)}
               className={cn("grid aspect-square place-items-center rounded-card border-2 border-transparent hover:bg-selection", option === look.mascot && "border-[var(--accent-color)]")}
             >
               <MonoMascot monoId={monoId} mascot={option} color={look.color} size={40} />
             </button>
           ))}
-        </div>
+        </RadioGroup>
       </Group>
 
       <Group title="Color">
-        <div role="radiogroup" aria-label="Color" className="flex flex-wrap gap-3 p-2.5">
-          {MONO_SWATCHES.map((swatch) => {
+        <RadioGroup aria-label="Color" className="flex flex-wrap gap-3 p-2.5">
+          {MONO_SWATCHES.map((swatch, index) => {
             const selected = swatch === look.color.toLowerCase();
             return (
               <button
@@ -177,18 +202,20 @@ function Editor({ desktopId, monoId, mono, projects }: { desktopId: string; mono
                 type="button"
                 role="radio"
                 aria-checked={selected}
-                aria-label={swatch}
+                aria-label={MONO_SWATCH_NAMES[swatch]}
+                title={MONO_SWATCH_NAMES[swatch]}
+                tabIndex={radioTabIndex(selected, index, (MONO_SWATCHES as readonly string[]).includes(look.color.toLowerCase()))}
                 onClick={() => pickColor(swatch)}
                 className="grid size-11 place-items-center rounded-pill border-2 border-transparent pointer-fine:size-9"
                 style={selected ? { borderColor: swatch } : undefined}
               >
-                <span className="grid size-7 place-items-center rounded-pill text-white" style={{ background: swatch }}>
+                <span className="grid size-7 place-items-center rounded-pill text-inverse" style={{ background: swatch }}>
                   {selected ? <Icon name="check" size={14} /> : null}
                 </span>
               </button>
             );
           })}
-        </div>
+        </RadioGroup>
       </Group>
 
       <ChatColor desktopId={desktopId} monoId={monoId} />
@@ -202,7 +229,7 @@ function Editor({ desktopId, monoId, mono, projects }: { desktopId: string; mono
               const on = assigned.includes(project.id);
               return (
                 <li key={project.id}>
-                  <Checkbox label={<span className="truncate text-row">{project.name}</span>} checked={on} className="rounded-row px-2 hover:bg-selection" onChange={(event) => toggleProject(project.id, event.target.checked)} />
+                  <Checkbox label={<span className="truncate text-row">{project.name}</span>} checked={on} disabled={saving.includes(project.id)} className="rounded-row px-2 hover:bg-selection" onChange={(event) => toggleProject(project.id, event.target.checked)} />
                 </li>
               );
             })}
@@ -214,11 +241,25 @@ function Editor({ desktopId, monoId, mono, projects }: { desktopId: string; mono
   );
 }
 
-/** The model and effort for sessions the Mono starts without naming one (`subsessions`). */
-function SubsessionsGroup({ monoId, subsessions, onSave }: { monoId: string; subsessions: NonNullable<CatalogMono["subsessions"]> | null; onSave: (value: NonNullable<Update["subsessions"]>) => void }) {
+/**
+ * The model and effort for sessions the Mono starts without naming one (`subsessions`). Unset (null) means "Same as
+ * <Mono>": they run on the Mono's own model, as on mobile (mono-profile subsessions screen).
+ */
+function SubsessionsGroup({
+  monoId,
+  monoName,
+  subsessions,
+  onSave,
+}: {
+  monoId: string;
+  monoName: string;
+  subsessions: NonNullable<CatalogMono["subsessions"]> | null;
+  onSave: (value: Update["subsessions"]) => void;
+}) {
   const catalog = useModelCatalog();
   const [open, setOpen] = useState(false);
   const data: ModelCatalog | undefined = catalog.data;
+  const inherited = !subsessions;
   const value = ((): ModelSelectionInput | null => {
     if (!data) return null;
     const harness = subsessions?.harness ?? data.current.harness;
@@ -227,25 +268,31 @@ function SubsessionsGroup({ monoId, subsessions, onSave }: { monoId: string; sub
     const effortId = modelEffortSetting(entry)?.id;
     return { harness, model, modelSettings: effortId && subsessions?.effort ? { [effortId]: subsessions.effort } : data.current.modelSettings, runtimeMode: data.current.runtimeMode };
   })();
-  const summary = data && value ? summarizeSelection(data, value) : null;
+  const summary = data && value && !inherited ? summarizeSelection(data, value) : null;
   const pick = (selection: ModelSelection) => {
     const entry = data?.models.find((candidate) => candidate.id === selection.model);
     const effortId = modelEffortSetting(entry)?.id;
     const effort = effortId ? selection.modelSettings[effortId] : undefined;
-    onSave({ harness: selection.harness as NonNullable<Update["subsessions"]>["harness"], model: selection.model, ...(effort ? { effort } : {}) });
+    onSave({ harness: selection.harness as NonNullable<NonNullable<Update["subsessions"]>["harness"]>, model: selection.model, ...(effort ? { effort } : {}) });
   };
+  const row = "flex min-h-11 w-full items-center gap-3 rounded-row px-2 text-left hover:bg-selection disabled:opacity-50";
   return (
     <>
       <Group title="Sessions it starts">
+        <button type="button" aria-pressed={inherited} className={row} onClick={() => (inherited ? undefined : onSave(null))}>
+          <Icon name="sparkle" size={16} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate text-row">Same as {monoName}</span>
+          {inherited ? <Icon name="check" size={16} className="text-[color:var(--accent-color)]" /> : null}
+        </button>
         <button
           type="button"
           disabled={!data}
-          aria-label={summary ? `Sessions it starts: ${summary.name}${summary.effort ? `, ${summary.effort}` : ""}` : "Sessions it starts"}
+          aria-label={summary ? `Sessions it starts: ${summary.name}${summary.effort ? `, ${summary.effort}` : ""}` : "Choose a model for sessions it starts"}
           onClick={() => setOpen(true)}
-          className="flex min-h-11 w-full items-center gap-3 rounded-row px-2 text-left hover:bg-selection disabled:opacity-50"
+          className={row}
           data-mono={monoId}
         >
-          {value ? <HarnessIcon harness={value.harness} className="size-4 shrink-0" /> : null}
+          {value && !inherited ? <HarnessIcon harness={value.harness} className="size-4 shrink-0" /> : <Icon name="chat" size={16} className="shrink-0" />}
           <span className="min-w-0 flex-1 truncate text-row">{summary?.name ?? "Choose a model"}</span>
           {summary?.effort ? <span className="text-meta text-muted-text">{summary.effort}</span> : null}
           <Icon name="chevronRight" size={16} className="text-muted-text" />
@@ -264,8 +311,8 @@ function ChatColor({ desktopId, monoId }: { desktopId: string; monoId: string })
   return (
     <>
       <Group title="Chat color">
-        <div role="radiogroup" aria-label="Chat color" className="flex flex-wrap gap-3 p-2.5">
-          {ACCENTS.map((option: Accent) => {
+        <RadioGroup aria-label="Chat color" className="flex flex-wrap gap-3 p-2.5">
+          {ACCENTS.map((option: Accent, index) => {
             const selected = option === accent;
             const swatch = option === "theme" ? null : ACCENT_COLORS[option][scheme === "dark" ? 0 : 1];
             return (
@@ -275,17 +322,18 @@ function ChatColor({ desktopId, monoId }: { desktopId: string; monoId: string })
                 role="radio"
                 aria-checked={selected}
                 aria-label={ACCENT_LABELS[option]}
+                tabIndex={radioTabIndex(selected, index, true)}
                 onClick={() => setMonoAccent(desktopId, monoId, option)}
                 className="grid size-11 place-items-center rounded-pill border-2 border-transparent pointer-fine:size-9"
                 style={selected ? { borderColor: swatch ?? "var(--content)" } : undefined}
               >
-                <span className="grid size-7 place-items-center rounded-pill border border-stroke text-white" style={{ background: swatch ?? "var(--surface-raised)" }}>
+                <span className="grid size-7 place-items-center rounded-pill border border-stroke text-inverse" style={{ background: swatch ?? "var(--surface-raised)" }}>
                   {selected ? <Icon name="check" size={14} className={swatch ? undefined : "text-content"} /> : null}
                 </span>
               </button>
             );
           })}
-        </div>
+        </RadioGroup>
       </Group>
       <p className="-mt-2 px-1 text-meta text-muted-text">Only on this device: it colours this chat and is not sent to your desktop.</p>
     </>

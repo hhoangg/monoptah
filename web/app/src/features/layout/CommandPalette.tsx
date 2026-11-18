@@ -4,6 +4,8 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useCatalog } from "@/data";
+import { requestCreateMono } from "@/features/monos/createRequest";
+import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { fuzzyMatch } from "@/lib/fuzzy";
 import { cn } from "@/lib/utils";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
@@ -19,7 +21,7 @@ export { openCommandPalette };
 
 const RECENT_SESSIONS = 20;
 
-type ItemKind = "action" | "project" | "mono" | "session";
+type ItemKind = "action" | "go" | "project" | "mono" | "session";
 
 export interface PaletteItem {
   id: string;
@@ -31,6 +33,7 @@ export interface PaletteItem {
 
 const GROUPS: ReadonlyArray<{ kind: ItemKind; label: string; icon: IconName }> = [
   { kind: "action", label: "This project", icon: "folder" },
+  { kind: "go", label: "Go to", icon: "bot" },
   { kind: "project", label: "Projects", icon: "folder" },
   { kind: "mono", label: "Monos", icon: "bot" },
   { kind: "session", label: "Recent sessions", icon: "chat" },
@@ -39,6 +42,8 @@ const GROUPS: ReadonlyArray<{ kind: ItemKind; label: string; icon: IconName }> =
 interface Source {
   /** Actions on the current project (Files, Changes, Git, Background); absent outside a project screen. */
   actions?: ReadonlyArray<{ id: string; label: string; icon?: IconName }>;
+  /** Places and actions of the desktop itself (the Mono list, a new Mono). */
+  places?: ReadonlyArray<{ id: string; label: string }>;
   projects: ReadonlyArray<{ id: string; name: string; path: string }>;
   monos: ReadonlyArray<{ id: string; name: string }>;
   sessions: ReadonlyArray<{ id: string; projectId: string; title: string; updatedAt: number }>;
@@ -55,6 +60,10 @@ export function paletteItems(source: Source, query: string): PaletteItem[] {
   for (const action of source.actions ?? []) {
     const hit = rank(action.label);
     if (hit) items.push({ id: action.id, kind: "action", label: action.label, positions: hit.positions });
+  }
+  for (const place of source.places ?? []) {
+    const hit = rank(place.label);
+    if (hit) items.push({ id: place.id, kind: "go", label: place.label, positions: hit.positions });
   }
   const projectNames = new Map(source.projects.map((project) => [project.id, project.name]));
 
@@ -106,6 +115,7 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
 
+  const readOnly = useReadOnly();
   const tools = useProjectTools();
   const toolPanels = tools.panels.join("\0");
   const hasScope = tools.scope !== null;
@@ -119,8 +129,10 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
           { id: "background", label: "Background" },
         ]
       : [];
-    return paletteItems({ actions, projects: data.projects, monos: data.monos, sessions: data.sessions }, query);
-  }, [data, query, toolPanels, hasScope]);
+    // F-13, F-75: the Mono list, and a new Mono where this device may make one.
+    const places = [{ id: "monos", label: "Monos" }, ...(data.monoTools === true && !readOnly ? [{ id: "new-mono", label: "New Mono" }] : [])];
+    return paletteItems({ actions, places, projects: data.projects, monos: data.monos, sessions: data.sessions }, query);
+  }, [data, query, toolPanels, hasScope, readOnly]);
   const current = Math.min(active, Math.max(0, items.length - 1));
   const optionId = (index: number) => `${listId}-${index}`;
 
@@ -134,6 +146,9 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
     if (item.kind === "action") {
       if (item.id === "background") tools.openBackground();
       else tools.open(item.id as PanelKind);
+    } else if (item.kind === "go") {
+      if (item.id === "new-mono") requestCreateMono();
+      void navigate({ to: "/d/$desktopId/monos", params: { desktopId } });
     } else if (item.kind === "project") void navigate({ to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId: item.id } });
     else if (item.kind === "mono") void navigate({ to: "/d/$desktopId/monos/$monoId", params: { desktopId, monoId: item.id } });
     else void navigate({ to: "/d/$desktopId/s/$sessionId", params: { desktopId, sessionId: item.id } });

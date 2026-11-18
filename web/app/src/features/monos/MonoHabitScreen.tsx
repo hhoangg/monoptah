@@ -62,10 +62,10 @@ export function MonoHabitScreen({ desktopId, monoId, habitId }: { desktopId: str
           <Group title="Recent runs">
             {habit.runs.length ? (
               <ul className="divide-y divide-stroke">
-                {habit.runs.map((run) => (
-                  <li key={run.at} className="flex flex-col gap-1 px-2 py-2.5">
+                {habit.runs.map((run, index) => (
+                  <li key={`${index}:${run.at}`} className="flex flex-col gap-1 px-2 py-2.5">
                     <div className="flex items-baseline justify-between gap-3">
-                      <span className="text-row">{new Date(run.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</span>
+                      <span className="text-row">{run.at > 0 ? new Date(run.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "Unknown time"}</span>
                       <span className="text-meta text-muted-text">
                         {run.outcome}
                         {run.durationMs ? ` · ${duration(run.durationMs)}` : ""}

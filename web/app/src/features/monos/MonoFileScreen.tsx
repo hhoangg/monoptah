@@ -1,8 +1,8 @@
 // `/d/:desktopId/monos/:monoId/profile/file/:name`: one file of a Mono's profile.
-//  - F-79: `soul` or `memory` is the Mono's mind, shown as a read-only viewer (`mono.file`). Saving
+//  - F-79: `?mind=soul` or `?mind=memory` is the Mono's mind, shown as a read-only viewer (`mono.file`). Saving
 //    (`mono.saveFile`) is denied for web devices in v1 (security.md section 7): there is no Save button, no
 //    editor and the method is never called.
-//  - F-76: any other name is a document id (`mono.document`): Markdown through the safe renderer, or a visual
+//  - F-76: a name without `mind` is a document id (`mono.document`): Markdown through the safe renderer, or a visual
 //    tree drawn by the SVG renderer (F-73).
 import { Link } from "@tanstack/react-router";
 import { useCatalog, useLinkQuery } from "@/data";
@@ -16,14 +16,9 @@ import { readDocument, useMonoProfile } from "./profile";
 const MIND_FILES = { soul: "Soul", memory: "Memory" } as const;
 type MindFile = keyof typeof MIND_FILES;
 
-const mindFile = (name: string): MindFile | null => {
-  const key = name.replace(/\.md$/i, "").toLowerCase();
-  return key === "soul" || key === "memory" ? key : null;
-};
-
-export function MonoFileScreen({ desktopId, monoId, name }: { desktopId: string; monoId: string; name: string }) {
-  const file = mindFile(name);
-  return file ? <MindViewer desktopId={desktopId} monoId={monoId} file={file} /> : <DocumentPage desktopId={desktopId} monoId={monoId} documentId={name} />;
+export function MonoFileScreen({ desktopId, monoId, name, mind }: { desktopId: string; monoId: string; name: string; mind?: MindFile | undefined }) {
+  // Only the `mind` search param opens the viewer: a document id of `soul`, `memory` or `Memory.md` is a document.
+  return mind ? <MindViewer desktopId={desktopId} monoId={monoId} file={mind} /> : <DocumentPage desktopId={desktopId} monoId={monoId} documentId={name} />;
 }
 
 function Back({ desktopId, monoId }: { desktopId: string; monoId: string }) {

@@ -8,17 +8,15 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { Composer } from "@/features/composer/Composer";
-import { useLinkReady } from "@/features/composer/SessionComposer";
+import { SessionQuestionCard, SessionUsageCard, useLinkReady } from "@/features/composer/SessionComposer";
 import { useSendGuard } from "@/features/composer/useSendGuard";
 import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
-import { DocumentDialog } from "@/features/transcript/DocumentDialog";
 import { Transcript } from "@/features/transcript/Transcript";
 import type { TranscriptActions } from "@/features/transcript/context";
 import { useOlderTurns } from "@/features/transcript/useOlderTurns";
-import type { DocumentItem } from "@/features/transcript/turnItems";
 import { safeHexColor } from "@/lib/color";
 import { useLinkMutation } from "@/data";
 import { Badge } from "@/ui/badge";
@@ -32,8 +30,12 @@ import { MonoMenu } from "./MonoMenu";
 
 const EXCERPT = 140;
 const excerpt = (text: string) => (text.length > EXCERPT ? `${text.slice(0, EXCERPT - 1)}...` : text);
-/** The replied-to message as a Markdown quote, so the Mono sees what the reply answers. */
-const quote = (text: string) => excerpt(text).split("\n").map((line) => `> ${line}`).join("\n");
+const QUOTE_MAX = 280;
+/** The replied-to message as a one-line Markdown quote (as on mobile), so the Mono sees what the reply answers. */
+const quote = (text: string) => {
+  const line = text.replace(/\s+/g, " ").trim();
+  return `> ${line.length > QUOTE_MAX ? `${line.slice(0, QUOTE_MAX - 1)}…` : line}`;
+};
 
 export const monoConversationId = (monoId: string) => `mono:${monoId}`;
 
@@ -52,7 +54,6 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const older = useOlderTurns(conversationId, state?.turns ?? [], state?.older ?? false);
   const cancel = useLinkMutation("session.cancel");
   const accentStyle = useMonoAccentStyle(desktopId, monoId);
-  const [document, setDocument] = useState<DocumentItem | null>(null);
   // F-71: the message being replied to; the reply is sent with it quoted.
   const [replyTo, setReplyTo] = useState<HeldMessage | null>(null);
 
@@ -65,7 +66,10 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const actions = useMemo<TranscriptActions>(
     () => ({
       onNavigate: (href) => void navigate({ to: href as never }),
-      onOpenDocument: setDocument,
+      // A document card opens the profile's document page: it reads the document's own body and visual tree.
+      onOpenDocument: (item) => {
+        void navigate({ to: "/d/$desktopId/monos/$monoId/profile/file/$name", params: { desktopId, monoId, name: item.documentId } });
+      },
       onOpenSession: (_projectId, sessionId) => {
         void navigate({ to: "/d/$desktopId/s/$sessionId", params: { desktopId, sessionId } });
       },
@@ -79,7 +83,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             },
           }),
     }),
-    [catalog, desktopId, navigate, readOnly, send],
+    [catalog, desktopId, monoId, navigate, readOnly, send],
   );
 
   const retry = useCallback((id: string) => void conversation.retry(id), [conversation]);
@@ -130,7 +134,17 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             </Glass>
           ) : null}
           {monoTools ? (
-            <MonoMenu desktopId={desktopId} monoId={monoId} />
+            <>
+              <Link
+                to="/d/$desktopId/monos/$monoId/profile"
+                params={{ desktopId, monoId }}
+                aria-label="Mono profile"
+                className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection pointer-fine:size-9"
+              >
+                <Icon name="info" size={18} />
+              </Link>
+              <MonoMenu desktopId={desktopId} monoId={monoId} />
+            </>
           ) : (
             <Link
               to="/d/$desktopId/settings"
@@ -184,8 +198,16 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
           />
         </MessageActions>
       )}
-      <DocumentDialog document={document} onClose={() => setDocument(null)} />
-      <ComposerRegion desktopId={desktopId} sessionId={conversationId}>
+      <ComposerRegion
+        desktopId={desktopId}
+        sessionId={conversationId}
+        above={
+          <>
+            {state?.usageLimit ? <SessionUsageCard sessionId={conversationId} state={state.usageLimit} readOnly={readOnly} /> : null}
+            {state?.question ? <SessionQuestionCard sessionId={conversationId} prompt={state.question} readOnly={readOnly} /> : null}
+          </>
+        }
+      >
         <Composer
           onSubmit={submit}
           busy={state?.busy ?? false}

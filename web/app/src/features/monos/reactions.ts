@@ -5,7 +5,7 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { getLinkStore } from "@/link";
 
-export const REACTIONS_DB = "monoptah-mono-reactions";
+export const REACTIONS_DB = "monoptah.monoReactions";
 export const REACTIONS_STORE = "reactions";
 
 /** The 12 reactions offered, two rows of six as Messages lays them out. */
@@ -23,6 +23,8 @@ interface State {
 let state: State = { desktopId: null, loaded: false, reactions: {} };
 /** Counts the loads and resets, so a read that was overtaken by either is dropped when it comes back. */
 let generation = 0;
+/** A reaction was set before the stored ones were read: the merged result is written once they are. */
+let dirty = false;
 const listeners = new Set<() => void>();
 
 function publish(next: State): void {
@@ -82,6 +84,7 @@ function clean(stored: unknown): MonoReactions {
 export function loadReactions(desktopId: string | undefined): void {
   if (!desktopId || state.desktopId === desktopId) return;
   const mine = ++generation;
+  dirty = false;
   publish({ desktopId, loaded: !hasIdb(), reactions: {} });
   if (!hasIdb()) return;
   void withStore<unknown>("readonly", (store) => store.get(desktopId))
@@ -92,15 +95,29 @@ export function loadReactions(desktopId: string | undefined): void {
       const merged: Record<string, Record<string, string>> = {};
       for (const monoId of new Set([...Object.keys(stored), ...Object.keys(state.reactions)])) merged[monoId] = { ...stored[monoId], ...state.reactions[monoId] };
       publish({ desktopId, loaded: true, reactions: merged });
+      // What was set while the read was out is written on top of what was stored, never instead of it.
+      if (dirty) {
+        dirty = false;
+        persist(desktopId, merged);
+      }
     });
 }
 
-function save(desktopId: string, reactions: MonoReactions): void {
-  publish({ ...state, reactions });
+function persist(desktopId: string, reactions: MonoReactions): void {
   // A revoked link keeps nothing on disk.
   const link = getLinkStore(desktopId).getState();
   if (!hasIdb() || link.revoked || link.blocked === "revoked") return;
   void withStore("readwrite", (store) => store.put(reactions, desktopId)).catch(() => undefined);
+}
+
+function save(desktopId: string, reactions: MonoReactions): void {
+  publish({ ...state, reactions });
+  // Before the stored reactions are read, writing now would replace them with only this one.
+  if (!state.loaded) {
+    dirty = true;
+    return;
+  }
+  persist(desktopId, reactions);
 }
 
 /** Sets (or, with null, removes) the reaction of one message of a Mono. */
@@ -127,6 +144,7 @@ export async function forgetReactions(desktopId: string): Promise<void> {
 /** Forgets what is in memory. For tests. */
 export function resetReactions(): void {
   generation += 1;
+  dirty = false;
   publish({ desktopId: null, loaded: false, reactions: {} });
 }
 

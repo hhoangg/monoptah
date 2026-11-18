@@ -19,7 +19,8 @@ import { createAppRouter } from "@/router";
 import { clearHooks } from "@/ui/hooks";
 import { clearSlots } from "@/ui/slots";
 import { WsPSettingsSections } from "@/features/themes/SettingsSections";
-import { REACTIONS_DB, REACTIONS_STORE, REACTION_EMOJIS, loadReactions, resetReactions } from "./reactions";
+import { MonosOnlySection } from "./MonosOnlySection";
+import { REACTIONS_DB, REACTIONS_STORE, REACTION_EMOJIS, loadReactions, resetReactions, setReaction } from "./reactions";
 import { MONOS_ONLY_KEY, reloadMonoPrefs, useMonoPrefs } from "./monoPrefs";
 import { MONO_ACCENTS_KEY, reloadMonoAccents, setMonoAccent } from "./monoAccent";
 
@@ -182,9 +183,14 @@ describe("Mono home (F-13)", () => {
 });
 
 describe("Monos only setting (F-13)", () => {
-  it("is a switch in the WS-P settings group, stored as monoptah.monosOnly", async () => {
-    const user = userEvent.setup();
+  it("is not offered in the settings page until the workspace home reads it", () => {
     render(<WsPSettingsSections />);
+    expect(screen.queryByRole("switch", { name: "Monos only" })).toBeNull();
+  });
+
+  it("is a switch stored as monoptah.monosOnly", async () => {
+    const user = userEvent.setup();
+    render(<MonosOnlySection />);
     const toggle = screen.getByRole("switch", { name: "Monos only" });
     expect(toggle).toHaveAttribute("aria-checked", "false");
     await user.click(toggle);
@@ -244,6 +250,10 @@ describe("message actions (F-71)", () => {
     fireEvent.contextMenu(await reply());
     await user.click(await screen.findByRole("menuitem", { name: "Mark unread" }));
     await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}`));
+    // Opening the chat had marked it seen; now the Mono list shows it unread again.
+    await router.navigate({ to: "/d/$desktopId/monos", params: { desktopId: DESKTOP_ID } });
+    const row = (await screen.findAllByTestId("mono-row")).find((candidate) => candidate.textContent?.includes("Example Mono"))!;
+    expect(row).toHaveAttribute("data-unread", "true");
   });
 
   it("copies the message text", async () => {
@@ -262,5 +272,202 @@ describe("message actions (F-71)", () => {
     const menu = await screen.findByRole("menu");
     expect(within(menu).queryByRole("group", { name: "Reactions" })).toBeNull();
     expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Mark unread", "Copy"]);
+  });
+});
+
+describe("message actions on touch, from the keyboard and with the native menu (F-71)", () => {
+  const reply = () => screen.findByText("Done. This is canned example output.");
+  const messageOf = async () => (await reply()).closest<HTMLElement>("[data-chat-message-role]")!;
+
+  it("opens from a long press on touch, where iOS fires no contextmenu", async () => {
+    mount(`/monos/${MONO}`);
+    const message = await messageOf();
+    fireEvent.pointerDown(message, { pointerType: "touch", button: 0 });
+    // Radix opens the menu from a 700 ms pointerdown timer.
+    expect(await screen.findByRole("menu", undefined, { timeout: 2000 })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Copy" })).toBeInTheDocument();
+  });
+
+  it("does not open from a long press outside a message", async () => {
+    mount(`/monos/${MONO}`);
+    const message = await messageOf();
+    fireEvent.pointerDown(message.closest("[data-turn-id]")!, { pointerType: "touch", button: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("opens from the keyboard through the Message actions button", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}`);
+    const button = await within(await messageOf()).findByRole("button", { name: "Message actions" });
+    button.focus();
+    await user.keyboard("{Enter}");
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Reply" })).toBeInTheDocument();
+    // The button is not part of what Copy copies.
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    await user.click(screen.getByRole("menuitem", { name: "Copy" }));
+    expect(writeText).toHaveBeenCalledWith("Done. This is canned example output.");
+  });
+
+  it("opens from Shift+F10 and the Menu key on a focused part of a message", async () => {
+    mount(`/monos/${MONO}`);
+    const button = await within(await messageOf()).findByRole("button", { name: "Message actions" });
+    fireEvent.keyDown(button, { key: "F10", shiftKey: true });
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    fireEvent.keyDown(button, { key: "ContextMenu" });
+    expect(await screen.findByRole("menu")).toBeInTheDocument();
+  });
+
+  it("keeps the browser's menu when text is selected in the message", async () => {
+    mount(`/monos/${MONO}`);
+    const message = await messageOf();
+    window.getSelection()?.selectAllChildren(message);
+    const notPrevented = fireEvent.contextMenu(await reply());
+    expect(notPrevented).toBe(true);
+    expect(screen.queryByRole("menu")).toBeNull();
+    window.getSelection()?.removeAllRanges();
+  });
+
+  it("keeps the browser's menu on a link inside a message", async () => {
+    mount(`/monos/${MONO}`);
+    const message = await messageOf();
+    const link = document.createElement("a");
+    link.href = "https://example.com/";
+    link.textContent = "a link";
+    message.append(link);
+    expect(fireEvent.contextMenu(link)).toBe(true);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+});
+
+describe("Mono chat cards", () => {
+  const prompt = {
+    requestId: 7,
+    autoResolveAt: Date.now() + 120_000,
+    questions: [{ id: "q1", prompt: "Which branch?", multiSelect: false, allowCustom: true, options: [{ id: "main", label: "main" }, { id: "dev", label: "dev" }] }],
+  };
+  const usage = { token: "tok", resetsAt: null, resumeAtReset: false, canResume: true, canAutoResume: false, resetLabel: "in 2 hours", limitation: "Usage limit reached" };
+
+  function withFrame(extra: (first: boolean) => Record<string, unknown>) {
+    return (desktop: MockDesktop) => {
+      const next = desktop.world.nextFrame.bind(desktop.world);
+      desktop.world.nextFrame = (id, cursor) => {
+        const first = cursor.first;
+        const frame = next(id, cursor);
+        return frame && id === `mono:${MONO}` ? ({ ...frame, ...extra(first) } as typeof frame) : frame;
+      };
+    };
+  }
+
+  it("shows the pending question above the composer", async () => {
+    mount(`/monos/${MONO}`, { seed: withFrame((first) => (first ? { question: prompt } : {})) });
+    const card = await screen.findByTestId("question-card");
+    expect(card).toHaveTextContent("Which branch?");
+    expect(within(screen.getByTestId("composer-region")).getByTestId("question-card")).toBe(card);
+  });
+
+  it("shows the usage limit card above the composer", async () => {
+    mount(`/monos/${MONO}`, { seed: withFrame(() => ({ usageLimit: usage })) });
+    expect(await screen.findByTestId("usage-limit-card")).toBeInTheDocument();
+  });
+
+  it("opens a document card on the Mono's document page, not a dialog", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(`/monos/${MONO}`, {
+      seed: (desktop) => {
+        desktop.world.sessions.get(`mono:${MONO}`)!.turns.push({ id: "t-doc", stampAt: Date.now(), items: [{ type: "document", id: "dd1", documentId: "doc-0", title: "Plan", kind: "md" }] } as never);
+      },
+    });
+    await user.click(await screen.findByRole("button", { name: "Open document Plan" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/monos/${MONO}/profile/file/doc-0`));
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("quotes a reply on one line, cut at 280 characters", async () => {
+    const user = userEvent.setup();
+    const long = `Line  one   ${"x".repeat(400)}`;
+    mount(`/monos/${MONO}`, {
+      seed: (desktop) => {
+        const turn = desktop.world.sessions.get(`mono:${MONO}`)!.turns.find((candidate) => candidate.items.some((item) => item.type === "text"))!;
+        (turn.items.find((item) => item.type === "text") as unknown as { text: string }).text = long;
+      },
+    });
+    fireEvent.contextMenu(await screen.findByText(/Line one/));
+    await user.click(await screen.findByRole("menuitem", { name: "Reply" }));
+    await user.type(await field(), "ok");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(JSON.stringify(link.desktop.world.sessions.get(`mono:${MONO}`)!.turns)).toContain("\\n\\nok"));
+    const sent = JSON.stringify(link.desktop.world.sessions.get(`mono:${MONO}`)!.turns);
+    const quote = /> (Line one x+)…\\n\\nok/.exec(sent);
+    expect(quote).not.toBeNull();
+    // 279 characters and an ellipsis.
+    expect(quote![1]!).toHaveLength(279);
+  });
+
+  it("offers a profile action in the header when the desktop allows Mono tools", async () => {
+    mount(`/monos/${MONO}`);
+    expect(await screen.findByRole("link", { name: "Mono profile" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/monos/${MONO}/profile`);
+  });
+});
+
+describe("Mono home status", () => {
+  it("shows Needs you in the caution colour, and only a working Mono as working", async () => {
+    mount("/monos", {
+      seed: (desktop) => {
+        const monos = desktop.world.monos() as unknown as Array<Record<string, unknown>>;
+        monos[0]!.status = "needs-you";
+        monos[1]!.status = "working";
+      },
+    });
+    const rows = await screen.findAllByTestId("mono-row");
+    const needs = rows.find((row) => row.textContent?.includes("Example Mono"))!;
+    const working = rows.find((row) => row.textContent?.includes("Research Mono"))!;
+    expect(within(needs).getByText("Needs you")).toHaveClass("text-caution");
+    expect(needs).not.toHaveTextContent("Working");
+    expect(working).toHaveTextContent("Working...");
+  });
+
+  it("keeps the Hidden line a 44px target", async () => {
+    mount("/monos");
+    const research = (await screen.findAllByTestId("mono-row")).find((row) => row.textContent?.includes("Research Mono"))!;
+    fireEvent.contextMenu(research);
+    await userEvent.setup().click(await screen.findByRole("menuitem", { name: "Hide" }));
+    expect(await screen.findByRole("button", { name: /Hidden \(1\)/ })).toHaveClass("min-h-11");
+  });
+});
+
+describe("reactions store (F-71)", () => {
+  const seedStored = (desktopId: string, value: unknown) =>
+    new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open(REACTIONS_DB, 1);
+      open.onupgradeneeded = () => open.result.createObjectStore(REACTIONS_STORE);
+      open.onsuccess = () => {
+        const tx = open.result.transaction(REACTIONS_STORE, "readwrite");
+        tx.objectStore(REACTIONS_STORE).put(value, desktopId);
+        tx.oncomplete = () => {
+          open.result.close();
+          resolve();
+        };
+        tx.onerror = () => reject(tx.error);
+      };
+      open.onerror = () => reject(open.error);
+    });
+
+  it("lives in a database under the monoptah. prefix", () => {
+    expect(REACTIONS_DB).toBe("monoptah.monoReactions");
+  });
+
+  it("does not overwrite the stored reactions when one is set before they were read", async () => {
+    await seedStored("desk-x", { [MONO]: { "t1#0": "\u{1F44D}" } });
+    setReaction("desk-x", MONO, "t2#0", "\u{1F525}");
+    await waitFor(async () => {
+      const stored = JSON.stringify(await storedReactions("desk-x"));
+      expect(stored).toContain("\u{1F525}");
+      expect(stored).toContain("\u{1F44D}");
+    });
   });
 });
