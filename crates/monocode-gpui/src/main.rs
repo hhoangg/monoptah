@@ -44,6 +44,7 @@ mod emoji_library;
 mod explorer;
 mod file_editor;
 mod file_icons;
+mod file_links;
 mod fix_terminal;
 mod fixtures;
 mod fonts;

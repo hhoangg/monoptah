@@ -9315,6 +9315,7 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.keep_visible_idle_agents(cx);
         self.sync_ui_scale(window, cx);
+        crate::file_links::note_window_project(window, &self.workspace.project, cx);
         if !self.cloud_archive_request.is_empty() {
             let ids = std::mem::take(&mut self.cloud_archive_request);
             let this = cx.entity();
@@ -9702,7 +9703,19 @@ impl Render for Shell {
                         return;
                     }
                     let cwd = this.git.read(cx).project().to_owned();
-                    let (path, location) = crate::file_editor::file_location(&event.0, &cwd);
+                    // A Mono's chat links are bound to its first project; the file may be in
+                    // another one (or in the project the window shows).
+                    let roots = if this.mono_active(cx) {
+                        let projects = this
+                            .monos
+                            .as_ref()
+                            .and_then(|m| m.read(cx).current().map(|m| m.projects.clone()))
+                            .unwrap_or_default();
+                        crate::file_links::candidate_roots(Some(&this.workspace.project), &projects)
+                    } else {
+                        Vec::new()
+                    };
+                    let (path, location) = crate::file_links::resolve_link(&event.0, &cwd, &roots);
                     this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
                     // Monos render above the session pane tree. Give its file
                     // an independent visible tab using the normal navigation
