@@ -36,14 +36,14 @@ const SIGN: Record<DiffLine["kind"], string> = { add: "+", del: "-", context: " 
 const Row = memo(function Row({ line, tokens, wrap }: { line: DiffLine; tokens: CodeToken[] | undefined; wrap: boolean }) {
   if (line.kind === "hunk") {
     return (
-      <div role="row" data-kind="hunk" className="bg-fill px-3 py-0.5 text-muted-text">
+      <div role="listitem" data-kind="hunk" className="bg-fill px-3 py-0.5 text-muted-text">
         {line.text}
       </div>
     );
   }
   return (
     <div
-      role="row"
+      role="listitem"
       data-kind={line.kind}
       className={cn("flex", line.kind === "add" && "bg-additions/10", line.kind === "del" && "bg-deletions/10")}
     >
@@ -79,8 +79,8 @@ export function DiffView({ file }: { file: ChangedFile }) {
           {file.relative}
         </span>
         <span className="text-small text-muted-text">{STATUS_LABEL[file.status]}</span>
-        {file.additions > 0 ? <span className="text-small text-additions">+{formatCount(file.additions)}</span> : null}
-        {file.deletions > 0 ? <span className="text-small text-deletions">-{formatCount(file.deletions)}</span> : null}
+        {file.additions > 0 ? <span className="text-small text-additions tabular-nums">+{formatCount(file.additions)}</span> : null}
+        {file.deletions > 0 ? <span className="text-small text-deletions tabular-nums">-{formatCount(file.deletions)}</span> : null}
         <button
           type="button"
           aria-label="Wrap lines"
@@ -91,7 +91,7 @@ export function DiffView({ file }: { file: ChangedFile }) {
           <Icon name="wrap" size={18} />
         </button>
       </header>
-      <div role="table" aria-label="Changed lines" tabIndex={0} className="min-h-0 flex-1 overflow-auto font-mono text-small leading-5">
+      <div role="list" aria-label="Changed lines" tabIndex={0} className="min-h-0 flex-1 overflow-auto font-mono text-small leading-5">
         <div className={wrap ? "" : "w-max min-w-full"}>
           {file.lines.length === 0 ? <p className="p-4 text-muted-text">There is no diff to show for this file.</p> : null}
           {blocks.map((block, index) => {
@@ -104,13 +104,13 @@ export function DiffView({ file }: { file: ChangedFile }) {
                   <Row key={`h${i}`} line={line} tokens={tokens?.get(line)} wrap={wrap} />
                 ))}
                 {hidden > 0 ? (
-                  <div role="row" className="flex items-center gap-2 bg-fill px-3 py-1 text-muted-text">
+                  <div role="listitem" className="flex flex-wrap items-center gap-2 bg-fill px-3 py-1 text-muted-text">
                     <Icon name="chevronUpDown" size={16} />
                     <span>{hidden} unchanged {hidden === 1 ? "line" : "lines"}</span>
-                    <button type="button" onClick={() => expand(block.id, total, "down")} className="min-h-9 rounded-pill px-3 hover:bg-selection">
+                    <button type="button" onClick={() => expand(block.id, total, "down")} className="min-h-11 rounded-pill px-3 hover:bg-selection pointer-fine:min-h-9">
                       Show {Math.min(UNIFIED_FOLD_STEP, hidden)} more
                     </button>
-                    <button type="button" onClick={() => expand(block.id, total, "all")} className="min-h-9 rounded-pill px-3 hover:bg-selection">
+                    <button type="button" onClick={() => expand(block.id, total, "all")} className="min-h-11 rounded-pill px-3 hover:bg-selection pointer-fine:min-h-9">
                       Show all {hidden}
                     </button>
                   </div>

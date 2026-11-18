@@ -8,7 +8,7 @@ import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Icon, type IconName } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { CommitDialog } from "./CommitDialog";
-import { barAction, canGenerate, errorText, openPullRequest, safePrUrl, sections, type BarKind, type ChangedFile, type GitStatus } from "./gitModel";
+import { barAction, canGenerate, nextSteps, errorText, openPullRequest, safePrUrl, sections, type BarAction, type BarKind, type ChangedFile, type GitStatus } from "./gitModel";
 import { useRunGitAction } from "./useGit";
 
 const ICONS: Record<BarKind, IconName> = { commit: "check", stageAll: "add", publish: "send", sync: "send", viewPr: "branch", createPr: "branch" };
@@ -54,6 +54,8 @@ export function GitActionBar({ projectId, files, status, canPush, onStageAll, st
 
   const { staged } = sections(files);
   const bar = barAction({ changed: files.length, staged: staged.length, status, canPush });
+  // Publish, Sync and the pull request stay reachable with a dirty tree (F-66); the main button may already be one of them.
+  const secondary = nextSteps({ changed: files.length, status, canPush }).filter((step) => step.kind !== bar?.kind);
   const additions = staged.reduce((sum, file) => sum + file.additions, 0);
   const deletions = staged.reduce((sum, file) => sum + file.deletions, 0);
   const branch = status?.branch ?? "this branch";
@@ -65,17 +67,17 @@ export function GitActionBar({ projectId, files, status, canPush, onStageAll, st
     setPush(next);
   };
 
-  const press = () => {
-    if (!bar) return;
+  const press = (action: BarAction | null = bar) => {
+    if (!action) return;
     setError(null);
-    if (bar.kind === "stageAll") {
+    if (action.kind === "stageAll") {
       if (onStageAll) onStageAll();
       else void stageEverything();
     }
-    else if (bar.kind === "commit") setCommitOpen(true);
-    else if (bar.kind === "viewPr") {
+    else if (action.kind === "commit") setCommitOpen(true);
+    else if (action.kind === "viewPr") {
       if (!openPullRequest(status?.pr?.url)) setError("This pull request link is not a safe https address.");
-    } else ask({ kind: bar.kind });
+    } else ask({ kind: action.kind });
   };
 
   const stageEverything = async () => {
@@ -131,11 +133,17 @@ export function GitActionBar({ projectId, files, status, canPush, onStageAll, st
         </Notice>
       ) : null}
       {bar ? (
-        <Button type="button" size="lg" disabled={stagingAll || busy} aria-busy={stagingAll} onClick={press}>
+        <Button type="button" size="lg" disabled={stagingAll || busy} aria-busy={stagingAll} onClick={() => press()}>
           <Icon name={ICONS[bar.kind]} size={18} />
           {bar.label}
         </Button>
       ) : null}
+      {secondary.map((step) => (
+        <Button key={step.kind} type="button" size="lg" variant="outline" disabled={stagingAll || busy} onClick={() => press(step)}>
+          <Icon name={ICONS[step.kind]} size={18} />
+          {step.label}
+        </Button>
+      ))}
       <CommitDialog
         open={commitOpen}
         onOpenChange={setCommitOpen}
@@ -145,6 +153,8 @@ export function GitActionBar({ projectId, files, status, canPush, onStageAll, st
         status={status}
         canGenerate={canGenerate(status)}
         canPush={canPush}
+        secondary={secondary}
+        onSecondary={(step) => press(step)}
         run={run}
         onCommitted={onChanged}
         onCommitAndPush={(message) => ask({ kind: "commit", message })}

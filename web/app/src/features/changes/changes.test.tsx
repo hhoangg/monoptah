@@ -2,21 +2,21 @@
 // desktop, whose project.changes, project.git and project.gitAction are replaced in-process (and restored).
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { KNOWN_CAPABILITIES } from "@monoptah/protocol";
 import { FIXTURE_HANDLERS, FixtureError } from "@monoptah/mock-desktop";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
-import { clearPanels } from "@/features/layout/panels";
+import { clearPanels, openPanel, registerPanel } from "@/features/layout/panels";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace } from "@/features/sessions/dev/mockLink";
 import { resetSessionActivity } from "@/features/sessions/activityStore";
 import { resetHighlighting } from "@/features/markdown/highlight/plugin";
-import { resetLinkConnections } from "@/link";
+import { LinkConnection, resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
-import { clearHooks } from "@/ui/hooks";
+import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots } from "@/ui/slots";
 import { MAX_KEPT_DIFFS, clearKeptDiffs, keepDiff, keptDiff, keptDiffCount } from "./shownDiffs";
 import { POLL_MS, barAction, safePrUrl, type ChangedFile, type GitStatus } from "./gitModel";
@@ -138,10 +138,10 @@ describe("changes list (F-64, F-65)", () => {
     const changes = screen.getByRole("region", { name: "Changes" });
     expect(within(staged).getAllByTestId("change-row")).toHaveLength(1);
     expect(within(changes).getAllByTestId("change-row")).toHaveLength(2);
-    const readme = within(changes).getByRole("button", { name: "Open diff of README.md" });
+    const readme = within(changes).getByRole("button", { name: /^Open diff of README\.md/ });
     expect(readme).toHaveTextContent("A");
     expect(readme).toHaveTextContent("+3");
-    expect(within(staged).getByRole("button", { name: "Open diff of src/a.ts" })).toHaveTextContent("M");
+    expect(within(staged).getByRole("button", { name: /^Open diff of src\/a\.ts/ })).toHaveTextContent("M");
   });
 
   it("stages a file at once and keeps it after the desktop answers", async () => {
@@ -372,7 +372,7 @@ describe("diff screen (F-68)", () => {
     const view = await screen.findByTestId("diff-view");
     await waitFor(() => expect(view.textContent).toContain("new <b>line</b>"));
     expect(view.querySelector("b")).toBeNull();
-    const rows = within(view).getAllByRole("row");
+    const rows = within(view).getAllByRole("listitem");
     expect(rows.some((row) => row.dataset["kind"] === "hunk")).toBe(true);
     expect(rows.find((row) => row.dataset["kind"] === "add")).toHaveTextContent("1");
   });
@@ -392,7 +392,7 @@ describe("diff screen (F-68)", () => {
     expect(within(fold).getByText("7 unchanged lines")).toBeInTheDocument();
     await user.click(within(fold).getByRole("button", { name: "Show all 7" }));
     expect(within(fold).queryByText(/unchanged line/)).toBeNull();
-    expect(within(fold).getAllByRole("row")).toHaveLength(27);
+    expect(within(fold).getAllByRole("listitem")).toHaveLength(27);
   });
 
   it("toggles wrapping", async () => {
@@ -406,15 +406,21 @@ describe("diff screen (F-68)", () => {
 
   it("opens from the list and keeps showing a diff that left the list", async () => {
     const user = userEvent.setup();
-    list();
-    await user.click(await screen.findByRole("button", { name: "Open diff of src/b.ts" }));
+    const { queryClient } = list();
+    await user.click(await screen.findByRole("button", { name: /^Open diff of src\/b\.ts/ }));
     await screen.findByTestId("diff-view");
+    // The desktop no longer lists the file, and the list is really read again (not a focus event that refetches nothing).
     files = [];
+    const before = changesCalls;
     await act(async () => {
-      fireEvent.focus(window);
+      await queryClient.refetchQueries({ predicate: (query) => query.queryKey[2] === "project.changes" });
     });
-    expect(keptDiff("proj-alpha", "src/b.ts")).toBeDefined();
-    expect(screen.getByTestId("diff-view")).toBeInTheDocument();
+    expect(changesCalls).toBeGreaterThan(before);
+    const cached = queryClient.getQueryCache().getAll().find((query) => query.queryKey[2] === "project.changes");
+    expect((cached?.state.data as { files: unknown[] } | undefined)?.files).toEqual([]);
+    expect(keptDiff(DESKTOP_ID, "proj-alpha", "src/b.ts")).toBeDefined();
+    expect(screen.getByTestId("diff-view")).toHaveTextContent("src/b.ts");
+    expect(screen.queryByText("No longer changed")).toBeNull();
   });
 
   it("says so when a file has no changes and was never opened", async () => {
@@ -423,10 +429,10 @@ describe("diff screen (F-68)", () => {
   });
 
   it("keeps at most the last 4 diffs in memory", () => {
-    for (let i = 0; i < 7; i += 1) keepDiff("p", makeFile(`f${i}.ts`));
+    for (let i = 0; i < 7; i += 1) keepDiff("d", "p", makeFile(`f${i}.ts`));
     expect(keptDiffCount()).toBe(MAX_KEPT_DIFFS);
-    expect(keptDiff("p", "f0.ts")).toBeUndefined();
-    expect(keptDiff("p", "f6.ts")).toBeDefined();
+    expect(keptDiff("d", "p", "f0.ts")).toBeUndefined();
+    expect(keptDiff("d", "p", "f6.ts")).toBeDefined();
   });
 });
 
@@ -439,5 +445,208 @@ describe("git status (F-67)", () => {
     expect(view).toHaveTextContent("2 ahead, 1 behind");
     expect(view).toHaveTextContent("Tracking a remote branch");
     expect(within(view).getByRole("button", { name: "PR #12" })).toBeInTheDocument();
+  });
+});
+
+/** Holds every `project.gitAction` answer until the test releases it, and records what was sent and under which id. */
+function holdGitActions() {
+  const sent: Array<{ params: Record<string, unknown>; id: string | undefined }> = [];
+  const gates: Array<() => void> = [];
+  const original = LinkConnection.prototype.request;
+  vi.spyOn(LinkConnection.prototype, "request").mockImplementation(function (this: LinkConnection, method: string, params?: unknown, options?: { id?: string }) {
+    const result = (original as (...args: unknown[]) => Promise<unknown>).call(this, method, params, options);
+    if (method !== "project.gitAction") return result as never;
+    sent.push({ params: params as Record<string, unknown>, id: options?.id });
+    return new Promise((resolve, reject) => gates.push(() => void result.then(resolve, reject))) as never;
+  } as never);
+  return { sent, release: () => gates.shift()?.() };
+}
+
+/** Records the command id of each `project.gitAction` without holding the answer. */
+function recordGitIds() {
+  const sent: Array<{ params: Record<string, unknown>; id: string | undefined }> = [];
+  const original = LinkConnection.prototype.request;
+  vi.spyOn(LinkConnection.prototype, "request").mockImplementation(function (this: LinkConnection, method: string, params?: unknown, options?: { id?: string }) {
+    if (method === "project.gitAction") sent.push({ params: params as Record<string, unknown>, id: options?.id });
+    return (original as (...args: unknown[]) => unknown).call(this, method, params, options) as never;
+  } as never);
+  return sent;
+}
+
+describe("quick toggles (race)", () => {
+  it("sends the toggles one after the other and keeps the row where the user left it", async () => {
+    const user = userEvent.setup();
+    // The desktop applies each call to its state, so the list read after a call shows it.
+    actionImpl = (params) => {
+      if (params.action === "stage" || params.action === "unstage") {
+        const paths = params.paths as string[];
+        files = files.map((file) => (paths.includes(file.relative) ? { ...file, staged: params.action === "stage", unstaged: params.action !== "stage" } : file));
+      }
+      return { message: "ok" };
+    };
+    const held = holdGitActions();
+    list();
+    await screen.findByRole("region", { name: "Staged Changes" });
+    await user.click(screen.getByRole("checkbox", { name: "Stage b.ts" }));
+    // Toggled again before the desktop answered the first call.
+    await user.click(await screen.findByRole("checkbox", { name: "Unstage b.ts" }));
+    await waitFor(() => expect(held.sent).toHaveLength(1));
+    expect(held.sent[0]?.params).toMatchObject({ action: "stage", paths: ["src/b.ts"] });
+    expect(screen.getByRole("checkbox", { name: "Stage b.ts" })).toHaveAttribute("aria-checked", "false");
+    // The first answer arrives: the row must not flip back to staged while the second call is still to be sent.
+    held.release();
+    await waitFor(() => expect(held.sent).toHaveLength(2));
+    expect(held.sent[1]?.params).toMatchObject({ action: "unstage", paths: ["src/b.ts"] });
+    expect(screen.getByRole("checkbox", { name: "Stage b.ts" })).toHaveAttribute("aria-checked", "false");
+    held.release();
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "Stage b.ts" })).toHaveAttribute("aria-checked", "false"));
+    expect(files.find((file) => file.relative === "src/b.ts")?.staged).toBe(false);
+  });
+
+  it("disables the per-file toggles while Stage All runs", async () => {
+    const user = userEvent.setup();
+    const held = holdGitActions();
+    list();
+    await screen.findByRole("region", { name: "Staged Changes" });
+    await user.click(screen.getByRole("button", { name: "Stage All" }));
+    await waitFor(() => expect(held.sent).toHaveLength(1));
+    for (const box of screen.getAllByRole("checkbox")) expect(box).toBeDisabled();
+    held.release();
+    await waitFor(() => expect(screen.getAllByRole("checkbox").every((box) => !(box as HTMLButtonElement).disabled)).toBe(true));
+  });
+});
+
+describe("generate ids and polling", () => {
+  it("re-sends a pending generation under the same id, also after Stop writing, and stops polling on Stop", async () => {
+    const user = userEvent.setup();
+    actionImpl = (params) => (params.action === "generate" ? { pending: true } : { message: "ok" });
+    const sent = recordGitIds();
+    mount("changes/", { capabilities: NO_PUSH });
+    await user.click(await screen.findByRole("button", { name: "Commit 1 file" }));
+    const dialog = await screen.findByRole("dialog", { name: "Commit" });
+    const generates = () => sent.filter((call) => call.params["action"] === "generate");
+    await user.click(within(dialog).getByRole("button", { name: "Write a message" }));
+    await waitFor(() => expect(generates().length).toBeGreaterThanOrEqual(2), { timeout: 3000 });
+    expect(new Set(generates().map((call) => call.id)).size).toBe(1);
+    const firstId = generates()[0]?.id;
+    await user.click(await within(dialog).findByRole("button", { name: "Stop writing" }));
+    // Let a request that was already out settle, then the count must stay put: the polling loop ended.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const settled = generates().length;
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(generates()).toHaveLength(settled);
+    // Writing again is the same command to the desktop.
+    await user.click(within(dialog).getByRole("button", { name: "Write a message" }));
+    await waitFor(() => expect(generates().length).toBeGreaterThan(settled));
+    expect(generates().at(-1)?.id).toBe(firstId);
+  }, 15_000);
+
+  it("stops polling when the dialog closes", async () => {
+    const user = userEvent.setup();
+    actionImpl = (params) => (params.action === "generate" ? { pending: true } : { message: "ok" });
+    const sent = recordGitIds();
+    mount("changes/", { capabilities: NO_PUSH });
+    await user.click(await screen.findByRole("button", { name: "Commit 1 file" }));
+    const dialog = await screen.findByRole("dialog", { name: "Commit" });
+    await user.click(within(dialog).getByRole("button", { name: "Write a message" }));
+    await waitFor(() => expect(sent.filter((call) => call.params["action"] === "generate").length).toBeGreaterThanOrEqual(1));
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const settled = sent.length;
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(sent).toHaveLength(settled);
+  }, 15_000);
+});
+
+describe("next steps with a dirty tree (F-66)", () => {
+  it("offers Sync beside Commit, and confirms it like the bottom action", async () => {
+    const user = userEvent.setup();
+    status = { ...status, ahead: 2 };
+    mount("changes/");
+    await screen.findByRole("button", { name: "Commit 1 file" });
+    await user.click(await screen.findByRole("button", { name: "Sync" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent('"feature/x"');
+    expect(actions).toHaveLength(0);
+    await user.click(within(dialog).getByRole("button", { name: "Push" }));
+    await waitFor(() => expect(actions).toContainEqual({ projectId: "proj-alpha", action: "sync" }));
+  });
+
+  it("offers Publish Branch in the commit dialog and asks twice on the default branch", async () => {
+    const user = userEvent.setup();
+    status = { ...status, branch: "main", upstream: false };
+    mount("changes/");
+    await user.click(await screen.findByRole("button", { name: "Commit 1 file" }));
+    const commit = await screen.findByRole("dialog", { name: "Commit" });
+    await user.click(within(commit).getByRole("button", { name: "Publish Branch" }));
+    const first = await screen.findByRole("dialog", { name: /Publish "main"/ });
+    await user.click(within(first).getByRole("button", { name: "Push" }));
+    expect(actions).toHaveLength(0);
+    const second = await screen.findByRole("dialog", { name: /default branch "main"/ });
+    await user.click(within(second).getByRole("button", { name: "Push to default branch" }));
+    await waitFor(() => expect(actions).toContainEqual({ projectId: "proj-alpha", action: "sync" }));
+  });
+
+  it("shows View PR for an open pull request even with changes, and never Create PR while the tree is dirty", async () => {
+    const user = userEvent.setup();
+    status = { ...status, aheadOfDefault: 3, pr: { number: 7, url: "https://github.com/o/r/pull/7" } };
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    mount("changes/");
+    await user.click(await screen.findByRole("button", { name: "View PR #7" }));
+    expect(open).toHaveBeenCalledWith("https://github.com/o/r/pull/7", "_blank", "noopener,noreferrer");
+    expect(screen.queryByRole("button", { name: "Create PR" })).toBeNull();
+  });
+
+  it("is on the Git screen too, and hidden without Remote push in Git", async () => {
+    status = { ...status, upstream: false };
+    mount("git");
+    expect(await within(await screen.findByTestId("git-status")).findByRole("button", { name: "Publish Branch" })).toBeInTheDocument();
+  });
+
+  it("is hidden while the desktop does not report Remote push in Git", async () => {
+    status = { ...status, upstream: false, ahead: 1 };
+    mount("changes/", { capabilities: NO_PUSH });
+    await screen.findByRole("button", { name: "Commit 1 file" });
+    expect(screen.queryByRole("button", { name: /Publish Branch|Sync|View PR/ })).toBeNull();
+  });
+});
+
+describe("session-capabilities predicate", () => {
+  it("hides the changes screen, its data and the cross-link to Git when changes is refused", async () => {
+    registerSessionCapabilities((capability) => capability !== "changes");
+    mount("changes/");
+    expect(await screen.findByText("Changes are not available for this project.")).toBeInTheDocument();
+    expect(changesCalls).toBe(0);
+    expect(screen.queryByTestId("changes-view")).toBeNull();
+  });
+
+  it("hides the cross-link to Git on the changes screen when git is refused", async () => {
+    registerSessionCapabilities((capability) => capability !== "git");
+    mount("changes/");
+    await screen.findByTestId("changes-view");
+    expect(screen.queryByRole("link", { name: "Git status" })).toBeNull();
+  });
+
+  it("refuses the git screen, and its link to Changes when changes is refused", async () => {
+    registerSessionCapabilities((capability) => capability !== "git");
+    mount("git");
+    expect(await screen.findByText("Git is not available for this project.")).toBeInTheDocument();
+    expect(screen.queryByTestId("git-status")).toBeNull();
+  });
+
+  it("hides the Changes link on the git screen when changes is refused", async () => {
+    registerSessionCapabilities((capability) => capability !== "changes");
+    mount("git");
+    await screen.findByTestId("git-status");
+    expect(screen.queryByRole("link", { name: "Changes" })).toBeNull();
+  });
+
+  it("cannot open the panels the predicate refuses", () => {
+    for (const kind of ["files", "changes", "git"] as const) registerPanel(kind, { title: kind, component: () => null });
+    registerSessionCapabilities((capability) => capability === "changes");
+    const target = { desktopId: DESKTOP_ID, projectId: "proj-alpha" };
+    expect(openPanel("changes", target, { target: null, desktopCapabilities: [] })).toBe(true);
+    expect(openPanel("git", target, { target: null, desktopCapabilities: [] })).toBe(false);
+    expect(openPanel("files", target, { target: null, desktopCapabilities: [] })).toBe(false);
   });
 });

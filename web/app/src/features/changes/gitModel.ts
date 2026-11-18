@@ -70,6 +70,31 @@ export function barAction(input: { changed: number; staged: number; status: GitS
   return null;
 }
 
+/**
+ * The branch's next steps (F-66), offered next to the commit button whatever the tree looks like: publish or sync,
+ * and view or create the pull request. Only with `canPush`. A new PR needs a clean tree, a branch that is not the
+ * default one, no divergence and commits ahead of the default branch (as on mobile).
+ */
+export function nextSteps(input: { changed: number; status: GitStatus | undefined; canPush: boolean }): BarAction[] {
+  const { changed, status, canPush } = input;
+  if (!canPush || !status?.remote) return [];
+  const steps: BarAction[] = [];
+  if (!status.upstream) steps.push({ kind: "publish", label: "Publish Branch", pushes: true });
+  else if (status.ahead > 0 || status.behind > 0) steps.push({ kind: "sync", label: "Sync", pushes: true });
+  if (status.pr) steps.push({ kind: "viewPr", label: `View PR #${status.pr.number}`, pushes: false });
+  else if (
+    !!status.defaultBranch &&
+    status.branch !== status.defaultBranch &&
+    !(status.ahead > 0 && status.behind > 0) &&
+    changed === 0 &&
+    (status.aheadOfDefault ?? 0) > 0 &&
+    status.behind === 0
+  ) {
+    steps.push({ kind: "createPr", label: "Create PR", pushes: true });
+  }
+  return steps;
+}
+
 /** The URL when it is an https URL, else null (a desktop reply is data, never trusted to be a safe link). */
 export function safePrUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;

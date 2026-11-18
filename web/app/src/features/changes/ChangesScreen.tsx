@@ -11,6 +11,7 @@ export function ChangesScreen({ desktopId, projectId, path }: { desktopId: strin
   const capabilities = useLinkState((state) => state.capabilities);
   const project = useCatalog().data?.projects.find((candidate) => candidate.id === projectId);
   const allowed = sessionCan("changes", { target: null, desktopCapabilities: capabilities });
+  const canGit = sessionCan("git", { target: null, desktopCapabilities: capabilities });
   return (
     <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-col" data-testid="changes-screen">
       <header className="flex items-start gap-3 px-4 pt-3 pb-2">
@@ -20,10 +21,14 @@ export function ChangesScreen({ desktopId, projectId, path }: { desktopId: strin
             <Link to="/d/$desktopId/p/$projectId" params={{ desktopId, projectId }} className="hover:underline">
               {project?.name ?? "Project"}
             </Link>
-            {" / "}
-            <Link to="/d/$desktopId/p/$projectId/git" params={{ desktopId, projectId }} className="hover:underline">
-              Git status
-            </Link>
+            {canGit ? (
+              <>
+                {" / "}
+                <Link to="/d/$desktopId/p/$projectId/git" params={{ desktopId, projectId }} className="hover:underline">
+                  Git status
+                </Link>
+              </>
+            ) : null}
           </p>
         </div>
       </header>

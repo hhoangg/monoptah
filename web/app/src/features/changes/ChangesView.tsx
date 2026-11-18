@@ -1,7 +1,7 @@
 // F-64/F-65: the changes list. Staged and unstaged sections, status letters, +/- counts, stage and unstage per
 // file and for all (optimistic, rolled back on error), polled every 10 s while the screen is up, and the
 // context-aware bottom action. Read-only devices see the list without any control.
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
@@ -37,26 +37,40 @@ export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
     await Promise.all([changes.refetch(), git.refetch()]);
   };
 
-  const stage = async (paths: string[], toStaged: boolean, all = false) => {
-    const mark = (next: boolean | null) =>
+  // Optimistic staging that survives quick toggles: calls go out one after the other (the desktop applies them in
+  // the order the user clicked), and a call clears the optimistic value of a path only while it is still the
+  // latest one asked for that path, so an earlier answer never flips a row the user has toggled again.
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const latest = useRef(new Map<string, number>());
+  const counter = useRef(0);
+
+  const stage = (paths: string[], toStaged: boolean, all = false): Promise<void> => {
+    const token = ++counter.current;
+    for (const path of paths) latest.current.set(path, token);
+    setWanted((current) => {
+      const copy = new Map(current);
+      for (const path of paths) copy.set(path, toStaged);
+      return copy;
+    });
+    setError(null);
+    const task = queue.current.then(async () => {
+      try {
+        await run(all ? { action: toStaged ? "stageAll" : "unstageAll" } : { action: toStaged ? "stage" : "unstage", paths });
+        await reread();
+      } catch (reason) {
+        // The optimistic state is rolled back below (for the paths no later call owns).
+        setError(`Could not ${toStaged ? "stage" : "unstage"}: ${errorText(reason)}`);
+      }
+      const owned = paths.filter((path) => latest.current.get(path) === token);
+      for (const path of owned) latest.current.delete(path);
       setWanted((current) => {
         const copy = new Map(current);
-        for (const path of paths) {
-          if (next === null) copy.delete(path);
-          else copy.set(path, next);
-        }
+        for (const path of owned) copy.delete(path);
         return copy;
       });
-    mark(toStaged);
-    setError(null);
-    try {
-      await run(all ? { action: toStaged ? "stageAll" : "unstageAll" } : { action: toStaged ? "stage" : "unstage", paths });
-      await reread();
-    } catch (reason) {
-      // Roll the optimistic state back.
-      setError(`Could not ${toStaged ? "stage" : "unstage"}: ${errorText(reason)}`);
-    }
-    mark(null);
+    });
+    queue.current = task;
+    return task;
   };
 
   const stageAll = async (toStaged: boolean) => {
@@ -95,7 +109,7 @@ export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
           >
             <Icon name={collapsed.has(id) ? "chevronRight" : "chevronDown"} size={16} className="text-muted-text" />
             <span className="truncate">{title}</span>
-            <span className="rounded-pill bg-fill px-2 text-small text-muted-text">{formatCount(list.length)}</span>
+            <span className="rounded-pill bg-fill px-2 text-small text-muted-text tabular-nums">{formatCount(list.length)}</span>
           </button>
           {readOnly ? null : (
             <button
@@ -112,7 +126,7 @@ export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
         {collapsed.has(id) ? null : (
           <ul className="border-t border-stroke">
             {list.map((file) => (
-              <FileRow key={file.relative} file={file} readOnly={readOnly} onOpen={() => onOpenFile(file)} onToggle={() => void stage([file.relative], !isStaged(file))} />
+              <FileRow key={file.relative} file={file} readOnly={readOnly} busy={stagingAll} onOpen={() => onOpenFile(file)} onToggle={() => void stage([file.relative], !isStaged(file))} />
             ))}
           </ul>
         )}
@@ -129,8 +143,8 @@ export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
         <span className="truncate font-medium text-content">{changes.data.branch}</span>
         {files.length > 0 ? (
           <span>
-            {files.length} {files.length === 1 ? "file" : "files"}, <span className="text-additions">+{formatCount(additions)}</span>{" "}
-            <span className="text-deletions">-{formatCount(deletions)}</span>
+            {files.length} {files.length === 1 ? "file" : "files"}, <span className="text-additions tabular-nums">+{formatCount(additions)}</span>{" "}
+            <span className="text-deletions tabular-nums">-{formatCount(deletions)}</span>
           </span>
         ) : null}
       </p>
@@ -154,7 +168,7 @@ export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
   );
 }
 
-function FileRow({ file, readOnly, onOpen, onToggle }: { file: ChangedFile; readOnly: boolean; onOpen: () => void; onToggle: () => void }) {
+function FileRow({ file, readOnly, busy, onOpen, onToggle }: { file: ChangedFile; readOnly: boolean; busy: boolean; onOpen: () => void; onToggle: () => void }) {
   const { name, dir } = splitPath(file.relative);
   const staged = isStaged(file);
   const partly = isPartlyStaged(file);
@@ -168,6 +182,7 @@ function FileRow({ file, readOnly, onOpen, onToggle }: { file: ChangedFile; read
           role="checkbox"
           aria-checked={partly ? "mixed" : staged}
           aria-label={staged ? `Unstage ${name}` : `Stage ${name}`}
+          disabled={busy}
           onClick={onToggle}
           className="inline-flex size-11 shrink-0 items-center justify-center pointer-fine:size-9"
         >
@@ -180,7 +195,7 @@ function FileRow({ file, readOnly, onOpen, onToggle }: { file: ChangedFile; read
         type="button"
         disabled={!openable}
         onClick={onOpen}
-        aria-label={`Open diff of ${file.relative}`}
+        aria-label={`Open diff of ${file.relative}, ${STATUS_LABEL[file.status]}${file.additions > 0 ? `, ${file.additions} added` : ""}${file.deletions > 0 ? `, ${file.deletions} removed` : ""}`}
         className={cn("flex min-h-11 min-w-0 flex-1 items-center gap-2 py-1 pr-3 text-left hover:bg-selection disabled:hover:bg-transparent pointer-fine:min-h-9", readOnly && "pl-3")}
       >
         <FileTypeIcon name={name} isDir={false} />
@@ -188,8 +203,8 @@ function FileRow({ file, readOnly, onOpen, onToggle }: { file: ChangedFile; read
           <span className="block truncate text-label">{name}</span>
           {dir ? <span className="block truncate text-small text-faint">{dir}</span> : null}
         </span>
-        {file.additions > 0 ? <span className="text-small text-additions">+{formatCount(file.additions)}</span> : null}
-        {file.deletions > 0 ? <span className="text-small text-deletions">-{formatCount(file.deletions)}</span> : null}
+        {file.additions > 0 ? <span className="text-small text-additions tabular-nums">+{formatCount(file.additions)}</span> : null}
+        {file.deletions > 0 ? <span className="text-small text-deletions tabular-nums">-{formatCount(file.deletions)}</span> : null}
         <span title={STATUS_LABEL[file.status]} aria-label={STATUS_LABEL[file.status]} className="w-4 shrink-0 text-center font-mono text-small text-muted-text">
           {STATUS_LETTER[file.status]}
         </span>
