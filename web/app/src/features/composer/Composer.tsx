@@ -13,7 +13,7 @@
 // - F-47 morph (design-system.md section 6.2 and the Composer row): at rest the glass is a one-line pill, 50 px
 //   high with 25 px corners: add, dictation, the field and Send in one row; the workspace row and the model
 //   controls are clipped to nothing (still in the DOM, so a Tab into them focuses and opens the card). It becomes
-//   the card (26 px corners, field min 64, two rows) while it has focus, a draft, an attachment, a notice or an
+//   the card (26 px corners, field min 64, two rows) while the field or a keyboard-focused control has focus, a draft, an attachment, a notice or an
 //   error. The size change is a `motion` layout animation of 280 ms out-cubic (`--ease-out-cubic`); motion writes
 //   through the CSSOM, so the CSP needs no inline style attribute. With `prefers-reduced-motion` it is instant.
 //   `data-shape` says which one it is.
@@ -73,6 +73,15 @@ export interface ComposerProps {
   initialText?: string;
   onTextChange?: (text: string) => void;
   className?: string;
+}
+
+/** True when focus came from the keyboard (`:focus-visible`); a pointer press on a button is not. */
+function isKeyboardFocus(target: EventTarget): boolean {
+  try {
+    return target instanceof Element && target.matches(":focus-visible");
+  } catch {
+    return false;
+  }
 }
 
 export function Composer({ onSubmit, busy = false, onStop, readOnly = false, offline = false, notice, toolbar, topRow, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
@@ -226,9 +235,14 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
         animate={{ borderRadius: card ? CARD_RADIUS_PX : PILL_RADIUS_PX }}
         transition={reducedMotion ? { duration: 0 } : MORPH_TRANSITION}
         onFocus={(event) => {
-          // Only the field opens the card. A pointer press on a button (Stop, add) focuses it on pointerdown, and
-          // morphing the layout then moves the button from under the pointer, so the click never lands on it.
-          if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement) setFocusWithin(true);
+          // The field opens the card, and so does keyboard focus (Tab into a clipped control). A pointer press on a
+          // button (Stop, add) does not: morphing the layout then moves the button from under the pointer.
+          if (event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLInputElement || isKeyboardFocus(event.target)) setFocusWithin(true);
+        }}
+        onMouseDown={(event) => {
+          // A press on a composer button must not take focus from the field: in WebKit that blur (relatedTarget null)
+          // collapses the card on pointerdown and moves the button. Keyboard activation is unaffected.
+          if (event.target instanceof Element && event.target.closest("button") && !event.target.closest("[data-composer-extra]")) event.preventDefault();
         }}
         onBlur={(event) => {
           if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusWithin(false);
@@ -238,7 +252,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
         }}
         onDrop={onDrop}
       >
-        {topRow ? <div className={card ? "flex min-w-0 items-center gap-2 px-1" : "size-0 overflow-hidden"}>{topRow}</div> : null}
+        {topRow ? <div data-composer-extra className={card ? "flex min-w-0 items-center gap-2 px-1" : "size-0 overflow-hidden"}>{topRow}</div> : null}
 
         {attachments.length > 0 ? (
           <ul aria-label="Attachments" className="m-0 flex list-none gap-2 overflow-x-auto px-1 py-1">
@@ -302,7 +316,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
             <Icon name="add" size={18} />
           </button>
           <DictationButton onText={insertText} disabled={readOnly || blocked} className={cn("size-11 pointer-fine:size-9", !card && "order-2")} />
-          <div className={card ? "flex min-w-0 flex-1 items-center" : "order-4 size-0 overflow-hidden"}>{toolbar}</div>
+          <div data-composer-extra className={card ? "flex min-w-0 flex-1 items-center" : "order-4 size-0 overflow-hidden"}>{toolbar}</div>
           {showStop ? (
             <button
               type="button"

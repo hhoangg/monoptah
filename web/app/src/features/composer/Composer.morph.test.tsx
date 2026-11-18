@@ -81,6 +81,22 @@ describe("composer morph (F-47)", () => {
     expect(screen.getByRole("button", { name: "Model" }).parentElement?.className).not.toContain("overflow-hidden");
   });
 
+  it("opens the card when Shift+Tab lands on a clipped control from after the composer", async () => {
+    const user = userEvent.setup();
+    render(
+      <>
+        {/* Read-only: the field and buttons are disabled, so the clipped button is the only stop and the field cannot open the card. */}
+        <Composer onSubmit={() => Promise.resolve()} readOnly topRow={<button type="button">Workspace</button>} />
+        <button type="button">After</button>
+      </>,
+    );
+    screen.getByRole("button", { name: "After" }).focus();
+    expect(glass()).toHaveAttribute("data-shape", "pill");
+    await user.tab({ shift: true });
+    expect(glass()).toHaveAttribute("data-shape", "card");
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Workspace" }));
+  });
+
   it("morphs over 280 ms with out-cubic, the duration of design-system.md section 6.2", () => {
     expect(MORPH_TRANSITION).toEqual({ duration: 0.28, ease: [0.215, 0.61, 0.355, 1] });
   });

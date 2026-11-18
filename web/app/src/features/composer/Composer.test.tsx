@@ -101,14 +101,46 @@ describe("send", () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("also this", []));
   });
 
-  it("keeps its layout when Stop takes focus, so the press is not moved from under the pointer", () => {
+  it("keeps its layout when Stop takes pointer focus, so the press is not moved from under the pointer", () => {
+    // jsdom matches `:focus-visible` for every focus; a browser does not for a pointer press, so say it does not.
+    const matches = Element.prototype.matches;
+    const spy = vi.spyOn(Element.prototype, "matches").mockImplementation(function (this: Element, selector: string) {
+      return selector === ":focus-visible" ? false : matches.call(this, selector);
+    });
+    try {
+      const { field } = setup({ busy: true, onStop: () => Promise.resolve() });
+      const shape = () => field.closest("[data-shape]");
+      expect(shape()).toHaveAttribute("data-shape", "pill");
+      act(() => screen.getByRole("button", { name: "Stop" }).focus());
+      expect(shape()).toHaveAttribute("data-shape", "pill");
+      act(() => field.focus());
+      expect(shape()).toHaveAttribute("data-shape", "card");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a pointer press on Stop does not morph the pill and does not steal focus from the field", async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn(() => Promise.resolve());
+    const { field } = setup({ busy: true, onStop });
+    const shape = () => field.closest("[data-shape]");
+    const stop = screen.getByRole("button", { name: "Stop" });
+    await user.pointer({ keys: "[MouseLeft>]", target: stop });
+    expect(shape()).toHaveAttribute("data-shape", "pill");
+    expect(stop).not.toHaveFocus();
+    await user.pointer({ keys: "[/MouseLeft]", target: stop });
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the card when Stop is pressed while the empty field has focus", async () => {
+    const user = userEvent.setup();
     const { field } = setup({ busy: true, onStop: () => Promise.resolve() });
     const shape = () => field.closest("[data-shape]");
-    expect(shape()).toHaveAttribute("data-shape", "pill");
-    // A pointer press focuses the button on pointerdown; a layout change there would swallow the click.
-    act(() => screen.getByRole("button", { name: "Stop" }).focus());
-    expect(shape()).toHaveAttribute("data-shape", "pill");
     act(() => field.focus());
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    await user.pointer({ keys: "[MouseLeft>]", target: screen.getByRole("button", { name: "Stop" }) });
+    expect(field).toHaveFocus();
     expect(shape()).toHaveAttribute("data-shape", "card");
   });
 
