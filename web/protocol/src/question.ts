@@ -1,4 +1,15 @@
-// Stub owned later by WS-T, which extends it under W-17/W-18. It only re-exports the
-// question wire types from methods.ts (defined in wire.ts) so imports stay stable.
+// Question card types (W-17). The wire shapes are defined once in wire.ts and re-exported by
+// methods.ts; this file re-exports them and adds the element types the card uses.
+// Copied from src/features/sessions/model/userQuestion.ts at ca73ac2b
+// Types only.
+import type { QuestionPrompt, QuestionReply } from "./methods.ts";
+
 export { QuestionOptionSchema, QuestionPromptSchema, QuestionReplySchema, QuestionSchema } from "./methods.ts";
 export type { QuestionPrompt, QuestionReply } from "./methods.ts";
+
+/** One question of a prompt (desktop `UserQuestion`). */
+export type Question = QuestionPrompt["questions"][number];
+/** One selectable option of a question (desktop `UserQuestionOption`). */
+export type QuestionOption = Question["options"][number];
+/** The `answered` arm of a reply. */
+export type AnsweredQuestionReply = Extract<QuestionReply, { kind: "answered" }>;
