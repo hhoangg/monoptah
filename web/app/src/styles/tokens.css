@@ -127,6 +127,20 @@
   --radius: 12px;
 }
 
+/* Chart series hues (features/visuals/charts.tsx): the desktop's own chart colours, tuned for each scheme.
+   Light is the default, like the palette above. */
+:root,
+:root[data-scheme="light"] {
+  --viz-positive: #0a924b;  --viz-negative: #d01d21;  --viz-warning: #d96700;
+  --viz-series-2: #0a924b;  --viz-series-3: #863ad2;  --viz-series-4: #d96700;
+  --viz-series-5: #d12c80;  --viz-series-6: #0077d7;
+}
+:root[data-scheme="dark"] {
+  --viz-positive: #4fd57f;  --viz-negative: #fc5855;  --viz-warning: #fea247;
+  --viz-series-2: #4fd57f;  --viz-series-3: #b77df8;  --viz-series-4: #fea247;
+  --viz-series-5: #fa78b2;  --viz-series-6: #3faff3;
+}
+
 /* Accessibility overrides (design-system.md section 9) */
 :root[data-scheme="light"] {
   --muted: #666666;
