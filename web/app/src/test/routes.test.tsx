@@ -150,6 +150,9 @@ const SCREENS: Record<string, string> = {
   "/desktops/:id": "Desktop not found",
   "/desktops/dk1/verify": "Verify desktop",
   "/desktops/:id/verify": "Verify desktop",
+  // U-17 (WS-C): the cloud instance list, framed by the workspace with its "Cloud" h1.
+  "/d/dk1/cloud": "Cloud",
+  "/d/:desktopId/cloud": "Cloud",
   // The default test account is a member, so the admin routes show their guard screen (U-04).
   "/admin": "Not available",
   "/admin/users": "Not available",
