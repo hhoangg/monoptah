@@ -868,6 +868,8 @@ impl MobileHost {
         let result = self.call_from(via, peer, &request, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
+            // Still Ok here: no core refusal, so the app answered.
+            event.from_app = event.outcome == Outcome::Ok;
             event.outcome = outcome_of(event.outcome, &result);
             audit::record(&context, &event);
         }
@@ -1057,6 +1059,8 @@ impl MobileHost {
             .await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
+            // Still Ok here: no core refusal, so the app answered.
+            event.from_app = event.outcome == Outcome::Ok;
             event.outcome = outcome_of(event.outcome, &result);
             audit::record(&context, &event);
         }

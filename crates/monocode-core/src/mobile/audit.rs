@@ -121,6 +121,13 @@ pub struct AuditEvent {
     pub project_id: Option<String>,
     pub outcome: Outcome,
     pub command_id: Option<String>,
+    /// The call is not a read once its parameters are looked at (a
+    /// `mono.file` carrying `text` is a save), so it is written when it
+    /// succeeds.
+    pub writes: bool,
+    /// The call was admitted and reached the app, which answered it. Set by
+    /// the host after the call; a refusal in the core leaves it false.
+    pub from_app: bool,
 }
 
 impl AuditEvent {
@@ -139,6 +146,11 @@ impl AuditEvent {
             project_id: request["params"]["projectId"].as_str().map(Into::into),
             outcome: Outcome::Ok,
             command_id: request["id"].as_str().map(Into::into),
+            writes: !matches!(
+                policy::classify(method, &request["params"]),
+                Some(Access::Read)
+            ),
+            from_app: false,
         }
     }
 }
@@ -173,7 +185,7 @@ fn should_write(event: &AuditEvent) -> bool {
     if event.outcome != Outcome::Ok {
         return true;
     }
-    if param_dependent(&event.method) {
+    if param_dependent(&event.method) || event.writes {
         return true;
     }
     !matches!(
@@ -189,6 +201,7 @@ fn should_write(event: &AuditEvent) -> bool {
 /// core before the app, and any other failure, still write theirs.
 fn written_by_the_app(event: &AuditEvent) -> bool {
     event.method == "project.file"
+        && event.from_app
         && matches!(
             event.outcome,
             Outcome::Ok
@@ -427,6 +440,8 @@ mod tests {
             project_id: Some("p1".into()),
             outcome,
             command_id: Some("c1".into()),
+            writes: false,
+            from_app: false,
         }
     }
 
@@ -522,16 +537,47 @@ mod tests {
             Outcome::Denied(Code::PathDenied),
             Outcome::Denied(Code::NotSelected),
         ] {
-            log.record(&device(), &event("project.file", outcome));
+            let mut answered = event("project.file", outcome);
+            answered.from_app = true;
+            log.record(&device(), &answered);
         }
         assert!(lines(dir.path()).is_empty());
-        // A refusal the core made before the app, and a failure, still write.
+        // A refusal the core made before the app (the request never reached
+        // it, so nothing else writes a line), and a failure, still write.
         log.record(
             &device(),
-            &event("project.file", Outcome::Denied(Code::Revoked)),
+            &event("project.file", Outcome::Denied(Code::NotSelected)),
         );
+        assert_eq!(lines(dir.path()).len(), 1);
+        assert_eq!(lines(dir.path())[0]["outcome"], "denied:not_selected");
+        let mut revoked = event("project.file", Outcome::Denied(Code::Revoked));
+        revoked.from_app = true;
+        log.record(&device(), &revoked);
         log.record(&device(), &event("project.file", Outcome::Error));
-        assert_eq!(lines(dir.path()).len(), 2);
+        assert_eq!(lines(dir.path()).len(), 3);
+    }
+
+    #[test]
+    fn a_mono_file_save_is_written_and_a_read_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        let call = |params: Value| {
+            let request = json!({"id": "c", "params": params});
+            AuditEvent::for_call("abcdef0123456789", Transport::Quic, "mono.file", &request)
+        };
+        log.record(&device(), &call(json!({"monoId": "m", "file": "soul"})));
+        assert!(lines(dir.path()).is_empty());
+        log.record(
+            &device(),
+            &call(json!({"monoId": "m", "file": "soul", "text": "x"})),
+        );
+        let written = lines(dir.path());
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0]["method"], "mono.file");
+        assert_eq!(written[0]["outcome"], "ok");
+        assert!(!fs::read_to_string(dir.path().join(FILE))
+            .unwrap()
+            .contains("\"x\""));
     }
 
     #[test]
