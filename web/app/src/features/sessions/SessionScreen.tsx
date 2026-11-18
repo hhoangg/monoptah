@@ -1,8 +1,9 @@
 // `/d/:desktopId/s/:sessionId` (W-07): the header (back, title, the `session-header-chip` slot host), the
 // transcript of the conversation and the composer region (Task 5 mounts the composer there).
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useCallback, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
+import { useGuardedReplies } from "@/features/composer/useSendGuard";
 import { SessionComposer, SessionQuestionCard, SessionUsageCard } from "@/features/composer/SessionComposer";
 import { DocumentDialog } from "@/features/transcript/DocumentDialog";
 import { Transcript } from "@/features/transcript/Transcript";
@@ -35,8 +36,10 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
   const error = state ? latestSessionError(state.turns) : undefined;
   const errorKey = error ? `${state?.turns.at(-1)?.id ?? ""}:${error.text}` : null;
 
-  const { send } = conversation;
+  const { send, retry: retryTurn } = conversation;
   const projectId = session?.projectId;
+  // Retry and a tapped choice go through the send-guard like a typed message.
+  const replies = useGuardedReplies({ desktopId, sessionId, target: session?.target ?? null, send, retry: retryTurn });
   const actions = useMemo<TranscriptActions>(
     () => ({
       onOpenFile: (path) => {
@@ -53,16 +56,12 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
       ...(readOnly
         ? {}
         : {
-            onChoose: async (text: string) => {
-              const result = await send(text);
-              if (!result.sent) throw new Error(result.error ?? "not_sent");
-            },
+            onChoose: replies.onChoose,
           }),
     }),
-    [catalog, desktopId, navigate, projectId, readOnly, send],
+    [catalog, desktopId, navigate, projectId, readOnly, replies.onChoose],
   );
 
-  const retry = useCallback((id: string) => void conversation.retry(id), [conversation]);
   const title = session?.title ?? "Session";
 
   return (
@@ -110,7 +109,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
         loadingOlder={older.loading}
         olderError={older.error}
         loadOlder={older.loadOlder}
-        onRetry={readOnly ? undefined : retry}
+        onRetry={readOnly ? undefined : replies.onRetry}
         busy={state?.busy ?? false}
         actions={actions}
       />
@@ -121,6 +120,11 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
         above={
           <>
             {state?.usageLimit ? <SessionUsageCard sessionId={sessionId} state={state.usageLimit} readOnly={readOnly} /> : null}
+            {replies.error ? (
+              <p role="alert" className="px-4 pb-2 text-meta text-deletions" data-testid="send-refused">
+                {replies.error}
+              </p>
+            ) : null}
             {state?.question ? <SessionQuestionCard sessionId={sessionId} prompt={state.question} readOnly={readOnly} /> : null}
           </>
         }
@@ -136,6 +140,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
           notice={error && errorKey !== dismissedError ? { text: error.text, dismiss: () => setDismissedError(errorKey) } : null}
         />
       </ComposerRegion>
+      {replies.dialog}
     </div>
   );
 }

@@ -10,6 +10,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Turn } from "@monoptah/protocol";
 import type { OptimisticTurn } from "@/data";
+import { sendErrorMessage } from "@/features/composer/sendErrors";
 import { cn } from "@/lib/utils";
 import { useStableValue } from "@/lib/useStableValue";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
@@ -321,6 +322,9 @@ function SendStatus({ turn, onRetry }: { turn: OptimisticTurn; onRetry: ((id: st
   }
   return (
     <p className="pr-5 pb-3 text-right text-caption text-deletions" data-testid="not-sent">
+      <span className="mr-2" data-testid="not-sent-reason">
+        {sendErrorMessage(turn.error)}
+      </span>
       <button type="button" disabled={!onRetry} title={turn.error} onClick={() => onRetry?.(turn.id)} className="font-semibold underline">
         Not sent, retry
       </button>
