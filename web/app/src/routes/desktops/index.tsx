@@ -1,12 +1,7 @@
-// Route stub of /desktops. Owner: WS-M (workstreams.md 3.1).
+// Route of /desktops. Owner: WS-M (workstreams.md 3.1). Desktop list, pairing help and this account's devices.
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import { DesktopsScreen } from "@/features/desktops/DesktopsScreen";
 
 export const Route = createFileRoute("/desktops/")({
-  component: Page,
+  component: DesktopsScreen,
 });
-
-function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/desktops" purpose="Desktop list: online status, rename, color, pending confirmations badge." params={params} />;
-}

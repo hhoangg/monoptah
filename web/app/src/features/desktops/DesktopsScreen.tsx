@@ -1,0 +1,228 @@
+// `/desktops`: the desktop list, the "Pair a desktop" help with the optional paste field (F-02) and
+// this account's devices (U-01, N-09, N-12). Owner: WS-M. Names and OS strings come from other
+// machines: they are rendered as text only.
+import { Link, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { useState, type FormEvent } from "react";
+import { safeName, lastSeenLabel, versionLabel } from "./format";
+import { forgetDevice, useDesktops, useDevices, type DesktopSummary, type DeviceSummary } from "./api";
+import { desktopErrorMessage, ColorDot, Fingerprint, PresenceBadge } from "./parts";
+import { parsePairingInput } from "./pairingLink";
+import { useThisDevice } from "./thisDevice";
+import { SettingsLayout } from "@/features/settings/SettingsLayout";
+import { QueryBoundary } from "@/features/settings/QueryBoundary";
+import { formatRelative } from "@/features/settings/format";
+import { useAction } from "@/features/settings/useAction";
+import { Badge } from "@/ui/badge";
+import { Button, buttonVariants } from "@/ui/button";
+import { ConfirmDialog } from "@/ui/ConfirmDialog";
+import { Field } from "@/ui/Field";
+import { PageHeader } from "@/ui/PageHeader";
+import { SettingsCard } from "@/ui/SettingsCard";
+import { cn } from "@/lib/utils";
+
+export function DesktopsScreen() {
+  const desktops = useDesktops();
+  return (
+    <SettingsLayout>
+      <PageHeader title="Desktops" description="Open a desktop to work with its sessions, or manage who can reach it." />
+      <SettingsCard title="Your desktops">
+        <QueryBoundary query={desktops} label="desktops">
+          {(data) => (data.desktops.length === 0 ? <EmptyDesktops /> : <DesktopList desktops={data.desktops} />)}
+        </QueryBoundary>
+      </SettingsCard>
+      <PairSection />
+      <DevicesSection />
+    </SettingsLayout>
+  );
+}
+
+function EmptyDesktops() {
+  return (
+    <div className="px-1.5 py-3">
+      <p className="text-body text-content">No desktop is paired yet.</p>
+      <p className="mt-1 text-small text-muted-text">Pair one below.</p>
+    </div>
+  );
+}
+
+function DesktopList({ desktops }: { desktops: DesktopSummary[] }) {
+  return (
+    <ul className="m-0 list-none p-0">
+      {desktops.map((desktop) => (
+        <DesktopRow key={desktop.id} desktop={desktop} />
+      ))}
+    </ul>
+  );
+}
+
+function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
+  const name = safeName(desktop.name, "Unnamed desktop");
+  const version = versionLabel(desktop.os, desktop.appVersion);
+  return (
+    <li className="relative flex flex-wrap items-center gap-x-2 gap-y-1 rounded-row px-1.5 py-1 before:absolute before:top-0 before:right-0 before:left-4 before:h-px before:bg-stroke first:before:hidden">
+      <Link
+        to="/d/$desktopId"
+        params={{ desktopId: desktop.id }}
+        aria-label={`Open ${name}`}
+        className="flex min-h-13 min-w-0 flex-[1_1_12rem] items-center gap-3 rounded-row py-2 text-left hover:bg-selection active:opacity-60"
+      >
+        <ColorDot color={desktop.color} className="ml-1.5" />
+        <span className="min-w-0 flex-1 wrap-anywhere">
+          <span className="flex flex-wrap items-center gap-2 text-row text-content">
+            {name}
+            <PresenceBadge online={desktop.online} />
+            {desktop.pendingCount > 0 ? <Badge variant="brand">{`${desktop.pendingCount} to confirm`}</Badge> : null}
+          </span>
+          <span className="block text-meta text-muted-text">{[lastSeenLabel(desktop.lastSeenAt, desktop.online), version].filter(Boolean).join(" - ")}</span>
+        </span>
+      </Link>
+      <Link
+        to="/desktops/$id"
+        params={{ id: desktop.id }}
+        aria-label={`Manage ${name}`}
+        className={cn(buttonVariants({ variant: "outline", size: "sm" }), "shrink-0")}
+      >
+        Manage
+      </Link>
+    </li>
+  );
+}
+
+// --- Pair a desktop (F-02) ---
+
+function PairSection() {
+  const navigate = useNavigate();
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    const target = parsePairingInput(value);
+    if (!target) {
+      setError("That is not a pairing link or code of this app. Paste the link shown on the desktop, or its 8 character code.");
+      return;
+    }
+    setError(null);
+    await navigate({ to: "/pair/$code", params: { code: target.code }, hash: target.fp ? `fp=${encodeURIComponent(target.fp)}` : undefined });
+  }
+
+  return (
+    <SettingsCard
+      title="Pair a desktop"
+      footnote="On the desktop, open Settings > Web app > Pair. It shows a link and a QR code. Scan the code with this device, or paste the link here."
+    >
+      <form onSubmit={(event) => void submit(event)} className="flex flex-col gap-3 px-1.5 py-2" noValidate>
+        <Field
+          label="Paste a pairing link"
+          placeholder="Pairing link or code"
+          value={value}
+          onChange={(event) => {
+            setValue(event.target.value);
+            setError(null);
+          }}
+          autoComplete="off"
+          autoCapitalize="none"
+          spellCheck={false}
+          error={error}
+          hint="Optional. A link of this site, or the code shown next to it."
+        />
+        <Button type="submit" variant="outline" className="w-full sm:w-auto sm:self-start" disabled={value.trim() === ""}>
+          Continue
+        </Button>
+      </form>
+    </SettingsCard>
+  );
+}
+
+// --- This account's devices ---
+
+function DevicesSection() {
+  const devices = useDevices();
+  const thisDevice = useThisDevice();
+  return (
+    <SettingsCard
+      title="This account's devices"
+      footnote="Browsers that have asked to reach a desktop. Forgetting a device removes its access on every desktop and deletes its notifications."
+    >
+      <QueryBoundary query={devices} label="devices">
+        {(data) =>
+          data.devices.length === 0 ? (
+            <p className="px-1.5 py-3 text-small text-muted-text">No device has asked for access yet.</p>
+          ) : (
+            <DeviceList devices={data.devices} thisDeviceId={thisDevice?.deviceId ?? null} />
+          )
+        }
+      </QueryBoundary>
+    </SettingsCard>
+  );
+}
+
+function DeviceList({ devices, thisDeviceId }: { devices: DeviceSummary[]; thisDeviceId: string | null }) {
+  const queryClient = useQueryClient();
+  const action = useAction(desktopErrorMessage);
+  const [target, setTarget] = useState<DeviceSummary | null>(null);
+  const ordered = [...devices].sort((a, b) => Number(b.id === thisDeviceId) - Number(a.id === thisDeviceId) || (b.lastSeenAt ?? 0) - (a.lastSeenAt ?? 0));
+
+  async function confirm() {
+    if (!target) return;
+    const ok = await action.run(() => forgetDevice(queryClient, target.id));
+    if (ok) setTarget(null);
+  }
+
+  return (
+    <>
+      <ul className="m-0 list-none p-0">
+        {ordered.map((device) => {
+          const name = safeName(device.name, "Unnamed device");
+          const isThis = device.id === thisDeviceId;
+          return (
+            <li
+              key={device.id}
+              className="relative flex flex-wrap items-center gap-x-3 gap-y-1 rounded-row px-1.5 py-2 before:absolute before:top-0 before:right-0 before:left-4 before:h-px before:bg-stroke first:before:hidden"
+            >
+              <span className="min-w-0 flex-[1_1_12rem] wrap-anywhere">
+                <span className="flex flex-wrap items-center gap-2 text-row text-content">
+                  {name}
+                  {isThis ? <Badge variant="outline">This device</Badge> : null}
+                </span>
+                <Fingerprint hex={device.fingerprint} className="block" />
+                <span className="block text-meta text-muted-text">{device.lastSeenAt === null ? "Never used" : `Last seen ${formatRelative(device.lastSeenAt)}`}</span>
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                aria-label={`Forget device ${name}`}
+                onClick={() => {
+                  action.reset();
+                  setTarget(device);
+                }}
+              >
+                Forget device
+              </Button>
+            </li>
+          );
+        })}
+      </ul>
+      <ConfirmDialog
+        open={target !== null}
+        onOpenChange={(open) => {
+          if (!open) setTarget(null);
+        }}
+        title={target ? `Forget ${safeName(target.name, "this device")}?` : "Forget device?"}
+        description={
+          target?.id === thisDeviceId
+            ? "This is the browser you are using. It loses access on every desktop, its notifications are removed, and its key is deleted here. It has to ask for access again."
+            : "It loses access on every desktop and its notifications are removed. It has to ask for access again."
+        }
+        confirmLabel="Forget device"
+        destructive
+        busy={action.busy}
+        error={action.error}
+        notice={action.notice}
+        onConfirm={() => void confirm()}
+      />
+    </>
+  );
+}
