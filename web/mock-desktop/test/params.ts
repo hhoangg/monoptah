@@ -15,7 +15,7 @@ export const SAMPLE_PARAMS: Record<MethodName, Record<string, unknown>> = {
   "session.resumeUsageAtReset": { conversationId: "sess-local-1", token: "example-token", enabled: true },
   "session.answerQuestion": { conversationId: "sess-local-1", requestId: 1, reply: { kind: "skipped" } },
   "session.keepQuestionOpen": { conversationId: "sess-local-1", requestId: 1 },
-  "session.answerApproval": { conversationId: "sess-local-approval", requestId: 41, decision: "allow" },
+  "session.answerApproval": { conversationId: "sess-local-approval", requestId: "41", decision: "allow" },
   "session.cancel": { conversationId: "sess-local-1" },
   "session.rename": { conversationId: "sess-local-1", title: "Renamed example" },
   "session.archive": { conversationId: "sess-codespace-1", cloud: "keep" },

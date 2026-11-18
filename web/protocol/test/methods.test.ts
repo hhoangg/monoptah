@@ -36,7 +36,7 @@ const cloud = {
 const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
   "conversation.read": {
     params: { conversationId: "s1" },
-    result: { id: "s1", messages: [], turns: [turn], busy: false, usageLimit: null, older: true, question: null, cloud, approvals: [{ requestId: 3, label: "Run npm test", detail: "npm test" }] },
+    result: { id: "s1", messages: [], turns: [turn], busy: false, usageLimit: null, older: true, question: null, cloud, approvals: [{ requestId: "3", label: "Run npm test", detail: "npm test" }] },
   },
   "conversation.older": { params: { conversationId: "s1", before: "t1", limit: 20 }, result: { turns: [turn], older: false } },
   "conversation.watch": {
@@ -71,7 +71,7 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
     result: Ok,
   },
   "session.keepQuestionOpen": { params: { conversationId: "s1", requestId: 4 }, result: Ok },
-  "session.answerApproval": { params: { conversationId: "s1", requestId: 3, decision: "allow" }, result: Ok },
+  "session.answerApproval": { params: { conversationId: "s1", requestId: "3", decision: "allow" }, result: Ok },
   "session.cancel": { params: { conversationId: "s1" }, result: Ok },
   "session.rename": { params: { conversationId: "s1", title: "New title" }, result: Ok },
   "session.archive": { params: { conversationId: "s1", cloud: "stop" }, result: Ok },
@@ -216,6 +216,12 @@ describe("param validation", () => {
     expect(stop.safeParse({ sessionId: "s" }).success).toBe(true);
     expect(stop.safeParse({ kind: "codespace", instance: "cs" }).success).toBe(true);
     expect(stop.safeParse({ kind: "codespace" }).success).toBe(false);
+  });
+  it("session.answerApproval names the request by the desktop's string id only", () => {
+    const answer = METHODS["session.answerApproval"].params;
+    expect(answer.safeParse({ conversationId: "s", requestId: "ap-1", decision: "allow" }).success).toBe(true);
+    expect(answer.safeParse({ conversationId: "s", requestId: 3, decision: "allow" }).success).toBe(false);
+    expect(answer.safeParse({ conversationId: "s", requestId: "ap-1", decision: "always" }).success).toBe(false);
   });
   it("session.answerQuestion needs a well-formed reply", () => {
     const answer = METHODS["session.answerQuestion"].params;

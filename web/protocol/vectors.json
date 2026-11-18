@@ -843,6 +843,8 @@
       "disabled",
       "forbidden",
       "instance_busy",
+      "needs_desktop",
+      "not_pending",
       "not_selected",
       "path_denied",
       "read_only",

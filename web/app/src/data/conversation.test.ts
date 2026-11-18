@@ -226,7 +226,7 @@ describe("optimistic turns", () => {
 
 describe("cloud and approvals", () => {
   const cloud = { kind: "codespace" as const, instance: "fake-codespace-one", state: "available" as const };
-  const approval = { requestId: 41, label: "Run example command", detail: "example-cli --check (fake detail)" };
+  const approval = { requestId: "41", label: "Run example command", detail: "example-cli --check (fake detail)" };
 
   it("keeps them from frames, leaves them when absent, and clears approvals with []", () => {
     watcher();

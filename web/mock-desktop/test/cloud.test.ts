@@ -44,14 +44,14 @@ describe("catalog and reads carry the cloud fields", () => {
     const local = await client.call("conversation.read", { conversationId: "sess-local-1" });
     expect(local.cloud).toBeUndefined();
     const approval = await client.call("conversation.read", { conversationId: "sess-local-approval" });
-    expect(approval.approvals).toEqual([{ requestId: 41, label: "Run example command", detail: "example-cli --check (fake detail)" }]);
+    expect(approval.approvals).toEqual([{ requestId: "41", label: "Run example command", detail: "example-cli --check (fake detail)" }]);
   });
 
   it("without the approvals capability the approvals field is absent", async () => {
     const { client } = await setup({ desktop: { capabilities: ["cloud"] } });
     const read = await client.call("conversation.read", { conversationId: "sess-local-approval" });
     expect("approvals" in read).toBe(false);
-    expect(await client.request("session.answerApproval", { conversationId: "sess-local-approval", requestId: 41, decision: "allow" })).toMatchObject({ error: "Unsupported mobile operation" });
+    expect(await client.request("session.answerApproval", { conversationId: "sess-local-approval", requestId: "41", decision: "allow" })).toMatchObject({ error: "Unsupported mobile operation" });
   });
 
   it("cloud.instances has cost estimates, a stop report and the other-instances count", async () => {
@@ -76,7 +76,7 @@ describe("watch frames carry cloud and approvals on change only", () => {
     expect(watch.frames[0]?.approvals).toHaveLength(1);
     expect(watch.frames[0]?.cloud).toBeUndefined();
 
-    await client.call("session.answerApproval", { conversationId: "sess-local-approval", requestId: 41, decision: "allow" });
+    await client.call("session.answerApproval", { conversationId: "sess-local-approval", requestId: "41", decision: "allow" });
     await relay.settled();
     expect(watch.frames).toHaveLength(2);
     expect(watch.frames[1]?.approvals).toEqual([]);

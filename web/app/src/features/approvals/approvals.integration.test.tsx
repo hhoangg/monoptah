@@ -85,7 +85,7 @@ describe("approval card over the mock desktop (U-08)", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled(), { timeout: 3000 });
     await user.dblClick(screen.getByRole("button", { name: "Allow once" }));
     await waitFor(() => expect(screen.queryByRole("region", { name: "Needs your approval" })).toBeNull());
-    expect(calls).toEqual([{ conversationId: SESSION, requestId: 41, decision: "allow" }]);
+    expect(calls).toEqual([{ conversationId: SESSION, requestId: "41", decision: "allow" }]);
   });
 
   it("sends deny", async () => {
@@ -96,12 +96,12 @@ describe("approval card over the mock desktop (U-08)", () => {
     await waitFor(() => expect(deny).toBeEnabled(), { timeout: 3000 });
     await user.click(deny);
     await waitFor(() => expect(calls).toHaveLength(1));
-    expect(calls[0]).toEqual({ conversationId: SESSION, requestId: 41, decision: "deny" });
+    expect(calls[0]).toEqual({ conversationId: SESSION, requestId: "41", decision: "deny" });
   });
 
   it("renders hostile provider text as inert text", async () => {
     const seed = (desktop: MockDesktop) => {
-      desktop.world.session(SESSION).approvals = [{ requestId: 41, label: "<img src=x onerror=alert(1)>", detail: "[x](javascript:alert(1))\n<script>alert(1)</script>" }];
+      desktop.world.session(SESSION).approvals = [{ requestId: "41", label: "<img src=x onerror=alert(1)>", detail: "[x](javascript:alert(1))\n<script>alert(1)</script>" }];
     };
     mount({ seed });
     const region = await screen.findByRole("region", { name: "Needs your approval" });

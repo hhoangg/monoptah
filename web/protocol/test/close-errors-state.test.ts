@@ -72,6 +72,8 @@ describe("error codes", () => {
         "starting",
         "auto_stopping",
         "instance_busy",
+        "not_pending",
+        "needs_desktop",
       ].sort(),
     );
   });

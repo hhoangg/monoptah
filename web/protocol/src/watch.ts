@@ -88,9 +88,12 @@ export type CloudField = z.infer<typeof CloudFieldSchema>;
  * present when the desktop advertises `approvals`.
  */
 export const ApprovalSchema = z.looseObject({
-  requestId: z.union([z.number().int().nonnegative(), z.string()]),
+  /** The desktop's own opaque id for this request (never the provider's), a string. */
+  requestId: z.string().min(1).max(128),
   label: z.string(),
   detail: z.string(),
+  /** The desktop cut the label or detail: the whole request cannot be shown, so allowing it is refused. */
+  truncated: z.boolean().optional(),
 });
 export type Approval = z.infer<typeof ApprovalSchema>;
 export const ApprovalsFieldSchema = z.array(ApprovalSchema);

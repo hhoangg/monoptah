@@ -71,11 +71,21 @@ describe("watch frame (crates/monocode-core/src/mobile/watch.rs)", () => {
       order: [],
       turns: [],
       cloud: { kind: "sandbox", instance: "sbx-1", state: "stopped", kept: true, autoStop: { at: 1_700_000_000_000, reason: "idle" }, move: { step: "upload", status: "running" } },
-      approvals: [{ requestId: 9, label: "Run rm -rf build", detail: "rm -rf build" }],
+      approvals: [{ requestId: "9", label: "Run rm -rf build", detail: "rm -rf build" }],
     });
     expect(frame.cloud?.kept).toBe(true);
     expect(frame.approvals).toHaveLength(1);
     expect(WatchFrameSchema.parse({ usageLimit: null, busy: false, older: false, order: [], turns: [], approvals: [] }).approvals).toEqual([]);
+  });
+
+  it("types an approval request id as a string and carries the desktop's truncated flag", () => {
+    const base = { usageLimit: null, busy: false, older: false, order: [], turns: [] };
+    const cut = WatchFrameSchema.parse({ ...base, approvals: [{ requestId: "ap-1", label: "Run", detail: "x\u2026", truncated: true }] });
+    expect(cut.approvals?.[0]?.truncated).toBe(true);
+    expect(WatchFrameSchema.parse({ ...base, approvals: [{ requestId: "ap-2", label: "Run", detail: "x" }] }).approvals?.[0]?.truncated).toBeUndefined();
+    // The numeric form is gone: the desktop never sends one and the answer cannot name one.
+    expect(WatchFrameSchema.safeParse({ ...base, approvals: [{ requestId: 9, label: "Run", detail: "x" }] }).success).toBe(false);
+    expect(WatchFrameSchema.safeParse({ ...base, approvals: [{ requestId: "", label: "Run", detail: "x" }] }).success).toBe(false);
   });
 
   it("is the result of an ok response", () => {

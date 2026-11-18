@@ -343,3 +343,8 @@ export function useCloud(sessionId: string): CloudField | undefined {
 export function useApprovals(sessionId: string): Approval[] {
   return useConversationSelect(sessionId, (state) => state.approvals) ?? NO_APPROVALS;
 }
+
+/** How many times the desktop sent the `approvals` field for this conversation; see `ConversationState.approvalsSeq`. */
+export function useApprovalsSeq(sessionId: string): number {
+  return useConversationSelect(sessionId, (state) => state.approvalsSeq) ?? 0;
+}

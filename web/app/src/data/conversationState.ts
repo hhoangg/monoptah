@@ -30,6 +30,12 @@ export interface ConversationState {
   error: string | null;
   cloud: CloudField | undefined;
   approvals: Approval[];
+  /**
+   * Counts the times the desktop itself sent the `approvals` field (a frame that carried it, or a read). A card
+   * armed before a reconnect compares it with the value it saw then, so a list that survived the reconnect
+   * unconfirmed never decides anything (U-13).
+   */
+  approvalsSeq: number;
   optimistic: OptimisticTurn[];
   /** The turns come from the persisted cache only; the desktop has not confirmed them yet. */
   cachedOnly: boolean;
@@ -47,6 +53,7 @@ export function emptyConversation(): ConversationState {
     error: null,
     cloud: undefined,
     approvals: NO_APPROVALS,
+    approvalsSeq: 0,
     optimistic: [],
     cachedOnly: false,
   };
@@ -109,6 +116,7 @@ export function withFrames(state: ConversationState, applied: AppliedFrames): Co
     // A field a frame does not carry is unchanged; `approvals: []` clears.
     cloud: applied.cloud !== undefined ? applied.cloud : state.cloud,
     approvals: applied.approvals !== undefined ? applied.approvals : state.approvals,
+    approvalsSeq: applied.approvals !== undefined ? state.approvalsSeq + 1 : state.approvalsSeq,
     cachedOnly: false,
   });
 }
@@ -136,6 +144,7 @@ export function withRead(
     error: null,
     cloud: result.cloud,
     approvals: result.approvals ?? NO_APPROVALS,
+    approvalsSeq: state.approvalsSeq + 1,
     cachedOnly: false,
   });
 }

@@ -385,7 +385,8 @@ export const METHODS = {
     // Params are drafted here; WS-T and WS-D2 extend them under X-01.
     params: z.object({
       conversationId: ConversationId,
-      requestId: z.union([z.number().int().nonnegative(), z.string()]),
+      // The id of the request as the desktop sent it in `approvals`: always a string.
+      requestId: z.string().min(1).max(128),
       decision: z.enum(["allow", "deny"]),
     }),
     result: SessionAck,

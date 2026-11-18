@@ -128,7 +128,7 @@ describe("typed hooks over the mock desktop", () => {
     expect(Number(view.getByTestId("sessions").textContent)).toBeGreaterThan(0);
 
     await act(async () => {
-      await getLinkConnection(DESKTOP_ID).request("session.answerApproval", { conversationId: "sess-local-approval", requestId: 41, decision: "allow" });
+      await getLinkConnection(DESKTOP_ID).request("session.answerApproval", { conversationId: "sess-local-approval", requestId: "41", decision: "allow" });
     });
     await settle();
     expect(view.getByTestId("approvals")).toHaveTextContent("none");

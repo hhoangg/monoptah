@@ -134,7 +134,7 @@ export class MockWorld {
     this.#addSession({ id: "sess-local-1", projectId: "proj-alpha", title: "Fix the example parser", target: { kind: "local" } });
     const approval = this.#addSession({ id: "sess-local-approval", projectId: "proj-alpha", title: "Run the example checks", target: { kind: "local" }, busy: true });
     approval.waiting = "approval";
-    approval.approvals = [{ requestId: 41, label: "Run example command", detail: "example-cli --check (fake detail)" }];
+    approval.approvals = [{ requestId: "41", label: "Run example command", detail: "example-cli --check (fake detail)" }];
     approval.script = [() => this.#clearApprovals(approval)];
     this.#addSession({ id: "sess-codespace-1", projectId: "proj-alpha", title: "Refactor on the fake codespace", target: { kind: "codespace", instance: "fake-codespace-one" }, cloudState: "available" });
     this.#addSession({ id: "sess-sandbox-stopped", projectId: "proj-beta", title: "Stopped sandbox work", target: { kind: "sandbox", instance: "fake-sandbox-one" }, cloudState: "stopped" });
@@ -451,7 +451,7 @@ export class MockWorld {
     return { accepted: true };
   }
 
-  answerApproval(conversationId: string, requestId: number | string): void {
+  answerApproval(conversationId: string, requestId: string): void {
     const s = this.session(conversationId);
     if (!s.approvals.some((a) => a.requestId === requestId)) throw new FixtureError("No such approval");
     s.script = [];

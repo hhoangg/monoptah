@@ -8,6 +8,7 @@ export {
   conversationQueryOptions,
   openConversation,
   useApprovals,
+  useApprovalsSeq,
   useCloud,
   useConversation,
   type ConversationHandle,
