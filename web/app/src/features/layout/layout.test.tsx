@@ -74,6 +74,13 @@ beforeAll(() => {
   Element.prototype.scrollIntoView ??= () => {};
 });
 
+// The route files import the panel registrations for their side effects: start every test from an empty registry,
+// so `vitest -t` (which skips the earlier tests' cleanup) finds nothing registered twice.
+beforeEach(() => {
+  clearPanels();
+  clearShortcuts();
+});
+
 let previous: PersistAdapter;
 beforeEach(() => {
   localStorage.clear();
@@ -738,6 +745,35 @@ describe("project tools (project bar and palette)", () => {
     expect(within(bar).getAllByRole("button").map((button) => button.textContent)).toEqual(["Files", "Changes", "Git", "Background"]);
     await act(async () => router.history.push(`/d/${DESKTOP_ID}/s/sess-codespace-1`));
     await waitFor(() => expect(within(screen.getByRole("toolbar", { name: "Project tools" })).getAllByRole("button").map((button) => button.textContent)).toEqual(["Background"]));
+  });
+
+  it.each([768, 1280])("adds no element above the screen on a session route at %i, the tools sit in the sidebar", async (width) => {
+    const { view } = mount(width, "/s/sess-local-1");
+    const bar = await screen.findByRole("toolbar", { name: "Project tools" });
+    expect(screen.getByTestId("app-sidebar")).toContainElement(bar);
+    const pane = view.container.querySelector("[data-testid='app-shell'] > .\\@container");
+    expect(pane).not.toBeNull();
+    expect(pane!.querySelector('[data-testid="project-bar"]')).toBeNull();
+    expect(pane!.firstElementChild).toHaveAttribute("data-testid", "route-stub");
+  });
+
+  it("keeps the tools in the sidebar rail as icon buttons when it is collapsed", async () => {
+    const user = userEvent.setup();
+    mount(768, "/s/sess-local-1");
+    await user.click(await screen.findByRole("button", { name: "Collapse sidebar" }));
+    const bar = await screen.findByRole("toolbar", { name: "Project tools" });
+    expect(screen.getByTestId("app-sidebar")).toContainElement(bar);
+    expect(within(bar).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Files", "Changes", "Git", "Background"]);
+  });
+
+  it("hides a panel opened on the local project while a cloud session of it is shown", async () => {
+    registerSessionCapabilities(localOnly);
+    const { router } = mount(1280, "/s/sess-local-1");
+    await screen.findByTestId("app-shell");
+    act(() => void openPanel("files", target, local));
+    await screen.findByTestId("right-panel");
+    await act(async () => router.history.push(`/d/${DESKTOP_ID}/s/sess-codespace-1`));
+    await waitFor(() => expect(screen.queryByTestId("right-panel")).toBeNull());
   });
 
   it("opens the background picker for the project in a dialog", async () => {

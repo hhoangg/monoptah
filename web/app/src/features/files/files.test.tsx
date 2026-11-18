@@ -95,6 +95,13 @@ beforeEach(() => {
   }) as never;
 });
 
+// The route files import the panel registrations for their side effects: start every test from an empty registry,
+// so `vitest -t` (which skips the earlier tests' cleanup) finds nothing registered twice.
+beforeEach(() => {
+  clearPanels();
+  clearShortcuts();
+});
+
 let previous: PersistAdapter;
 beforeEach(() => {
   localStorage.clear();

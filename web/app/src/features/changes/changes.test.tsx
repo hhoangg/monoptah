@@ -83,6 +83,12 @@ beforeEach(() => {
   }) as never;
 });
 
+// The route files import the panel registrations for their side effects: start every test from an empty registry,
+// so `vitest -t` (which skips the earlier tests' cleanup) finds nothing registered twice.
+beforeEach(() => {
+  clearPanels();
+});
+
 let previous: PersistAdapter;
 beforeEach(() => {
   localStorage.clear();
@@ -513,6 +519,50 @@ describe("quick toggles (race)", () => {
     for (const box of screen.getAllByRole("checkbox")) expect(box).toBeDisabled();
     held.release();
     await waitFor(() => expect(screen.getAllByRole("checkbox").every((box) => !(box as HTMLButtonElement).disabled)).toBe(true));
+  });
+});
+
+describe("one queue per project", () => {
+  it("holds a generate behind a stage call that is still in flight", async () => {
+    const user = userEvent.setup();
+    actionImpl = (params) => (params.action === "generate" ? { message: "feat: ok" } : { message: "ok" });
+    const held = holdGitActions();
+    mount("changes/", { capabilities: NO_PUSH });
+    await screen.findByRole("region", { name: "Staged Changes" });
+    await user.click(screen.getByRole("checkbox", { name: "Stage b.ts" }));
+    await waitFor(() => expect(held.sent).toHaveLength(1));
+    // The bar and the dialog use their own runner: their call must still wait for the stage call.
+    await user.click(await screen.findByRole("button", { name: /^Commit \d+ files?$/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Commit" });
+    await user.click(within(dialog).getByRole("button", { name: "Write a message" }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(held.sent).toHaveLength(1);
+    held.release();
+    await waitFor(() => expect(held.sent).toHaveLength(2));
+    expect(held.sent[1]?.params).toMatchObject({ action: "generate" });
+    held.release();
+  });
+
+  it("removes its abort listener from the lifetime signal when a call settles", async () => {
+    const user = userEvent.setup();
+    actionImpl = () => ({ message: "ok" });
+    const added: unknown[] = [];
+    const removed: unknown[] = [];
+    const add = AbortSignal.prototype.addEventListener;
+    const remove = AbortSignal.prototype.removeEventListener;
+    vi.spyOn(AbortSignal.prototype, "addEventListener").mockImplementation(function (this: AbortSignal, type: string, listener: never, options?: never) {
+      if (type === "abort" && (listener as { name?: string }).name === "abort") added.push(listener);
+      return add.call(this, type, listener, options);
+    } as never);
+    vi.spyOn(AbortSignal.prototype, "removeEventListener").mockImplementation(function (this: AbortSignal, type: string, listener: never, options?: never) {
+      if (type === "abort" && (listener as { name?: string }).name === "abort") removed.push(listener);
+      return remove.call(this, type, listener, options);
+    } as never);
+    list();
+    await screen.findByRole("region", { name: "Staged Changes" });
+    await user.click(screen.getByRole("button", { name: "Stage All" }));
+    await waitFor(() => expect(added.length).toBeGreaterThan(0));
+    await waitFor(() => expect(removed).toEqual(added));
   });
 });
 

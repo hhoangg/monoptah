@@ -59,15 +59,40 @@ export interface GitActionOptions {
   signal?: AbortSignal;
 }
 
+interface ProjectGitState {
+  /** Command ids held per call signature until the call succeeds. */
+  ids: Map<string, string>;
+  /** The end of the calls queued for this project: the next call waits for it. */
+  tail: Promise<unknown>;
+}
+
+// One state per connection and project, so every runner of the project (the staging list, the action bar, the
+// commit dialog) shares one id map and one queue: a generate or commit never overtakes a stage call in flight.
+const projectStates = new WeakMap<object, Map<string, ProjectGitState>>();
+
+function projectState(client: object, projectId: string): ProjectGitState {
+  let byProject = projectStates.get(client);
+  if (!byProject) {
+    byProject = new Map();
+    projectStates.set(client, byProject);
+  }
+  let state = byProject.get(projectId);
+  if (!state) {
+    state = { ids: new Map(), tail: Promise.resolve() };
+    byProject.set(projectId, state);
+  }
+  return state;
+}
+
 /**
- * Runs `project.gitAction`. A long job answers `{pending: true}`: the call is sent again under the SAME command
- * id until the desktop has its answer. The id belongs to the call's signature (like `Mutator` in
- * `data/mutations.ts`): it is kept until the call succeeds, so a retry after a failure or a Stop is the same
- * command to the desktop. The polling ends when `options.signal` aborts and when the component unmounts.
+ * Runs `project.gitAction`. Calls for one project (on one connection) run one after the other. A long job
+ * answers `{pending: true}`: the call is sent again under the SAME command id until the desktop has its answer.
+ * The id belongs to the call's signature (like `Mutator` in `data/mutations.ts`): it is kept until the call
+ * succeeds, so a retry after a failure or a Stop is the same command to the desktop. The polling ends when
+ * `options.signal` aborts and when the component unmounts.
  */
 export function useRunGitAction(projectId: string) {
   const client = useLinkConnection();
-  const ids = useRef(new Map<string, string>());
   const lifetime = useRef<AbortController | null>(null);
   useEffect(() => {
     const controller = new AbortController();
@@ -75,36 +100,45 @@ export function useRunGitAction(projectId: string) {
     return () => controller.abort();
   }, []);
   return useCallback(
-    async (input: GitActionInput, options: GitActionOptions = {}): Promise<{ message?: string; url?: string }> => {
+    (input: GitActionInput, options: GitActionOptions = {}): Promise<{ message?: string; url?: string }> => {
+      const state = projectState(client, projectId);
       const params = { projectId, ...input };
       const signature = JSON.stringify(params);
-      let id = ids.current.get(signature);
-      if (!id) {
-        id = makeCommandId();
-        ids.current.set(signature, id);
-        if (ids.current.size > MAX_HELD_IDS) {
-          const oldest = ids.current.keys().next().value;
-          if (oldest !== undefined) ids.current.delete(oldest);
-        }
-      }
-      // One signal for the caller's and the component's lifetime.
+      // One signal for the caller's and the component's lifetime; its listeners go when the call settles.
       const controller = new AbortController();
-      for (const source of [options.signal, lifetime.current?.signal]) {
-        if (!source) continue;
+      const abort = () => controller.abort();
+      const sources = [options.signal, lifetime.current?.signal].filter((source): source is AbortSignal => !!source);
+      for (const source of sources) {
         if (source.aborted) controller.abort();
-        else source.addEventListener("abort", () => controller.abort(), { once: true });
+        else source.addEventListener("abort", abort, { once: true });
       }
       const { signal } = controller;
-      for (let round = 0; round < MAX_PENDING_ROUNDS; round += 1) {
-        if (signal.aborted) throw abortedError();
-        const result = (await client.request("project.gitAction", params, { id, signal })) as { pending?: boolean; message?: string; url?: string };
-        if (!result.pending) {
-          ids.current.delete(signature);
-          return result;
+      const execute = async (): Promise<{ message?: string; url?: string }> => {
+        let id = state.ids.get(signature);
+        if (!id) {
+          id = makeCommandId();
+          state.ids.set(signature, id);
+          if (state.ids.size > MAX_HELD_IDS) {
+            const oldest = state.ids.keys().next().value;
+            if (oldest !== undefined) state.ids.delete(oldest);
+          }
         }
-        await sleep(PENDING_DELAY_MS, signal);
-      }
-      throw new Error("The desktop is still working on this. Check the Git status in a moment.");
+        for (let round = 0; round < MAX_PENDING_ROUNDS; round += 1) {
+          if (signal.aborted) throw abortedError();
+          const result = (await client.request("project.gitAction", params, { id, signal })) as { pending?: boolean; message?: string; url?: string };
+          if (!result.pending) {
+            state.ids.delete(signature);
+            return result;
+          }
+          await sleep(PENDING_DELAY_MS, signal);
+        }
+        throw new Error("The desktop is still working on this. Check the Git status in a moment.");
+      };
+      const task = state.tail.then(execute);
+      state.tail = task.catch(() => undefined);
+      return task.finally(() => {
+        for (const source of sources) source.removeEventListener("abort", abort);
+      });
     },
     [client, projectId],
   );

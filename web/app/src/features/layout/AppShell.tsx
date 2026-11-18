@@ -10,7 +10,8 @@
 // A right panel belongs to a project: it shows only on that project's screens (`p/$projectId/...` and the
 // sessions of that project).
 // The shell also mounts the global shortcuts (shortcuts.ts), the command palette (F-15), the project bar (from
-// 640px: toggles Files, Changes and Git and opens the background picker) and the background dialog.
+// 640px, in the sidebar foot or, on the screens with their own sidebar, above the page: toggles Files, Changes and
+// Git and opens the background picker) and the background dialog.
 import { useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { useCatalog } from "@/data";
@@ -74,6 +75,9 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
           <Icon name="sidebar" size={20} />
         </button>
         <SearchButton compact />
+        <div className="mt-auto">
+          <ProjectBar variant="rail" />
+        </div>
       </aside>
     );
   }
@@ -96,6 +100,7 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
         <div className="min-h-0 flex-1">
           <WorkspaceNav desktopId={desktopId} />
         </div>
+        <ProjectBar variant="foot" />
       </aside>
       {tablet ? null : <Splitter label="Resize sidebar" value={width} min={SIDEBAR_WIDTH.min} max={SIDEBAR_WIDTH.max} onChange={setWidth} onCommit={persistWidth} grow={1} />}
     </>
@@ -147,7 +152,7 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
       <div data-testid="app-shell" data-layout={!wide ? "mobile" : desktop ? "desktop" : "tablet"} className="flex w-full">
         {sidebar ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
         <div className="@container min-w-0 flex-1">
-          {wide ? <ProjectBar /> : null}
+          {wide && !sidebar ? <ProjectBar /> : null}
           {children}
         </div>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}
