@@ -8,6 +8,12 @@
   // Checked against the installed workerd (1.20261117.1): 2026-09-01 is accepted.
   "compatibility_date": "2026-09-01",
 
+  // The official host serves the root domain only (the passkey RP ID). No workers.dev or preview URL, so the
+  // app has exactly one origin. Self-hosters change the pattern to their own domain.
+  "routes": [{ "pattern": "zptah.app", "custom_domain": true }],
+  "workers_dev": false,
+  "preview_urls": false,
+
   "assets": {
     // The client output of web/app (`pnpm --filter @monoptah/app build`). It holds `_headers` and no Worker
     // bundle: the Vite build also writes app/dist/monoptah_web (a Worker bundle and its sourcemap), which
@@ -30,9 +36,9 @@
     {
       "binding": "DB",
       "database_name": "monoptah",
-      // PLACEHOLDER. The maintainer (or a self-hoster) runs `wrangler d1 create monoptah`
-      // and pastes the real id here. The all-zero UUID only lets `--local` and the tests run.
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      // The official host's database (`wrangler d1 create monoptah`). Self-hosters create their own and
+      // replace this id; `--local` and the tests do not use it.
+      "database_id": "11eee6d9-4097-41f6-a06a-580fcb9f656a",
       "migrations_dir": "worker/migrations"
     }
   ],
@@ -45,8 +51,8 @@
     // RP_ID must never change after the first user registers: every passkey would break.
     "RP_ID": "zptah.app",
     "RP_ORIGIN": "https://zptah.app",
-    // Public half of the VAPID key pair (P-256, base64url). Placeholder until the `vapid:generate` script of P-01 exists.
-    "VAPID_PUBLIC_KEY": "REPLACE_WITH_VAPID_PUBLIC_KEY_BASE64URL",
+    // Public half of the official host's VAPID key pair (P-256, base64url, from `pnpm vapid:generate`).
+    "VAPID_PUBLIC_KEY": "BB1PzReHnjoUI6Ya2zu3mIg_q9smtWPUkLtSjm_nLgn3KHRaI6JDZhOTLP0qb3C_rUWIgqFxT_8LjXQvVZ03_as",
     // Which VAPID key the public key above is (stored in push_subscriptions.vapid_key_id, for rotation).
     "VAPID_KEY_ID": "v1",
     "VAPID_SUBJECT": "mailto:admin@zptah.app",
