@@ -1,0 +1,9 @@
+// S-05 spike: minimal Worker config for the workers-pool tests. Same compatibility_date as web/wrangler.jsonc and
+// deliberately NO compatibility_flags: the point is to prove @simplewebauthn/server needs none.
+{
+  "name": "monoptah-spike-s05",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  // Workers Logs: invocation logs with CPU time, for the PENDING-MAC measurement in FINDINGS.md.
+  "observability": { "enabled": true }
+}

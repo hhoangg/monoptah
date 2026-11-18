@@ -1,0 +1,11 @@
+// PENDING-MAC / PENDING-DEVICE only: the same spike Worker plus the probe page as static assets.
+// Used as `wrangler deploy -c wrangler.deploy.jsonc` after `vite build -c device/vite.config.ts`.
+{
+  "name": "monoptah-spike-07",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "assets": { "directory": "device/dist", "run_worker_first": ["/desktop", "/device", "/stats", "/rl"] },
+  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "SpikeRoom" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SpikeRoom"] }],
+  "ratelimits": [{ "name": "LIMITER", "namespace_id": "1007", "simple": { "limit": 3, "period": 60 } }]
+}

@@ -5,6 +5,8 @@ packages:
   - worker
   - app
   - mock-desktop
+  - e2e # WS-Q, E-01 harness
+  - spikes # WS-Q, Wave 0 spikes
 
 # security.md section 8 item 8: no dependency runs an install script unless it is
 # listed here. pnpm 12 reads `allowBuilds` (a package -> true map); the pnpm 10

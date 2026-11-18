@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <title>Monoptah push spike</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Monoptah push spike (S-06)</h1>
+      <p id="support" role="status"></p>
+      <label>
+        VAPID public key (base64url, printed by <code>send.ts keygen</code>)
+        <input id="vapid" type="text" autocomplete="off" spellcheck="false" />
+      </label>
+      <p>
+        <button id="enable" type="button">Enable notifications</button>
+        <button id="copy" type="button" disabled>Copy subscription JSON</button>
+      </p>
+      <p id="status" role="status"></p>
+      <pre id="subscription"></pre>
+      <p>Append <code>?auto=1</code> to the URL to request permission on page load (no gesture) and log what the browser does.</p>
+    </main>
+    <script src="app.js" type="module"></script>
+  </body>
+</html>

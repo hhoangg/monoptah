@@ -18,3 +18,4 @@ pub use host::{
 };
 pub use monocode_mobile_link::Address;
 pub use policy::{DeviceContext, DeviceKind, Permission};
+pub use web_link::{WebState, WebStatus};

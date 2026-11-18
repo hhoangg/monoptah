@@ -469,6 +469,13 @@ mod tests {
             name: "Phone".into(),
             fingerprint: "ab".into(),
             push: None,
+            kind: DeviceKind::Phone,
+            permission: Permission::Control,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
         };
         let ctx = DeviceContext::phone(&device);
         assert_eq!(ctx.kind, DeviceKind::Phone);

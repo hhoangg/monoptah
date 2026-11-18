@@ -1,0 +1,9 @@
+// S-05 spike control: the same Worker with an OLD compatibility date (before nodejs_compat became the default on 2026-08-04) and no flags,
+// to show the library needs no Node compatibility at all. Used with `wrangler dev --local -c` (the vitest pool forces nodejs_compat itself).
+{
+  "name": "monoptah-spike-s05-old",
+  "main": "worker/index.ts",
+  "compatibility_date": "2025-09-01",
+  // Workers Logs: invocation logs with CPU time, for the PENDING-MAC measurement in FINDINGS.md.
+  "observability": { "enabled": true }
+}

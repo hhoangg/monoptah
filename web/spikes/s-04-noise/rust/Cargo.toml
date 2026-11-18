@@ -1,0 +1,21 @@
+[package]
+name = "s04-noise-interop"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Spike S-04: Noise_IK_25519_ChaChaPoly_SHA256 interop of snow against the TypeScript implementation"
+
+# Standalone: not part of any repo workspace.
+[workspace]
+
+[dependencies]
+# Default features: the pure Rust resolver (chacha20poly1305, curve25519-dalek, sha2).
+snow = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Same major as snow's default resolver; only used to derive public keys from the fixed private keys.
+curve25519-dalek = "4"
+
+[[bin]]
+name = "gen"
+path = "src/bin/gen.rs"

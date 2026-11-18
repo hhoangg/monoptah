@@ -1,0 +1,10 @@
+// Throwaway S-07 spike Worker. Local use: `wrangler dev --local`. Deploy (PENDING-MAC) only under this own name.
+{
+  "name": "monoptah-spike-07",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "SpikeRoom" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SpikeRoom"] }],
+  // S-01 item 2 local check: 3 calls per 60 s.
+  "ratelimits": [{ "name": "LIMITER", "namespace_id": "1007", "simple": { "limit": 3, "period": 60 } }]
+}

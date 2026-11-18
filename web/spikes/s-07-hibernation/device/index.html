@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="stylesheet" href="./spike.css" />
+    <title>S-07 background socket probe</title>
+  </head>
+  <body>
+    <h1>S-07 socket probe</h1>
+    <p id="env"></p>
+    <label>wss URL <input id="url" size="40" autocomplete="off" /></label>
+    <button id="connect" type="button">Connect</button>
+    <button id="clear" type="button">Clear log</button>
+    <pre id="log"></pre>
+    <script type="module" src="./spike.ts"></script>
+  </body>
+</html>

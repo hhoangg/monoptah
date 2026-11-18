@@ -1,0 +1,5 @@
+# Outputs live outside the repo (E2E_OUTPUT_DIR, default /tmp/evidence/ws-q/e2e); these are only a safety net.
+test-results/
+playwright-report/
+blob-report/
+*.log

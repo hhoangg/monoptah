@@ -1,0 +1,40 @@
+{
+  "name": "@monoptah/spikes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Wave 0 spikes S-01..S-09 (WS-Q): measurement code, interop tests and findings notes. Not product code",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.workers.json",
+    "lint": "eslint .",
+    "test": "vitest run && vitest run -c s-05-webauthn/vitest.workers.config.ts && vitest run -c s-06-webpush/vitest.workers.config.ts && vitest run -c s-07-hibernation/vitest.workers.config.ts",
+    "browser": "playwright test -c playwright.config.ts"
+  },
+  "dependencies": {
+    "@monoptah/protocol": "workspace:*",
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
+    "@simplewebauthn/server": "^14.1.0",
+    "@tanstack/react-query": "^5.107.1",
+    "@tanstack/react-router": "^1.170.46",
+    "motion": "^14.14.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "shiki": "^4.6.0",
+    "sonner": "^2.0.8",
+    "vaul": "^1.1.2",
+    "workbox-precaching": "^7.4.1",
+    "workbox-window": "^7.4.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.8.3",
+    "@cloudflare/workers-types": "5.20261116.1",
+    "@playwright/test": "1.65.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "vite": "^8.3.8",
+    "wrangler": "4.163.0"
+  }
+}
