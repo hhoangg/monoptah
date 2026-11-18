@@ -16,7 +16,7 @@ export interface RunningServer {
   /** The one-use bootstrap invite. Never print it. */
   invite: string;
   /** More bootstrap invites, one per spec that needs its own account. Never print them. */
-  extraInvites: { pairing: string; devices: string; ui: string };
+  extraInvites: { pairing: string; devices: string; ui: string; w14: string; w14b: string };
   /** Stops wrangler and removes the temp dir. Waits for exit, escalates to SIGKILL, never throws. */
   stop(): Promise<void>;
 }
@@ -120,7 +120,7 @@ export async function startServer(logFile: string): Promise<RunningServer> {
       return code;
     };
     const invite = bootstrap();
-    const extraInvites = { pairing: bootstrap(), devices: bootstrap(), ui: bootstrap() };
+    const extraInvites = { pairing: bootstrap(), devices: bootstrap(), ui: bootstrap(), w14: bootstrap(), w14b: bootstrap() };
 
     // Obviously fake secrets, passed with --var so a developer's web/.dev.vars is never read.
     const fake = {

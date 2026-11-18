@@ -16,5 +16,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   process.env["E2E_INVITE_PAIRING"] = server.extraInvites.pairing;
   process.env["E2E_INVITE_DEVICES"] = server.extraInvites.devices;
   process.env["E2E_INVITE_UI"] = server.extraInvites.ui;
+  process.env["E2E_INVITE_W14"] = server.extraInvites.w14;
+  process.env["E2E_INVITE_W14B"] = server.extraInvites.w14b;
   return () => server.stop();
 }
