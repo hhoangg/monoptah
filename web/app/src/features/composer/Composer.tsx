@@ -395,7 +395,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           {showStop ? (
             <button
               type="button"
-              aria-label="Stop"
+              aria-label={stopping ? undefined : "Stop"}
               title={stopping ? "Stopping..." : undefined}
               aria-busy={stopping}
               aria-disabled={!stopArmed || (stopping && !retryable) || undefined}
@@ -408,7 +408,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
               )}
             >
               {stopping ? <Icon name="spinner" size={16} className="animate-spin" /> : <span aria-hidden="true" className="block size-3 rounded-[3px] bg-current" />}
-              {stopping ? <span aria-hidden="true">Stopping...</span> : null}
+              {stopping ? <span>Stopping...</span> : null}
             </button>
           ) : null}
           {/* One polite live region, outside the button, so the state is announced without changing its name. */}
@@ -436,18 +436,17 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
       ) : null}
       {readOnly && requestControl ? (
         <div className="flex items-center gap-2 px-2 pt-1 text-meta">
-          {requestControl.state === "requested" ? (
-            <p role="status" className="px-2 text-muted-text">Requested, confirm on the desktop.</p>
-          ) : (
-            <button
-              type="button"
-              disabled={requestControl.state === "pending" || requestControl.ready === false}
-              onClick={requestControl.request}
-              className="inline-flex min-h-11 items-center rounded-row px-2 font-medium text-content hover:bg-selection disabled:opacity-60 pointer-fine:min-h-8"
-            >
-              {requestControl.state === "pending" ? "Requesting..." : "Request control"}
-            </button>
-          )}
+          {requestControl.state === "requested" ? <p role="status" className="px-2 text-muted-text">Requested, confirm on the desktop.</p> : null}
+          <button
+            type="button"
+            disabled={requestControl.state === "pending" || requestControl.ready === false}
+            title={requestControl.ready === false ? "Checking this device..." : undefined}
+            onClick={requestControl.request}
+            className="inline-flex min-h-11 items-center rounded-row px-2 font-medium text-content hover:bg-selection disabled:opacity-60 pointer-fine:min-h-8"
+          >
+            {requestControl.state === "pending" ? "Requesting..." : requestControl.state === "requested" ? "Ask again" : "Request control"}
+            {requestControl.ready === false ? <span className="sr-only">. Checking this device...</span> : null}
+          </button>
           {requestControl.state === "error" ? <p role="alert" className="text-deletions">Could not request control. Try again.</p> : null}
         </div>
       ) : null}

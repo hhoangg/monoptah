@@ -1,4 +1,4 @@
-import { useEffect, useState, type MouseEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 /** One entry of the section index of a long settings page: an anchor to the element with this `id`. */
@@ -34,11 +34,35 @@ export function SettingsLayout({ children, className, sections }: { children: Re
 function useActiveSection(ids: readonly string[]): [string | undefined, (id: string) => void] {
   const [active, setActive] = useState<string | undefined>(ids[0]);
   const key = ids.join("|");
+  // The area a link jumped to stays current until the person scrolls by hand: near the end the bottom-of-page rule
+  // would otherwise replace it with the last area.
+  const pinned = useRef(false);
+  const choose = useCallback((id: string) => {
+    pinned.current = true;
+    setActive(id);
+  }, []);
+  useEffect(() => {
+    const release = () => {
+      pinned.current = false;
+    };
+    const keys = ["wheel", "touchmove", "keydown"] as const;
+    for (const type of keys) window.addEventListener(type, release, { passive: true });
+    return () => {
+      for (const type of keys) window.removeEventListener(type, release);
+    };
+  }, []);
   useEffect(() => {
     if (typeof IntersectionObserver === "undefined") return undefined;
     const visible = new Set<string>();
     const observer = new IntersectionObserver(
       (entries) => {
+        if (pinned.current) {
+          for (const entry of entries) {
+            if (entry.isIntersecting) visible.add(entry.target.id);
+            else visible.delete(entry.target.id);
+          }
+          return;
+        }
         for (const entry of entries) {
           if (entry.isIntersecting) visible.add(entry.target.id);
           else visible.delete(entry.target.id);
@@ -52,6 +76,7 @@ function useActiveSection(ids: readonly string[]): [string | undefined, (id: str
     );
     // The last area can be too short to reach the observed band: the bottom of the page then selects it.
     const onScroll = () => {
+      if (pinned.current) return;
       const ids = key.split("|");
       if (window.scrollY > 0 && window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) setActive(ids[ids.length - 1]);
     };
@@ -65,7 +90,7 @@ function useActiveSection(ids: readonly string[]): [string | undefined, (id: str
       window.removeEventListener("scroll", onScroll);
     };
   }, [key]);
-  return [active, setActive];
+  return [active, choose];
 }
 
 function jumpTo(event: MouseEvent<HTMLAnchorElement>, id: string, setActive: (id: string) => void) {

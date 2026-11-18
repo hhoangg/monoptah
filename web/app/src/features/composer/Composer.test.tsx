@@ -103,7 +103,7 @@ describe("send", () => {
     await user.click(await armedStop());
     expect(onStop).toHaveBeenCalledTimes(1);
     await user.type(field, "also this");
-    expect(screen.getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stopping..." })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("also this", []));
   });
@@ -127,7 +127,7 @@ describe("send", () => {
     const onSubmit = vi.fn<ComposerProps["onSubmit"]>(() => Promise.resolve());
     const { rerender } = render(<Composer onSubmit={onSubmit} busy onStop={onStop} />);
     await user.click(await armedStop());
-    const stop = screen.getByRole("button", { name: "Stop" });
+    const stop = screen.getByRole("button", { name: "Stopping..." });
     await waitFor(() => expect(stop).toHaveAttribute("aria-busy", "true"));
     // Visible text inside the button (touch has no tooltip) and one polite live region outside it.
     expect(stop).toHaveTextContent("Stopping...");
@@ -163,7 +163,7 @@ describe("send", () => {
       const onStop = vi.fn(() => Promise.resolve());
       setup({ busy: true, onStop });
       await user.click(await armedStop());
-      const stop = screen.getByRole("button", { name: "Stop" });
+      const stop = screen.getByRole("button", { name: "Stopping..." });
       await waitFor(() => expect(stop).toHaveAttribute("aria-busy", "true"));
       expect(stop).toHaveAttribute("aria-disabled", "true");
       await user.click(stop);
@@ -297,6 +297,9 @@ describe("disabled states", () => {
     rerender(<Composer onSubmit={vi.fn()} readOnly requestControl={{ state: "requested", request }} />);
     expect(screen.getByText("Requested, confirm on the desktop.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Request control" })).toBeNull();
+    // The user is never stuck: asking again re-sends the request.
+    await user.click(screen.getByRole("button", { name: "Ask again" }));
+    expect(request).toHaveBeenCalledTimes(2);
   });
 });
 
