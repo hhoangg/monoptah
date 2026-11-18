@@ -123,7 +123,7 @@ function DeckCard({
       {stacked ? (
         <span className="mr-1 inline-flex h-[22px] items-center rounded-pill bg-fill px-2 text-small font-semibold tabular text-muted-text">+{count - 1}</span>
       ) : (
-        <span className="mr-1 text-small tabular text-faint">{relativeTime(entry.at, now)}</span>
+        <span className="mr-1 text-small tabular text-muted-text">{relativeTime(entry.at, now)}</span>
       )}
     </>
   );

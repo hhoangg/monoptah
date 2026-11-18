@@ -105,7 +105,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
       {current.waiting ? null : <TerminalSpinner className="text-brand-text" />}
       <span className={cn("truncate", current.waiting && "text-caution")}>{detailOf(current, current.id in arrivals)}</span>
       {many ? (
-        <span className="ml-auto shrink-0 tabular text-faint" aria-label={`${index + 1} of ${live.length}`}>
+        <span className="ml-auto shrink-0 tabular text-muted-text" aria-label={`${index + 1} of ${live.length}`}>
           {index + 1} of {live.length}
         </span>
       ) : null}

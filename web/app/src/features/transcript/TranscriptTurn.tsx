@@ -84,7 +84,7 @@ function ErrorNotice({ item, onPress }: { item: NoticeItem; onPress: () => void 
       <Icon name={recovery ? "lock" : "chat"} size={18} className="shrink-0 text-muted-text" />
       <span className="min-w-0 flex-1">
         <span className="block text-small font-medium text-muted-text">{title}</span>
-        <span className="block text-caption text-faint">View details</span>
+        <span className="block text-caption text-muted-text">View details</span>
       </span>
       <Icon name="chevronRight" size={16} className="shrink-0 text-faint" />
     </button>

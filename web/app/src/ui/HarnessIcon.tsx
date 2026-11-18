@@ -23,7 +23,7 @@ export const PROVIDER_NOTICE: string = providerNotice.trim();
 /** The provider trademark note as small print, shown where the marks are listed (the model picker). */
 export function ProviderNotice({ className }: { className?: string }) {
   return (
-    <p data-testid="provider-notice" className={cn("text-meta text-faint", className)}>
+    <p data-testid="provider-notice" className={cn("text-meta text-muted-text", className)}>
       {PROVIDER_NOTICE}
     </p>
   );

@@ -63,13 +63,13 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
               Working...
             </span>
           ) : (
-            <span className="shrink-0 text-meta tabular text-faint">{relativeTime(session.updatedAt, now)}</span>
+            <span className="shrink-0 text-meta tabular text-muted-text">{relativeTime(session.updatedAt, now)}</span>
           )}
         </span>
         <span className="flex items-center gap-2 text-meta text-muted-text">
           <span className="flex min-w-0 flex-1 items-center gap-1.5">
             <Icon name="branch" size={13} className="shrink-0 text-faint" />
-            <span className={cn("truncate", !session.branch && "text-faint")}>{session.branch || "No branch"}</span>
+            <span className={cn("truncate", !session.branch && "text-muted-text")}>{session.branch || "No branch"}</span>
             <SessionCardBadgeSlot desktopId={desktopId} session={session} />
           </span>
           <span className="flex max-w-[50%] shrink items-center gap-1.5">

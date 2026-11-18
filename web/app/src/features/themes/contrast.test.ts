@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ACCENTS, THEMES } from "@/styles/themes";
@@ -79,6 +79,46 @@ describe("accent contrast (measured from tokens.css and contrast-overrides.css)"
       }
     }
   }
+
+describe("essential text uses the muted token, not the decorative faint one", () => {
+  for (const scheme of SCHEMES) {
+    for (const theme of THEMES) {
+      it(`${theme}/${scheme}: faint is measured as decorative, muted passes on every ground`, () => {
+        const v = computeVars(rules, { scheme, theme, accent: "theme" });
+        for (const ground of ["--background", "--surface", "--sheet", "--list-card"]) {
+          const bg = resolveColor(ground, v);
+          const faint = contrastRatio(resolveColor("--faint", v), bg);
+          const muted = contrastRatio(resolveColor("--muted", v), bg);
+          table.push(`${theme} | ${scheme} | ${ground} | faint ${fmt(faint)} (decorative only) / muted ${fmt(muted)}`);
+          // Faint stays below the text bar: the markup test below is what keeps text off it.
+          expect(faint, `faint on ${ground} is decorative`).toBeLessThan(TEXT);
+          expect(muted, `muted on ${ground}`).toBeGreaterThanOrEqual(TEXT);
+        }
+      });
+    }
+  }
+});
+
+describe("text-faint is for decorative elements only", () => {
+  const srcRoot = path.resolve(import.meta.dirname, "../..");
+  const sources = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) return entry.name === "node_modules" ? [] : sources(full);
+      return /\.tsx$/.test(entry.name) && !/\.test\.tsx$/.test(entry.name) ? [full] : [];
+    });
+  // A faint hit is allowed on an icon or an aria-hidden element (a gutter number), never on text a person reads.
+  const decorative = (line: string) => /<Icon\b/.test(line) || /aria-hidden/.test(line);
+
+  it("finds no essential text with text-faint or placeholder:text-faint", () => {
+    const offenders = sources(srcRoot).flatMap((file) =>
+      readFileSync(file, "utf8")
+        .split("\n")
+        .flatMap((line, index) => (/(?<![-\w])(placeholder:)?text-faint\b/.test(line) && !decorative(line) ? [`${path.relative(srcRoot, file)}:${index + 1}: ${line.trim()}`] : [])),
+    );
+    expect(offenders).toEqual([]);
+  });
+});
 
   it("lists the measured ratio of every combination", () => {
     console.info(`theme | scheme | pair | ratio\n${table.join("\n")}`);

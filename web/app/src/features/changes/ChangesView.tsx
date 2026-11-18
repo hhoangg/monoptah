@@ -201,7 +201,7 @@ function FileRow({ file, readOnly, busy, onOpen, onToggle }: { file: ChangedFile
         <FileTypeIcon name={name} isDir={false} />
         <span className="min-w-0 flex-1">
           <span className="block truncate [unicode-bidi:isolate] text-label">{name}</span>
-          {dir ? <span className="block truncate [unicode-bidi:isolate] text-small text-faint">{dir}</span> : null}
+          {dir ? <span className="block truncate [unicode-bidi:isolate] text-small text-muted-text">{dir}</span> : null}
         </span>
         {file.additions > 0 ? <span className="text-small text-additions tabular-nums">+{formatCount(file.additions)}</span> : null}
         {file.deletions > 0 ? <span className="text-small text-deletions tabular-nums">-{formatCount(file.deletions)}</span> : null}

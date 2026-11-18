@@ -283,7 +283,7 @@ function QuestionFields({
       aria-label="Your answer"
       onChange={(event) => onCustom(event.target.value)}
       placeholder="Type your answer"
-      className="mt-1.5 min-h-10 w-full rounded-row border border-stroke bg-transparent px-3 text-body text-content outline-none placeholder:text-faint focus:border-muted-text"
+      className="mt-1.5 min-h-10 w-full rounded-row border border-stroke bg-transparent px-3 text-body text-content outline-none placeholder:text-muted-text focus:border-muted-text"
     />
   );
 
@@ -351,7 +351,7 @@ function QuestionFields({
                     aria-label="Your answer"
                     onChange={(event) => onCustom(event.target.value)}
                     placeholder="Type your answer"
-                    className="mt-1.5 min-h-10 w-full rounded-row border border-stroke bg-transparent px-3 text-body text-content outline-none placeholder:text-faint focus:border-muted-text"
+                    className="mt-1.5 min-h-10 w-full rounded-row border border-stroke bg-transparent px-3 text-body text-content outline-none placeholder:text-muted-text focus:border-muted-text"
                     onFocus={() => {
                       if (!customSelected) onSelect(customId);
                     }}

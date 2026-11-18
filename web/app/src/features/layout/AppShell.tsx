@@ -51,7 +51,7 @@ function SearchButton({ compact }: { compact?: boolean }) {
     >
       <Icon name="search" size={18} />
       <span className="flex-1 text-left">Search</span>
-      <kbd className="font-sans text-meta text-faint">{isMac() ? "\u2318K" : "Ctrl K"}</kbd>
+      <kbd className="font-sans text-meta text-muted-text">{isMac() ? "\u2318K" : "Ctrl K"}</kbd>
     </button>
   );
 }
