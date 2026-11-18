@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
 import type * as KeysModule from "@/link/keys";
 import type * as PinsModule from "@/link/pins";
+import type * as PersistModule from "@/data/persist";
+import { displayFingerprint } from "@/link/fingerprint";
 
 const webauthn = vi.hoisted(() => ({ createPasskey: vi.fn(), getPasskey: vi.fn() }));
 vi.mock("@/features/accounts/webauthn", () => webauthn);
@@ -11,6 +13,9 @@ const keys = vi.hoisted(() => ({ getDeviceKeyInfo: vi.fn(), forgetDeviceKey: vi.
 const pins = vi.hoisted(() => ({ forgetPins: vi.fn() }));
 vi.mock("@/link/keys", async (importOriginal) => ({ ...(await importOriginal<typeof KeysModule>()), ...keys }));
 vi.mock("@/link/pins", async (importOriginal) => ({ ...(await importOriginal<typeof PinsModule>()), ...pins }));
+
+const persist = vi.hoisted(() => ({ clearPersistedCache: vi.fn() }));
+vi.mock("@/data/persist", async (importOriginal) => ({ ...(await importOriginal<typeof PersistModule>()), ...persist }));
 
 import { createFakeServer, desktop, device, FP_A, FP_B, type FakeServer } from "./testServer";
 import { mountApp } from "./testMount";
@@ -28,6 +33,7 @@ beforeEach(() => {
   keys.getDeviceKeyInfo.mockResolvedValue(null);
   keys.forgetDeviceKey.mockResolvedValue(undefined);
   pins.forgetPins.mockResolvedValue(undefined);
+  persist.clearPersistedCache.mockResolvedValue(undefined);
 });
 afterEach(() => {
   restore?.();
@@ -126,6 +132,7 @@ describe("This account's devices", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Forget device Firefox on Linux" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/every desktop/)).toBeInTheDocument();
+    expect(dialog).toHaveTextContent(`Device fingerprint: ${displayFingerprint(FP_A)}`);
     expect(server.calls.some((call) => call.method === "DELETE")).toBe(false);
     await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(server.calls.some((call) => call.method === "DELETE")).toBe(false);
@@ -145,9 +152,11 @@ describe("This account's devices", () => {
     await userEvent.click(screen.getByRole("button", { name: "Forget device Chrome on macOS" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/browser you are using/)).toBeInTheDocument();
+    expect(dialog).toHaveTextContent(/pinned desktop keys/);
     await userEvent.click(within(dialog).getByRole("button", { name: "Forget device" }));
     await waitFor(() => expect(keys.forgetDeviceKey).toHaveBeenCalledTimes(1));
     expect(pins.forgetPins).toHaveBeenCalledTimes(1);
+    expect(persist.clearPersistedCache).toHaveBeenCalledWith();
   });
 
   it("renders device names as text only", async () => {

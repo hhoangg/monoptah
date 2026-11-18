@@ -12,13 +12,16 @@ export type LinkSlice = Pick<LinkState, "status" | "blocked">;
  * `login_required`, `web_outdated` and `desktop_outdated` are handled by the `/d/:desktopId` layout and
  * never block here. While the grant request is in flight, a `revoked` block is not a verdict.
  */
-export function blockingScreen(link: LinkSlice, phase: GrantPhase, reconnected: boolean): BlockingScreen | null {
+export function blockingScreen(link: LinkSlice, phase: GrantPhase, reconnected: boolean, raceOpen: boolean): BlockingScreen | null {
+  // A fresh start of the connection has not reset a block kept from an earlier visit yet: no verdict.
+  if (link.status === "idle") return null;
   if (phase === "revoked") return "revoked";
   switch (link.blocked) {
     case "revoked": {
+      // Only the first-open 4003 race is not a verdict yet. Anything else is a real revoke.
+      if (!raceOpen) return "revoked";
       if (phase === "failed") return "grant_failed";
-      const settled = phase === "posted" ? reconnected : false;
-      return settled ? "revoked" : "requesting";
+      return phase === "posted" && reconnected ? "revoked" : "requesting";
     }
     case "account_blocked":
     case "key_changed":
@@ -38,6 +41,7 @@ export function blockingScreen(link: LinkSlice, phase: GrantPhase, reconnected: 
  * `revoked` block always hides it, which is the right answer in every phase.
  */
 export function isLinkBlocking(link: LinkSlice): boolean {
+  if (link.status === "idle") return false;
   if (link.blocked === "login_required" || link.blocked === "web_outdated" || link.blocked === "desktop_outdated") return false;
   return link.blocked !== null || link.status === "pending";
 }

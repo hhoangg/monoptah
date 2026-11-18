@@ -18,6 +18,7 @@ vi.mock("@/link", async (importOriginal) => {
 });
 vi.mock("@/link/keys", async (importOriginal) => ({ ...(await importOriginal<typeof KeysModule>()), getDeviceKeyInfo: h.getDeviceKeyInfo }));
 
+import { setBlockingLayerShown } from "./blockingLayer";
 import { DesktopSwitcher } from "./DesktopSwitcher";
 import { createFakeServer, desktop, grant, type FakeServer } from "./testServer";
 import { mountSlot } from "./testSlotMount";
@@ -57,6 +58,15 @@ afterEach(() => {
 });
 
 describe("desktop switcher", () => {
+  it("is not rendered while any blocking layer shows, including the requesting one", async () => {
+    mountSlot(<DesktopSwitcher />);
+    await screen.findByRole("button", { name: /Switch desktop/ });
+    act(() => setBlockingLayerShown("d1", true));
+    expect(screen.queryByRole("button", { name: /Switch desktop/ })).toBeNull();
+    act(() => setBlockingLayerShown("d1", false));
+    expect(await screen.findByRole("button", { name: /Switch desktop/ })).toBeInTheDocument();
+  });
+
   it("shows the current desktop in a slim bar and records it as last used", async () => {
     mountSlot(<DesktopSwitcher />);
     const trigger = await screen.findByRole("button", { name: "Switch desktop, current: Studio Mac" });

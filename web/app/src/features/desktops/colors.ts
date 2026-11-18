@@ -21,8 +21,8 @@ export const DESKTOP_COLORS: readonly DesktopColor[] = [
   { value: "#8b63e9", name: "Violet" },
 ];
 
-/** The fallback for a missing or unknown color (the dark `muted` token value). */
-export const FALLBACK_COLOR: DesktopColor = { value: "#8a8a8a", name: "Gray" };
+/** The fallback for a missing or unknown color (the dark `muted` token value, design-system.md section 1). */
+export const FALLBACK_COLOR: DesktopColor = { value: "#8c8c8c", name: "Gray" };
 
 /** The palette entry of a stored color (case-insensitive), or null when it is not in the palette. */
 export function findDesktopColor(stored: string | null | undefined): DesktopColor | null {

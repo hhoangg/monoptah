@@ -133,4 +133,23 @@ describe("/desktops/:id/verify", () => {
     expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
     expect(sessionStorage.getItem("monoptah.fp")).toBeNull();
   });
+
+  it("clears a leftover parked value when the address already carries the fragment", async () => {
+    install(NEW_KEY);
+    sessionStorage.setItem("monoptah.fp", JSON.stringify({ path: "/desktops/d1/verify", fp: fingerprint(OTHER_KEY) }));
+    mountApp(`/desktops/d1/verify#fp=${NEW_FP}`);
+    expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
+    // The address wins, and the parked value of an older link is gone.
+    expect(await pinnedFingerprint()).toBe(NEW_FP);
+    expect(sessionStorage.getItem("monoptah.fp")).toBeNull();
+  });
+
+  it("reads the parked value in an effect: under strict mode (two effect runs) it still verifies once", async () => {
+    install(NEW_KEY);
+    sessionStorage.setItem("monoptah.fp", JSON.stringify({ path: "/desktops/d1/verify", fp: NEW_FP }));
+    mountApp("/desktops/d1/verify", { strict: true });
+    expect(await screen.findByText("Desktop verified")).toBeInTheDocument();
+    expect(server.calls.filter((call) => call.path === "/api/desktops/d1")).toHaveLength(1);
+    expect(sessionStorage.getItem("monoptah.fp")).toBeNull();
+  });
 });

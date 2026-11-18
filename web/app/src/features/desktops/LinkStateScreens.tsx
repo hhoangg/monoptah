@@ -7,11 +7,13 @@
 // the layout and never reach this slot. There is deliberately no "trust the new key" control: a changed
 // key is accepted only through `/desktops/:id/verify#fp=` (R-14).
 import { Link } from "@tanstack/react-router";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { useLinkConnection, useLinkDesktopId, useLinkState } from "@/link";
 import { Button, buttonVariants } from "@/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/ui/dialog";
+import { useDelayed } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
+import { setBlockingLayerShown } from "./blockingLayer";
 import { blockingScreen, type BlockingScreen } from "./linkStateModel";
 import { safeName } from "./format";
 import { Fingerprint } from "./parts";
@@ -27,14 +29,22 @@ function LinkStateLayer({ desktopId }: { desktopId: string }) {
   const grant = useLazyGrant(desktopId);
   const status = useLinkState((state) => state.status);
   const blocked = useLinkState((state) => state.blocked);
-  const screen = blockingScreen({ status, blocked }, grant.phase, grant.reconnected);
-  if (screen === null) return null;
+  const screen = blockingScreen({ status, blocked }, grant.phase, grant.reconnected, grant.raceOpen);
+  // "Requesting access..." only shows when the request takes longer than 250 ms (no flash on a fast answer).
+  const requestingShown = useDelayed(screen === "requesting");
+  const visible = screen !== null && (screen !== "requesting" || requestingShown);
+  useEffect(() => {
+    setBlockingLayerShown(desktopId, visible);
+    return () => setBlockingLayerShown(desktopId, false);
+  }, [desktopId, visible]);
+  if (screen === null || !visible) return null;
   return <BlockingLayer screen={screen} desktopId={desktopId} onRetryGrant={grant.retry} />;
 }
 
+// The secondary actions use the filled `secondary` variant: the 8% outline stroke is nearly invisible on dark.
 const BACK_TO_DESKTOPS = (
-  <Link to="/desktops" className={buttonVariants({ variant: "outline", size: "lg", className: "w-full" })}>
-    Go to my desktops
+  <Link to="/desktops" className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
+    Go to desktops
   </Link>
 );
 
@@ -72,7 +82,12 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
       body = (
         <>
           <p>This device can no longer use {name}. A revoked device comes back only as a new device.</p>
-          <p>To get access again, forget this device in My desktops (under "This account's devices"), then open the desktop again and confirm it on the desktop.</p>
+          <p>
+            To get access again, forget this device in Desktops (under "This account's devices"). That removes this device's access on every desktop. Then open the desktop again and confirm it on the desktop.
+          </p>
+          <p>
+            Before you confirm, compare the fingerprints on the confirmation screen with the ones in the dialog on your desktop. They must match exactly. If they differ, do not confirm.
+          </p>
         </>
       );
       break;
@@ -92,7 +107,7 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
         </>
       );
       actions = (
-        <Link to="/desktops/$id" params={{ id: desktopId }} className={buttonVariants({ variant: "outline", size: "lg", className: "w-full" })}>
+        <Link to="/desktops/$id" params={{ id: desktopId }} className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
           Manage this desktop
         </Link>
       );
@@ -123,7 +138,7 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
       break;
     case "policy":
       title = "This desktop closed the connection";
-      body = <p>The desktop ended the connection on purpose. Check the desktop, then open it again from My desktops.</p>;
+      body = <p>The desktop ended the connection on purpose. Check the desktop, then open it again from Desktops.</p>;
       break;
   }
 
@@ -139,6 +154,7 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
         className="top-0 left-0 h-dvh w-full max-w-none translate-x-0 translate-y-0 content-start overflow-y-auto rounded-none border-0 bg-background p-0 data-[state=open]:animate-[fade-in_180ms_var(--ease-out-cubic)]"
       >
         <div className="mx-auto flex w-full max-w-md flex-col gap-5 px-[max(1.25rem,env(safe-area-inset-left))] pt-[max(2.5rem,env(safe-area-inset-top))] pr-[max(1.25rem,env(safe-area-inset-right))] pb-[calc(env(safe-area-inset-bottom)+2rem)]">
+          <p className="text-label font-semibold text-content">Monoptah</p>
           <DialogTitle className="text-headline font-semibold wrap-anywhere">{title}</DialogTitle>
           <DialogDescription asChild>
             <div className="flex flex-col gap-4 text-body text-muted-text">{body}</div>

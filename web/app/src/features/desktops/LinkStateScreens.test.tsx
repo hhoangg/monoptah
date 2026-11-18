@@ -25,6 +25,8 @@ import { mountSlot } from "./testSlotMount";
 
 const MARKER = "monoptah.desktops.grantRequested.d1.dev1";
 const GRANT_PATH = "/api/desktops/d1/grants";
+/** The first-open race: the relay closed with 4003 before the link was ever pending or ready. */
+const RACE: Partial<LinkState> = { status: "closed", blocked: "revoked", revoked: true, lastError: { code: "close_4003", closeCode: 4003 } };
 let server: FakeServer;
 let restore: (() => void) | undefined;
 
@@ -46,7 +48,7 @@ beforeEach(() => {
   resetLinkStore("d1");
   h.ensureDevice.mockResolvedValue({ deviceId: "dev1" });
   // The real reconnect clears the block and starts over.
-  h.reconnect.mockImplementation(() => getLinkStore("d1").setState({ blocked: null, revoked: false, status: "connecting" }));
+  h.reconnect.mockImplementation(() => getLinkStore("d1").setState({ blocked: null, revoked: false, lastError: null, status: "connecting" }));
 });
 afterEach(() => {
   restore?.();
@@ -56,7 +58,7 @@ afterEach(() => {
 describe("lazy grant request", () => {
   it("requests the grant once for the opened desktop only, then reconnects exactly once", async () => {
     install();
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     mountSlot(<LinkStateScreens />);
     await waitFor(() => expect(h.reconnect).toHaveBeenCalledTimes(1));
     expect(grantPosts()).toEqual([{ path: GRANT_PATH, body: { deviceId: "dev1" } }]);
@@ -76,8 +78,10 @@ describe("lazy grant request", () => {
       if (url.endsWith("/grants") && init.method === "POST") await gate;
       return inner(url, init);
     });
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     mountSlot(<LinkStateScreens />);
+    // Not at once: the layer waits 250 ms so a fast answer never flashes it.
+    expect(screen.queryByRole("alertdialog")).toBeNull();
     expect(await screen.findByRole("alertdialog", { name: "Requesting access..." })).toBeInTheDocument();
     expect(screen.queryByText("Access to this desktop was revoked")).toBeNull();
     release();
@@ -88,11 +92,15 @@ describe("lazy grant request", () => {
   it("shows the revoked screen on a 409 and never reconnects", async () => {
     install();
     server.conflicts.add(`POST ${GRANT_PATH}`);
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     mountSlot(<LinkStateScreens />);
     const dialog = await screen.findByRole("alertdialog", { name: "Access to this desktop was revoked" });
     expect(dialog).toHaveTextContent(/forget this device/i);
-    expect(screen.getByRole("link", { name: "Go to my desktops" })).toHaveAttribute("href", "/desktops");
+    expect(dialog).toHaveTextContent(/on every desktop/);
+    expect(dialog).toHaveTextContent(/compare the fingerprints on the confirmation screen with the ones in the dialog on your desktop/i);
+    expect(dialog).toHaveTextContent("Monoptah");
+    expect(dialog).not.toHaveTextContent(/My desktops/);
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
     expect(screen.queryByRole("button", { name: /try again|reconnect|retry/i })).toBeNull();
     expect(h.reconnect).not.toHaveBeenCalled();
     expect(grantPosts()).toHaveLength(1);
@@ -100,11 +108,11 @@ describe("lazy grant request", () => {
 
   it("with a pending grant and a revoked block, reconnects exactly once even if the block comes back", async () => {
     install({ grants: { d1: [grant({ deviceId: "dev1", state: "pending", permission: null, confirmedAt: null })] } });
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     mountSlot(<LinkStateScreens />);
     await waitFor(() => expect(h.reconnect).toHaveBeenCalledTimes(1));
     // The relay refuses again: the layer settles on the revoked screen and does not loop.
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     await screen.findByRole("alertdialog", { name: "Access to this desktop was revoked" });
     expect(h.reconnect).toHaveBeenCalledTimes(1);
     expect(grantPosts()).toHaveLength(1);
@@ -124,7 +132,7 @@ describe("lazy grant request", () => {
   it("re-checks once with a POST when the marker is set but the link reports revoked", async () => {
     install({ grants: { d1: [grant({ deviceId: "dev1", state: "confirmed" })] } });
     localStorage.setItem(MARKER, "1");
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     mountSlot(<LinkStateScreens />);
     await waitFor(() => expect(h.reconnect).toHaveBeenCalledTimes(1));
     expect(grantPosts()).toHaveLength(1);
@@ -134,7 +142,7 @@ describe("lazy grant request", () => {
     install();
     server.conflicts.add(`POST ${GRANT_PATH}`);
     localStorage.setItem(MARKER, "1");
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     mountSlot(<LinkStateScreens />);
     await screen.findByRole("alertdialog", { name: "Access to this desktop was revoked" });
     expect(h.reconnect).not.toHaveBeenCalled();
@@ -149,12 +157,98 @@ describe("lazy grant request", () => {
       if (failing && url.endsWith("/grants") && init.method === "POST") throw new TypeError("offline");
       return inner(url, init);
     });
-    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    setLink(RACE);
     mountSlot(<LinkStateScreens />);
     await screen.findByRole("alertdialog", { name: "Could not request access" });
     failing = false;
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(h.reconnect).toHaveBeenCalledTimes(1));
+  });
+});
+
+describe("revoked block after the first open", () => {
+  it("never reconnects and never POSTs for a revoked block without a close code", async () => {
+    install();
+    localStorage.setItem(MARKER, "1");
+    setLink({ status: "closed", blocked: "revoked", revoked: true });
+    mountSlot(<LinkStateScreens />);
+    await screen.findByRole("alertdialog", { name: "Access to this desktop was revoked" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.reconnect).not.toHaveBeenCalled();
+    expect(grantPosts()).toHaveLength(0);
+  });
+
+  it("treats a revoke after the link was ready as final: no reconnect, no re-check POST", async () => {
+    install();
+    localStorage.setItem(MARKER, "1");
+    setLink({ status: "ready", permission: "control" });
+    mountSlot(<LinkStateScreens />);
+    await waitFor(() => expect(h.ensureDevice).toHaveBeenCalled());
+    setLink({ status: "closed", blocked: "revoked", revoked: true, lastError: { code: "close_4003", closeCode: 4003 } });
+    await screen.findByRole("alertdialog", { name: "Access to this desktop was revoked" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.reconnect).not.toHaveBeenCalled();
+    expect(grantPosts()).toHaveLength(0);
+  });
+
+  it("after a successful POST and a ready link, a later 4003 is final", async () => {
+    install();
+    setLink({ status: "connecting" });
+    mountSlot(<LinkStateScreens />);
+    await waitFor(() => expect(localStorage.getItem(MARKER)).toBe("1"));
+    setLink({ status: "pending" });
+    setLink({ status: "closed", blocked: "revoked", revoked: true, lastError: { code: "close_4003", closeCode: 4003 } });
+    await screen.findByRole("alertdialog", { name: "Access to this desktop was revoked" });
+    expect(h.reconnect).not.toHaveBeenCalled();
+    expect(grantPosts()).toHaveLength(1);
+  });
+
+  it("does not reconnect more than once under strict mode", async () => {
+    install();
+    setLink(RACE);
+    mountSlot(<LinkStateScreens />, "/d/d1", { strict: true });
+    await waitFor(() => expect(h.reconnect).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.reconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows nothing for a block kept from an earlier visit while the connection is idle", async () => {
+    install();
+    localStorage.setItem(MARKER, "1");
+    setLink({ status: "idle", blocked: "key_changed" });
+    mountSlot(<LinkStateScreens />);
+    await waitFor(() => expect(h.ensureDevice).toHaveBeenCalled());
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  it.each([404, 403])("shows the revoked screen when the grant POST answers %i for the device", async (status) => {
+    install();
+    const inner = server.transport;
+    restore?.();
+    restore = setApiTransport(async (url, init) => {
+      if (url.endsWith("/grants") && init.method === "POST") return new Response(JSON.stringify({ error: "x", code: status === 404 ? "not_found" : "forbidden" }), { status, headers: { "Content-Type": "application/json" } });
+      return inner(url, init);
+    });
+    setLink(RACE);
+    mountSlot(<LinkStateScreens />);
+    await screen.findByRole("alertdialog", { name: "Access to this desktop was revoked" });
+    expect(screen.queryByText("Could not request access")).toBeNull();
+    expect(h.reconnect).not.toHaveBeenCalled();
+  });
+
+  it("never renders the requesting layer when the request answers fast", async () => {
+    install();
+    let everShown = false;
+    const observer = new MutationObserver(() => {
+      if (document.querySelector('[role="alertdialog"]')) everShown = true;
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    setLink(RACE);
+    mountSlot(<LinkStateScreens />);
+    await waitFor(() => expect(h.reconnect).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    observer.disconnect();
+    expect(everShown).toBe(false);
   });
 });
 
@@ -174,7 +268,7 @@ describe("blocking screens", () => {
     expect(dialog).toHaveTextContent(displayFingerprint(FP_B));
     expect(dialog).toHaveTextContent(/Waiting for confirmation on Studio Mac/);
     expect(dialog).toHaveTextContent(/updates by itself/);
-    expect(screen.getByRole("link", { name: "Go to my desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
     setLink({ status: "ready", permission: "control" });
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
   });
@@ -207,14 +301,14 @@ describe("blocking screens", () => {
     setLink({ blocked: "policy" });
     await screen.findByRole("alertdialog", { name: "This desktop closed the connection" });
     expect(screen.queryByRole("button")).toBeNull();
-    expect(screen.getByRole("link", { name: "Go to my desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
   });
 
   it("desktop_refused offers Try again, which reconnects", async () => {
     setLink({ status: "closed", blocked: "desktop_refused" });
     mountSlot(<LinkStateScreens />);
     await screen.findByRole("alertdialog", { name: "This desktop did not accept this device" });
-    expect(screen.getByRole("link", { name: "Go to my desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(h.reconnect).toHaveBeenCalledTimes(1);
   });

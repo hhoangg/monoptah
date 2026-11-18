@@ -5,13 +5,14 @@
 // desktop reported and what was requested.
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import { isApiError } from "@/features/accounts/api";
 import { QueryBoundary } from "@/features/settings/QueryBoundary";
 import { SettingsLayout } from "@/features/settings/SettingsLayout";
 import { useAction } from "@/features/settings/useAction";
 import { formatRelative } from "@/features/settings/format";
 import { cn } from "@/lib/utils";
+import { displayFingerprint } from "@/link/fingerprint";
 import { Badge } from "@/ui/badge";
 import { Button, buttonVariants } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
@@ -33,6 +34,7 @@ import {
 } from "./api";
 import { DESKTOP_COLORS, findDesktopColor } from "./colors";
 import { grantStateLabel, lastSeenLabel, permissionLabel, safeName, versionLabel } from "./format";
+import { useKeyStatus } from "./keyStatus";
 import { ColorDot, desktopErrorMessage, Fingerprint, PresenceBadge } from "./parts";
 import { useThisDevice } from "./thisDevice";
 
@@ -93,9 +95,7 @@ function DesktopDetail({ desktop }: { desktop: DesktopDirectory }) {
         <dl className="m-0 flex flex-col gap-2 px-1.5 py-2">
           <Detail label="Status">{desktop.online ? "Online" : "Offline"}</Detail>
           {version ? <Detail label="System and version">{version}</Detail> : null}
-          <Detail label="Fingerprint">
-            <Fingerprint hex={desktop.fingerprint} />
-          </Detail>
+          <KeyDetail desktop={desktop} />
         </dl>
       </SettingsCard>
       <RenameSection desktop={desktop} />
@@ -107,7 +107,43 @@ function DesktopDetail({ desktop }: { desktop: DesktopDirectory }) {
   );
 }
 
-function Detail({ label, children }: { label: string; children: React.ReactNode }) {
+/** The key of this desktop as THIS device knows it: the pin, or the locally computed one; never the server's claim. */
+function KeyDetail({ desktop }: { desktop: DesktopDirectory }) {
+  const status = useKeyStatus(desktop.id, desktop.publicKey);
+  switch (status.kind) {
+    case "loading":
+      return <Detail label="Fingerprint">Checking...</Detail>;
+    case "invalid":
+      return <Detail label="Fingerprint">The key of this desktop could not be read.</Detail>;
+    case "pinned":
+      return (
+        <Detail label="Pinned on this device">
+          <Fingerprint hex={status.pinned} />
+        </Detail>
+      );
+    case "changed":
+      return (
+        <>
+          <Detail label="Pinned on this device">
+            <Fingerprint hex={status.pinned} />
+          </Detail>
+          <Notice variant="error" title="Key changed since this device pinned it">
+            The directory now serves a different key, with this fingerprint:
+            <Fingerprint hex={status.directory} className="mt-1 block text-body" />
+            Do not trust it yet. On your desktop, open Settings, then Web app, then "Verify on another device", and open that link on this device.
+          </Notice>
+        </>
+      );
+    case "unpinned":
+      return (
+        <Detail label="Reported by the server, not yet verified on this device">
+          <Fingerprint hex={status.computed} />
+        </Detail>
+      );
+  }
+}
+
+function Detail({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="flex flex-col gap-0.5">
       <dt className="text-meta text-muted-text">{label}</dt>
@@ -122,6 +158,12 @@ function RenameSection({ desktop }: { desktop: DesktopDirectory }) {
   const queryClient = useQueryClient();
   const action = useAction(desktopErrorMessage);
   const [draft, setDraft] = useState(desktop.name);
+  // The name changed elsewhere (another tab or device, the 15 s refetch): follow it unless the field has edits.
+  const [seenName, setSeenName] = useState(desktop.name);
+  if (desktop.name !== seenName) {
+    setSeenName(desktop.name);
+    if (draft === seenName) setDraft(desktop.name);
+  }
   const [saved, setSaved] = useState(false);
   const trimmed = draft.trim();
   const tooLong = [...trimmed].length > 64;
@@ -246,6 +288,7 @@ function GrantList({ desktopId, desktopName, grants, thisDeviceId }: { desktopId
   }
 
   const targetName = target ? safeName(target.deviceName, "this device") : "";
+  const targetFingerprint = target ? displayFingerprint(target.fingerprint) : "";
 
   return (
     <>
@@ -271,7 +314,12 @@ function GrantList({ desktopId, desktopName, grants, thisDeviceId }: { desktopId
           if (!open) setTarget(null);
         }}
         title={`Revoke access for ${targetName}?`}
-        description={`${targetName} will no longer be able to reach ${desktopName}. It can ask for access again only after you forget the device.`}
+        description={
+          <>
+            {targetName} will no longer be able to reach {desktopName}. It can ask for access again only after you forget the device.
+            <span className="mt-2 block text-meta">Device fingerprint: {targetFingerprint}</span>
+          </>
+        }
         confirmLabel="Revoke access"
         destructive
         busy={revoke.busy}
@@ -294,10 +342,12 @@ function GrantRow({ grant, isThis, busy, onChange, onRevoke }: { grant: Grant; i
   return (
     <li className="relative flex flex-wrap items-center gap-x-3 gap-y-2 rounded-row px-1.5 py-2 before:absolute before:top-0 before:right-0 before:left-4 before:h-px before:bg-stroke first:before:hidden">
       <div className="min-w-0 flex-[1_1_14rem] wrap-anywhere">
-        <span className="flex flex-wrap items-center gap-2 text-row text-content">
-          {name}
-          {isThis ? <Badge variant="outline">This device</Badge> : null}
-          <Badge variant={revoked ? "destructive" : grant.state === "pending" ? "outline" : "default"}>{grantStateLabel(grant.state)}</Badge>
+        <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-row text-content">
+          <span className="min-w-0 wrap-anywhere">{name}</span>
+          <span className="inline-flex flex-wrap items-center gap-1.5">
+            {isThis ? <Badge variant="outline">This device</Badge> : null}
+            <Badge variant={revoked ? "destructive" : grant.state === "pending" ? "outline" : "default"}>{grantStateLabel(grant.state)}</Badge>
+          </span>
         </span>
         <Fingerprint hex={grant.fingerprint} className="block" />
         {revoked ? null : (
@@ -360,11 +410,9 @@ function DangerZone({ desktop, name }: { desktop: DesktopDirectory; name: string
   const [open, setOpen] = useState(false);
 
   async function confirm() {
-    const ok = await action.run(() => revokeDesktop(queryClient, desktop.id));
-    if (ok) {
-      setOpen(false);
-      await navigate({ to: "/desktops" });
-    }
+    // Leave the page before its queries are removed, so the deleted desktop is never refetched ("not found" flash).
+    const ok = await action.run(() => revokeDesktop(queryClient, desktop.id, { afterRevoke: () => navigate({ to: "/desktops" }) }));
+    if (ok) setOpen(false);
   }
 
   return (

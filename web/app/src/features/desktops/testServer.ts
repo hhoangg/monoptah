@@ -14,6 +14,8 @@ export interface FakeServerOptions {
   grants?: Record<string, Grant[]>;
   /** Directory public keys (base64url, 32 bytes) per desktop id, for the verify page. Others get a fixed short key. */
   publicKeys?: Record<string, string>;
+  /** What the directory CLAIMS as `fingerprint` per desktop id (default: the real SHA-256 of the key). For tests of a lying directory. */
+  fingerprintClaims?: Record<string, string>;
   /** Revoke and revoked-grant calls need a re-auth first. Default true (the real routes are fresh). */
   requireFresh?: boolean;
 }
@@ -101,7 +103,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
       if (parts.length === 3) {
         if (method === "GET") {
           const key = options.publicKeys?.[id];
-          return json(200, { ...target, publicKey: key ?? "cHVibGljLWtleQ", fingerprint: key ? fingerprint(base64UrlDecode(key)) : FP_B });
+          return json(200, { ...target, publicKey: key ?? "cHVibGljLWtleQ", fingerprint: options.fingerprintClaims?.[id] ?? (key ? fingerprint(base64UrlDecode(key)) : FP_B) });
         }
         if (method === "PATCH") {
           const patch = body as { name?: string; color?: string | null };
@@ -121,6 +123,8 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
         if (parts.length === 4 && method === "POST") {
           const deviceId = (body as { deviceId: string }).deviceId;
           const existing = list.find((item) => item.deviceId === deviceId);
+          // Like the real server: a revoked grant answers 409 (grants/handlers.ts).
+          if (existing?.state === "revoked") return error(409, "conflict");
           if (existing) return json(200, { grant: existing });
           const created = grant({ deviceId, state: "pending", permission: null, confirmedAt: null });
           list.push(created);
@@ -130,6 +134,8 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
           const current = list.find((item) => item.deviceId === parts[4]);
           if (!current) return error(404, "not_found");
           const put = body as { requestedPermission?: "read" | "control"; state?: "revoked" };
+          // Like the real server: changing the requested permission of a revoked grant answers 409.
+          if (put.requestedPermission && current.state === "revoked") return error(409, "conflict");
           if (put.state === "revoked") {
             const blocked = gate();
             if (blocked) return blocked;

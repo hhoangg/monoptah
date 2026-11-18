@@ -20,6 +20,8 @@ import {
 import { queryOptions, useQuery, type QueryClient } from "@tanstack/react-query";
 import { apiFetch, endpoint, isApiError } from "@/features/accounts/api";
 import { withFreshAuth } from "@/features/accounts/queries";
+import { clearPersistedCache } from "@/data/persist";
+import { getLinkConnection, resetLinkConnections } from "@/link";
 import { forgetDeviceKey, getDeviceKeyInfo } from "@/link/keys";
 import { forgetPins } from "@/link/pins";
 
@@ -138,11 +140,31 @@ export async function setDesktopColor(queryClient: QueryClient, id: string, colo
   return desktop;
 }
 
-/** Revokes a desktop (fresh route: re-authenticates once when the server asks). */
-export async function revokeDesktop(queryClient: QueryClient, id: string): Promise<void> {
+export interface RevokeDesktopOptions {
+  /**
+   * Runs after the server revoked the desktop and before its queries are removed. The detail screen
+   * navigates away here, so the removal never makes its own observer refetch a deleted desktop.
+   */
+  afterRevoke?: () => Promise<unknown> | void;
+}
+
+/**
+ * Revokes a desktop (fresh route: re-authenticates once when the server asks). After the server
+ * succeeded it also drops what this browser holds of that desktop: the live link, the persisted
+ * (encrypted) cache and every query of it.
+ */
+export async function revokeDesktop(queryClient: QueryClient, id: string, options: RevokeDesktopOptions = {}): Promise<void> {
   await withFreshAuth(() => apiFetch(desktopEndpoints.revoke, { params: { id } }));
+  try {
+    getLinkConnection(id).stop();
+  } catch {
+    // A connection that cannot stop must not keep the cache around.
+  }
+  await clearPersistedCache(id);
+  await options.afterRevoke?.();
   queryClient.removeQueries({ queryKey: desktopKeys.detail(id) });
   queryClient.removeQueries({ queryKey: desktopKeys.grants(id) });
+  queryClient.removeQueries({ queryKey: ["link", id] });
   await queryClient.invalidateQueries({ queryKey: desktopKeys.list, exact: true });
 }
 
@@ -186,23 +208,50 @@ export async function revokeGrant(queryClient: QueryClient, desktopId: string, d
   return grant;
 }
 
+/** Every step runs even when an earlier one failed; the first failure is rethrown at the end. */
+async function runAll(steps: Array<() => Promise<unknown> | unknown>): Promise<void> {
+  const failures: unknown[] = [];
+  for (const step of steps) {
+    try {
+      await step();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw failures[0];
+}
+
 /**
  * Forgets a device: the server revokes every grant of it and deletes its push subscriptions. When it
- * is this browser's own device, the local key and every pin are removed after the server call succeeded.
+ * is this browser's own device, the local state goes too: the device key, every pin, the persisted
+ * (encrypted) cache of every desktop, the live link connections and the link queries. A 404 for this
+ * browser's own device means an earlier attempt already deleted it on the server (and failed locally),
+ * so the local cleanup still runs.
  */
 export async function forgetDevice(queryClient: QueryClient, deviceId: string): Promise<{ wasThisDevice: boolean }> {
   const local = await getDeviceKeyInfo().catch(() => null);
-  await apiFetch(desktopEndpoints.forgetDevice, { params: { id: deviceId } });
   const wasThisDevice = local?.deviceId === deviceId;
-  if (wasThisDevice) {
-    await forgetDeviceKey();
-    await forgetPins();
+  try {
+    await apiFetch(desktopEndpoints.forgetDevice, { params: { id: deviceId } });
+  } catch (error) {
+    if (!(wasThisDevice && isApiError(error, "not_found"))) throw error;
   }
-  await Promise.all([
-    queryClient.invalidateQueries({ queryKey: desktopKeys.devices }),
-    queryClient.invalidateQueries({ queryKey: desktopKeys.grantsRoot }),
-    queryClient.invalidateQueries({ queryKey: desktopKeys.list, exact: true }),
-    queryClient.invalidateQueries({ queryKey: desktopKeys.thisDevice }),
-  ]);
+  const cleanup = wasThisDevice
+    ? runAll([
+        () => forgetDeviceKey(),
+        () => forgetPins(),
+        () => clearPersistedCache(),
+        () => resetLinkConnections(),
+        () => queryClient.removeQueries({ queryKey: ["link"] }),
+      ])
+    : Promise.resolve();
+  await cleanup.finally(() =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: desktopKeys.devices }),
+      queryClient.invalidateQueries({ queryKey: desktopKeys.grantsRoot }),
+      queryClient.invalidateQueries({ queryKey: desktopKeys.list, exact: true }),
+      queryClient.invalidateQueries({ queryKey: desktopKeys.thisDevice }),
+    ]),
+  );
   return { wasThisDevice };
 }

@@ -37,11 +37,15 @@ type Outcome =
 
 const PUBLIC_KEY_BYTES = 32;
 
-/** The raw fragment value, from the address or from the value parked across a sign-in. */
+/**
+ * The raw fragment value, from the address or from the value parked across a sign-in. Reading the parked
+ * value consumes it (a side effect), so this runs in an effect, never during render. It is always read,
+ * so a leftover parked value is cleared even when the address already carries `#fp`.
+ */
 function readFragment(hash: string, pathname: string): string | null {
+  const parked = restoreFingerprintFragment(pathname);
   const fromHash = fingerprintFromHash(hash);
   if (fromHash !== null) return fromHash;
-  const parked = restoreFingerprintFragment(pathname);
   return parked === null ? null : fingerprintFromHash(parked);
 }
 
@@ -53,9 +57,11 @@ function stripFragment(): void {
 export function VerifyScreen({ id }: { id: string }) {
   const hash = useRouterState({ select: (state) => state.location.hash });
   const pathname = useRouterState({ select: (state) => state.location.pathname });
-  // Read once: the fragment is removed from the address bar right after.
-  const [fragment] = useState(() => readFragment(hash, pathname));
-  const [outcome, setOutcome] = useState<Outcome>(fragment === null ? { kind: "missing" } : { kind: "checking" });
+  // `undefined` until the mount effect read the fragment; then the value or null. Read once: the fragment
+  // is removed from the address bar right after.
+  const [fragment, setFragment] = useState<string | null | undefined>(undefined);
+  const resolved = useRef<{ value: string | null } | null>(null);
+  const [outcome, setOutcome] = useState<Outcome>({ kind: "checking" });
   const [attempt, setAttempt] = useState(0);
   const started = useRef<number | null>(null);
   const alive = useRef(true);
@@ -68,11 +74,17 @@ export function VerifyScreen({ id }: { id: string }) {
   }, []);
 
   useEffect(() => {
+    // The ref keeps the first read when strict mode runs this effect twice (the parked value is consumed once).
+    resolved.current ??= { value: readFragment(hash, pathname) };
+    const { value } = resolved.current;
+    setFragment(value);
+    if (value === null) setOutcome({ kind: "missing" });
     stripFragment();
-  }, []);
+    // Reruns after the fragment is stripped from the address; the ref keeps the first read.
+  }, [hash, pathname]);
 
   useEffect(() => {
-    if (fragment === null || started.current === attempt) return;
+    if (fragment === undefined || fragment === null || started.current === attempt) return;
     started.current = attempt;
     void (async () => {
       const result = await verify(id, fragment);
@@ -176,7 +188,7 @@ function Body({ id, outcome, onRetry }: { id: string; outcome: Outcome; onRetry:
           <Notice variant="error">This desktop was not found on your account. It may have been revoked.</Notice>
           <div>
             <Link to="/desktops" className={buttonVariants({ variant: "outline" })}>
-              Go to my desktops
+              Go to desktops
             </Link>
           </div>
         </div>

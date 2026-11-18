@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, setApiTransport } from "@/features/accounts/api";
 import type * as KeysModule from "@/link/keys";
 import type * as PinsModule from "@/link/pins";
+import type * as PersistModule from "@/data/persist";
+import type * as LinkModule from "@/link";
 
 const webauthn = vi.hoisted(() => ({ createPasskey: vi.fn(), getPasskey: vi.fn() }));
 vi.mock("@/features/accounts/webauthn", () => webauthn);
@@ -13,6 +15,13 @@ const keys = vi.hoisted(() => ({ getDeviceKeyInfo: vi.fn(), forgetDeviceKey: vi.
 const pins = vi.hoisted(() => ({ forgetPins: vi.fn() }));
 vi.mock("@/link/keys", async (importOriginal) => ({ ...(await importOriginal<typeof KeysModule>()), ...keys }));
 vi.mock("@/link/pins", async (importOriginal) => ({ ...(await importOriginal<typeof PinsModule>()), ...pins }));
+const side = vi.hoisted(() => ({ clearPersistedCache: vi.fn(), resetLinkConnections: vi.fn(), stop: vi.fn() }));
+vi.mock("@/data/persist", async (importOriginal) => ({ ...(await importOriginal<typeof PersistModule>()), clearPersistedCache: side.clearPersistedCache }));
+vi.mock("@/link", async (importOriginal) => ({
+  ...(await importOriginal<typeof LinkModule>()),
+  resetLinkConnections: side.resetLinkConnections,
+  getLinkConnection: () => ({ stop: side.stop }),
+}));
 
 import {
   desktopKeys,
@@ -50,6 +59,7 @@ beforeEach(() => {
   keys.getDeviceKeyInfo.mockResolvedValue(null);
   keys.forgetDeviceKey.mockResolvedValue(undefined);
   pins.forgetPins.mockResolvedValue(undefined);
+  side.clearPersistedCache.mockResolvedValue(undefined);
   install();
 });
 afterEach(() => {
@@ -122,14 +132,19 @@ describe("mutations", () => {
   });
 
   it("setRequestedPermission lowers with requestedPermission read and raises with control", async () => {
+    server.grants.d1 = [grant({ permission: "control" })];
+    await queryClient.prefetchQuery({ queryKey: desktopKeys.grants("d1"), queryFn: () => ({ grants: [grant({ permission: "control" })] }) });
     await setRequestedPermission(queryClient, "d1", "dev1", "read");
     await setRequestedPermission(queryClient, "d1", "dev1", "control");
     expect(server.calls.filter((call) => call.method === "PUT")).toEqual([
       { method: "PUT", path: "/api/desktops/d1/grants/dev1", body: { requestedPermission: "read" } },
       { method: "PUT", path: "/api/desktops/d1/grants/dev1", body: { requestedPermission: "control" } },
     ]);
-    // The server never writes the applied permission.
-    expect(server.grants.d1?.[0]?.permission).toBe("read");
+    // The client never patches the applied permission itself: the cache keeps what the desktop reported
+    // (control) and is only marked stale, so the next fetch shows what the desktop applied.
+    expect(queryClient.getQueryData<{ grants: Array<{ permission: string }> }>(desktopKeys.grants("d1"))?.grants[0]?.permission).toBe("control");
+    expect(queryClient.getQueryState(desktopKeys.grants("d1"))?.isInvalidated).toBe(true);
+    for (const put of server.calls.filter((call) => call.method === "PUT")) expect(Object.keys(put.body as object)).toEqual(["requestedPermission"]);
   });
 
   it("revokeGrant re-authenticates once on fresh_required and retries", async () => {
@@ -150,11 +165,37 @@ describe("mutations", () => {
 
   it("revokeDesktop re-authenticates once, deletes, and drops the desktop caches", async () => {
     await queryClient.prefetchQuery({ queryKey: desktopKeys.detail("d1"), queryFn: () => 1 });
+    await queryClient.prefetchQuery({ queryKey: ["link", "d1", "catalog"], queryFn: () => 1 });
+    await queryClient.prefetchQuery({ queryKey: ["link", "d2", "catalog"], queryFn: () => 1 });
     await revokeDesktop(queryClient, "d1");
     expect(server.calls.filter((call) => call.method === "DELETE")).toHaveLength(2);
     expect(server.reauths).toBe(1);
     expect(server.desktops.map((item) => item.id)).toEqual(["d2"]);
     expect(queryClient.getQueryData(desktopKeys.detail("d1"))).toBeUndefined();
+    // Also its persisted cache, its live link and its link queries (not those of other desktops).
+    expect(side.clearPersistedCache).toHaveBeenCalledWith("d1");
+    expect(side.stop).toHaveBeenCalledTimes(1);
+    expect(queryClient.getQueryData(["link", "d1", "catalog"])).toBeUndefined();
+    expect(queryClient.getQueryData(["link", "d2", "catalog"])).toBe(1);
+  });
+
+  it("revokeDesktop runs afterRevoke before the queries are removed, and never fetches the deleted desktop again", async () => {
+    await queryClient.prefetchQuery({ queryKey: desktopKeys.detail("d1"), queryFn: () => 1 });
+    let stillThere = false;
+    await revokeDesktop(queryClient, "d1", {
+      afterRevoke: () => {
+        stillThere = queryClient.getQueryData(desktopKeys.detail("d1")) === 1;
+      },
+    });
+    expect(stillThere).toBe(true);
+    expect(queryClient.getQueryData(desktopKeys.detail("d1"))).toBeUndefined();
+    expect(side.clearPersistedCache).toHaveBeenCalledTimes(1);
+  });
+
+  it("revokeDesktop clears nothing when the server call fails", async () => {
+    server.conflicts.add("DELETE /api/desktops/d1");
+    await expect(revokeDesktop(queryClient, "d1")).rejects.toMatchObject({ code: "conflict" });
+    expect(side.clearPersistedCache).not.toHaveBeenCalled();
   });
 
   it("revokeDesktop does not re-authenticate when the session is already fresh", async () => {
@@ -173,6 +214,8 @@ describe("forgetDevice", () => {
     expect(server.calls.at(-1)).toMatchObject({ method: "DELETE", path: "/api/devices/dev1" });
     expect(keys.forgetDeviceKey).not.toHaveBeenCalled();
     expect(pins.forgetPins).not.toHaveBeenCalled();
+    expect(side.clearPersistedCache).not.toHaveBeenCalled();
+    expect(side.resetLinkConnections).not.toHaveBeenCalled();
     expect(server.devices).toHaveLength(0);
   });
 
@@ -184,10 +227,47 @@ describe("forgetDevice", () => {
     expect(pins.forgetPins).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the local key when the server call fails", async () => {
+  it("also clears the persisted cache of every desktop, stops the live links and drops the link queries", async () => {
+    keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "dev1", publicKey: new Uint8Array(32) });
+    await queryClient.prefetchQuery({ queryKey: ["link", "d1", "catalog"], queryFn: () => 1 });
+    await queryClient.prefetchQuery({ queryKey: ["link", "d2", "catalog"], queryFn: () => 1 });
+    await forgetDevice(queryClient, "dev1");
+    expect(side.clearPersistedCache).toHaveBeenCalledTimes(1);
+    expect(side.clearPersistedCache).toHaveBeenCalledWith();
+    expect(side.resetLinkConnections).toHaveBeenCalledTimes(1);
+    expect(queryClient.getQueryData(["link", "d1", "catalog"])).toBeUndefined();
+    expect(queryClient.getQueryData(["link", "d2", "catalog"])).toBeUndefined();
+  });
+
+  it("still cleans up locally when the server already forgot this browser's own device (404 on retry)", async () => {
     keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "gone", publicKey: new Uint8Array(32) });
+    const result = await forgetDevice(queryClient, "gone");
+    expect(result.wasThisDevice).toBe(true);
+    expect(keys.forgetDeviceKey).toHaveBeenCalledTimes(1);
+    expect(pins.forgetPins).toHaveBeenCalledTimes(1);
+    expect(side.clearPersistedCache).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs every cleanup step even when one fails, and reports the failure", async () => {
+    keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "dev1", publicKey: new Uint8Array(32) });
+    keys.forgetDeviceKey.mockRejectedValue(new Error("idb"));
+    await expect(forgetDevice(queryClient, "dev1")).rejects.toThrow("idb");
+    expect(pins.forgetPins).toHaveBeenCalledTimes(1);
+    expect(side.clearPersistedCache).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers 404 for another device as an error and leaves local state alone", async () => {
+    keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "me", publicKey: new Uint8Array(32) });
     await expect(forgetDevice(queryClient, "gone")).rejects.toMatchObject({ code: "not_found" });
     expect(keys.forgetDeviceKey).not.toHaveBeenCalled();
+  });
+
+  it("keeps the local key when the server call fails", async () => {
+    keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "dev1", publicKey: new Uint8Array(32) });
+    server.conflicts.add("DELETE /api/devices/dev1");
+    await expect(forgetDevice(queryClient, "dev1")).rejects.toMatchObject({ code: "conflict" });
+    expect(keys.forgetDeviceKey).not.toHaveBeenCalled();
     expect(pins.forgetPins).not.toHaveBeenCalled();
+    expect(side.clearPersistedCache).not.toHaveBeenCalled();
   });
 });

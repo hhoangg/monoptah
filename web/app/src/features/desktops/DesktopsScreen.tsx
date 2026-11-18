@@ -20,6 +20,7 @@ import { Field } from "@/ui/Field";
 import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard } from "@/ui/SettingsCard";
 import { cn } from "@/lib/utils";
+import { displayFingerprint } from "@/link/fingerprint";
 
 export function DesktopsScreen() {
   const desktops = useDesktops();
@@ -182,8 +183,8 @@ function DeviceList({ devices, thisDeviceId }: { devices: DeviceSummary[]; thisD
               className="relative flex flex-wrap items-center gap-x-3 gap-y-1 rounded-row px-1.5 py-2 before:absolute before:top-0 before:right-0 before:left-4 before:h-px before:bg-stroke first:before:hidden"
             >
               <span className="min-w-0 flex-[1_1_12rem] wrap-anywhere">
-                <span className="flex flex-wrap items-center gap-2 text-row text-content">
-                  {name}
+                <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-row text-content">
+                  <span className="min-w-0 wrap-anywhere">{name}</span>
                   {isThis ? <Badge variant="outline">This device</Badge> : null}
                 </span>
                 <Fingerprint hex={device.fingerprint} className="block" />
@@ -212,9 +213,12 @@ function DeviceList({ devices, thisDeviceId }: { devices: DeviceSummary[]; thisD
         }}
         title={target ? `Forget ${safeName(target.name, "this device")}?` : "Forget device?"}
         description={
-          target?.id === thisDeviceId
-            ? "This is the browser you are using. It loses access on every desktop, its notifications are removed, and its key is deleted here. It has to ask for access again."
-            : "It loses access on every desktop and its notifications are removed. It has to ask for access again."
+          <>
+            {target?.id === thisDeviceId
+              ? "This is the browser you are using. It loses access on every desktop, its notifications are removed, and its key, its pinned desktop keys and its saved desktop data are deleted here. It has to ask for access again."
+              : "It loses access on every desktop and its notifications are removed. It has to ask for access again."}
+            {target ? <span className="mt-2 block text-meta">Device fingerprint: {displayFingerprint(target.fingerprint)}</span> : null}
+          </>
         }
         confirmLabel="Forget device"
         destructive

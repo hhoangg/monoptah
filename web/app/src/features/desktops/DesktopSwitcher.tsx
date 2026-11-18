@@ -4,7 +4,7 @@
 // account's desktops: a bottom sheet under 640 px, a dialog from 640 px (`ResponsiveOverlay`,
 // design-system.md 11). Desktops are sorted by last use; choosing one opens `/d/:id`. "Request
 // access" posts the grant of that one desktop on tap (never for all). The bar is hidden while a
-// blocking link-state screen shows, and the last-used order is updated when the page mounts.
+// blocking link-state layer shows (any of them, including "Requesting access..."), and the last-used order is updated when the page mounts.
 import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
@@ -17,6 +17,7 @@ import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
 import { useAction } from "@/features/settings/useAction";
 import { requestGrantAndRefresh, useDesktopGrants, useDesktops, type DesktopSummary } from "./api";
 import { safeName } from "./format";
+import { useBlockingLayerShown } from "./blockingLayer";
 import { isLinkBlocking } from "./linkStateModel";
 import { ColorDot, desktopErrorMessage } from "./parts";
 import { markGrantRequested, readLastUsed, sortByLastUsed, touchLastUsed } from "./storage";
@@ -38,13 +39,15 @@ export function DesktopSwitcher() {
   const linkName = useLinkState((state) => state.desktopName);
   const presence = useLinkState((state) => state.presence);
   const desktops = useDesktops();
+  const layerShown = useBlockingLayerShown(desktopId);
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
     touchLastUsed(desktopId);
   }, [desktopId]);
 
-  if (isLinkBlocking({ status, blocked })) return null;
+  // Hidden while any blocking layer shows, including "Requesting access...".
+  if (layerShown || isLinkBlocking({ status, blocked })) return null;
 
   const current = desktops.data?.desktops.find((item) => item.id === desktopId);
   const name = safeName(current?.name ?? linkName ?? "", "Desktop");
