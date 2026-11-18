@@ -26,6 +26,8 @@ export const APPROVAL_READ_ONLY_REASON = "Approvals need a device with control a
 export const APPROVAL_CONNECTING_REASON = "Connecting. Approvals unlock once the link is ready.";
 export const APPROVAL_LINK_NOT_READY_REASON = "The link to your desktop is not ready. Approvals unlock once it is back.";
 export const APPROVAL_UNCONFIRMED = "Could not confirm the answer; it may have reached the desktop. Wait for the desktop to update.";
+export const APPROVAL_NEEDS_DESKTOP = "Answer this one on the desktop. It cannot be allowed once from here. You can still deny it.";
+export const APPROVAL_NOT_PENDING = "This request is no longer waiting. The card updates when the desktop sends the next list.";
 export const APPROVAL_STALE_REASON = "The link was interrupted. Approvals unlock once the desktop confirms this request again.";
 export const APPROVAL_CUT_NOTICE =
   "Only the start of this request reached your browser. Review the full request on the desktop. Allow once is off because the whole request cannot be shown here.";
@@ -59,6 +61,12 @@ function Segments({ segments }: { segments: TextSegment[] }): ReactNode {
   );
 }
 
+/** The desktop `code` a rejected answer carries (`LinkRequestError.code`), when it has one. */
+function failureCode(reason: unknown): string | undefined {
+  const code = (reason as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
 function errorDetail(reason: unknown): string {
   if (!(reason instanceof Error)) return "";
   const text = reason.message.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim();
@@ -82,6 +90,8 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
   const armKey = current ? `${currentId}\u0000${current.label}\u0000${current.detail ?? ""}` : null;
   const [answered, setAnswered] = useState<ReadonlySet<string>>(() => new Set());
   const [errors, setErrors] = useState<ReadonlyMap<string, string>>(() => new Map());
+  // Ids the desktop refused to allow from here (`needs_desktop`): Deny stays available, Allow never is.
+  const [desktopOnly, setDesktopOnly] = useState<ReadonlySet<string>>(() => new Set());
   const [armedFor, setArmedFor] = useState<string | null>(null);
   // Synchronous lock: two clicks in one tick must send once, before React re-renders the disabled state.
   const locked = useRef(new Set<string>());
@@ -104,6 +114,7 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
     setSeenSignature(signature);
     setAnswered((previous) => new Set([...previous].filter((id) => live.has(id))));
     setErrors((previous) => new Map([...previous].filter(([id]) => live.has(id))));
+    setDesktopOnly((previous) => new Set([...previous].filter((id) => live.has(id))));
   }
   useEffect(() => {
     const live = new Set(signature === "" ? [] : signature.split("\u0000"));
@@ -147,7 +158,8 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
   const labelText = label.map((segment) => segment.text).join("");
   // The desktop cut the text (its own cap) or this card did: the whole request is not on screen, so only Deny works.
   const cutByDesktop = current.truncated === true;
-  const cut = cutByDesktop || detail.truncated;
+  const needsDesktop = desktopOnly.has(currentId);
+  const cut = cutByDesktop || detail.truncated || needsDesktop;
 
   const decide = async (decision: ApprovalDecision) => {
     const pressed = pressedOn.current;
@@ -170,6 +182,24 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
       await onAnswer(current.requestId, decision);
       // Stay locked: the result is shown from the next watch frame, never removed optimistically.
     } catch (reason) {
+      const code = failureCode(reason);
+      if (code === "not_pending") {
+        // Nothing was decided: the request is already gone. Stay disarmed until the next frame drops it.
+        setErrors((previous) => new Map(previous).set(id, APPROVAL_NOT_PENDING));
+        return;
+      }
+      if (code === "needs_desktop") {
+        // Nothing was decided and the desktop accepts a deny: unlock the card, with Allow off for this request.
+        locked.current.delete(id);
+        setDesktopOnly((previous) => new Set(previous).add(id));
+        setAnswered((previous) => {
+          const next = new Set(previous);
+          next.delete(id);
+          return next;
+        });
+        setErrors((previous) => new Map(previous).set(id, APPROVAL_NEEDS_DESKTOP));
+        return;
+      }
       // Stay locked too. The answer may have reached the desktop, and a second decision for the same request
       // (a different one, even) must not be sent before the desktop's frame says what happened.
       const extra = errorDetail(reason);

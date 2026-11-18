@@ -6,6 +6,8 @@ import {
   APPROVAL_CONNECTING_REASON,
   APPROVAL_CUT_NOTICE,
   APPROVAL_READ_ONLY_REASON,
+  APPROVAL_NEEDS_DESKTOP,
+  APPROVAL_NOT_PENDING,
   APPROVAL_UNCONFIRMED,
   ARM_DELAY_MS,
   ApprovalCardView,
@@ -153,6 +155,37 @@ describe("ApprovalCardView", () => {
     expect(allow()).toBeDisabled();
     expect(deny()).toBeDisabled();
     fireEvent.click(deny());
+    expect(onAnswer).toHaveBeenCalledTimes(1);
+  });
+
+  // N-6
+  it("after needs_desktop explains it, turns Allow off and keeps Deny", async () => {
+    const user = setup();
+    const refused = Object.assign(new Error("refused"), { code: "needs_desktop" });
+    const onAnswer = vi.fn().mockRejectedValueOnce(refused).mockResolvedValue(undefined);
+    render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} />);
+    arm();
+    await user.click(allow());
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(APPROVAL_NEEDS_DESKTOP);
+    expect(alert).not.toHaveTextContent("may have reached");
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeEnabled();
+    await user.click(deny());
+    expect(onAnswer).toHaveBeenLastCalledWith("41", "deny");
+    expect(onAnswer).toHaveBeenCalledTimes(2);
+  });
+
+  it("after not_pending says the request is gone and stays disarmed", async () => {
+    const user = setup();
+    const gone = Object.assign(new Error("gone"), { code: "not_pending" });
+    const onAnswer = vi.fn().mockRejectedValue(gone);
+    render(<ApprovalCardView approvals={[one]} onAnswer={onAnswer} />);
+    arm();
+    await user.click(deny());
+    expect(await screen.findByRole("alert")).toHaveTextContent(APPROVAL_NOT_PENDING);
+    expect(allow()).toBeDisabled();
+    expect(deny()).toBeDisabled();
     expect(onAnswer).toHaveBeenCalledTimes(1);
   });
 
