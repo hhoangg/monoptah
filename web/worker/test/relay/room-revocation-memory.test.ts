@@ -102,6 +102,26 @@ describe("a socket past its session expiry", () => {
   });
 });
 
+describe("a sweep never delays or reorders forwarding (N4)", () => {
+  it("forwards frames in order to the desktop while an expired socket is swept", async () => {
+    const f = await seedRoom();
+    const desktop = await connectDesktop(f);
+    const soon = Math.floor(Date.now() / 1000) + 2;
+    const second = await loginAs(f.userId);
+    await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE id_hash = ?").bind(soon, second.idHash).run();
+    const quiet = await connectDevice({ desktopId: f.desktopId, session: second }, f.deviceId);
+    const active = await connectDevice(f, f.deviceId);
+    await quiet.until(() => quiet.ctrl().length === 1);
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, soon * 1000 - Date.now()) + 1100));
+    // The first frame triggers the sweep; the rest must still arrive in send order.
+    for (let channel = 1; channel <= 20; channel += 1) active.send(hs1(f.deviceId, channel));
+    await desktop.until(() => desktop.ofType(FrameType.HS1).length === 20);
+    expect(desktop.ofType(FrameType.HS1).map((frame) => frame.channel)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+    expect(await quiet.closed(1000)).toBe(4001);
+    await closeAll(desktop, active);
+  });
+});
+
 describe("the web side tells the room again when D1 already shows the revocation", () => {
   it("PUT grant revoked a second time re-sends room.revoke (closes a socket that survived the first call)", async () => {
     const f = await seedRoom();

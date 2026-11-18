@@ -152,7 +152,7 @@ export class DesktopRoom extends DurableObject<Env> {
         logClose("device", refusal);
         return new Response(null, { status: 101, webSocket: client });
       }
-      await this.#sweepExpired(true);
+      this.#sweepExpired(true);
       const all = this.#devices();
       const same = all.filter((ws) => this.#att(ws)?.deviceId === id).length;
       const pendingSockets = all.filter((ws) => this.#att(ws)?.grantState === "pending").length;
@@ -178,10 +178,11 @@ export class DesktopRoom extends DurableObject<Env> {
     const att = this.#att(ws);
     if (!att || att.gone) return;
     if (att.role === "device" && att.expiresAt !== undefined && Date.now() >= att.expiresAt) {
-      await this.#expire(ws, att);
+      this.#expire(ws, att);
       return;
     }
-    await this.#sweepExpired(false);
+    // Synchronous: no await between the sweep and forwarding, so frames keep their order (N4).
+    this.#sweepExpired(false);
     if (typeof message === "string") {
       if (message === ROOM_QUOTAS.textFramePing) {
         ws.send(ROOM_QUOTAS.textFramePong);
@@ -347,24 +348,28 @@ export class DesktopRoom extends DurableObject<Env> {
     }
   }
 
-  /** Closes one device socket whose session expired (4001), with BYE per channel and the departure effects. No timer: runs on a message or a join. */
-  async #expire(ws: WebSocket, att: Attachment): Promise<void> {
+  /**
+   * Closes one device socket whose session expired (4001), with BYE per channel. No timer: runs on a message or a join.
+   * Everything here is synchronous; the departure effects (CTRL left, a D1 write) run afterwards without being awaited,
+   * so a sweep never opens the input gate between a join check and `acceptWebSocket`, and never delays a frame (N4).
+   */
+  #expire(ws: WebSocket, att: Attachment): void {
     const desktop = this.#desktop();
     if (desktop) this.#sendByes(desktop, att, new Set());
     this.#markGone(ws);
     this.#close(ws, CloseCodes.UNAUTHORIZED);
     logClose("device", CloseCodes.UNAUTHORIZED);
-    await this.#deviceLeft(att);
+    void this.#deviceLeft(att).catch(() => undefined);
   }
 
-  /** Closes every device socket past its session expiry; throttled unless `force`. */
-  async #sweepExpired(force: boolean): Promise<void> {
+  /** Closes every device socket past its session expiry; throttled unless `force`. Synchronous. */
+  #sweepExpired(force: boolean): void {
     const now = Date.now();
     if (!force && now - this.#lastSweep < SWEEP_INTERVAL_MS) return;
     this.#lastSweep = now;
     for (const ws of this.#devices()) {
       const att = this.#att(ws);
-      if (att?.expiresAt !== undefined && now >= att.expiresAt) await this.#expire(ws, att);
+      if (att?.expiresAt !== undefined && now >= att.expiresAt) this.#expire(ws, att);
     }
   }
 
