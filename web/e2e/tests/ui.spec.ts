@@ -114,10 +114,9 @@ test.describe("UI pages (E-01)", () => {
     await registerThroughUi(actor, namedInvite("devices"), "e2eadminui", "E2E Admin");
     const me = await actor.call("GET", "/api/me");
     expect(me.json["user"]).toMatchObject({ role: "admin" });
-    // Nothing sets `users.recovery_ack_at` after register (or regenerate), so the guard confines every new account to
-    // /settings ("Get new recovery codes"). Until WS-A/WS-S acknowledge the codes the admin pages are out of reach.
-    if (me.json["recoveryAckAt"] === null) console.log("skip reason: recoveryAckAt stays null after /register");
-    test.skip(me.json["recoveryAckAt"] === null, "TODO(E-01:WS-A A-05, WS-S W-02) recoveryAckAt is null after register, the guard confines the account to /settings");
+    // /register acknowledges the codes on Continue (RegisterScreen -> POST /api/recovery-codes/ack), so the guard does not
+    // confine the account to /settings. The ack is sent without waiting, so poll for it instead of reading `me` once.
+    await expect.poll(async () => (await actor.call("GET", "/api/me")).json["recoveryAckAt"]).not.toBeNull();
     await requirePage(actor.page, "/admin", "TODO(E-01:WS-S admin screens W-02)");
     await expect(actor.page).toHaveURL(/\/admin$/);
   });
