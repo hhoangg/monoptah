@@ -3,9 +3,12 @@
 // never HTML: text goes through React children, so a hostile string is only text. Interactive nodes (button,
 // toggle, input, select, slider, tabs) show their state but do not act: the visual runs on the desktop. 3D
 // scenes are not drawn.
+import { Component, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { Cartesian, Donut, Gauge, Heatmap, Progress, Trend, alpha, useVisualColor } from "./charts";
 import type { Shape, TextSize, VisualNode } from "./types";
+
+export { parseVisualTree } from "./parse";
 
 const TEXT_CLASS: Record<TextSize, string> = {
   caption: "text-[11px] leading-4",
@@ -16,10 +19,23 @@ const TEXT_CLASS: Record<TextSize, string> = {
   hero: "text-[34px] leading-10 font-semibold",
 };
 
+/** A node the renderer cannot draw (data the parser let through but a chart cannot lay out) must not take the page down. */
+class VisualBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  override state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  override render() {
+    return this.state.failed ? <p className="text-small text-muted-text">This visual could not be drawn. Open it on your desktop to see it.</p> : this.props.children;
+  }
+}
+
 export function VisualTree({ node }: { node: VisualNode }) {
   return (
     <div data-testid="visual-tree" className="min-w-0">
-      <Node node={node} />
+      <VisualBoundary>
+        <Node node={node} />
+      </VisualBoundary>
     </div>
   );
 }
@@ -147,7 +163,7 @@ function Node({ node }: { node: VisualNode }) {
         <div className="flex items-center justify-between gap-3 text-small" data-visual="toggle">
           <span className="min-w-0 flex-1">{node.label}</span>
           <span aria-hidden="true" className="inline-flex h-5 w-[34px] items-center rounded-pill p-0.5" style={{ background: node.value ? "var(--accent-color)" : alpha("var(--content)", 15) }}>
-            <span className={cn("size-4 rounded-pill bg-white", node.value && "ml-3.5")} />
+            <span className={cn("size-4 rounded-pill bg-inverse", node.value && "ml-3.5")} />
           </span>
           <span className="sr-only">{node.value ? "On" : "Off"}</span>
         </div>
@@ -226,11 +242,4 @@ function CanvasShape({ shape, tint }: { shape: Shape; tint: string }) {
         </text>
       );
   }
-}
-
-/** Reads a visual tree out of a document or profile payload; null when it is not one of the known shapes. */
-export function parseVisualTree(value: unknown): VisualNode | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const kind = (value as { kind?: unknown }).kind;
-  return typeof kind === "string" ? (value as VisualNode) : null;
 }

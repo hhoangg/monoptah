@@ -2,9 +2,10 @@
 import { render, screen } from "@testing-library/react";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ContributionGraph } from "./charts";
 import { inked } from "./dither";
+import { CHART_HEIGHT, MAX_DEPTH, MAX_NODES, parseVisualTree } from "./parse";
 import { VisualTree } from "./VisualTree";
 import type { VisualNode } from "./types";
 
@@ -122,5 +123,58 @@ describe("contribution graph (F-74)", () => {
     expect(["Mon", "Wed", "Fri"].every((day) => screen.getByText(day))).toBe(true);
     expect(container.querySelectorAll("text").length).toBeGreaterThan(5);
     expect(container.querySelectorAll("path").length).toBeGreaterThan(0);
+  });
+});
+
+describe("parseVisualTree (data from the desktop is checked)", () => {
+  const text = { kind: "text", text: "hi", size: "body", color: "ink" };
+
+  it("reads a well-formed tree and nothing else", () => {
+    expect(parseVisualTree({ kind: "column", gap: 4, children: [text] })).toEqual({ kind: "column", gap: 4, children: [text] });
+    for (const bad of [null, undefined, 3, "x", [], {}, { kind: 4 }]) expect(parseVisualTree(bad)).toBeNull();
+  });
+
+  it("refuses a node with a missing or wrongly typed field", () => {
+    expect(parseVisualTree({ kind: "column", gap: 4 })).toBeNull();
+    expect(parseVisualTree({ kind: "column", gap: 4, children: "x" })).toBeNull();
+    expect(parseVisualTree({ kind: "column", gap: 4, children: [{ kind: "text", size: "body" }] })).toBeNull();
+    expect(parseVisualTree({ kind: "table", columns: null, rows: [] })).toBeNull();
+    expect(parseVisualTree({ kind: "gauge", label: "x", value: "40", min: 0, max: 1 })).toBeNull();
+    expect(parseVisualTree({ kind: "chart", chart_type: "pie", series: [], labels: [], height: 200 })).toBeNull();
+    expect(parseVisualTree({ kind: "chart", chart_type: "bar", series: [{ label: "a", values: [1, Number.NaN] }], labels: [], height: 200 })).toBeNull();
+  });
+
+  it("skips a node kind it does not know, as the renderer always did", () => {
+    expect(parseVisualTree({ kind: "column", gap: 4, children: [{ kind: "hologram" }, text] })).toEqual({ kind: "column", gap: 4, children: [text] });
+    expect(parseVisualTree({ kind: "hologram" })).toBeNull();
+  });
+
+  it("clamps a chart height to the desktop's 120 to 900", () => {
+    const chart = (height: number) => parseVisualTree({ kind: "chart", chart_type: "line", series: [{ label: "a", values: [1, 2] }], labels: ["x", "y"], height });
+    expect(chart(5)).toMatchObject({ height: CHART_HEIGHT.min });
+    expect(chart(5000)).toMatchObject({ height: CHART_HEIGHT.max });
+    expect(chart(300)).toMatchObject({ height: 300 });
+  });
+
+  it("refuses more than 512 nodes, more than 16 levels and oversized series", () => {
+    expect(parseVisualTree({ kind: "column", gap: 0, children: Array.from({ length: MAX_NODES }, () => text) })).toBeNull();
+    expect(parseVisualTree({ kind: "column", gap: 0, children: Array.from({ length: MAX_NODES - 1 }, () => text) })).not.toBeNull();
+    let deep: unknown = text;
+    for (let i = 0; i < MAX_DEPTH; i += 1) deep = { kind: "column", gap: 0, children: [deep] };
+    expect(parseVisualTree(deep)).toBeNull();
+    expect(parseVisualTree({ kind: "chart", chart_type: "bar", series: [{ label: "a", values: new Array(513).fill(1) }], labels: [], height: 200 })).toBeNull();
+  });
+
+  it("falls back to a line of text when a node still cannot be drawn", () => {
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    const broken = { kind: "table", columns: null, rows: [] } as unknown as VisualNode;
+    render(<VisualTree node={broken} />);
+    expect(screen.getByText(/This visual could not be drawn/)).toBeInTheDocument();
+    quiet.mockRestore();
+  });
+
+  it("draws the last 26 weeks of a longer contribution list", () => {
+    const { container } = render(<ContributionGraph levels={Array.from({ length: 400 }, (_, i) => i % 5)} today={new Date(2026, 10, 18)} />);
+    expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe(`0 0 ${28 + 26 * 15} ${18 + 7 * 15}`);
   });
 });

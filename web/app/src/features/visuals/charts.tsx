@@ -9,7 +9,11 @@ import { CELL, center, cells, inked, step } from "./dither";
 import { Curve, Scale, compact } from "./scale";
 import type { Series, Slice, ThemeColor } from "./types";
 
-/** Desktop series hues, tuned for dark and for light surfaces. */
+/**
+ * Desktop series hues, tuned for dark and for light surfaces. Design-system exception (WS-S owns the tokens): these
+ * are the desktop's own chart colours (crates/monocode-gpui/src/visuals/charts.rs), kept literal so a chart reads the
+ * same on every client; the design system has no series tokens.
+ */
 const HUES: Partial<Record<ThemeColor, readonly [dark: string, light: string]>> = {
   positive: ["#4fd57f", "#0a924b"],
   negative: ["#fc5855", "#d01d21"],
@@ -101,6 +105,7 @@ export function Cartesian({ kind, series, labels, height }: { kind: "bar" | "lin
   const color = useVisualColor();
   const dark = useAppearance((state) => state.scheme) === "dark";
   const width = CHART_WIDTH;
+  height = Math.min(Math.max(height, 120), 900);
   const bars = kind === "bar";
   const count = Math.max(labels.length, ...series.map((s) => s.values.length), 0);
   if (count === 0) return null;
@@ -518,7 +523,9 @@ export function Progress({ label, value, max, detail, tint }: { label: string; v
  * each day a square of 4x4 dither cells in the accent, denser the busier it was. `levels` run day by day from a
  * Sunday (26 weeks), each 0 to 4.
  */
-export function ContributionGraph({ levels, today = new Date() }: { levels: number[]; today?: Date }) {
+export function ContributionGraph({ levels: given, today = new Date() }: { levels: number[]; today?: Date }) {
+  // 26 weeks (182 days): a longer list loses its oldest whole weeks, so the days keep their place in the week.
+  const levels = given.length > 182 ? given.slice(Math.ceil((given.length - 182) / 7) * 7) : given;
   const TONES = [0, 0.25, 0.5, 0.75, 1];
   const SQUARE = 4;
   const PITCH = 5;
