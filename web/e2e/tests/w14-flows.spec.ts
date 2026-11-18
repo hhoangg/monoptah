@@ -3,7 +3,7 @@
 // steps; the desktop side is `web_link_headless serve`, driven with its stdin commands (lib/r12.ts HeadlessDesktop).
 import { join } from "node:path";
 import { E2E_CATALOG } from "../lib/catalog.ts";
-import { namedInvite } from "../lib/env.ts";
+import { clearRateLimits, namedInvite } from "../lib/env.ts";
 import { test, expect } from "../lib/fixtures.ts";
 import { probePair } from "../lib/probes.ts";
 import { HeadlessDesktop } from "../lib/r12.ts";
@@ -16,6 +16,9 @@ const MACHINE = "w14-headless";
 test.describe("W-14 flows through the UI", () => {
   let pending: PendingPairing | null = null;
   let serving: HeadlessDesktop | null = null;
+
+  // A fresh pair/start window: the suite pairs more headless desktops than the per-IP limit allows (lib/env.ts).
+  test.beforeAll(clearRateLimits);
 
   test.afterAll(() => {
     serving?.kill();

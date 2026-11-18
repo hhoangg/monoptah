@@ -11,11 +11,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { E2E_CATALOG } from "../lib/catalog.ts";
 import { connectDevice, generateKeyPair } from "../lib/device.ts";
-import { namedInvite, origin } from "../lib/env.ts";
+import { clearRateLimits, namedInvite, origin } from "../lib/env.ts";
 import { test, expect } from "../lib/fixtures.ts";
 import type { Actor } from "../lib/actor.ts";
 import { headlessBin, probeHeadless, probePair, probePairing } from "../lib/probes.ts";
-import { base64urlEncode } from "../lib/pure.ts";
+import { findCredentialLeaks, base64urlEncode } from "../lib/pure.ts";
+import { modeProblems } from "../lib/r12.ts";
 
 interface Headless {
   child: ChildProcess;
@@ -58,6 +59,9 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
   let owner: Actor;
   let desktopId = "";
   let serving: Headless | null = null;
+
+  // A fresh pair/start window: the suite pairs more headless desktops than the per-IP limit allows (lib/env.ts).
+  test.beforeAll(clearRateLimits);
 
   test.afterAll(() => {
     serving?.child.kill("SIGTERM");
@@ -105,9 +109,13 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
       desktopId = paired.desktopId;
       // The token is minted by the poll, sealed in the data dir's store and never printed: no stream or event carries
       // a credential, and no plain token file is left behind.
-      expect(pair.stdoutText() + pair.stderr()).not.toMatch(/desktopToken|deviceCode|verifier/);
+      // There is no test-only reader of the sealed token, so the scan is structural: no credential field name and no
+      // 32+ character base64url or hex run (ids and fingerprints set aside) on stdout or stderr, and the sealed store
+      // and its key are private files (0600, not on Windows).
+      expect(findCredentialLeaks(`${pair.stdoutText()}\n${pair.stderr()}`)).toEqual([]);
       expect(JSON.stringify(pair.events)).not.toMatch(/desktopToken|deviceCode|verifier/);
       expect(existsSync(join(dataDir, "data", "web-pairing.json"))).toBe(false);
+      expect(modeProblems(join(dataDir, "data"))).toEqual([]);
     } finally {
       pair.child.kill("SIGTERM");
     }
@@ -166,5 +174,7 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
     } finally {
       client.bye();
     }
+    expect(findCredentialLeaks(`${serving.stdoutText()}\n${serving.stderr()}`)).toEqual([]);
+    expect(modeProblems(join(dataDir, "data"))).toEqual([]);
   });
 });

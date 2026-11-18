@@ -146,3 +146,45 @@ export function decideUiProbe(snapshot: PageSnapshot): Probe {
   }
   return { run: true, reason: "the page renders the real app" };
 }
+
+/**
+ * The `wrangler d1 execute` arguments that empty the local rate limiter table (harness only). The limits are D1 rows
+ * (security.md 3.5, `rate_limits`) that survive a Worker restart, and every headless `pair` reaches the Worker from
+ * the same address, so a suite with more than 5 pairings inside 600 s would be answered 429. The table holds only
+ * counters (hashed keys, a window start, a count): clearing it between spec files changes no Worker code and no
+ * product behaviour, it only starts a new window.
+ */
+export function clearRateLimitsArgs(persistDir: string, wranglerConfig: string): string[] {
+  return ["d1", "execute", "monoptah", "--local", "--persist-to", persistDir, "-c", wranglerConfig, "--command", "DELETE FROM rate_limits"];
+}
+
+/** Words of the credential fields (`desktopToken`, the pairing `deviceCode` and `verifier`, an Authorization bearer). */
+const TOKEN_WORDS = /desktopToken|deviceCode|verifier|Bearer|Authorization/i;
+/** A run that looks like key material or a token: 32 or more base64url or hex characters in a row. */
+const SECRET_RUN = /[A-Za-z0-9_-]{32,}/;
+/** Event fields that are public by design: ids and fingerprints are not secrets, and the link holds a fingerprint. */
+const PUBLIC_FIELDS = new Set(["fingerprint", "desktopId", "deviceId", "link"]);
+
+/**
+ * Looks for a credential in what a headless process printed (stdout lines and stderr). There is no test-only reader of
+ * the sealed token, so the scan is structural: none of the credential field names, and no 32+ character base64url or
+ * hex run once the public fields (ids, fingerprints, the pairing link) are set aside. Returns what it found, never the
+ * matched text itself (it would put a secret into a failure message).
+ */
+export function findCredentialLeaks(text: string): string[] {
+  const found: string[] = [];
+  for (const [index, raw] of text.split(/\r?\n/).entries()) {
+    let line = raw;
+    try {
+      const value: unknown = JSON.parse(raw);
+      if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+        line = JSON.stringify(Object.fromEntries(Object.entries(value).filter(([key]) => !PUBLIC_FIELDS.has(key))));
+      }
+    } catch {
+      // not a JSON line: scanned as it is
+    }
+    if (TOKEN_WORDS.test(line)) found.push(`line ${index + 1}: a credential field name`);
+    if (SECRET_RUN.test(line)) found.push(`line ${index + 1}: a 32+ character base64url or hex run`);
+  }
+  return found;
+}

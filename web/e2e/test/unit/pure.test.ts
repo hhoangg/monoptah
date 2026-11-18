@@ -1,7 +1,11 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   base64urlDecode,
   base64urlEncode,
+  clearRateLimitsArgs,
+  findCredentialLeaks,
   decideDevicesProbe,
   decideRouteProbe,
   decideHeadlessProbe,
@@ -13,7 +17,7 @@ import {
   resolveHeadlessBin,
   testIp,
 } from "../../lib/pure.ts";
-import { outputDir } from "../../lib/paths.ts";
+import { outputDir, webDir } from "../../lib/paths.ts";
 
 describe("parseInviteCode", () => {
   it("reads the code from the printed link", () => {
@@ -131,5 +135,49 @@ describe("probe decisions", () => {
   it("ui: a served app that renders nothing fails with the page errors", () => {
     expect(() => decideUiProbe({ ...page, rootHasContent: false, pageErrors: ["boom"] })).toThrow(/boom/);
     expect(() => decideUiProbe({ ...page, hasRoot: false, rootHasContent: false })).toThrow(/neither RouteStub/);
+  });
+});
+
+describe("clearRateLimitsArgs", () => {
+  const args = clearRateLimitsArgs("state-dir", "wrangler.jsonc");
+  it("runs one statement on the local database of the harness persistence dir, and nothing else", () => {
+    expect(args.slice(0, 3)).toEqual(["d1", "execute", "monoptah"]);
+    expect(args).toContain("--local");
+    expect(args[args.indexOf("--persist-to") + 1]).toBe("state-dir");
+    expect(args[args.indexOf("-c") + 1]).toBe("wrangler.jsonc");
+    expect(args[args.indexOf("--command") + 1]).toBe("DELETE FROM rate_limits");
+    expect(args).not.toContain("--remote");
+  });
+  it("names a table that the Worker migrations create", () => {
+    const sql = readFileSync(join(webDir, "worker", "migrations", "0001_init.sql"), "utf8");
+    expect(sql).toContain("CREATE TABLE `rate_limits`");
+  });
+});
+
+describe("findCredentialLeaks", () => {
+  const fingerprint = "a".repeat(64);
+  const id = "6f1c2d3e-aaaa-bbbb-cccc-123456789abc";
+  it("accepts the events of pair and serve", () => {
+    const out = [
+      JSON.stringify({ event: "pairing", userCode: "ABCD-EFGH", confirmationCode: "123456", fingerprint, link: `http://localhost/pair/ABCD-EFGH#fp=${fingerprint}`, expiresIn: 600 }),
+      JSON.stringify({ event: "paired", desktopId: id, account: "x", fingerprint }),
+      JSON.stringify({ event: "online", desktopId: id, fingerprint }),
+      JSON.stringify({ event: "request", method: "workspace.list" }),
+    ].join("\n");
+    expect(findCredentialLeaks(out)).toEqual([]);
+    expect(findCredentialLeaks("")).toEqual([]);
+  });
+  it("finds a token-like run, in a JSON field or in free text, without echoing it", () => {
+    const token = "Zk3-".repeat(11);
+    for (const text of [JSON.stringify({ event: "error", message: `bad ${token}` }), `panic: ${token}`, "b".repeat(40)]) {
+      const found = findCredentialLeaks(text);
+      expect(found.length).toBeGreaterThan(0);
+      expect(found.join(" ")).not.toContain(token);
+    }
+  });
+  it("finds the credential field names", () => {
+    for (const text of ['{"desktopToken":"x"}', "deviceCode=abc", "verifier: abc", "Authorization: Bearer abc"]) {
+      expect(findCredentialLeaks(text).length).toBeGreaterThan(0);
+    }
   });
 });

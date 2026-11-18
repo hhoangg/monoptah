@@ -6,7 +6,7 @@ import { createWriteStream, existsSync, mkdirSync, mkdtempSync, rmSync } from "n
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { parseInviteCode } from "./pure.ts";
+import { clearRateLimitsArgs, parseInviteCode } from "./pure.ts";
 import { webDir, wranglerBin, wranglerConfig } from "./paths.ts";
 
 export const RP_ID = "localhost";
@@ -17,8 +17,12 @@ export interface RunningServer {
   invite: string;
   /** More bootstrap invites, one per spec that needs its own account. Never print them. */
   extraInvites: { pairing: string; devices: string; ui: string; w14: string; w14b: string; r12: string };
-  /** Kills wrangler and starts it again on the same port with the same local persistence (D1 and DO state survive). */
-  restart(): Promise<void>;
+  /**
+   * Kills wrangler and starts it again on the same port with the same local persistence (D1 and DO state survive).
+   * With `clearRateLimits` the D1 rate limiter table is emptied while wrangler is down (harness only, see
+   * `clearRateLimitsArgs`), and the restart also drops the Worker's in-memory per-IP pre-filter: a new window.
+   */
+  restart(options?: { clearRateLimits?: boolean }): Promise<void>;
   /** Stops wrangler and removes the temp dir. Waits for exit, escalates to SIGKILL, never throws. */
   stop(): Promise<void>;
 }
@@ -176,10 +180,11 @@ export async function startServer(logFile: string): Promise<RunningServer> {
     }
     if (lastError !== undefined) throw lastError;
 
-    const restart = async (): Promise<void> => {
+    const restart = async (options: { clearRateLimits?: boolean } = {}): Promise<void> => {
       const port = Number(new URL(origin).port);
       await killTree(wrangler);
       wrangler = null;
+      if (options.clearRateLimits) runSync(wranglerBin, clearRateLimitsArgs(persist, wranglerConfig), "d1 clear rate_limits");
       let failure: unknown;
       for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
         try {

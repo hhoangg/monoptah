@@ -20,13 +20,14 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   process.env["E2E_INVITE_W14"] = server.extraInvites.w14;
   process.env["E2E_INVITE_W14B"] = server.extraInvites.w14b;
   process.env["E2E_INVITE_R12"] = server.extraInvites.r12;
-  // The tests run in another process: a loopback control port lets the R-12 spec restart the relay (the Worker).
+  // The tests run in another process: a loopback control port lets the R-12 spec restart the relay (the Worker) and the specs that pair a headless desktop start a fresh rate limit window.
   const control = createServer((req, res) => {
-    if (req.method !== "POST" || req.url !== "/restart") {
+    const clear = req.method === "POST" && req.url === "/clear-rate-limits";
+    if (!clear && (req.method !== "POST" || req.url !== "/restart")) {
       res.writeHead(404).end();
       return;
     }
-    server.restart().then(
+    server.restart({ clearRateLimits: clear }).then(
       () => res.writeHead(200).end("ok"),
       (err: unknown) => res.writeHead(500).end(String(err)),
     );

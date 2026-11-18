@@ -5,7 +5,7 @@
 // (wcag2a, wcag2aa) with zero violations of impact serious or critical. Screenshots go to <output>/w14-visual and are
 // reviewed by eye; there are no committed pixel baselines. Keyboard checks follow in the last tests.
 import type { Page } from "@playwright/test";
-import { namedInvite } from "../lib/env.ts";
+import { clearRateLimits, namedInvite } from "../lib/env.ts";
 import { test, expect } from "../lib/fixtures.ts";
 import { probePair } from "../lib/probes.ts";
 import { startPairing, type PendingPairing } from "../lib/w14-headless.ts";
@@ -49,6 +49,9 @@ const SIGNED_IN: Screen[] = [
 
 test.describe.serial("W-14 screens: visual, axe and keyboard", () => {
   let pending: PendingPairing | null = null;
+
+  // A fresh pair/start window: the suite pairs more headless desktops than the per-IP limit allows (lib/env.ts).
+  test.beforeAll(clearRateLimits);
 
   test.afterAll(() => pending?.dispose());
 

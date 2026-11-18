@@ -3,13 +3,15 @@
 // never reveals).
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { statSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { FrameType } from "@monoptah/protocol";
 import type { FrameSocket } from "../../mock-desktop/src/transport.ts";
 import { connectRelay } from "../../mock-desktop/src/transport.ts";
 import { generateKeyPair } from "../../mock-desktop/src/noise.ts";
 import { headlessBin } from "./probes.ts";
-import { base64urlEncode } from "./pure.ts";
+import { base64urlEncode, findCredentialLeaks } from "./pure.ts";
 
 export type DesktopEvent = Record<string, unknown>;
 
@@ -19,6 +21,7 @@ export class HeadlessDesktop {
   readonly events: DesktopEvent[] = [];
   readonly exited: Promise<number | null>;
   #stderr = "";
+  #stderrAll = "";
   #stdout = "";
 
   constructor(args: string[]) {
@@ -35,6 +38,7 @@ export class HeadlessDesktop {
     });
     this.child.stderr!.on("data", (chunk: Buffer) => {
       this.#stderr = (this.#stderr + chunk.toString()).slice(-2000);
+      this.#stderrAll = (this.#stderrAll + chunk.toString()).slice(-262_144);
     });
     this.child.stdin!.on("error", () => undefined);
     this.exited = new Promise((resolve) => this.child.on("exit", (code) => resolve(code)));
@@ -42,6 +46,10 @@ export class HeadlessDesktop {
 
   stderr(): string {
     return this.#stderr;
+  }
+  /** Everything printed on stderr (the last 256 KiB), for the credential scan. */
+  stderrAll(): string {
+    return this.#stderrAll;
   }
   stdoutText(): string {
     return this.#stdout;
@@ -203,4 +211,27 @@ export async function connectDesktop(origin: string, desktopId: string, token: s
     code = value;
   };
   return { socket, closeCode: () => code };
+}
+
+/** Credential leaks in everything this process printed (stdout lines and stderr); see `findCredentialLeaks`. */
+export function leaksOf(desktop: HeadlessDesktop): string[] {
+  return findCredentialLeaks(`${desktop.stdoutText()}\n${desktop.stderrAll()}`);
+}
+
+/**
+ * Files of a desktop data dir that hold or seal the credentials, with a mode other than 0600. Empty on Windows, where
+ * POSIX modes mean nothing. A missing file is a problem too: the token is sealed in `store.db` with the key beside it.
+ */
+export function modeProblems(dataDir: string): string[] {
+  if (process.platform === "win32") return [];
+  const problems: string[] = [];
+  for (const name of ["store.db", "credentials.key"]) {
+    try {
+      const mode = statSync(join(dataDir, name)).mode & 0o777;
+      if (mode !== 0o600) problems.push(`${name} has mode ${mode.toString(8)}, expected 600`);
+    } catch {
+      problems.push(`${name} is missing`);
+    }
+  }
+  return problems;
 }
