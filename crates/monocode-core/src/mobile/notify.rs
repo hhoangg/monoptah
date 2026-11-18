@@ -1,7 +1,7 @@
 //! Notifications for paired phones, sent through Expo's push service so they
 //! arrive while the app is closed. The desktop sends them itself; there is no
 //! server of ours in between.
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::Read;
 
 const ENDPOINT: &str = "https://exp.host/--/api/v2/push/send";
@@ -302,14 +302,12 @@ mod tests {
     #[test]
     fn plan_sends_nothing_for_unselected_projects_other_categories_or_no_session() {
         let devices = [web_device("p2", Some(&["p2"]), None)];
-        assert!(
-            plan(
-                &notice("agentFinished", Some("s1"), None),
-                &devices,
-                project_p1
-            )
-            .is_none()
-        );
+        assert!(plan(
+            &notice("agentFinished", Some("s1"), None),
+            &devices,
+            project_p1
+        )
+        .is_none());
         assert!(plan(&notice("agentFinished", Some("s1"), None), &[], project_p1).is_none());
         let all = [web_device("all", None, None)];
         assert!(plan(&notice("somethingElse", Some("s1"), None), &all, project_p1).is_none());
@@ -364,10 +362,9 @@ mod tests {
     fn deliver_sends_nothing_when_unpaired() {
         let (_base, rx) = stub(200);
         deliver(|| None, &json!({}), std::time::Duration::ZERO);
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300))
-                .is_err()
-        );
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
     }
 
     #[test]
@@ -381,10 +378,9 @@ mod tests {
         );
         let first = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&first).unwrap(), body);
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300))
-                .is_err()
-        );
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
     }
 
     #[test]
@@ -398,9 +394,8 @@ mod tests {
         let wait = std::time::Duration::from_secs(2);
         assert!(rx.recv_timeout(wait).is_ok());
         assert!(rx.recv_timeout(wait).is_ok());
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(300))
-                .is_err()
-        );
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err());
     }
 }
