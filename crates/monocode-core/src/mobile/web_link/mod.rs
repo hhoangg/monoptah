@@ -156,7 +156,8 @@ struct Shared {
     pairing_seq: AtomicU64,
     /// The pending Noise sessions that are connected, with their fingerprint.
     live: Mutex<HashMap<SessionKey, String>>,
-    commands: Mutex<Option<UnboundedSender<LinkCommand>>>,
+    /// The running loop's command channel, tagged with its generation.
+    commands: Mutex<Option<(u64, UnboundedSender<LinkCommand>)>>,
     requests: Mutex<Vec<PermissionRequest>>,
     /// Requests the user denied, by device row id, with the permission that
     /// was asked: they stay hidden until the server asks for something else.
@@ -272,10 +273,21 @@ impl WebLink {
 
     /// A fresh command channel for a running relay loop; the earlier one, if
     /// any, is replaced.
-    pub(crate) fn install_commands(&self) -> UnboundedReceiver<LinkCommand> {
+    pub(crate) fn install_commands(&self, generation: u64) -> UnboundedReceiver<LinkCommand> {
         let (sender, receiver) = unbounded_channel();
-        *lock(&self.shared.commands) = Some(sender);
+        *lock(&self.shared.commands) = Some((generation, sender));
         receiver
+    }
+
+    /// Ends a loop's own channel and live set. A loop of an older generation
+    /// (aborted by a quick off and on) must not clear the new loop's.
+    pub(crate) fn end_run(&self, generation: u64) {
+        let mut commands = lock(&self.shared.commands);
+        if commands.as_ref().is_some_and(|(g, _)| *g == generation) {
+            *commands = None;
+            drop(commands);
+            self.live_clear();
+        }
     }
 
     pub(crate) fn clear_commands(&self) {
@@ -285,7 +297,7 @@ impl WebLink {
     /// Hands a command to the running relay loop. With no loop running there
     /// are no live sessions to act on, so it is dropped.
     pub(crate) fn command(&self, command: LinkCommand) {
-        if let Some(sender) = lock(&self.shared.commands).as_ref() {
+        if let Some((_, sender)) = lock(&self.shared.commands).as_ref() {
             let _ = sender.send(command);
         }
     }

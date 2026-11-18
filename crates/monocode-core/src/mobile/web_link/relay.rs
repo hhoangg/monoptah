@@ -379,10 +379,9 @@ impl GrantSync {
         let Ok(grants) = desktop_api::desktop_grants(&self.base, &self.token) else {
             return;
         };
-        if self.link.generation() != self.generation {
-            return;
-        }
-        for (device_id, state, permission) in self.host.apply_server_grants(&grants) {
+        for (device_id, state, permission) in
+            self.host.apply_server_grants(&grants, self.generation)
+        {
             // Best effort: the next sync repeats what the server still lacks.
             let _ = desktop_api::report_grant_state(
                 &self.base,
@@ -407,7 +406,7 @@ async fn serve_socket(
     let (mut sink, mut stream) = socket.split();
     let directory_host = host.clone();
     let directory: Directory =
-        Box::new(move |fingerprint, _relay_id| directory_host.web_lookup(fingerprint));
+        Box::new(move |fingerprint, relay_id| directory_host.web_lookup_for(fingerprint, relay_id));
     let mut table = SessionTable::new(
         static_private.clone(),
         desktop_id,
@@ -417,7 +416,7 @@ async fn serve_socket(
     );
     let (out_tx, mut out_rx) = mpsc::channel::<Out>(256);
     let mut requests = Requests::new(host.clone(), out_tx);
-    let mut commands = link.install_commands();
+    let mut commands = link.install_commands(sync.generation);
     // Every connect fetches the grants: the pending ones live in memory only.
     sync.trigger();
     let started = Instant::now();
@@ -473,8 +472,7 @@ async fn serve_socket(
     // The socket is gone: end every session without sending anything.
     let actions = table.close_all();
     collect(actions, &mut requests, link, &mut Vec::new());
-    link.clear_commands();
-    link.live_clear();
+    link.end_run(sync.generation);
     end
 }
 
@@ -647,9 +645,19 @@ fn run_command(
             fingerprint,
             device,
         } => {
+            // Only a session under the relay id the grant named becomes ready:
+            // any other of this key is ended.
+            let bound = device.server_device_id.clone().unwrap_or_default();
             for key in table.live_channels(&fingerprint) {
                 link.live_remove(&key);
-                let actions = table.confirm(key, (*device).clone(), now);
+                let id = uuid::Uuid::from_bytes(key.device_id)
+                    .hyphenated()
+                    .to_string();
+                let actions = if id.eq_ignore_ascii_case(&bound) {
+                    table.confirm(key, (*device).clone(), now)
+                } else {
+                    table.close_device(&key.device_id)
+                };
                 collect(actions, requests, link, frames);
             }
         }

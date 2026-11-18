@@ -70,8 +70,12 @@ pub(crate) struct Plan {
     /// `(row id, server device id, requested)`: a raise the user must approve.
     pub raised: Vec<(String, String, Permission)>,
     /// Server device ids confirmed on the server that this desktop has no
-    /// row for: the desktop reports them revoked.
+    /// row for: the desktop reports them `pending` again (not `revoked`, which
+    /// is final), so they show up for local confirmation.
     pub orphaned: Vec<String>,
+    /// `(server device id, permission)`: the server's view of a confirmed
+    /// local row is stale (a report failed), so report `confirmed` again.
+    pub reconfirm: Vec<(String, Permission)>,
 }
 
 /// The fingerprint of a grant's public key, `None` for a key that is not
@@ -92,6 +96,16 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device]) -> Plan {
                 .is_some_and(|row_id| row_id.eq_ignore_ascii_case(id))
         })
     };
+    // A key listed under several device ids is ambiguous: list none of them.
+    let mut ids_by_key: std::collections::HashMap<String, Vec<&str>> = Default::default();
+    for grant in grants {
+        if let Some(own) = grant_fingerprint(&grant.public_key) {
+            let ids = ids_by_key.entry(own).or_default();
+            if !ids.contains(&grant.device_id.as_str()) {
+                ids.push(grant.device_id.as_str());
+            }
+        }
+    }
     let mut plan = Plan::default();
     for grant in grants {
         let Some(own) = grant_fingerprint(&grant.public_key) else {
@@ -102,10 +116,22 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device]) -> Plan {
         if !grant.fingerprint.eq_ignore_ascii_case(&own) {
             continue;
         }
+        if ids_by_key.get(&own).is_some_and(|ids| ids.len() > 1) {
+            continue;
+        }
         match grant.state.as_str() {
             "pending" => {
-                let confirmed = rows.iter().filter(web).any(|row| row.fingerprint == own);
-                if !confirmed {
+                let row = rows.iter().filter(web).find(|row| row.fingerprint == own);
+                if let Some(row) = row {
+                    let same_id = row
+                        .server_device_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&grant.device_id));
+                    if same_id {
+                        plan.reconfirm
+                            .push((grant.device_id.clone(), row.permission));
+                    }
+                } else {
                     plan.pending.push((
                         own,
                         clean_name(&grant.device_name),
@@ -122,6 +148,10 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device]) -> Plan {
                 None => plan.orphaned.push(grant.device_id.clone()),
                 Some(row) if row.fingerprint != own => {}
                 Some(row) => {
+                    if grant.permission != Some(row.permission) {
+                        plan.reconfirm
+                            .push((grant.device_id.clone(), row.permission));
+                    }
                     if let Some(requested) = grant.requested.filter(|r| *r != row.permission) {
                         if rank(requested) < rank(row.permission) {
                             plan.lowered.push((row.id.clone(), requested));
@@ -299,6 +329,40 @@ mod tests {
             plan.raised,
             [("row-s7".to_string(), "s7".to_string(), Permission::Control)]
         );
+    }
+
+    #[test]
+    fn the_plan_heals_stale_server_state_and_skips_ambiguous_keys() {
+        let stale_pending = server_grant([1; 32], "s1", "pending");
+        let mut wrong_permission = server_grant([2; 32], "s2", "confirmed");
+        wrong_permission.permission = Some(Permission::Read);
+        let mut right_permission = server_grant([3; 32], "s3", "confirmed");
+        right_permission.permission = Some(Permission::Control);
+        let twin_a = server_grant([4; 32], "s4", "pending");
+        let twin_b = server_grant([4; 32], "s5", "pending");
+        let rows = [
+            web_row([1; 32], "s1", Permission::Control),
+            web_row([2; 32], "s2", Permission::Control),
+            web_row([3; 32], "s3", Permission::Control),
+        ];
+        let plan = plan(
+            &[
+                stale_pending,
+                wrong_permission,
+                right_permission,
+                twin_a,
+                twin_b,
+            ],
+            &rows,
+        );
+        assert_eq!(
+            plan.reconfirm,
+            [
+                ("s1".to_string(), Permission::Control),
+                ("s2".to_string(), Permission::Control)
+            ]
+        );
+        assert!(plan.pending.is_empty());
     }
 
     #[test]

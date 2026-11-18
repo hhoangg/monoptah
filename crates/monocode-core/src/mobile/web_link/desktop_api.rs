@@ -39,6 +39,11 @@ pub fn base_url(url: &str, allow_insecure_localhost: bool) -> Result<String, Str
     })
 }
 
+/// The id in a `.../relay/desktop/<id>` URL, if it has that form.
+pub fn relay_path_id(url: &str) -> Option<&str> {
+    url.trim().split_once(RELAY_PATH).map(|(_, id)| id)
+}
+
 /// What `POST /api/pair/start` answered.
 pub struct PairStarted {
     pub user_code: String,
@@ -231,8 +236,8 @@ pub fn pair_start(
         user_code,
         device_code: Zeroizing::new(device_code),
         confirmation_code,
-        expires_in: body["expiresIn"].as_u64().unwrap_or(600),
-        interval: body["interval"].as_u64().unwrap_or(3).max(1),
+        expires_in: body["expiresIn"].as_u64().unwrap_or(600).clamp(60, 900),
+        interval: body["interval"].as_u64().unwrap_or(3).clamp(1, 60),
     })
 }
 

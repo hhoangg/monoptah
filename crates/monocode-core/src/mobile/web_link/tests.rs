@@ -1726,10 +1726,7 @@ mod seam {
                 }
             })
             .await;
-            assert!(
-                !matches!(reply, Ok(FrameType::Hs2 | FrameType::Transport)),
-                "{reply:?}"
-            );
+            assert!(matches!(reply, Ok(FrameType::Bye)), "{reply:?}");
             let _ = &mut unknown;
             // A pending device completes the handshake but no method runs.
             let state = pending.handshake(&mut conn, 2).await;
@@ -1954,6 +1951,142 @@ mod seam {
             .host
             .set_device_access("nobody", Permission::Read, None, None)
             .is_err());
+    }
+    #[test]
+    fn a_relay_url_on_another_host_or_with_another_id_is_refused_and_given_back() {
+        let variant = Arc::new(Mutex::new(0usize));
+        let pick = variant.clone();
+        let handler: Handler = Arc::new(move |req| {
+            match req.path.as_str() {
+            "/api/pair/start" => (
+                200,
+                r#"{"userCode":"ABCD-2345","deviceCode":"fake-device-code","confirmationCode":"123456","expiresIn":600,"interval":3}"#.into(),
+            ),
+            "/api/pair/poll" => {
+                let relay = match *pick.lock().unwrap() {
+                    0 => format!("ws://127.0.0.1:1/relay/desktop/{DESKTOP_UUID}"),
+                    _ => format!("ws://127.0.0.1:{}/relay/desktop/someone-else", req.port),
+                };
+                (
+                    200,
+                    json!({"status":"approved","desktopId":DESKTOP_UUID,"desktopToken":TOKEN,
+                        "account":{"handle":"alice"},"relayUrl":relay})
+                    .to_string(),
+                )
+            }
+            "/api/desktop/me" => (200, r#"{"ok":true}"#.into()),
+            _ => (404, "{}".into()),
+        }
+        });
+        let world = world(handler, false);
+        let host_url = format!("http://127.0.0.1:{}", world.hub.port);
+        for round in 0..2 {
+            *variant.lock().unwrap() = round;
+            world.host.web_pair_start(&host_url, "Mac").unwrap();
+            let error = world.host.web_pair_poll().unwrap_err();
+            assert!(error.contains("invalid pairing"), "{error}");
+            assert!(!world.status().paired);
+            assert_eq!(world.host.load_web_identity().unwrap(), None);
+            // The desktop the server made is deleted on the host the user typed.
+            let deleted = world.hub.requests("DELETE", "/api/desktop/me");
+            assert_eq!(deleted.len(), round + 1);
+            assert_eq!(deleted[round].auth, bearer());
+        }
+    }
+
+    #[test]
+    fn a_pending_session_must_use_the_relay_id_its_grant_names() {
+        let grants = Grants::default();
+        let world = world(grant_handler(grants.clone()), true);
+        let mut peer = world.peer(71);
+        let mut wrong = grant(&peer, "pending", None, None);
+        wrong["deviceId"] = json!(world.peer(72).relay_id());
+        *grants.lock().unwrap() = vec![wrong];
+        let mut conn = world.connect();
+        world.wait_for("the pending grant", |w| w.status().pending.len() == 1);
+        world.hub.rt.block_on(async {
+            let desktop = *uuid::Uuid::parse_str(DESKTOP_UUID).unwrap().as_bytes();
+            let mut init =
+                Initiator::new(&peer.private, &peer.desktop_public, &desktop, &peer.id, 1).unwrap();
+            let hs1 = init.write_hs1(br#"{"name":"Laptop"}"#).unwrap();
+            conn.send(peer.frame(FrameType::Hs1, hs1)).await;
+            let frame = conn.frame().await;
+            assert_eq!((frame.kind, frame.device_id), (FrameType::Bye, peer.id));
+            let _ = &mut peer;
+        });
+        assert!(!world.status().pending[0].online);
+    }
+
+    #[test]
+    fn one_key_under_two_device_ids_is_not_listed_and_a_taken_id_is_refused() {
+        let grants = Grants::default();
+        let world = world(grant_handler(grants.clone()), true);
+        let (twin, other, known) = (world.peer(81), world.peer(82), world.peer(83));
+        let mut second = grant(&twin, "pending", None, None);
+        second["deviceId"] = json!(world.peer(84).relay_id());
+        // `other` is pending under the relay id a confirmed row already has.
+        let mut clash = grant(&other, "pending", None, None);
+        clash["deviceId"] = json!(known.relay_id());
+        *grants.lock().unwrap() = vec![grant(&twin, "pending", None, None), second, clash];
+        world
+            .host
+            .add_device_for_test(confirmed_row(&known, "row-k", Permission::Read));
+        let _conn = world.connect();
+        world.wait_for("the pending list", |w| w.status().pending.len() == 1);
+        let pending = world.status().pending;
+        assert_eq!(pending[0].fingerprint, other.fingerprint());
+        let error = world
+            .host
+            .web_confirm(&other.fingerprint(), Permission::Read, None, None)
+            .unwrap_err();
+        assert!(error.contains("already uses"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_confirm_report_is_repeated_by_the_next_sync() {
+        let grants = Grants::default();
+        let seen_grants = grants.clone();
+        let handler: Handler = Arc::new(move |req| {
+            if req.method == "POST" && req.path.starts_with("/api/desktop/grants/") {
+                return (500, "{}".into());
+            }
+            grant_handler(seen_grants.clone())(req)
+        });
+        let world = world(handler, true);
+        let peer = world.peer(91);
+        // The server still lists the device `pending` though it is confirmed here.
+        *grants.lock().unwrap() = vec![grant(&peer, "pending", None, None)];
+        world
+            .host
+            .add_device_for_test(confirmed_row(&peer, "row-h", Permission::Control));
+        let mut conn = world.connect();
+        let path = format!("/api/desktop/grants/{}/state", peer.relay_id());
+        world.wait_for("the first report", |w| w.hub.count("POST", &path) == 1);
+        assert!(world.status().pending.is_empty());
+        let frame = Frame {
+            kind: FrameType::Ctrl,
+            channel: 0,
+            device_id: [0; 16],
+            body: serde_json::to_vec(&json!({"t": "grants"})).unwrap(),
+        };
+        world.hub.rt.block_on(conn.send(frame));
+        world.wait_for("the repeated report", |w| w.hub.count("POST", &path) == 2);
+        for report in world.hub.requests("POST", &path) {
+            assert_eq!(
+                report.body,
+                json!({"state": "confirmed", "permission": "control"})
+            );
+        }
+        // A confirmed grant that shows another permission is healed too.
+        grants.lock().unwrap()[0] = grant(&peer, "confirmed", None, Some("read"));
+        let frame = Frame {
+            kind: FrameType::Ctrl,
+            channel: 0,
+            device_id: [0; 16],
+            body: serde_json::to_vec(&json!({"t": "grants"})).unwrap(),
+        };
+        world.hub.rt.block_on(conn.send(frame));
+        world.wait_for("the permission report", |w| w.hub.count("POST", &path) == 3);
     }
 }
 

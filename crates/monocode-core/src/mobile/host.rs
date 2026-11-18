@@ -1238,8 +1238,15 @@ impl MobileHost {
         use rand::RngCore;
         use sha2::{Digest, Sha256};
         let base = desktop_api::base_url(host_url, allow_insecure_localhost)?;
-        if self.web.is_paired() || self.load_web_identity()?.is_some() {
+        if self.web.is_paired() {
             return Err("Unpair first".into());
+        }
+        match self.load_web_identity() {
+            Ok(Some(_)) => return Err("Unpair first".into()),
+            Ok(None) => {}
+            // A damaged identity counts as a reinstall: pairing replaces it.
+            Err(error) if error == identity_store::WEB_UNREADABLE => {}
+            Err(error) => return Err(error),
         }
         let (private, public) = super::web_link::noise::generate_static()?;
         let private = Zeroizing::new(private);
@@ -1263,7 +1270,14 @@ impl MobileHost {
                 .user_code
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-');
-        if !code_ok {
+        // The confirmation code is shown to the user: plain short text only.
+        let confirmation_ok = !started.confirmation_code.is_empty()
+            && started.confirmation_code.len() <= 16
+            && started
+                .confirmation_code
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if !code_ok || !confirmation_ok {
             return Err("The web server sent an invalid pairing code".into());
         }
         let fingerprint = super::web_link::noise::fingerprint(&public);
@@ -1272,7 +1286,7 @@ impl MobileHost {
             user_code: started.user_code,
             confirmation_code: started.confirmation_code,
             fingerprint,
-            expires_at: now() + started.expires_in,
+            expires_at: now().saturating_add(started.expires_in),
             interval: started.interval,
         };
         *self.web.pairing() = Some(super::web_link::Pairing {
@@ -1351,24 +1365,38 @@ impl MobileHost {
                 None
             }
         };
-        let relay_base = desktop_api::base_url(&approval.relay_url, dev);
-        // Cancelled while the answer was on its way: the server made a desktop
-        // for it, so give it back instead of leaving it behind.
-        let undo = |base: &Result<String, String>| {
-            if let Ok(base) = base {
-                let _ =
-                    desktop_api::delete_me(base, &approval.desktop_token, Duration::from_secs(8));
-            }
+        // The server made a desktop for this pairing. If it cannot be used
+        // (cancelled, or the answer names another host), give it back to the
+        // host the user typed instead of leaving it behind.
+        let undo = |base: &str| {
+            let _ = desktop_api::delete_me(base, &approval.desktop_token, Duration::from_secs(8));
         };
         let Some(pairing) = pairing else {
-            undo(&relay_base);
+            // Cancelled while the answer was on its way: the typed host is
+            // gone with the pairing, so use the one the answer names.
+            if let Ok(base) = desktop_api::base_url(&approval.relay_url, dev) {
+                undo(&base);
+            }
             return Err("The pairing was cancelled".into());
         };
+        // The relay must be on the host the user typed, and its path id must be
+        // this desktop's id: the server cannot move the token elsewhere.
+        let relay_base = pairing.base.clone();
+        let same_host = desktop_api::base_url(&approval.relay_url, dev)
+            .is_ok_and(|base| base.eq_ignore_ascii_case(&relay_base));
+        let same_id = desktop_api::relay_path_id(&approval.relay_url)
+            .is_none_or(|id| id.eq_ignore_ascii_case(&approval.desktop_id));
         let valid_id = uuid::Uuid::parse_str(&approval.desktop_id).is_ok();
-        let (true, Ok(relay_base)) = (valid_id, relay_base.clone()) else {
+        if !(same_host && same_id && valid_id) {
             undo(&relay_base);
             return Err("The web server sent an invalid pairing".into());
-        };
+        }
+        // A new pairing starts every device over: old web rows would skip the
+        // re-confirmation a replaced pairing needs.
+        if let Err(error) = self.remove_web_rows() {
+            undo(&relay_base);
+            return Err(error);
+        }
         let handle = super::web_link::session::clean_name(&approval.handle);
         let identity = identity_store::WebIdentity {
             static_private: *pairing.private,
@@ -1379,7 +1407,7 @@ impl MobileHost {
             account_handle: Some(handle.clone()),
         };
         if let Err(error) = self.save_web_identity(&identity) {
-            undo(&Ok(relay_base));
+            undo(&relay_base);
             return Err(error);
         }
         self.set_web_enabled(true)?;
@@ -1391,9 +1419,31 @@ impl MobileHost {
         *self.web.pairing() = None;
     }
 
+    /// Removes every web device row and its watches.
+    fn remove_web_rows(&self) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(unavailable)?;
+        self.remove_web_rows_locked(&mut inner)
+    }
+
+    fn remove_web_rows_locked(&self, inner: &mut Inner) -> Result<(), String> {
+        let mut config = inner.config.clone();
+        config
+            .devices
+            .retain(|device| device.kind != DeviceKind::Web);
+        if config.devices.len() != inner.config.devices.len() {
+            self.save(&config)?;
+            inner.config = config;
+        }
+        inner
+            .watches
+            .retain(|_, watch| watch.via != DeviceKind::Web);
+        Ok(())
+    }
+
     /// Reports a grant state to the server on a background thread, so the
-    /// desktop's own action works while the server is offline. The next grant
-    /// sync fixes what a failed report left behind.
+    /// desktop's own action works while the server is offline. A report that
+    /// fails is repeated by the next grant sync, which compares the server's
+    /// state with the rows (`grants::plan`, `reconfirm`).
     fn report_async(
         &self,
         server_device_id: Option<String>,
@@ -1407,7 +1457,15 @@ impl MobileHost {
         let _ = std::thread::Builder::new()
             .name("monocode-web-report".into())
             .spawn(move || {
-                let Ok(Some(identity)) = host.load_web_identity() else {
+                // Read the store directly: this must not bring back the cached
+                // facts of an identity that Unpair wipes meanwhile.
+                let Ok(database) = host.web_database() else {
+                    return;
+                };
+                let Ok(Some(identity)) = identity_store::load_web(
+                    &database,
+                    &identity_store::web_account_for(&host.path),
+                ) else {
                     return;
                 };
                 let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions))
@@ -1447,6 +1505,17 @@ impl MobileHost {
                 .any(|device| device.fingerprint == fingerprint)
             {
                 return Err("This device is already paired".into());
+            }
+            // One relay device id belongs to one row.
+            let taken = inner.config.devices.iter().any(|device| {
+                device.kind == DeviceKind::Web
+                    && device
+                        .server_device_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&grant.server_device_id))
+            });
+            if taken {
+                return Err("Another paired device already uses this web device id".into());
             }
             let device = Device {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1608,33 +1677,33 @@ impl MobileHost {
             &self.web_database()?,
             &identity_store::web_account_for(&self.path),
         )?;
-        self.web.forget();
+        // Under the same lock the grant sync applies with, so a late sync
+        // cannot refill the pending set after the wipe.
         let mut inner = self.inner.lock().map_err(unavailable)?;
-        let mut config = inner.config.clone();
-        config
-            .devices
-            .retain(|device| device.kind != DeviceKind::Web);
-        if config.devices.len() != inner.config.devices.len() {
-            self.save(&config)?;
-            inner.config = config;
-        }
-        inner
-            .watches
-            .retain(|_, watch| watch.via != DeviceKind::Web);
-        Ok(())
+        self.web.forget();
+        self.remove_web_rows_locked(&mut inner)
     }
 
     /// Applies the server's grant list (grant sync): pending devices become
     /// the pending set, revoked ones lose their row, a lowered permission is
     /// applied and a raised one becomes a request. Live sessions are told
     /// through the link. Returns what to report to the server.
-    pub(super) fn apply_server_grants(&self, grants: &[desktop_api::ServerGrant]) -> Vec<Report> {
+    pub(super) fn apply_server_grants(
+        &self,
+        grants: &[desktop_api::ServerGrant],
+        generation: u64,
+    ) -> Vec<Report> {
         let mut reports: Vec<Report> = Vec::new();
         let mut commands: Vec<LinkCommand> = Vec::new();
         {
             let Ok(mut inner) = self.inner.lock() else {
                 return reports;
             };
+            // Checked under the lock Unpair also takes: a sync of an unpaired
+            // link applies nothing.
+            if self.web.generation() != generation {
+                return reports;
+            }
             let plan = super::web_link::grants::plan(grants, &inner.config.devices);
             let mut config = inner.config.clone();
             let mut closing: Vec<String> = Vec::new();
@@ -1687,7 +1756,12 @@ impl MobileHost {
             // takes, so a device confirmed meanwhile is not listed again.
             self.web.pending().replace(plan.pending);
             for server_id in plan.orphaned {
-                reports.push((server_id, "revoked", None));
+                reports.push((server_id, "pending", None));
+            }
+            for (server_id, permission) in plan.reconfirm {
+                if !reports.iter().any(|r| r.0 == server_id) {
+                    reports.push((server_id, "confirmed", Some(permission)));
+                }
             }
         }
         for command in commands {
@@ -1733,6 +1807,30 @@ impl MobileHost {
         Ok(())
     }
 
+    /// The projects and Monos of the last published catalog as `(id, name)`
+    /// pairs in catalog order (the `id` and `name` fields the app writes in
+    /// `shell/mobile_host.rs`; the ids are what `Device.projects` and
+    /// `Device.monos` hold). Empty before anything was published. One lock.
+    #[allow(clippy::type_complexity)] // the pair of (id, name) lists is the API
+    pub fn catalog_choices(&self) -> (Vec<(String, String)>, Vec<(String, String)>) {
+        let Ok(inner) = self.inner.lock() else {
+            return Default::default();
+        };
+        let pairs = |key: &str| -> Vec<(String, String)> {
+            inner.catalog[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| {
+                    let id = entry["id"].as_str()?;
+                    let name = entry["name"].as_str().unwrap_or(id);
+                    Some((id.to_owned(), name.to_owned()))
+                })
+                .collect()
+        };
+        (pairs("projects"), pairs("monos"))
+    }
+
     /// What Settings shows about the web link.
     pub fn web_status(&self) -> super::web_link::WebStatus {
         let (enabled, devices) = self
@@ -1759,6 +1857,24 @@ impl MobileHost {
     /// What the web link knows of a device fingerprint, for a handshake.
     /// Never blocks: one short lock, no I/O.
     pub(super) fn web_lookup(&self, fingerprint: &str) -> super::web_link::session::Lookup {
+        self.lookup(fingerprint, None)
+    }
+
+    /// `web_lookup` for a handshake: a pending device must also come in under
+    /// the relay device id its grant named.
+    pub(super) fn web_lookup_for(
+        &self,
+        fingerprint: &str,
+        relay_id: &str,
+    ) -> super::web_link::session::Lookup {
+        self.lookup(fingerprint, Some(relay_id))
+    }
+
+    fn lookup(
+        &self,
+        fingerprint: &str,
+        relay_id: Option<&str>,
+    ) -> super::web_link::session::Lookup {
         use super::web_link::session::Lookup;
         if let Ok(inner) = self.inner.lock() {
             if let Some(device) = inner
@@ -1776,7 +1892,10 @@ impl MobileHost {
                 };
             }
         }
-        if self.web.pending().contains(fingerprint) {
+        let pending = self.web.pending().get(fingerprint).is_some_and(|grant| {
+            relay_id.is_none_or(|id| grant.server_device_id.eq_ignore_ascii_case(id))
+        });
+        if pending {
             Lookup::Pending
         } else {
             Lookup::Unknown
@@ -2416,6 +2535,28 @@ mod tests {
             assert_eq!(inner.watches.keys().collect::<Vec<_>>(), ["w3"]);
         }
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn catalog_choices_lists_published_projects_and_monos_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_in(dir.path());
+        assert_eq!(host.catalog_choices(), (vec![], vec![]));
+        host.publish(json!({
+            "projects":[{"id":"p2","name":"Beta"},{"id":"p1","name":"Alpha"},{"name":"no id"}],
+            "monos":[{"id":"m1","name":"Fox"}],
+            "sessions":[]
+        }))
+        .unwrap();
+        let (projects, monos) = host.catalog_choices();
+        assert_eq!(
+            projects,
+            [
+                ("p2".to_string(), "Beta".to_string()),
+                ("p1".to_string(), "Alpha".to_string())
+            ]
+        );
+        assert_eq!(monos, [("m1".to_string(), "Fox".to_string())]);
     }
 
     #[tokio::test]
