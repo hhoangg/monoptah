@@ -124,6 +124,8 @@ pub(crate) enum LinkCommand {
     Resend { fingerprint: String },
     /// Send a fresh `state` on every ready session (a policy toggle changed).
     ResendAll,
+    /// Fetch the server's grants again (a report was answered "gone").
+    SyncGrants,
 }
 
 /// The identity facts Settings shows, cached so a refresh reads no database.

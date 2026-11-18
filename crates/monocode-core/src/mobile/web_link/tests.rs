@@ -1944,7 +1944,12 @@ mod seam {
         let grants = Grants::default();
         let world = world(grant_handler(grants.clone()), true);
         let (denied, revoked) = (world.peer(41), world.peer(42));
-        *grants.lock().unwrap() = vec![grant(&denied, "pending", None, None)];
+        // The server lists the grant of the confirmed row too: a row whose
+        // grant the server does not list is dropped by the sync.
+        *grants.lock().unwrap() = vec![
+            grant(&denied, "pending", None, None),
+            grant(&revoked, "confirmed", None, Some("control")),
+        ];
         world
             .host
             .add_device_for_test(confirmed_row(&revoked, "row-r", Permission::Control));
@@ -2062,6 +2067,58 @@ mod seam {
                 line("revoke", Some("unpair")),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_server_revoke_removes_the_device_row_and_a_deleted_grant_does_too() {
+        use crate::mobile::web_link::desktop_api::ServerGrant;
+        let env = env(1);
+        env.host.set_flags_for_test(true, true);
+        let peer = &env.peer;
+        let deleted = Peer::new(9, env.peer.desktop_public);
+        let mut row = web_row(&deleted);
+        row.id = "web-2".into();
+        env.host.add_device_for_test(row);
+        assert_eq!(env.host.web_status().devices.len(), 2);
+        let grant = ServerGrant {
+            device_id: peer.relay_id(),
+            device_name: "Laptop".into(),
+            public_key: URL_SAFE_NO_PAD.encode(peer.public),
+            fingerprint: peer.fingerprint(),
+            state: "revoked".into(),
+            requested: None,
+            permission: None,
+        };
+        let generation = env.host.web_link().generation();
+        // The server lists the first device as revoked and does not list the
+        // second one at all (the grant was deleted there): both rows go, and
+        // nothing is reported back, so neither can be re-created.
+        let reports = env.host.apply_server_grants(&[grant], generation);
+        assert!(reports.is_empty(), "{reports:?}");
+        assert!(env.host.web_status().devices.is_empty());
+        let saved = std::fs::read_to_string(env._dir.path().join("mobile-access.json")).unwrap();
+        assert!(!saved.contains(&peer.relay_id()), "{saved}");
+        assert!(!saved.contains(&deleted.relay_id()), "{saved}");
+    }
+
+    #[test]
+    fn a_report_the_server_answers_404_or_409_is_gone() {
+        let report = |status: u16, state: &str| {
+            let handler: Handler = Arc::new(move |_| (status, r#"{"ok":true}"#.into()));
+            let stub = world(handler, false);
+            let base = format!("http://127.0.0.1:{}", stub.hub.port);
+            desktop_api::report_grant_state(
+                &base,
+                TOKEN,
+                DESKTOP_UUID,
+                state,
+                (state == "confirmed").then_some(Permission::Control),
+            )
+        };
+        assert_eq!(report(404, "confirmed"), Ok(desktop_api::Reported::Gone));
+        assert_eq!(report(409, "confirmed"), Ok(desktop_api::Reported::Gone));
+        assert_eq!(report(200, "revoked"), Ok(desktop_api::Reported::Accepted));
+        assert!(report(500, "revoked").is_err());
     }
 
     #[tokio::test]

@@ -63,7 +63,7 @@ pub(crate) fn rank(permission: Permission) -> u8 {
 pub(crate) struct Plan {
     /// `(fingerprint, cleaned name, server device id)` of devices to confirm.
     pub pending: Vec<(String, String, String)>,
-    /// Row ids of web devices the server revoked.
+    /// Row ids of web devices the server revoked, or no longer lists at all.
     pub revoked_rows: Vec<String>,
     /// `(row id, new permission)`: a lowering the desktop applies by itself.
     pub lowered: Vec<(String, Permission)>,
@@ -181,6 +181,21 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device], user_revoked: &[Stri
                 }
             },
             _ => {}
+        }
+    }
+    // The list carries every grant of this desktop, a revoked one included.
+    // A web row whose server id is not in it at all is a grant the server
+    // deleted: the server says it is gone, so the row goes too and a stale
+    // row can never re-create it by reporting `confirmed`.
+    for row in rows.iter().filter(web) {
+        let Some(id) = row.server_device_id.as_deref() else {
+            continue;
+        };
+        let listed = grants
+            .iter()
+            .any(|grant| grant.device_id.eq_ignore_ascii_case(id));
+        if !listed && !plan.revoked_rows.contains(&row.id) {
+            plan.revoked_rows.push(row.id.clone());
         }
     }
     plan
@@ -398,6 +413,26 @@ mod tests {
         assert!(plan.pending.is_empty());
         // Another confirmed grant without a row is still an orphan.
         assert_eq!(plan.orphaned, ["s4"]);
+    }
+
+    #[test]
+    fn a_row_whose_grant_the_server_no_longer_lists_is_dropped() {
+        let listed = server_grant([1; 32], "s1", "confirmed");
+        let rows = [
+            web_row([1; 32], "s1", Permission::Control),
+            web_row([2; 32], "S2", Permission::Control),
+            web_row([3; 32], "s3", Permission::Read),
+        ];
+        // `s3` differs from the list only by being absent; a row with no
+        // server id at all is not the server's to drop.
+        let mut unbound = web_row([4; 32], "s4", Permission::Read);
+        unbound.server_device_id = None;
+        let mut rows = rows.to_vec();
+        rows.push(unbound);
+        let mut twin = server_grant([2; 32], "s2", "confirmed");
+        twin.permission = Some(Permission::Control);
+        let plan = plan(&[listed, twin], &rows, &[]);
+        assert_eq!(plan.revoked_rows, ["row-s3"]);
     }
 
     #[test]

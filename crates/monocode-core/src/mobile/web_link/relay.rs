@@ -410,13 +410,18 @@ impl GrantSync {
             self.host.apply_server_grants(&grants, self.generation)
         {
             // Best effort: the next sync repeats what the server still lacks.
-            let _ = desktop_api::report_grant_state(
+            let answer = desktop_api::report_grant_state(
                 &self.base,
                 &self.token,
                 &device_id,
                 state,
                 permission,
             );
+            // The server says the grant is gone or revoked: go round once
+            // more, which drops the row it still has here.
+            if answer == Ok(desktop_api::Reported::Gone) {
+                self.link.sync_gate().enter();
+            }
         }
     }
 }
@@ -480,7 +485,11 @@ async fn serve_socket(
                 reply(&mut table, &mut requests, out, now_ms(), &mut frames);
             }
             Some(command) = commands.recv() => {
-                run_command(command, host, link, &mut table, &mut requests, now_ms(), &mut frames);
+                if matches!(command, LinkCommand::SyncGrants) {
+                    sync.trigger();
+                } else {
+                    run_command(command, host, link, &mut table, &mut requests, now_ms(), &mut frames);
+                }
             }
             _ = ping.tick() => {
                 if sink.send(Message::text("ping")).await.is_err() {
@@ -701,6 +710,8 @@ fn run_command(
         LinkCommand::Deny { fingerprint } | LinkCommand::Revoke { fingerprint } => {
             close_fingerprint(&fingerprint, table, requests, link, now, frames);
         }
+        // Handled by the loop, which owns the grant sync.
+        LinkCommand::SyncGrants => {}
         LinkCommand::ResendAll => {
             // The permission comes from the desktop's current row, as for
             // `Resend`, never from the copy stored when the tab connected.

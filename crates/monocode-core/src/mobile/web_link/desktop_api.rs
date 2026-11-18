@@ -322,6 +322,15 @@ pub fn desktop_grants(base: &str, token: &str) -> Result<Vec<ServerGrant>, Strin
     Ok(grants)
 }
 
+/// How the server took a grant state report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reported {
+    Accepted,
+    /// 404 (the server has no such grant) or 409 (it revoked it): the grant
+    /// is gone on the server and the desktop must not keep a row for it.
+    Gone,
+}
+
 /// `POST /api/desktop/grants/:deviceId/state`: what the desktop applied.
 pub fn report_grant_state(
     base: &str,
@@ -329,21 +338,17 @@ pub fn report_grant_state(
     device_id: &str,
     state: &str,
     permission: Option<Permission>,
-) -> Result<(), String> {
+) -> Result<Reported, String> {
     let mut body = json!({"state": state});
     if let Some(permission) = permission {
         body["permission"] = json!(permission_name(permission));
     }
     let path = format!("/api/desktop/grants/{}/state", path_id(device_id)?);
-    ok_body(call(
-        "POST",
-        base,
-        &path,
-        Some(token),
-        Some(&body),
-        TIMEOUT,
-    )?)
-    .map(|_| ())
+    let answer = call("POST", base, &path, Some(token), Some(&body), TIMEOUT)?;
+    if matches!(answer.status, 404 | 409) {
+        return Ok(Reported::Gone);
+    }
+    ok_body(answer).map(|_| Reported::Accepted)
 }
 
 /// `DELETE /api/desktop/me`: the desktop unpairs itself.

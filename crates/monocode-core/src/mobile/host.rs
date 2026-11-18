@@ -1735,13 +1735,18 @@ impl MobileHost {
                 else {
                     return;
                 };
-                let _ = desktop_api::report_grant_state(
+                let answer = desktop_api::report_grant_state(
                     &base,
                     &identity.desktop_token,
                     &server_device_id,
                     state,
                     permission,
                 );
+                // The server revoked or deleted this grant: the next sync
+                // drops the row instead of leaving it to report again.
+                if answer == Ok(desktop_api::Reported::Gone) {
+                    host.web.command(LinkCommand::SyncGrants);
+                }
             });
     }
 
