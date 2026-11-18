@@ -21,6 +21,9 @@ import {
   INSTANCES_POLL_CAP_MS,
   INSTANCES_POLL_MS,
   INSTANCES_SLOW_POLL_MS,
+  LOADING_POLL_CAP_MS,
+  LOADING_POLL_MAX_MS,
+  LOADING_POLL_MIN_MS,
   OWN_ACTION_WATCH_MS,
   instancesRefetchInterval,
   type CloudInstancesResult,
@@ -184,6 +187,36 @@ describe("polling", () => {
     expect(lastUsedLabel(now - 5 * 60_000, now)).toBe("Last used: 5 minutes ago");
     expect(lastUsedLabel((now - 3 * 3_600_000) / 1000, now)).toBe("Last used: 3 hours ago");
     expect(lastUsedLabel(null, now)).toBe("Last used: unknown");
+  });
+});
+
+describe("a loading answer is re-polled (WS-Q)", () => {
+  it("backs off from 1 s to 8 s and stops at the cap", () => {
+    const loading = { instances: [], loading: true } as never;
+    const wait = (attempt: number, elapsedMs = 0) => instancesRefetchInterval(loading, { loadingAttempt: attempt, loadingElapsedMs: elapsedMs });
+    expect([0, 1, 2, 3, 4, 9].map((attempt) => wait(attempt))).toEqual([LOADING_POLL_MIN_MS, 2_000, 4_000, 8_000, LOADING_POLL_MAX_MS, LOADING_POLL_MAX_MS]);
+    expect(wait(2, LOADING_POLL_CAP_MS - 1)).toBe(4_000);
+    expect(wait(2, LOADING_POLL_CAP_MS)).toBe(false);
+    // Once the answer is complete the normal rules apply again (nothing moves: no poll).
+    expect(instancesRefetchInterval({ instances: [], loading: false } as never)).toBe(false);
+  });
+
+  it("shows a spinner, not the empty state, while loading, then the list once the desktop is done", async () => {
+    let answers = 0;
+    FIXTURE_HANDLERS["cloud.instances"] = (() => {
+      answers += 1;
+      return answers === 1
+        ? { instances: [], loading: true }
+        : { instances: [{ kind: "codespace", instance: "late", displayName: "Late one", state: "available", sessions: [] }] };
+    }) as never;
+    mount();
+    expect(await screen.findByText("Loading cloud instances")).toBeInTheDocument();
+    expect(screen.queryByTestId("cloud-empty")).toBeNull();
+    expect(await screen.findByRole("heading", { name: "Late one" }, { timeout: 3_000 })).toBeInTheDocument();
+    expect(screen.queryByTestId("cloud-empty")).toBeNull();
+    // `loading` is false now: the poll stops.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(answers).toBe(2);
   });
 });
 
