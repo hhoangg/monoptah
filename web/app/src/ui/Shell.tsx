@@ -1,6 +1,7 @@
 import { OfflineBanner } from "@/features/offline";
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
+import { ApiError } from "@/features/accounts/api";
 import { meQuery } from "@/features/accounts/queries";
 import { openCommandPalette } from "@/features/layout/palette";
 import { useStandalone } from "@/features/settings/standalone";
@@ -18,7 +19,7 @@ const SIGN_IN_FAMILY: readonly string[] = ["/login", "/register", "/recover"];
 
 const NAV: ReadonlyArray<{ to: string; label: string; icon: IconName; /** Extra path prefix that also marks this entry as the current one. */ alsoActiveFor?: string }> = [
   { to: "/desktops", label: "Desktops", icon: "computer" },
-  { to: "/settings", label: "Account", icon: "settings", alsoActiveFor: "/admin" },
+  { to: "/settings", label: "Account", icon: "account", alsoActiveFor: "/admin" },
   { to: "/install", label: "Install", icon: "download" },
 ];
 
@@ -38,7 +39,9 @@ export function Shell() {
   const standalone = useStandalone();
   // /install is public: a visitor without a session sees the brand only (the nav entries would bounce to /login).
   const me = useQuery({ ...meQuery, enabled: pathname === "/install", retry: false });
-  const publicPage = signInFamily || (pathname === "/install" && me.isError);
+  // Brand only until /api/me succeeds. A signed-in visitor who is merely offline (a network error, not a 401) keeps the nav.
+  const signedOut = me.isError && me.error instanceof ApiError && (me.error.status === 401 || me.error.status === 403);
+  const publicPage = signInFamily || (pathname === "/install" && (me.isPending || signedOut));
   const nav = NAV.filter((item) => !(item.to === "/install" && standalone));
   return (
     <TooltipProvider delayDuration={300}>

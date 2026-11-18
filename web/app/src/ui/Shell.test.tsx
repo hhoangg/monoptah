@@ -73,4 +73,14 @@ describe("app shell frame and navigation", () => {
     expect(screen.getByRole("link", { name: "Pair a desktop" })).toHaveAttribute("href", "/desktops");
     expect(screen.queryByTestId("route-stub")).toBeNull();
   });
+
+  it("treats a closed link with a directory 404 as gone too, but not while it is still connecting (B-6)", async () => {
+    mountApp("/d/dk-removed");
+    await screen.findByTestId("route-stub");
+    act(() => getLinkStore("dk-removed").setState({ status: "connecting", lastError: { code: "directory_404" } }));
+    expect(screen.queryByTestId("desktop-gone-screen")).toBeNull();
+    act(() => getLinkStore("dk-removed").setState({ status: "closed", blocked: null, lastError: { code: "directory_404" } }));
+    expect(await screen.findByRole("heading", { level: 1, name: "This desktop is no longer in your account" })).toBeInTheDocument();
+    expect(screen.queryByTestId("route-stub")).toBeNull();
+  });
 });

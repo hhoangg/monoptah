@@ -561,6 +561,7 @@ New web-only icons (all "to confirm" in the installed package, pick the nearest 
 | admin | UserShield01Icon |
 | external link | LinkSquare01Icon |
 | cloud (Cloud page and its empty state) | CloudIcon |
+| account / person (header Account entry) | UserCircleIcon (`account`) |
 
 Sizes in use: 22 menu leading icon, 20 default and circle buttons, 18 settings rows and chevrons, 16 fold marks, 14 inline file icon and swatch check, 11 Mono done check. Non-Hugeicons glyphs: braille spinner, provider logos as SVG (`src/features/sessions/providerSvgs.ts`), Monocode mark PNGs tinted via `mark` (use CSS `mask-image` + `background: var(--mark)`), file-type icons (`src/features/files/FileTypeIcon.tsx`).
 

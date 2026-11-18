@@ -158,7 +158,7 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
         onPointerDownOutside={(event) => event.preventDefault()}
         onInteractOutside={(event) => event.preventDefault()}
         data-screen={screen}
-        className="top-0 left-0 h-dvh max-h-none w-full max-w-none translate-x-0 translate-y-0 content-start overflow-y-auto rounded-none border-0 bg-background p-0 pb-[calc(env(safe-area-inset-bottom)+2rem)] data-[state=open]:animate-[fade-in_180ms_var(--ease-out-cubic)]"
+        className="top-0 left-0 h-dvh max-h-none w-full max-w-none translate-x-0 translate-y-0 content-start overflow-y-auto rounded-none border-0 bg-background p-0 pt-[max(2.5rem,env(safe-area-inset-top))] pb-[calc(env(safe-area-inset-bottom)+2rem)] data-[state=open]:animate-[fade-in_180ms_var(--ease-out-cubic)]"
       >
         {/* The same column and card as the sign-in and pair screens that lead here (AuthLayout). */}
         <AuthLayout>

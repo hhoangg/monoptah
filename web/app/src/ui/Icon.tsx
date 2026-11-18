@@ -62,6 +62,7 @@ import {
   SourceCodeIcon,
   SparklesIcon,
   Sun03Icon,
+  UserCircleIcon,
   TextWrapIcon,
   Tick02Icon,
   UnfoldMoreIcon,
@@ -146,6 +147,7 @@ export const ICONS = {
   smartphone: SmartPhone01Icon,
   laptop: LaptopIcon,
   success: CheckmarkCircle02Icon,
+  account: UserCircleIcon,
 } as const satisfies Record<string, IconSvgElement>;
 
 export type IconName = keyof typeof ICONS;

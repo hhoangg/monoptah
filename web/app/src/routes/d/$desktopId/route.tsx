@@ -32,7 +32,14 @@ function DesktopGate({ desktopId }: { desktopId: string }) {
   const linkReady = useLink(desktopId, (state) => state.status === "ready");
   // Only a link the server or desktop turned away counts: a link still connecting, or blocked by a version mismatch or a
   // login redirect, keeps its own screens even when the list does not know the id.
-  const refused = useLink(desktopId, (state) => state.blocked === "revoked" || state.blocked === "desktop_refused");
+  // The real revoke path ends with a closed link and a directory 404/403 (the directory no longer knows the desktop).
+  const refused = useLink(
+    desktopId,
+    (state) =>
+      state.blocked === "revoked" ||
+      state.blocked === "desktop_refused" ||
+      (state.status === "closed" && state.blocked === null && (state.lastError?.code === "directory_404" || state.lastError?.code === "directory_403")),
+  );
   const gone = desktops.isSuccess && refused && !linkReady && !desktops.data.desktops.some((desktop) => desktop.id === desktopId);
   // N-12: any screen of a desktop makes it the one `/` goes back to (never one that is gone).
   useEffect(() => (gone ? undefined : rememberDesktop(desktopId)), [desktopId, gone]);
