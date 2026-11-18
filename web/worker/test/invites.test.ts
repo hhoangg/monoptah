@@ -154,7 +154,7 @@ describe("GET /api/invites", () => {
     await env.DB.prepare("UPDATE invites SET created_at = ? WHERE id = ?").bind(200, c.id).run();
     const body = await list(session);
     expect(body.invites.map((i) => i.id)).toEqual([b.id, c.id, a.id]);
-    expect(body.invites.find((i) => i.id === c.id)?.usedBy).toBe(other.id);
+    expect(body.invites.find((i) => i.id === c.id)?.usedBy).toBe(other.handle);
     expect(body.invites.find((i) => i.id === b.id)?.revokedAt).not.toBeNull();
     // 5 granted, 3 created, one of them revoked-unused (given back): 5 - 2 = 3.
     expect(body.granted).toBe(5);

@@ -12,7 +12,7 @@ import { GATE_SQL, gateParams, registrationOpen } from "./gate.ts";
 
 /** The user's own invites, newest first. Uses `invites_created_by_idx`; a user holds at most `invites_granted` rows. */
 export const LIST_INVITES_SQL =
-  "SELECT id, created_at, expires_at, used_at, revoked_at, used_by FROM invites WHERE created_by = ? AND kind = 'user' ORDER BY created_at DESC, id DESC";
+  "SELECT i.id, i.created_at, i.expires_at, i.used_at, i.revoked_at, u.handle AS used_by FROM invites i LEFT JOIN users u ON u.id = i.used_by WHERE i.created_by = ? AND i.kind = 'user' ORDER BY i.created_at DESC, i.id DESC";
 
 /**
  * Creates an invite only while the creator has a slot and the gate is open, in one statement, so two parallel
@@ -37,6 +37,7 @@ interface InviteRow {
   expires_at: number;
   used_at: number | null;
   revoked_at: number | null;
+  /** The joiner's handle (not the user id). */
   used_by: string | null;
 }
 
