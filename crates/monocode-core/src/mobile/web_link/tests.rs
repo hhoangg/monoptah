@@ -1956,3 +1956,12 @@ mod seam {
             .is_err());
     }
 }
+
+#[test]
+fn attached_host_is_the_host_given_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let (host, _events) = MobileHost::open(dir.path().join("mobile-access.json")).unwrap();
+    super::start(&host);
+    let attached = super::attached_host().expect("start registers the host");
+    assert_eq!(attached.web_status(), host.web_status());
+}

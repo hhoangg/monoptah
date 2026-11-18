@@ -355,9 +355,20 @@ impl WebLink {
     }
 }
 
+/// The app's mobile host, registered by [`start`] (one host per app; a later
+/// `start` replaces it).
+static ATTACHED: Mutex<Option<MobileHost>> = Mutex::new(None);
+
+/// The app's mobile host as registered by [`start`], so the shell's web link
+/// bridge can reach it. `None` until `start` has run.
+pub fn attached_host() -> Option<MobileHost> {
+    ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Starts the outbound relay client for `host` when the web link is switched
 /// on and a web identity exists. Uses the host's runtime, binds nothing.
 pub fn start(host: &MobileHost) {
+    *ATTACHED.lock().unwrap_or_else(|e| e.into_inner()) = Some(host.clone());
     // Settings shows "paired" from cached facts: read the sealed identity
     // once, off the caller's thread, whether or not the link is switched on.
     let loader = host.clone();
