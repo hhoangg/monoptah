@@ -703,6 +703,12 @@ fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
     if flags.remote_git_push {
         list.push("gitPush".to_owned());
     }
+    if flags.remote_cloud_start {
+        list.push("cloudStart".to_owned());
+    }
+    if flags.remote_cloud_start && flags.remote_git_push {
+        list.push("cloudMove".to_owned());
+    }
     if approvals_effective(flags, approvals_gate) {
         list.push("approvals".to_owned());
     }
@@ -1258,7 +1264,10 @@ mod tests {
     #[test]
     fn capabilities_follow_flags_and_the_approvals_gate() {
         assert!(capabilities_with(&PolicyFlags::default(), false).is_empty());
-        assert_eq!(capabilities_with(&ON, false), ["gitPush"]);
+        assert_eq!(
+            capabilities_with(&ON, false),
+            ["gitPush", "cloudStart", "cloudMove"]
+        );
         // The gate alone does not list approvals: the desktop toggle is needed too.
         assert!(capabilities_with(&PolicyFlags::default(), true).is_empty());
         let toggle = PolicyFlags {
@@ -1267,7 +1276,31 @@ mod tests {
         };
         assert!(capabilities_with(&toggle, false).is_empty());
         assert_eq!(capabilities_with(&toggle, true), ["approvals"]);
-        assert_eq!(capabilities_with(&ON, true), ["gitPush", "approvals"]);
+        assert_eq!(
+            capabilities_with(&ON, true),
+            ["gitPush", "cloudStart", "cloudMove", "approvals"]
+        );
+    }
+
+    /// H-11, H-14: `cloudStart` follows the cloud toggle, `cloudMove` needs it
+    /// and the push toggle too (a move pushes a branch).
+    #[test]
+    fn cloud_capabilities_follow_their_toggles() {
+        let flags = |push, cloud| PolicyFlags {
+            remote_git_push: push,
+            remote_cloud_start: cloud,
+            remote_approvals: false,
+        };
+        assert_eq!(
+            capabilities_with(&flags(false, true), false),
+            ["cloudStart"]
+        );
+        assert_eq!(capabilities_with(&flags(true, false), false), ["gitPush"]);
+        assert_eq!(
+            capabilities_with(&flags(true, true), false),
+            ["gitPush", "cloudStart", "cloudMove"]
+        );
+        assert!(capabilities_with(&flags(false, false), false).is_empty());
     }
 
     /// H-08: approvals are effective only with the U-13 gate AND the toggle.

@@ -266,20 +266,21 @@ impl SettingsView {
     }
 
     /// "Remote push in Git" and "Remote cloud start": off by default. The
-    /// flags have no storage yet, so both rows stay disabled with a caption.
+    /// shell saves a change and tells the connected web devices.
     fn web_app_remote_actions(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        const CAPTION: &str = "Available once remote Git push / remote cloud start lands";
         let flags = self.ctx.web_policy;
         let rows = [
             (
                 "web-policy-git-push",
                 "Remote push in Git",
+                "Lets paired web devices push branches and open pull requests",
                 flags.remote_git_push,
                 WebPolicyFlag::GitPush,
             ),
             (
                 "web-policy-cloud-start",
                 "Remote cloud start",
+                "Lets paired web devices start billable cloud sessions",
                 flags.remote_cloud_start,
                 WebPolicyFlag::CloudStart,
             ),
@@ -287,15 +288,15 @@ impl SettingsView {
         let rows = rows
             .into_iter()
             .enumerate()
-            .map(|(index, (id, label, on, flag))| {
-                let toggle = self.toggle(id, label, on, true, cx, move |_, on, cx| {
+            .map(|(index, (id, label, caption, on, flag))| {
+                let toggle = self.toggle(id, label, on, false, cx, move |_, on, cx| {
                     cx.emit(SettingsEvent::WebSetPolicyFlag { flag, on });
                 });
                 self.row(
                     Some(id),
                     index == 0,
                     label,
-                    Some(CAPTION.into()),
+                    Some(caption.into()),
                     vec![toggle],
                 )
             })
