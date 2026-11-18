@@ -131,6 +131,7 @@ pub(crate) enum LinkCommand {
 struct Facts {
     desktop_id: String,
     account_handle: Option<String>,
+    desktop_name: Option<String>,
     host: Option<String>,
     fingerprint: String,
 }
@@ -143,6 +144,8 @@ pub(crate) struct Pairing {
     pub(crate) private: Zeroizing<[u8; 32]>,
     pub(crate) public: [u8; 32],
     pub(crate) base: String,
+    /// The machine name sent to the server, kept as the desktop name devices see.
+    pub(crate) machine_name: String,
     /// The server asked for a slower poll: no request before this instant.
     pub(crate) not_before: Option<std::time::Instant>,
 }
@@ -222,6 +225,7 @@ impl WebLink {
         *lock(&self.shared.facts) = Some(Facts {
             desktop_id: identity.desktop_id.clone(),
             account_handle: identity.account_handle.clone(),
+            desktop_name: identity.desktop_name.clone(),
             host,
             fingerprint: noise::fingerprint(&identity.static_public),
         });
@@ -239,6 +243,15 @@ impl WebLink {
 
     pub(crate) fn forget_facts(&self) {
         *lock(&self.shared.facts) = None;
+    }
+
+    /// The name devices see for this desktop: the machine name chosen at
+    /// pairing, or the host name for an identity sealed before it was kept.
+    pub(crate) fn desktop_name(&self) -> String {
+        lock(&self.shared.facts)
+            .as_ref()
+            .and_then(|f| f.desktop_name.clone())
+            .unwrap_or_else(crate::mobile::host::name)
     }
 
     pub(crate) fn is_paired(&self) -> bool {

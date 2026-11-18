@@ -1526,6 +1526,7 @@ impl MobileHost {
             private,
             public,
             base,
+            machine_name,
             not_before: None,
         });
         Ok(ticket)
@@ -1647,6 +1648,7 @@ impl MobileHost {
             // The full canonical address, built from the typed host and id.
             relay_url: canonical_relay,
             account_handle: Some(handle.clone()),
+            desktop_name: Some(pairing.machine_name.clone()),
         };
         if let Err(error) = self.save_web_identity(&identity) {
             undo(&relay_base);
@@ -2525,6 +2527,7 @@ mod tests {
             desktop_token: "test-token-not-real".into(),
             relay_url: "wss://relay.example.test/ws".into(),
             account_handle: None,
+            desktop_name: None,
         }
     }
 

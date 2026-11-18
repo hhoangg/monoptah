@@ -9,7 +9,7 @@ use super::desktop_api;
 use super::frame::{CloseCode, Frame, FrameType, RELAY_ERROR_CODES};
 use super::session::{Action, Directory, Lookup, SendError, SessionTable, PROTO};
 use super::{LinkCommand, WebLink, WebState};
-use crate::mobile::host::{name as desktop_name, MobileHost};
+use crate::mobile::host::MobileHost;
 use crate::mobile::identity_store::WebIdentity;
 use crate::mobile::policy;
 use futures_util::{SinkExt, StreamExt};
@@ -437,7 +437,7 @@ async fn serve_socket(
     let mut table = SessionTable::new(
         static_private.clone(),
         desktop_id,
-        desktop_name(),
+        link.desktop_name(),
         env!("CARGO_PKG_VERSION"),
         directory,
     );
@@ -626,14 +626,14 @@ fn reply(
 }
 
 /// The `state` message of a confirmed session, as `SessionTable` sends it.
-fn confirmed_state(permission: policy::Permission) -> Value {
+fn confirmed_state(permission: policy::Permission, name: &str) -> Value {
     json!({
         "type": "state",
         "state": "confirmed",
         "permission": desktop_api::permission_name(permission),
         "proto": PROTO,
         "capabilities": policy::capabilities(&policy::flags()),
-        "desktop": { "name": desktop_name(), "version": env!("CARGO_PKG_VERSION") },
+        "desktop": { "name": name, "version": env!("CARGO_PKG_VERSION") },
     })
 }
 
@@ -708,7 +708,11 @@ fn run_command(
                 let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
                     continue;
                 };
-                match table.send(key, &confirmed_state(device.permission), now) {
+                match table.send(
+                    key,
+                    &confirmed_state(device.permission, &link.desktop_name()),
+                    now,
+                ) {
                     Ok(sent) => frames.extend(sent),
                     Err(SendError::Encrypt) => {
                         frames.push(SessionTable::bye_frame(key));
@@ -722,7 +726,7 @@ fn run_command(
             let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
                 return;
             };
-            let state = confirmed_state(device.permission);
+            let state = confirmed_state(device.permission, &link.desktop_name());
             for key in table.live_channels(&fingerprint) {
                 match table.send(key, &state, now) {
                     Ok(sent) => frames.extend(sent),

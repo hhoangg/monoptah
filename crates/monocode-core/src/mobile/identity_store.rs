@@ -193,6 +193,9 @@ pub(crate) struct WebIdentity {
     /// The web account's handle, shown in Settings. Rows sealed before it
     /// existed have none.
     pub(crate) account_handle: Option<String>,
+    /// The machine name the user chose at pairing, shown to devices as the
+    /// desktop name. Rows sealed before it existed have none (the host name).
+    pub(crate) desktop_name: Option<String>,
 }
 
 impl std::fmt::Debug for WebIdentity {
@@ -226,6 +229,8 @@ struct WebIdentityJson {
     relay_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     account_handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    desktop_name: Option<String>,
 }
 
 impl Drop for WebIdentityJson {
@@ -244,6 +249,7 @@ fn encode_web(identity: &WebIdentity) -> Result<Zeroizing<Vec<u8>>, String> {
         desktop_token: identity.desktop_token.clone(),
         relay_url: identity.relay_url.clone(),
         account_handle: identity.account_handle.clone(),
+        desktop_name: identity.desktop_name.clone(),
     };
     serde_json::to_vec(&json)
         .map(Zeroizing::new)
@@ -271,6 +277,7 @@ fn decode_web(bytes: &[u8]) -> Result<WebIdentity, String> {
         desktop_token: json.desktop_token.clone(),
         relay_url: json.relay_url.clone(),
         account_handle: json.account_handle.clone(),
+        desktop_name: json.desktop_name.clone(),
     })
 }
 

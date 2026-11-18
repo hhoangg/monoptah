@@ -216,6 +216,7 @@ fn web_identity() -> WebIdentity {
         desktop_token: TOKEN.into(),
         relay_url: "wss://relay.example.test/ws".into(),
         account_handle: None,
+        desktop_name: None,
     }
 }
 
@@ -233,6 +234,22 @@ fn web_identity_saves_loads_and_wipes() {
     wipe_web(&path, WEB_ACCOUNT).unwrap();
     assert_eq!(load_web(&path, WEB_ACCOUNT), Ok(None));
     wipe_web(&path, WEB_ACCOUNT).unwrap();
+}
+
+#[test]
+fn web_identity_keeps_the_desktop_name_chosen_at_pairing() {
+    let (_dir, path) = database();
+    let mut named = web_identity();
+    named.desktop_name = Some("w14-headless".into());
+    save_web(&path, WEB_ACCOUNT, &named).unwrap();
+    let loaded = load_web(&path, WEB_ACCOUNT).unwrap().unwrap();
+    assert_eq!(loaded.desktop_name.as_deref(), Some("w14-headless"));
+    // A row sealed before the name was kept has none.
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    assert_eq!(
+        load_web(&path, WEB_ACCOUNT).unwrap().unwrap().desktop_name,
+        None
+    );
 }
 
 #[test]

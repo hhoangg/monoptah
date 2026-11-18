@@ -6,7 +6,7 @@ use super::frame::{Frame, FrameType, Plaintext};
 use super::noise::{fingerprint, generate_static, Initiator, Transport};
 use super::relay::{backoff_ceiling, react, relay_url, Budget, End, Step, Timing, REVOKED_TEXT};
 use super::session::{Lookup, SessionKey, SessionTable};
-use super::{WebState, WebStatus};
+use super::{WebLink, WebState, WebStatus};
 use crate::mobile::host::{Device, Event, MobileHost, Push};
 use crate::mobile::identity_store::WebIdentity;
 use crate::mobile::policy::{DeviceKind, Permission};
@@ -304,6 +304,7 @@ fn env_with_events(port: u16) -> (Env, async_channel::Receiver<Event>) {
         desktop_token: TOKEN.into(),
         relay_url: format!("http://127.0.0.1:{port}"),
         account_handle: None,
+        desktop_name: None,
     })
     .unwrap();
     let peer = Peer::new(7, public);
@@ -332,6 +333,26 @@ async fn status_is(host: &MobileHost, state: WebState) -> WebStatus {
 }
 
 // (a) handshake and a request over the web path while QUIC is off.
+#[test]
+fn devices_see_the_machine_name_chosen_at_pairing() {
+    let link = WebLink::default();
+    let (_, public) = generate_static().unwrap();
+    let identity = |desktop_name: Option<&str>| WebIdentity {
+        static_private: [1; 32],
+        static_public: public,
+        desktop_id: DESKTOP_UUID.into(),
+        desktop_token: TOKEN.into(),
+        relay_url: "http://127.0.0.1:1".into(),
+        account_handle: None,
+        desktop_name: desktop_name.map(str::to_owned),
+    };
+    link.remember(&identity(Some("w14-headless")));
+    assert_eq!(link.desktop_name(), "w14-headless");
+    // An identity sealed before the name was kept falls back to the host name.
+    link.remember(&identity(None));
+    assert_eq!(link.desktop_name(), crate::mobile::host::name());
+}
+
 #[test]
 fn web_request_is_served_while_quic_is_disabled() {
     let rt = runtime();
@@ -1376,6 +1397,7 @@ mod seam {
                 desktop_token: TOKEN.into(),
                 relay_url: format!("http://127.0.0.1:{}", hub.port),
                 account_handle: Some("alice".into()),
+                desktop_name: None,
             })
             .unwrap();
         }
