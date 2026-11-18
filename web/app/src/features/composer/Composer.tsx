@@ -5,8 +5,9 @@
 // - Send: the button always; Enter only on a desktop layout (a wide screen with a fine pointer), where
 //   Shift+Enter is a newline. Ctrl or Cmd+Enter sends everywhere. A draft mid-turn still sends (the desktop
 //   steers or queues). Stop shows for the whole turn: alone when the draft is empty, left of Send when there is a
-//   draft. It is armed ARM_DELAY_MS after it appears (a tap aimed at Send cannot land on it) and says "Stopping..."
-//   until the turn ends.
+//   draft. It is armed STOP_ARM_DELAY_MS after it appears and again after every slot change (a tap aimed at Send
+//   cannot land on it) and says "Stopping..." until the turn ends. If the turn is still running STOP_RETRY_MS
+//   after the cancel request resolved, Stop can be pressed again.
 // - The parent's `onSubmit` does the guard and the request. It resolves when the message is on its way (the
 //   draft is cleared) and rejects to keep the draft; the rejection's message is shown (a `SendCancelled` is silent).
 // - A read-only device cannot write: the field and buttons are disabled and a line says why, with a "Request
@@ -52,6 +53,8 @@ export const READ_ONLY_REASON = "Read-only: this device can read sessions but no
 export const DESKTOP_LAYOUT_QUERY = "(min-width: 640px) and (pointer: fine)";
 /** A new Stop button keeps its press off for this long, so a quick second tap after Send cannot land on it. */
 export const STOP_ARM_DELAY_MS = 500;
+/** How long after a resolved cancel request Stop may be pressed again while the turn still runs. */
+export const STOP_RETRY_MS = 4000;
 export const UNKNOWN_ERROR_SENTENCE = "Something went wrong. Try again, or check the desktop.";
 const INPUT_MIN_PX = 64;
 const INPUT_MAX_PX = 160;
@@ -94,8 +97,9 @@ export function plainErrorText(text: string): string {
 }
 
 /** A turn the user stopped is not a failure; the desktop reports it only as text, so match its plain wording. */
+// The desktop ends a stopped turn with the bare text "Stopped" (provider.rs `Err("Stopped".into())`); match only that.
 function isCancelNotice(text: string): boolean {
-  return /^(the )?(turn|request|session|run|task)?\s*(was |has been )?(cancel+ed|interrupted|aborted|stopped)( by (the )?user)?\.?$/i.test(text.trim());
+  return /^Stopped\.?$/.test(text.trim());
 }
 
 /** True when focus came from the keyboard (`:focus-visible`); a pointer press on a button is not. */
@@ -140,22 +144,35 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   const showStop = busy && !!onStop;
   const showSend = !showStop || hasDraft;
   // Stop is armed STOP_ARM_DELAY_MS after it appears; until then a press does nothing.
-  const [stopArmed, setStopArmed] = useState(false);
+  // It re-arms whenever it moves to another slot (alone, or left of Send once a draft exists), so a double tap on Send
+  // never lands on an armed Stop. `armedSlot` names the slot it was armed in.
+  const [armedSlot, setArmedSlot] = useState<boolean | null>(null);
+  const stopArmed = showStop && armedSlot === hasDraft;
   useEffect(() => {
     if (!showStop) return;
-    const timer = window.setTimeout(() => setStopArmed(true), STOP_ARM_DELAY_MS);
+    const timer = window.setTimeout(() => setArmedSlot(hasDraft), STOP_ARM_DELAY_MS);
     return () => {
       window.clearTimeout(timer);
-      setStopArmed(false);
+      setArmedSlot(null);
     };
-  }, [showStop]);
+  }, [showStop, hasDraft]);
+  // After the cancel request resolved and the turn still runs, Stop is pressable again (keeping its Stopping label).
+  const [retryable, setRetryable] = useState(false);
+  const retryTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(retryTimer.current), []);
   // Stopping lasts until the turn really ends (the desktop frame), not only until `session.cancel` resolves.
   // Adjusted during render when `busy` changes (React's pattern for state derived from a prop change).
   const [prevBusy, setPrevBusy] = useState(busy);
   if (busy !== prevBusy) {
     setPrevBusy(busy);
-    if (!busy) setStopping(false);
+    if (!busy) {
+      setStopping(false);
+      setRetryable(false);
+    }
   }
+  useEffect(() => {
+    if (!busy) window.clearTimeout(retryTimer.current);
+  }, [busy]);
 
   // Auto-grow: as tall as the text, between 64 and 160 px.
   useLayoutEffect(() => {
@@ -231,11 +248,14 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   };
 
   const stop = async () => {
-    if (!onStop || !stopArmed || stopping || offline || readOnly) return;
+    if (!onStop || !stopArmed || (stopping && !retryable) || offline || readOnly) return;
     setStopping(true);
+    setRetryable(false);
+    window.clearTimeout(retryTimer.current);
     setError(null);
     try {
       await onStop();
+      retryTimer.current = window.setTimeout(() => setRetryable(true), STOP_RETRY_MS);
     } catch (reason) {
       setStopping(false);
       setError(reason instanceof Error && reason.message ? `Could not stop: ${reason.message}` : "Could not stop the session.");
@@ -378,18 +398,23 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
               aria-label="Stop"
               title={stopping ? "Stopping..." : undefined}
               aria-busy={stopping}
-              aria-disabled={!stopArmed || stopping || undefined}
+              aria-disabled={!stopArmed || (stopping && !retryable) || undefined}
               disabled={offline || readOnly}
               onClick={() => void stop()}
               className={cn(
-                "inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 aria-disabled:opacity-60 pointer-fine:size-9",
+                "inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-pill bg-primary text-primary-foreground disabled:opacity-40 aria-disabled:opacity-60 pointer-fine:h-9",
+                stopping ? "px-3 text-meta font-medium" : "w-11 pointer-fine:w-9",
                 !card && "order-5",
               )}
             >
               {stopping ? <Icon name="spinner" size={16} className="animate-spin" /> : <span aria-hidden="true" className="block size-3 rounded-[3px] bg-current" />}
-              {stopping ? <span role="status" className="sr-only">Stopping...</span> : null}
+              {stopping ? <span aria-hidden="true">Stopping...</span> : null}
             </button>
           ) : null}
+          {/* One polite live region, outside the button, so the state is announced without changing its name. */}
+          <span role="status" className="sr-only">
+            {showStop && stopping ? "Stopping..." : ""}
+          </span>
           {showSend ? (
             <button
               type="button"
@@ -416,7 +441,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           ) : (
             <button
               type="button"
-              disabled={requestControl.state === "pending"}
+              disabled={requestControl.state === "pending" || requestControl.ready === false}
               onClick={requestControl.request}
               className="inline-flex min-h-11 items-center rounded-row px-2 font-medium text-content hover:bg-selection disabled:opacity-60 pointer-fine:min-h-8"
             >

@@ -3,7 +3,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Composer, DESKTOP_LAYOUT_QUERY, OFFLINE_PLACEHOLDER, READ_ONLY_REASON, UNKNOWN_ERROR_SENTENCE, type ComposerProps } from "./Composer";
+import { Composer, DESKTOP_LAYOUT_QUERY, OFFLINE_PLACEHOLDER, READ_ONLY_REASON, STOP_RETRY_MS, UNKNOWN_ERROR_SENTENCE, type ComposerProps } from "./Composer";
 import { SendCancelled } from "./useSendGuard";
 
 function setMedia(desktop: boolean) {
@@ -129,11 +129,55 @@ describe("send", () => {
     await user.click(await armedStop());
     const stop = screen.getByRole("button", { name: "Stop" });
     await waitFor(() => expect(stop).toHaveAttribute("aria-busy", "true"));
-    expect(screen.getByText("Stopping...")).toBeInTheDocument();
+    // Visible text inside the button (touch has no tooltip) and one polite live region outside it.
+    expect(stop).toHaveTextContent("Stopping...");
+    expect(screen.getByRole("status")).toHaveTextContent("Stopping...");
+    expect(stop).not.toContainElement(screen.getByRole("status"));
     await user.click(stop);
     expect(onStop).toHaveBeenCalledTimes(1);
     rerender(<Composer onSubmit={onSubmit} busy={false} onStop={onStop} />);
     expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("re-arms Stop when it changes slot, so a double tap on Send never hits an armed Stop", async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn(() => Promise.resolve());
+    const { field } = setup({ busy: true, onStop });
+    await armedStop();
+    await user.type(field, "x");
+    // The draft moved Stop to the slot beside Send: not armed until the delay passes again.
+    expect(screen.getByRole("button", { name: "Stop" })).toHaveAttribute("aria-disabled", "true");
+    await user.click(screen.getByRole("button", { name: "Stop" }));
+    expect(onStop).not.toHaveBeenCalled();
+    await armedStop();
+    await user.clear(field);
+    expect(screen.getByRole("button", { name: "Stop" })).toHaveAttribute("aria-disabled", "true");
+    await armedStop();
+  });
+
+  it("lets Stop be pressed again when the turn still runs after the cancel request resolved", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      const onStop = vi.fn(() => Promise.resolve());
+      setup({ busy: true, onStop });
+      await user.click(await armedStop());
+      const stop = screen.getByRole("button", { name: "Stop" });
+      await waitFor(() => expect(stop).toHaveAttribute("aria-busy", "true"));
+      expect(stop).toHaveAttribute("aria-disabled", "true");
+      await user.click(stop);
+      expect(onStop).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        vi.advanceTimersByTime(STOP_RETRY_MS + 50);
+      });
+      expect(stop).not.toHaveAttribute("aria-disabled");
+      expect(stop).toHaveTextContent("Stopping...");
+      await user.click(stop);
+      expect(onStop).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps its layout when Stop takes pointer focus, so the press is not moved from under the pointer", () => {
@@ -229,9 +273,19 @@ describe("disabled states", () => {
     expect(screen.getByTestId("composer-notice")).not.toHaveTextContent(/^unknown$/);
   });
 
-  it("raises no notice for a turn the user cancelled", () => {
-    setup({ notice: { text: "Interrupted", dismiss: () => {} } });
+  it("raises no notice for a turn the user stopped (the desktop sends \"Stopped\")", () => {
+    setup({ notice: { text: "Stopped", dismiss: () => {} } });
     expect(screen.queryByTestId("composer-notice")).toBeNull();
+  });
+
+  it("still shows a notice that only mentions stopping or cancelling", () => {
+    setup({ notice: { text: "Stopped Docker sandbox box-1 after 10 min idle; send a message to resume.", dismiss: () => {} } });
+    expect(screen.getByTestId("composer-notice")).toHaveTextContent("Stopped Docker sandbox box-1");
+  });
+
+  it("still shows an Interrupted or Cancelled notice: only the desktop's own wording is hidden", () => {
+    setup({ notice: { text: "Connection cancelled", dismiss: () => {} } });
+    expect(screen.getByTestId("composer-notice")).toHaveTextContent("Connection cancelled");
   });
 
   it("a read-only device can ask for control, and then sees that it was requested", async () => {

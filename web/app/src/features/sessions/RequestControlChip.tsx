@@ -4,8 +4,8 @@ import { useRequestControl } from "@/features/composer/useRequestControl";
 import { Glass } from "@/ui/Glass";
 
 export function RequestControlChip({ desktopId }: { desktopId: string }) {
-  const { state, request } = useRequestControl(desktopId);
-  const locked = state === "pending" || state === "requested";
+  const { state, request, ready = true } = useRequestControl(desktopId);
+  const locked = state === "pending" || state === "requested" || !ready;
   return (
     <Glass className="flex min-h-9 items-center rounded-pill">
       <button
