@@ -1,6 +1,7 @@
 // Watch frame result fields (crates/monocode-core/src/mobile/watch.rs) plus the
 // cloud and approvals fields of architecture.md 6.6. A watch frame is the `result`
 // of `{rid, ok: true, result}` after `{rid, ok: true, watching: true}`.
+import "./zod-config.ts";
 import { z } from "zod";
 import { QuestionPromptSchema, TurnSchema, UsageLimitSchema } from "./wire.ts";
 

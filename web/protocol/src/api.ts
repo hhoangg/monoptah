@@ -13,6 +13,7 @@
 // `Content-Type: application/json`, even when the request has no body (a bodiless POST or DELETE
 // still sends the header); otherwise 403 `bad_origin`, 403 `csrf` or 415 `unsupported_media_type`.
 // A WebSocket upgrade GET checks `Origin` only. Token and pairing routes are exempt.
+import "./zod-config.ts";
 import { z } from "zod";
 
 // --- Shared ---

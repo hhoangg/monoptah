@@ -3,6 +3,7 @@
 // The wire types live in wire.ts and are re-exported here; this file adds the pure helpers the
 // pickers use. There is no static model table (the catalog comes from `models.list`) and no
 // storage access: the web keeps these preferences under the `monoptah.` keys listed below.
+import "./zod-config.ts";
 import type { z } from "zod";
 import type { CatalogModel, ModelSettingSchema } from "./methods.ts";
 

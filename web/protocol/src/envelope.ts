@@ -1,5 +1,6 @@
 // JSON application envelope inside MSG plaintexts (architecture.md 5.5): the
 // existing mobile-link shapes plus `rid`, a client-chosen u32 correlation id.
+import "./zod-config.ts";
 import { z } from "zod";
 import { ENVELOPE_VERSION, MAX_COMMAND_ID_LENGTH } from "./limits.ts";
 import { DesktopErrorCodeSchema } from "./errors.ts";
