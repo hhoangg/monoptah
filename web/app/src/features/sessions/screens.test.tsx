@@ -105,7 +105,7 @@ describe("catalog home", () => {
 describe("workspace drawer (F-12)", () => {
   async function openDrawer(user: ReturnType<typeof userEvent.setup>) {
     await screen.findByRole("heading", { level: 1, name: "Workspace" });
-    await user.click(screen.getByRole("button", { name: "Open workspace list" }));
+    await user.click(screen.getByRole("button", { name: /^Open workspace list/ }));
     return screen.findByRole("navigation", { name: "Workspace" });
   }
 
@@ -165,7 +165,7 @@ describe("workspace drawer (F-12)", () => {
     mount("");
     const nav = await screen.findByRole("navigation", { name: "Workspace" });
     await within(nav).findByText("Example Alpha");
-    expect(screen.queryByRole("button", { name: "Open workspace list" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Open workspace list/ })).toBeNull();
   });
 
   it("renders the desktop-nav-items slot", async () => {

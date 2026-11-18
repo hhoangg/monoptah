@@ -3,10 +3,9 @@
 // its right, then the branch with the model and its provider's mark on its right. The card links to the
 // session; its menu offers the actions the `session-capabilities` predicate allows for its target.
 import { Link } from "@tanstack/react-router";
-import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import type { SessionCard as SessionCardData } from "@monoptah/protocol";
-import { catalogKey, useLinkMutation } from "@/data";
+import { useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
@@ -16,6 +15,7 @@ import { Icon } from "@/ui/Icon";
 import { sessionCan } from "@/ui/hooks";
 import { TerminalSpinner } from "@/features/transcript/TerminalSpinner";
 import { relativeTime } from "./relativeTime";
+import { ArchiveSessionDialog, RenameSessionDialog, useRefreshSessions } from "./SessionActionDialogs";
 import { SessionCardBadgeSlot, SessionMenuItemsSlot } from "./slots";
 
 /** Every card is the same height, which is what lets the list be virtualized (the card is 68 plus 4 padding each side). */
@@ -91,13 +91,15 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
   const canGit = sessionCan("git", context);
   const canDelete = sessionCan("delete", context);
   const [confirming, setConfirming] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [archiving, setArchiving] = useState(false);
   const remove = useLinkMutation("session.delete");
-  const queryClient = useQueryClient();
+  const refresh = useRefreshSessions(desktopId);
   const afterDelete = () => {
     setConfirming(false);
-    void queryClient.invalidateQueries({ queryKey: catalogKey(desktopId) });
-    void queryClient.invalidateQueries({ queryKey: ["link", desktopId, "sessions.list"] });
+    refresh();
   };
+  const readOnlyReason = readOnly ? "This device is read-only" : undefined;
   const params = { desktopId, projectId: session.projectId };
 
   return (
@@ -144,17 +146,25 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
             </DropdownMenuItem>
           ) : null}
           <SessionMenuItemsSlot desktopId={desktopId} session={session} />
+          <DropdownMenuSeparator />
+          <DropdownMenuItem disabled={readOnly} title={readOnlyReason} onSelect={() => setRenaming(true)}>
+            <Icon name="edit" size={18} />
+            Rename
+          </DropdownMenuItem>
+          <DropdownMenuItem disabled={readOnly} title={readOnlyReason} onSelect={() => setArchiving(true)}>
+            <Icon name="archive" size={18} />
+            Archive
+          </DropdownMenuItem>
           {canDelete ? (
-            <>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem destructive disabled={readOnly} onSelect={() => setConfirming(true)}>
-                <Icon name="trash" size={18} />
-                Delete
-              </DropdownMenuItem>
-            </>
+            <DropdownMenuItem destructive disabled={readOnly} title={readOnlyReason} onSelect={() => setConfirming(true)}>
+              <Icon name="trash" size={18} />
+              Delete
+            </DropdownMenuItem>
           ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
+      <RenameSessionDialog desktopId={desktopId} session={session} open={renaming} onOpenChange={setRenaming} />
+      {archiving ? <ArchiveSessionDialog desktopId={desktopId} session={session} open onOpenChange={setArchiving} /> : null}
       <ConfirmDialog
         open={confirming}
         onOpenChange={setConfirming}

@@ -8,7 +8,12 @@ import { Input } from "@/ui/input";
 import { Notice } from "@/ui/Notice";
 import { NowWorking } from "./NowWorking";
 import { SessionCard } from "./SessionCard";
-import { SessionsList } from "./SessionsList";
+import { SessionFilterMenu } from "./SessionFilterMenu";
+import { SessionsList, useProjectSessions } from "./SessionsList";
+import { useCatalogUnreadMonos } from "./monoSeen";
+import { harnessesInSessions } from "./sessionFilters";
+import { useSessionFilter, type Worktree } from "./sessionListFilter";
+import { WorkspaceMenu } from "./WorkspaceMenu";
 import { MonoRow, ProjectRow } from "./WorkspaceNav";
 import { WorkspaceFrame, useReadOnly } from "./WorkspaceFrame";
 import { SEARCH_DEBOUNCE_MS, useDebouncedValue } from "./useSessionPages";
@@ -34,6 +39,7 @@ const RECENT_COUNT = 8;
 export function HomeScreen({ desktopId }: { desktopId: string }) {
   const catalog = useCatalog();
   const readOnly = useReadOnly();
+  const unread = useCatalogUnreadMonos(desktopId);
   const data = catalog.data;
   const recent = data ? [...data.sessions].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RECENT_COUNT) : [];
   const empty = !!data && data.projects.length === 0 && data.monos.length === 0;
@@ -63,7 +69,7 @@ export function HomeScreen({ desktopId }: { desktopId: string }) {
             <section aria-label="Monos" className="flex flex-col gap-0.5">
               <h2 className="px-2.5 pb-1 text-meta font-medium text-muted-text">Monos</h2>
               {data.monos.map((mono) => (
-                <MonoRow key={mono.id} desktopId={desktopId} mono={mono} active={false} />
+                <MonoRow key={mono.id} desktopId={desktopId} mono={mono} active={false} unread={unread.has(mono.id)} />
               ))}
             </section>
           ) : null}
@@ -87,8 +93,11 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
   const readOnly = useReadOnly();
   const [text, setText] = useState("");
   const query = useDebouncedValue(text, SEARCH_DEBOUNCE_MS);
+  const [filter, updateFilter] = useSessionFilter();
+  const [worktree, setWorktree] = useState<Worktree | null>(null);
   const project = catalog.data?.projects.find((candidate) => candidate.id === projectId);
   const missing = !!catalog.data && !project;
+  const sessions = useProjectSessions(projectId, query, worktree);
 
   const newSession = readOnly ? (
     <Button type="button" size="pill" disabled title="This device is read-only">
@@ -118,10 +127,24 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
         </section>
       ) : (
         <>
-          <div className="pb-3">
+          {project ? (
+            <div className="pb-2">
+              <WorkspaceMenu
+                desktopId={desktopId}
+                projectId={projectId}
+                projectPath={project.path}
+                checkoutBranch={project.branch}
+                value={worktree}
+                onChange={setWorktree}
+                readOnly={readOnly}
+              />
+            </div>
+          ) : null}
+          <div className="flex items-center gap-2 pb-3">
             <Input type="search" aria-label="Search sessions" placeholder="Search sessions" autoComplete="off" value={text} onChange={(event) => setText(event.target.value)} />
+            <SessionFilterMenu value={filter} onChange={updateFilter} harnesses={harnessesInSessions(sessions.sessions)} />
           </div>
-          <SessionsList desktopId={desktopId} projectId={projectId} query={query} readOnly={readOnly} />
+          <SessionsList desktopId={desktopId} data={sessions} filter={filter} worktree={worktree} readOnly={readOnly} />
           <NowWorking desktopId={desktopId} projectId={projectId} readOnly={readOnly} />
         </>
       )}

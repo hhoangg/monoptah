@@ -23,6 +23,8 @@ export function filterWorkspace(
   catalog: Pick<WorkspaceList, "monos" | "projects">,
   query: string,
   { filter, show }: DrawerFilterState,
+  /** The Monos with a reply not seen on this device (F-17); the desktop's own count when omitted. */
+  unreadIds?: ReadonlySet<string>,
 ): { monos: CatalogMono[]; projects: CatalogProject[] } {
   const needle = query.trim().toLowerCase();
   const monos =
@@ -33,7 +35,7 @@ export function filterWorkspace(
           .filter(
             (mono) =>
               (!needle || mono.name.toLowerCase().includes(needle)) &&
-              (filter === "all" || (filter === "unread" ? monoUnread(mono) : monoWorking(mono))),
+              (filter === "all" || (filter === "unread" ? (unreadIds ? unreadIds.has(mono.id) : monoUnread(mono)) : monoWorking(mono))),
           );
   const projects =
     show === "monos"
