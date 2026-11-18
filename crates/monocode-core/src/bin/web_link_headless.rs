@@ -27,7 +27,7 @@
 //! unpaired:
 //!
 //! - `conversation.read` gives the turns of `e2e-session` (a seeded user and assistant turn, then the sent ones).
-//! - `conversation.send` appends the user text and answers `{sessionId}`; 400 ms later an assistant turn
+//! - `conversation.send` appends the user text and answers `{sessionId}`; 1500 ms later an assistant turn
 //!   `Echo: <text>` is pushed over every watch. A text containing `[hold]` gets no reply until `session.cancel`.
 //! - `session.cancel` (the stop method of `web/protocol/methods.json`) ends the streaming: busy turns false.
 //! - `conversation.watch` opens a watch: the current turns at once, then one frame per change.
@@ -48,6 +48,7 @@
 //! {"event":"revoked","scope":"device","deviceId"}           a paired device is gone (revoked on either side)
 //! {"event":"revoked","scope":"desktop"}                     the relay refused this desktop for good
 //! {"event":"unpaired"}                                      after the `unpair` command
+//! {"event":"status","state":"off"|"connecting"|"connected"|"offline"|"revoked"}   the answer to `status`
 //! {"event":"error","message"}
 //! ```
 //!
@@ -59,6 +60,7 @@
 //! {"cmd":"deny","deviceId":ID}                                          refuse a pending device
 //! {"cmd":"permission","deviceId":ID,"permission":"read-only"|"control"} change a paired device
 //! {"cmd":"revoke","deviceId":ID}                                        desktop-side revoke of a paired device
+//! {"cmd":"status"}                                                      print one `status` event
 //! {"cmd":"unpair"}                                                      unpair (revokes the token), then exit 0
 //! {"cmd":"quit"}                                                        exit 0
 //! ```
@@ -236,8 +238,9 @@ const PROJECT_NAME: &str = "E2E Project";
 const SESSION_ID: &str = "e2e-session";
 const SESSION_TITLE: &str = "E2E session";
 /// How long the fake assistant "thinks" before its reply; a `conversation.send` whose text holds
-/// [`HOLD_MARKER`] never gets one until `session.cancel` ends it.
-const REPLY_DELAY: Duration = Duration::from_millis(400);
+/// [`HOLD_MARKER`] never gets one until `session.cancel` ends it. It is well above the watch pacer interval
+/// (500 ms, `web_link/pacer.rs`), so the busy frame and the reply frame can never be merged into one.
+const REPLY_DELAY: Duration = Duration::from_millis(1500);
 const HOLD_MARKER: &str = "[hold]";
 
 /// Opens the desktop state in `data_dir`: the native store (it creates the tables the sealed web identity
@@ -684,6 +687,7 @@ enum Cmd {
         device_id: String,
         permission: Permission,
     },
+    Status,
     Unpair,
     Quit,
 }
@@ -717,6 +721,7 @@ fn parse_command(line: &str) -> Result<Cmd, String> {
             device_id: text("deviceId")?,
             permission: permission()?,
         }),
+        "status" => Ok(Cmd::Status),
         "unpair" => Ok(Cmd::Unpair),
         "quit" => Ok(Cmd::Quit),
         other => Err(format!("unknown command: {other}")),
@@ -799,6 +804,16 @@ fn run_command(
                     "permission": permission_name(permission),
                 }),
             );
+        }
+        Cmd::Status => {
+            let state = match status.state {
+                WebState::Off => "off",
+                WebState::Connecting => "connecting",
+                WebState::Connected => "connected",
+                WebState::Offline => "offline",
+                WebState::Revoked => "revoked",
+            };
+            say(lines, json!({"event": "status", "state": state}));
         }
         Cmd::Unpair => {
             host.web_unpair()?;
@@ -1559,6 +1574,7 @@ mod tests {
     fn commands_parse() {
         assert_eq!(parse_command(r#"{"cmd":"quit"}"#), Ok(Cmd::Quit));
         assert_eq!(parse_command(r#"{"cmd":"unpair"}"#), Ok(Cmd::Unpair));
+        assert_eq!(parse_command(r#"{"cmd":"status"}"#), Ok(Cmd::Status));
         assert_eq!(
             parse_command(r#"{"cmd":"revoke","deviceId":"x"}"#),
             Ok(Cmd::Revoke {
