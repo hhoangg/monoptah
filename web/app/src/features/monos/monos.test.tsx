@@ -2,7 +2,7 @@
 // wired to the mock desktop (sessions/dev/mockLink.ts).
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FIXTURE_HANDLERS, type MockDesktop } from "@monoptah/mock-desktop";
 import { IDBFactory } from "fake-indexeddb";
@@ -19,6 +19,8 @@ import { createAppRouter } from "@/router";
 import { clearHooks } from "@/ui/hooks";
 import { clearSlots } from "@/ui/slots";
 import { WsPSettingsSections } from "@/features/themes/SettingsSections";
+import { forgetDesktopLocally } from "@/features/settings/desktopLink";
+import "./register";
 import { MonosOnlySection } from "./MonosOnlySection";
 import { REACTIONS_DB, REACTIONS_STORE, REACTION_EMOJIS, loadReactions, resetReactions, setReaction } from "./reactions";
 import { MONOS_ONLY_KEY, reloadMonoPrefs, useMonoPrefs } from "./monoPrefs";
@@ -183,9 +185,9 @@ describe("Mono home (F-13)", () => {
 });
 
 describe("Monos only setting (F-13)", () => {
-  it("is not offered in the settings page until the workspace home reads it", () => {
+  it("is offered in the settings page, now that the workspace home reads it", () => {
     render(<WsPSettingsSections />);
-    expect(screen.queryByRole("switch", { name: "Monos only" })).toBeNull();
+    expect(screen.getByRole("switch", { name: "Monos only" })).toBeInTheDocument();
   });
 
   it("is a switch stored as monoptah.monosOnly", async () => {
@@ -197,6 +199,36 @@ describe("Monos only setting (F-13)", () => {
     expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(localStorage.getItem(MONOS_ONLY_KEY)).toBe("1");
     expect(useMonoPrefs.getState().monosOnly).toBe(true);
+  });
+});
+
+describe("Monos only home (F-13)", () => {
+  it("shows the project and session home while the preference is off", async () => {
+    mount("");
+    expect(await screen.findByRole("region", { name: "Projects" })).toBeInTheDocument();
+    expect(screen.queryByTestId("mono-home")).toBeNull();
+  });
+
+  it("shows the Mono list instead of projects when it is on, and follows the switch in settings", async () => {
+    localStorage.setItem(MONOS_ONLY_KEY, "1");
+    reloadMonoPrefs();
+    mount("");
+    expect(await screen.findByTestId("mono-home")).toBeInTheDocument();
+    expect(await screen.findAllByTestId("mono-row")).not.toHaveLength(0);
+    expect(screen.queryByRole("region", { name: "Projects" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Recent sessions" })).toBeNull();
+    act(() => useMonoPrefs.getState().setMonosOnly(false));
+    expect(await screen.findByRole("region", { name: "Projects" })).toBeInTheDocument();
+  });
+});
+
+describe("forgetting a desktop (F-71)", () => {
+  it("wipes its stored reactions", async () => {
+    loadReactions(DESKTOP_ID);
+    setReaction(DESKTOP_ID, MONO, "t1:0", "\u{1F525}");
+    await waitFor(async () => expect(JSON.stringify(await storedReactions(DESKTOP_ID))).toContain("\u{1F525}"));
+    await forgetDesktopLocally(DESKTOP_ID);
+    await waitFor(async () => expect(await storedReactions(DESKTOP_ID)).toBeUndefined());
   });
 });
 

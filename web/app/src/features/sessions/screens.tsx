@@ -15,6 +15,8 @@ import { harnessesInSessions } from "./sessionFilters";
 import { useSessionFilter, type Worktree } from "./sessionListFilter";
 import { WorkspaceMenu } from "./WorkspaceMenu";
 import { MonoRow, ProjectRow } from "./WorkspaceNav";
+import { MonoHome } from "@/features/monos/MonoHome";
+import { useMonoPrefs } from "@/features/monos/monoPrefs";
 import { WorkspaceFrame, useReadOnly } from "./WorkspaceFrame";
 import { SEARCH_DEBOUNCE_MS, useDebouncedValue } from "./useSessionPages";
 
@@ -43,11 +45,15 @@ export function HomeScreen({ desktopId }: { desktopId: string }) {
   const data = catalog.data;
   const recent = data ? [...data.sessions].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, RECENT_COUNT) : [];
   const empty = !!data && data.projects.length === 0 && data.monos.length === 0;
+  // F-13: with "Monos only" on, the home is the messaging-style Mono list instead of projects and sessions.
+  const monosOnly = useMonoPrefs((state) => state.monosOnly);
 
   return (
     // "route-stub" is kept as the outlet marker used by link/LinkProvider.test.tsx and version/layout.test.tsx (WS-L); rename when their owner switches to a real marker.
     <WorkspaceFrame desktopId={desktopId} title="Workspace" testId="route-stub">
-      {!data ? (
+      {monosOnly ? (
+        <MonoHome desktopId={desktopId} />
+      ) : !data ? (
         catalog.isError ? (
           <Notice variant="error">Could not load your workspace.</Notice>
         ) : (

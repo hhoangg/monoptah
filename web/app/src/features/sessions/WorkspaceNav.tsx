@@ -3,9 +3,11 @@
 // Projects, narrowed by the filter (All, Unread, Working now) and the search. It is the content of the
 // vaul drawer on the mobile layout and of the persistent sidebar from 640 px up (design-system 11). The desktop nav entries
 // (`desktop-nav-items` slot, Settings, Desktops) sit at the foot.
-import { Link, useRouterState } from "@tanstack/react-router";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useCatalog } from "@/data";
+import { requestCreateMono } from "@/features/monos/createRequest";
+import { useLinkState } from "@/link";
 import { useCapability } from "@/version";
 import { safeHexColor } from "@/lib/color";
 import { cn } from "@/lib/utils";
@@ -165,13 +167,25 @@ export interface WorkspaceNavProps {
   desktopId: string;
   /** Called when a link is followed, so the drawer can close. */
   onNavigate?: () => void;
-  /** Called by the New Mono button (visible only when `canCreateMono`). */
+  /** Called by the New Mono button (visible only when `canCreateMono`); by default it opens the dialog on the Mono list. */
   onNewMono?: () => void;
 }
 
 export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavProps) {
   const catalog = useCatalog();
   const monoTools = useCapability("monoTools");
+  const readOnly = useLinkState((state) => state.permission === "read");
+  const navigate = useNavigate();
+  const newMono = () => {
+    if (onNewMono) {
+      onNewMono();
+      return;
+    }
+    // The Mono list is not mounted yet: it takes the request once it is (createRequest.ts).
+    requestCreateMono();
+    onNavigate?.();
+    void navigate({ to: "/d/$desktopId/monos", params: { desktopId } });
+  };
   const [{ filter, show }, update] = useDrawerFilter();
   const [query, setQuery] = useState("");
   const active = useActivePlace(desktopId);
@@ -191,8 +205,8 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
       <div className="flex items-center gap-2.5 px-4 pt-3 pb-2">
         <span className="flex-1 text-title font-semibold">Monoptah</span>
         <FilterMenu filter={filter} show={show} onChange={update} />
-        {canCreateMono(monoTools) ? (
-          <button type="button" aria-label="New Mono" onClick={onNewMono} className="inline-flex size-11 items-center justify-center rounded-pill bg-fill hover:bg-selection pointer-fine:size-9">
+        {canCreateMono(monoTools) && !readOnly ? (
+          <button type="button" aria-label="New Mono" onClick={newMono} className="inline-flex size-11 items-center justify-center rounded-pill bg-fill hover:bg-selection pointer-fine:size-9">
             <Icon name="add" size={20} />
           </button>
         ) : null}

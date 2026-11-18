@@ -8,8 +8,8 @@ type WorkspaceList = ResultOf<"workspace.list">;
 export type CatalogMono = WorkspaceList["monos"][number];
 export type CatalogProject = WorkspaceList["projects"][number];
 
-/** This slice of the Mono create flow (U-09, U-12) is not built yet; "New Mono" stays hidden until it is. */
-export const MONO_CREATE_UI_SHIPPED = false;
+/** The Mono create flow (U-09, U-12) is built (`CreateMonoDialog`, opened from the Mono list). */
+export const MONO_CREATE_UI_SHIPPED = true;
 
 /** "New Mono" shows only when the desktop advertises `monoTools` AND the create UI exists. */
 export function canCreateMono(monoTools: boolean): boolean {
