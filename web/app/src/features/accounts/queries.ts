@@ -8,6 +8,7 @@ import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
 import { releaseDevice } from "./deviceBinding";
 import { clearLowCodes } from "./lowCodes";
+import { resetNewSessionDrafts } from "@/features/sessions/newSessionDraft";
 import { getRecoveryBatch, setRecoveryBatch } from "./pendingRecoveryCodes";
 import { unsubscribeFromPush } from "@/features/push/subscribe";
 import { getDeviceKeyInfo } from "@/link/keys";
@@ -103,6 +104,8 @@ export async function withFreshAuth<T>(fn: () => Promise<T>, reauthFn: typeof re
  */
 export function clearAccountCache(queryClient: QueryClient): void {
   queryClient.clear();
+  // A New session draft belongs to the account that typed it.
+  resetNewSessionDrafts();
   // The offline snapshots of the previous session must not outlive it (features/offline/accountCache.ts).
   void forgetAccountSnapshots();
 }
@@ -157,6 +160,7 @@ export async function signOut(queryClient: QueryClient, options: { keepLowCodes?
     await apiFetch(endpoints.logout, device?.deviceId ? { body: { deviceId: device.deviceId } } : {});
   } finally {
     queryClient.clear();
+    resetNewSessionDrafts();
     // The encrypted content cache, the snapshots and any push subscription left behind go with the session.
     await releaseDevice();
   }

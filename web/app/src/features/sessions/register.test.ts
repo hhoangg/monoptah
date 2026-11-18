@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { getSlot } from "@/ui/slots";
 import { forgetDesktopLocally } from "@/features/settings/desktopLink";
 import { loadMonoSeen, markMonoSeen } from "./monoSeen";
+import { readNewSessionDraft, writeNewSessionDraft } from "./newSessionDraft";
 import "./register";
 
 describe("sessions register", () => {
@@ -14,7 +15,9 @@ describe("sessions register", () => {
     localStorage.setItem("monoptah.lastPlace.dk", "/d/dk/p/1");
     loadMonoSeen("dk");
     markMonoSeen("dk", { id: "m", status: "idle", unread: 0, lastMessage: "x", lastActiveAt: 1 });
+    writeNewSessionDraft("dk", "p", { text: "draft" });
     await forgetDesktopLocally("dk");
+    expect(readNewSessionDraft("dk", "p").text).toBe("");
     expect(localStorage.getItem("monoptah.lastPlace.dk")).toBeNull();
   });
 });

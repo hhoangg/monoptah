@@ -6,10 +6,12 @@ import "@/features/models/register";
 import { onForgetDesktop } from "@/features/settings/desktopLink";
 import { forgetDesktop, readLastPlace } from "./lastPlace";
 import { forgetMonoSeen } from "./monoSeen";
+import { forgetNewSessionDrafts } from "./newSessionDraft";
 
 registerLastPlaceResolver(readLastPlace);
 // "Forget this device" wipes what the sessions screens keep per desktop: the last place and the Mono seen map.
 onForgetDesktop((desktopId) => {
   forgetDesktop(desktopId);
+  forgetNewSessionDrafts(desktopId);
   return forgetMonoSeen(desktopId);
 });
