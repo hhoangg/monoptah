@@ -203,7 +203,7 @@ fn visual_tree(body: &str) -> Result<Value, String> {
     serde_json::to_value(tree).map_err(|e| e.to_string())
 }
 
-fn project_id(path: &str) -> String {
+pub(super) fn project_id(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
@@ -222,7 +222,7 @@ fn string(params: &Value, key: &str) -> Option<String> {
 }
 
 /// Whether a selection (None means everything) includes `id`.
-fn in_selection(selection: &Option<Vec<String>>, id: &str) -> bool {
+pub(super) fn in_selection(selection: &Option<Vec<String>>, id: &str) -> bool {
     selection
         .as_ref()
         .is_none_or(|list| list.iter().any(|entry| entry == id))
@@ -428,7 +428,7 @@ impl Shell {
     // MARK: catalog
 
     /// Projects on the rail and those Monos work in.
-    fn mobile_projects(&self, cx: &App) -> Vec<String> {
+    pub(super) fn mobile_projects(&self, cx: &App) -> Vec<String> {
         let mut paths: Vec<String> = Vec::new();
         let monos = self
             .monos
@@ -777,6 +777,20 @@ impl Shell {
         self.sessions.get(&id).cloned()
     }
 
+    /// The session a cloud request names, checked against the device's
+    /// selection like every other request (H-10).
+    pub(super) fn mobile_cloud_session(
+        &self,
+        id: &str,
+        device: &DeviceContext,
+        cx: &App,
+    ) -> Result<i64, Failure> {
+        match self.mobile_target(id, device, cx)? {
+            Target::Session(session) => Ok(session),
+            Target::Mono(_) => Err(policy::Code::UnsupportedTarget.failure()),
+        }
+    }
+
     fn mobile_target(&self, id: &str, device: &DeviceContext, cx: &App) -> Result<Target, Failure> {
         if let Some(mono) = id.strip_prefix("mono:") {
             if !in_selection(&device.monos, mono) {
@@ -876,7 +890,7 @@ impl Shell {
             .collect()
     }
 
-    fn mobile_session_id(&mut self, id: i64) -> String {
+    pub(super) fn mobile_session_id(&mut self, id: i64) -> String {
         if let Some(value) = self.mobile.ids.get(&id) {
             return value.clone();
         }
@@ -910,10 +924,12 @@ impl Shell {
                 request.reply(Ok(project::file_highlight(&job, from)));
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
-            "cloud.instances" | "cloud.startOptions" => {
-                let result = cloud::dispatch(self, &request.device, &method, &request.params, cx);
-                request.reply(result);
-            }
+            "cloud.instances" | "cloud.startOptions" => cloud::dispatch_request(
+                self,
+                request,
+                |_, request, result| request.reply(result),
+                cx,
+            ),
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
@@ -1582,9 +1598,14 @@ impl Shell {
                 );
                 finish(self, request, result);
             }
-            method if method.starts_with("cloud.") => {
-                let result = cloud::dispatch(self, &request.device, method, &request.params, cx);
+            "cloud.moveToLocal" => {
+                // Opening the desktop's confirmation needs the window.
+                let result =
+                    cloud::move_to_local(self, &request.device, &request.params, window, cx);
                 finish(self, request, result);
+            }
+            method if method.starts_with("cloud.") => {
+                cloud::dispatch_request(self, request, finish, cx)
             }
             _ => {
                 let result = self.mobile_session_command(
@@ -1694,8 +1715,10 @@ impl Shell {
                 Ok(reply)
             }
             ("session.archive", Target::Session(id)) => {
-                if !self.session_metadata(*id, cx).summary.archived {
-                    cloud::before_archive(self, device, *id, params, cx)?;
+                if !self.session_metadata(*id, cx).summary.archived
+                    && cloud::before_archive(self, device, *id, params, window, cx)?
+                        == cloud::Archive::Local
+                {
                     self.toggle_archive_now(*id, cx);
                 }
                 Ok(reply)
@@ -1821,7 +1844,9 @@ impl Shell {
             let requested = remote_access(&params)?;
             // After the project is resolved, so a device cannot start
             // anything in one it may not reach.
-            cloud::start_target(self, &request.device, &cwd, &params, cx)?;
+            if let Some(plan) = cloud::start_target(self, &request.device, &cwd, &params, cx)? {
+                return Ok::<_, Failure>(Err((text, cwd, requested, plan)));
+            }
             let (default_kind, default_model, default_access) = self.mobile_defaults(&cwd, cx);
             let chosen = string(&params, "harness").as_deref().and_then(Kind::parse);
             let kind = chosen.unwrap_or(default_kind);
@@ -1834,10 +1859,28 @@ impl Shell {
             );
             let access = requested.unwrap_or(default_access);
             let account = self.mobile_account(kind, &cwd, &params, cx)?;
-            Ok::<_, Failure>((text, cwd, kind, model, access, account))
+            Ok::<_, Failure>(Ok((text, cwd, kind, model, access, account)))
         })();
         let (text, cwd, kind, model, access, account) = match prepared {
-            Ok(prepared) => prepared,
+            Ok(Ok(prepared)) => prepared,
+            // A cloud start: the shell records the session and the instance
+            // comes up in the background (H-11).
+            Ok(Err((text, cwd, access, plan))) => {
+                let start = cloud_start::CloudStartRequest {
+                    device: request.device.clone(),
+                    command_id: request.command_id.clone(),
+                    text,
+                    cwd,
+                    access,
+                    params,
+                    plan,
+                };
+                return self.mobile_start_cloud(
+                    start,
+                    move |this, result| finish(this, request, result),
+                    cx,
+                );
+            }
             Err(error) => return finish(self, request, Err(error)),
         };
         let effort = crate::conversation::preferred_effort(kind.id(), cx);
@@ -2861,6 +2904,11 @@ fn hidden_providers(prefs: &crate::settings::Preferences, cwd: &str) -> Vec<Stri
 }
 
 #[cfg(test)]
+mod cloud_lifecycle_tests;
+mod cloud_start;
+#[cfg(test)]
+mod cloud_start_tests;
+#[cfg(test)]
 mod cloud_tests;
 
 #[cfg(test)]
@@ -3244,7 +3292,7 @@ mod tests {
     ) {
         let (window, id, _) = super::super::tests::window(cx);
         window
-            .update(cx, |shell, _, cx| {
+            .update(cx, |shell, window, cx| {
                 let target = Target::Session(id);
                 // A read result gains no field.
                 assert!(shell.mobile_read_fields(&target, &phone(), cx).is_empty());
@@ -3291,8 +3339,8 @@ mod tests {
                 // Archive, delete, send and start are never refused by the
                 // hooks, and a send never wakes anything.
                 assert_eq!(
-                    cloud::before_archive(shell, &phone(), id, &json!({}), cx),
-                    Ok(())
+                    cloud::before_archive(shell, &phone(), id, &json!({}), window, cx),
+                    Ok(cloud::Archive::Local)
                 );
                 assert_eq!(cloud::before_delete(shell, &phone(), id, cx), Ok(()));
                 assert_eq!(
@@ -3302,7 +3350,7 @@ mod tests {
                 assert!(!cloud::SendPlan::default().wake);
                 assert_eq!(
                     cloud::start_target(shell, &phone(), "/tmp", &json!({}), cx),
-                    Ok(())
+                    Ok(None)
                 );
                 // A phone's session has no cloud binding and no extra project.
                 let summary = shell.session_metadata(id, cx).summary;

@@ -1043,6 +1043,16 @@ impl CloudSessions {
         self.machines.allowed(&*self.gh, repo, branch)
     }
 
+    /// [`Self::allowed_machines`] from the cache only: `None` until a caller that may reach
+    /// GitHub has loaded the list. Never calls `gh`.
+    pub fn cached_machines(
+        &self,
+        repo: &str,
+        branch: Option<&str>,
+    ) -> Option<Vec<codespaces::MachineType>> {
+        self.machines.cached(repo, branch)
+    }
+
     /// The machine a new codespace of `repo` on `branch` gets when none is named: the smallest
     /// the repository allows (a devcontainer's `hostRequirements` can rule out the 2-core
     /// `basicLinux32gb`). A failed lookup keeps [`codespaces::DEFAULT_MACHINE`]. BLOCKS.

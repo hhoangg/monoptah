@@ -226,7 +226,7 @@ fn git_output(cwd: &str, args: &[&str]) -> Result<String, String> {
 
 /// The real [`LocalBranches`]: `git config --get-regexp` for the remotes, then `for-each-ref`
 /// over the matching one's tracking branches.
-fn local_remote_branches(project: &str, want: &RepoMatch) -> Option<RemoteBranches> {
+pub(crate) fn local_remote_branches(project: &str, want: &RepoMatch) -> Option<RemoteBranches> {
     let config = git_output(
         project,
         &["config", "-z", "--get-regexp", r"^remote\..*\.url$"],

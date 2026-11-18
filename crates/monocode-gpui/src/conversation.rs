@@ -24,7 +24,7 @@ mod mono;
 mod notifications;
 mod question_api;
 pub(crate) use question_api::{QuestionAsked, QuestionSettled};
-mod cloud_branches;
+pub(crate) mod cloud_branches;
 mod cloud_location;
 pub(crate) use cloud_location::CloudLocationReset;
 mod cloud_move;

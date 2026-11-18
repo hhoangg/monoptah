@@ -19,15 +19,17 @@
 //! * `moves` (`cloud.moveToCloud`, `cloud.moveToLocal`, `cloud.cancelMove`):
 //!   H-14.
 use crate::shell::Shell;
-use gpui::{App, Context};
+use gpui::{App, Context, Window};
 use monocode_core::mobile::cloud_policy::{self, WEB_ONLY};
 use monocode_core::mobile::policy::{Code, Failure};
-use monocode_core::mobile::{DeviceContext, DeviceKind};
+use monocode_core::mobile::{DeviceContext, DeviceKind, Request};
 use monocode_core::store::Session;
 use serde_json::{Map, Value};
 
 mod instances;
 mod lifecycle;
+#[cfg(test)]
+mod lifecycle_tests;
 mod moves;
 mod send;
 mod start;
@@ -35,7 +37,14 @@ mod start;
 mod tests;
 mod view;
 
+pub(crate) use lifecycle::Archive;
+#[cfg(test)]
+pub(crate) use moves::STEP_IDS as MOVE_STEP_IDS;
+pub(crate) use moves::{move_to_local, step_id as move_step_id};
 pub(crate) use send::SendPlan;
+#[cfg(test)]
+pub(crate) use start::prepare_options;
+pub(crate) use start::{CloudStartPlan, OptionsProbe};
 pub(crate) use view::{Binding, CardView, Extras, Facts};
 // For the lifecycle and move tickets to fill `Extras` with.
 #[allow(unused_imports)]
@@ -54,8 +63,66 @@ const NEVER_EXPOSED: [&str; 7] = [
     "cloud.openBrowser",
 ];
 
-/// Answers a `cloud.*` method. Phones have none (they never had); the web
-/// methods route to the module of their ticket.
+fn precheck(device: &DeviceContext, method: &str) -> Result<(), Failure> {
+    if NEVER_EXPOSED.contains(&method) {
+        return Err(Code::Forbidden.failure());
+    }
+    if device.kind != DeviceKind::Web {
+        return Err(Code::Unsupported.failure());
+    }
+    Ok(())
+}
+
+/// Answers a `cloud.*` request. `cloud.instances` and `cloud.stop` reach the
+/// backends (cached listings, `gh`, `sbx`), so they answer when a worker is
+/// done; every other method answers at once. `finish` gets the answer.
+pub(crate) fn dispatch_request(
+    shell: &mut Shell,
+    request: Request,
+    finish: impl FnOnce(&mut Shell, Request, Result<Value, Failure>) + 'static,
+    cx: &mut Context<Shell>,
+) {
+    let device = request.device.clone();
+    let method = request.method.clone();
+    let params = request.params.clone();
+    dispatch_deferred(
+        shell,
+        &device,
+        &method,
+        &params,
+        move |shell, result| finish(shell, request, result),
+        cx,
+    );
+}
+
+/// [`dispatch_request`] without the request: `finish` gets the answer, now or
+/// from a worker.
+pub(crate) fn dispatch_deferred(
+    shell: &mut Shell,
+    device: &DeviceContext,
+    method: &str,
+    params: &Value,
+    finish: impl FnOnce(&mut Shell, Result<Value, Failure>) + 'static,
+    cx: &mut Context<Shell>,
+) {
+    if let Err(failure) = precheck(device, method) {
+        return finish(shell, Err(failure));
+    }
+    match method {
+        "cloud.instances" => instances::list(shell, device, finish, cx),
+        "cloud.stop" => lifecycle::stop(shell, device, params, finish, cx),
+        "cloud.startOptions" => start::options_deferred(shell, device, params, finish, cx),
+        _ => {
+            let result = dispatch(shell, device, method, params, cx);
+            finish(shell, result);
+        }
+    }
+}
+
+/// Answers a `cloud.*` method that needs no worker. Phones have none (they
+/// never had); the web methods route to the module of their ticket.
+/// `cloud.instances` and `cloud.stop` answer through [`dispatch_deferred`]
+/// only.
 pub(crate) fn dispatch(
     shell: &mut Shell,
     device: &DeviceContext,
@@ -63,21 +130,16 @@ pub(crate) fn dispatch(
     params: &Value,
     cx: &mut Context<Shell>,
 ) -> Result<Value, Failure> {
-    if NEVER_EXPOSED.contains(&method) {
-        return Err(Code::Forbidden.failure());
-    }
-    if device.kind != DeviceKind::Web {
-        return Err(Code::Unsupported.failure());
-    }
+    precheck(device, method)?;
     match method {
-        "cloud.instances" => instances::list(shell, device, params, cx),
-        "cloud.stop" => lifecycle::stop(shell, device, params, cx),
         "cloud.resume" => lifecycle::resume(shell, device, params, cx),
         "cloud.retryStart" => lifecycle::retry_start(shell, device, params, cx),
         "cloud.keepRunning" => lifecycle::keep_running(shell, device, params, cx),
         "cloud.startOptions" => start::options(shell, device, params, cx),
         "cloud.moveToCloud" => moves::move_to_cloud(shell, device, params, cx),
-        "cloud.moveToLocal" => moves::move_to_local(shell, device, params, cx),
+        // Opening the desktop's confirmation needs the window: the host
+        // routes this method to `move_to_local` below.
+        "cloud.moveToLocal" => Err(Code::Unsupported.failure()),
         "cloud.cancelMove" => moves::cancel_move(shell, device, params, cx),
         _ => Err(Code::Unsupported.failure()),
     }
@@ -176,15 +238,18 @@ pub(crate) fn mark_web_only(project: &mut Value) {
     project[WEB_ONLY] = Value::Bool(true);
 }
 
-/// Runs before a session is archived (H-12 fills `lifecycle::before_archive`).
+/// Runs before a session is archived. A cloud session of a web device is
+/// archived here, through the app's cloud archive ([`Archive::Handled`]);
+/// every other session is archived by the caller ([`Archive::Local`]).
 pub(crate) fn before_archive(
     shell: &mut Shell,
     device: &DeviceContext,
     session: i64,
     params: &Value,
+    window: &mut Window,
     cx: &mut Context<Shell>,
-) -> Result<(), Failure> {
-    lifecycle::before_archive(shell, device, session, params, cx)
+) -> Result<Archive, Failure> {
+    lifecycle::before_archive(shell, device, session, params, window, cx)
 }
 
 /// Runs before a session is deleted (H-12 fills `lifecycle::before_delete`).
@@ -211,14 +276,15 @@ pub(crate) fn before_send(
 }
 
 /// Checks the `target` of a session start once its project (`cwd`) is
-/// resolved (H-11 fills `start::start_target`).
+/// resolved. `None` is a local start; a plan is a cloud start the shell runs
+/// (`Shell::mobile_start_cloud`).
 pub(crate) fn start_target(
     shell: &Shell,
     device: &DeviceContext,
     cwd: &str,
     params: &Value,
     cx: &App,
-) -> Result<(), Failure> {
+) -> Result<Option<CloudStartPlan>, Failure> {
     start::start_target(shell, device, cwd, params, cx)
 }
 
@@ -248,7 +314,7 @@ fn session_fields(
     shell: &Shell,
     session: i64,
     device: &DeviceContext,
-    _cx: &App,
+    cx: &App,
 ) -> Map<String, Value> {
     if device.kind != DeviceKind::Web {
         return Map::new();
@@ -257,7 +323,7 @@ fn session_fields(
         return Map::new();
     };
     let mut extras = Extras::default();
-    lifecycle::extras(shell, session, &mut extras);
+    lifecycle::extras(shell, session, cx, &mut extras);
     moves::extras(shell, session, &mut extras);
     view.fields(&extras)
 }
