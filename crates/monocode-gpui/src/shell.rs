@@ -1629,6 +1629,7 @@ impl Shell {
         this.resume_cloud_moves(cx);
         this.resume_return_cleanups(cx);
         this.init_mobile_host(cx);
+        this.init_web_link(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
             this.record_worktree_session(id, cx);
@@ -7494,6 +7495,7 @@ impl Shell {
             let search = settings.update(cx, |v, cx| v.search_field(true, cx));
             let select = cx.weak_entity();
             let back = select.clone();
+            let web_waiting = self.web_badge(cx);
             return crate::settings::nav(
                 section,
                 search,
@@ -7503,6 +7505,7 @@ impl Shell {
                 move |window, cx| {
                     let _ = back.update(cx, |this, cx| this.close_settings(window, cx));
                 },
+                web_waiting,
             );
         }
         if self.workspace.classic_layout {

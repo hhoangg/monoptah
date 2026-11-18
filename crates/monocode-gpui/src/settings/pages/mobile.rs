@@ -13,7 +13,7 @@ use gpui::{
     HighlightStyle, MouseButton, Role, SharedString, Stateful, StyledText, Subscription, Task,
     Window, canvas, div, prelude::*, px, relative, rgb,
 };
-use monocode_core::mobile::Status;
+use monocode_core::mobile::{DeviceKind, Status};
 use std::{
     collections::HashSet,
     sync::Arc,
@@ -56,25 +56,27 @@ pub(in crate::settings) struct MobileState {
     notice: Option<String>,
     /// The device whose removal is waiting for confirmation.
     removing: Option<String>,
+    /// The device whose Projects list is open.
+    pub(in crate::settings) projects_open: Option<String>,
     copied: bool,
     copied_reset: Option<Task<()>>,
     /// "Connect away from home" is open.
     away: bool,
     remote: Option<Entity<Input>>,
     qr: Option<(String, Arc<Qr>)>,
-    poll: Option<Task<()>>,
+    pub(in crate::settings) poll: Option<Task<()>>,
     _remote_events: Vec<Subscription>,
 }
 
 /// A QR code's modules, row by row, without the quiet zone.
 #[derive(Debug, PartialEq)]
-pub(super) struct Qr {
+pub(in crate::settings) struct Qr {
     width: usize,
     dark: Vec<bool>,
 }
 
 /// The QR code phones scan; low error correction keeps the modules large.
-pub(super) fn qr(text: &str) -> Option<Qr> {
+pub(in crate::settings) fn qr(text: &str) -> Option<Qr> {
     let code =
         qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L).ok()?;
     Some(Qr {
@@ -134,7 +136,7 @@ impl SettingsView {
                         this.mobile.known = None;
                         cx.notify();
                     }
-                    if this.ctx.mobile_invite.is_some() {
+                    if this.ctx.mobile_invite.is_some() || this.ctx.web_pairing.is_some() {
                         cx.notify();
                     }
                     cx.emit(SettingsEvent::MobileRefresh);
@@ -154,9 +156,11 @@ impl SettingsView {
         if self.ctx.mobile_invite.is_some() {
             cx.emit(SettingsEvent::MobileCancelInvite);
         }
+        self.leave_web_app(cx);
         self.mobile.known = None;
         self.mobile.pairing = None;
         self.mobile.removing = None;
+        self.mobile.projects_open = None;
         self.mobile.notice = None;
     }
 
@@ -164,6 +168,9 @@ impl SettingsView {
     pub(in crate::settings) fn dismiss_mobile(&mut self, cx: &mut Context<Self>) -> bool {
         if self.section != Section::Connections {
             return false;
+        }
+        if self.dismiss_web_app(cx) {
+            return true;
         }
         if self.ctx.mobile_invite.is_some() {
             self.close_invite(cx);
@@ -195,12 +202,7 @@ impl SettingsView {
         let paired = showing
             .then(|| {
                 let known = self.mobile.known.as_ref()?;
-                self.ctx
-                    .mobile
-                    .as_ref()?
-                    .devices
-                    .iter()
-                    .find(|device| !known.contains(&device.id))
+                phones(self.ctx.mobile.as_ref()?).find(|device| !known.contains(&device.id))
             })
             .flatten();
         if let Some(device) = paired {
@@ -214,7 +216,7 @@ impl SettingsView {
         let Some(status) = &self.ctx.mobile else {
             return;
         };
-        self.mobile.known = Some(status.devices.iter().map(|d| d.id.clone()).collect());
+        self.mobile.known = Some(phones(status).map(|d| d.id.clone()).collect());
         self.mobile.notice = None;
         self.mobile.pairing = Some(Instant::now());
         cx.emit(SettingsEvent::MobilePair);
@@ -227,7 +229,7 @@ impl SettingsView {
         self.mobile.pairing = None;
         cx.emit(SettingsEvent::MobileCancelInvite);
         if let Some(status) = &self.ctx.mobile
-            && status.devices.is_empty()
+            && phones(status).next().is_none()
         {
             cx.emit(SettingsEvent::MobileConfigure {
                 enabled: false,
@@ -338,7 +340,7 @@ impl SettingsView {
             );
             return page;
         };
-        if !status.devices.is_empty() {
+        if phones(&status).next().is_some() {
             page.push(self.mobile_access(&status, cx));
         }
         page.push(self.mobile_devices(&status, showing, cx));
@@ -508,8 +510,82 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// The projects a phone may see, as checkboxes. A phone with no saved
+    /// selection (`None`) has every project ticked; ticking them all again
+    /// goes back to `None`, so existing phones keep seeing new projects.
+    fn phone_projects(
+        &self,
+        device: &monocode_core::mobile::host::Device,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let choices = self.ctx.web_projects.clone();
+        let ticked: Vec<String> = match &device.projects {
+            None => choices.iter().map(|(id, _)| id.clone()).collect(),
+            Some(selected) => selected.clone(),
+        };
+        div()
+            .id(SharedString::from(format!(
+                "mobile-project-list-{}",
+                device.id
+            )))
+            .role(Role::Group)
+            .aria_label("Projects this phone can see")
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .border_t_1()
+            .border_color(content(0.1))
+            .bg(content(0.03))
+            .px_4()
+            .py_3()
+            .text_size(px(13.))
+            .when(choices.is_empty(), |d| {
+                d.text_color(content(0.5))
+                    .child("No projects to choose from.")
+            })
+            .children(choices.iter().map(|(project, label)| {
+                let on = ticked.contains(project);
+                let (device_id, project) = (device.id.clone(), project.clone());
+                let all = choices.clone();
+                let current = ticked.clone();
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        crate::settings::widgets::checkbox(
+                            SharedString::from(format!("mobile-project-{device_id}-{project}")),
+                            label.clone(),
+                            on,
+                            false,
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let mut next: Vec<String> = all
+                                .iter()
+                                .map(|(id, _)| id.clone())
+                                .filter(|id| {
+                                    if *id == project {
+                                        !on
+                                    } else {
+                                        current.contains(id)
+                                    }
+                                })
+                                .collect();
+                            let projects =
+                                (next.len() != all.len()).then(|| std::mem::take(&mut next));
+                            cx.emit(SettingsEvent::PhoneSetProjects {
+                                device_id: device_id.clone(),
+                                projects,
+                            });
+                        })),
+                    )
+                    .child(div().min_w_0().truncate().child(label.clone()))
+            }))
+            .into_any_element()
+    }
+
     fn mobile_devices(&self, status: &Status, showing: bool, cx: &mut Context<Self>) -> AnyElement {
-        if status.devices.is_empty() {
+        if phones(status).next().is_none() {
             return div()
                 .mt_5()
                 .rounded_xl()
@@ -523,7 +599,7 @@ impl SettingsView {
                 .child("Pair your iPhone or Android phone to get started.")
                 .into_any_element();
         }
-        let last = status.devices.len() == 1;
+        let last = phones(status).count() == 1;
         let (open_router, remote) = (status.open_router, status.remote_address.clone());
         div()
             .mt_5()
@@ -533,10 +609,11 @@ impl SettingsView {
             .border_color(content(0.1))
             .flex()
             .flex_col()
-            .children(status.devices.iter().enumerate().map(|(ix, device)| {
+            .children(phones(status).enumerate().map(|(ix, device)| {
                 let id = device.id.clone();
                 let name = device.name.clone();
                 let confirming = self.mobile.removing.as_deref() == Some(id.as_str());
+                let projects_open = self.mobile.projects_open.as_deref() == Some(id.as_str());
                 div()
                     .when(ix > 0, |d| d.border_t_1().border_color(content(0.1)))
                     .child(
@@ -567,6 +644,29 @@ impl SettingsView {
                                     ),
                             )
                             .child(
+                                secondary_button(
+                                    SharedString::from(format!("mobile-projects-{id}")),
+                                    "Projects",
+                                    false,
+                                    false,
+                                )
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("mobile-projects-{id}")
+                                })
+                                .child("Projects")
+                                .on_click({
+                                    let id = id.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.mobile.projects_open =
+                                            (this.mobile.projects_open.as_deref()
+                                                != Some(id.as_str()))
+                                            .then(|| id.clone());
+                                        cx.notify();
+                                    })
+                                }),
+                            )
+                            .child(
                                 icon_action(
                                     SharedString::from(format!("mobile-remove-{id}")),
                                     format!("Remove {name}"),
@@ -576,6 +676,10 @@ impl SettingsView {
                                     0.4,
                                     false,
                                 )
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("mobile-remove-{id}")
+                                })
                                 .on_click({
                                     let id = id.clone();
                                     cx.listener(move |this, _, _, cx| {
@@ -585,6 +689,9 @@ impl SettingsView {
                                 }),
                             ),
                     )
+                    .when(projects_open, |d| {
+                        d.child(self.phone_projects(device, cx))
+                    })
                     .when(confirming, |d| {
                         let remote = remote.clone();
                         d.child(
@@ -624,6 +731,7 @@ impl SettingsView {
                                                 true,
                                                 false,
                                             )
+                                            .debug_selector(|| "mobile-confirm-remove".to_owned())
                                             .child("Remove phone")
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.emit(SettingsEvent::MobileRevoke(id.clone()));
@@ -808,7 +916,8 @@ impl SettingsView {
     /// PairPhoneDialog.tsx, presented by Shell alongside the other window
     /// overlays so its scrim and centering cover the entire viewport.
     pub(crate) fn mobile_overlay_open(&self) -> bool {
-        self.section == Section::Connections && self.ctx.mobile_invite.is_some()
+        self.section == Section::Connections
+            && (self.ctx.mobile_invite.is_some() || self.web_overlay_open())
     }
 
     pub(crate) fn mobile_overlay(
@@ -818,6 +927,9 @@ impl SettingsView {
     ) -> Option<AnyElement> {
         if !self.mobile_overlay_open() {
             return None;
+        }
+        if self.ctx.mobile_invite.is_none() {
+            return self.web_overlay(window, cx);
         }
         let invite = self.ctx.mobile_invite.clone()?;
         let left = invite.expires.saturating_sub(now());
@@ -1164,7 +1276,7 @@ fn expired_qr_blur() -> impl IntoElement {
 
 /// Dark modules on white with the same two-module quiet zone as React's
 /// QRCode.toDataURL. All edges land on device pixels so cameras see crisp ink.
-fn qr_canvas(qr: Arc<Qr>) -> impl IntoElement {
+pub(super) fn qr_canvas(qr: Arc<Qr>) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
@@ -1273,6 +1385,15 @@ fn mascot_glow() -> impl IntoElement {
     .size_full()
 }
 
+/// The rows under "Your phones": web devices have their own list on the Web
+/// app page, and removing one there also ends its live channel.
+fn phones(status: &Status) -> impl Iterator<Item = &monocode_core::mobile::host::Device> {
+    status
+        .devices
+        .iter()
+        .filter(|device| device.kind == DeviceKind::Phone)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,6 +1484,51 @@ mod tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
         window
+    }
+
+    fn row(id: &str, name: &str, kind: DeviceKind) -> monocode_core::mobile::host::Device {
+        monocode_core::mobile::host::Device {
+            id: id.into(),
+            name: name.into(),
+            fingerprint: format!("fp-{id}"),
+            push: None,
+            kind,
+            permission: monocode_core::mobile::Permission::Read,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: Some(1),
+            last_seen: Some(2),
+        }
+    }
+
+    #[gpui::test]
+    fn a_web_row_does_not_end_a_phone_pairing_but_a_new_phone_does(cx: &mut TestAppContext) {
+        let window = preview(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let settings = window.update(visual, |p, _, _| p.settings.clone()).unwrap();
+        let refresh = |visual: &mut VisualTestContext, devices: Vec<_>| {
+            settings.update(visual, |view, cx| {
+                let status = view.ctx.mobile.as_mut().unwrap();
+                status.devices = devices;
+                view.mobile_context_changed(cx);
+            });
+        };
+        let web = row("w1", "Browser", DeviceKind::Web);
+        settings.update(visual, |view, cx| {
+            view.ctx.mobile.as_mut().unwrap().devices = vec![web.clone()];
+            view.pair_phone(cx);
+        });
+        refresh(visual, vec![web.clone()]);
+        settings.update(visual, |view, _| {
+            assert!(view.mobile.notice.is_none(), "{:?}", view.mobile.notice);
+            assert!(view.mobile.known.is_some());
+        });
+        refresh(visual, vec![web, row("p1", "Pixel", DeviceKind::Phone)]);
+        settings.update(visual, |view, _| {
+            assert_eq!(view.mobile.notice.as_deref(), Some("Pixel is paired."));
+            assert!(view.mobile.known.is_none());
+        });
     }
 
     #[gpui::test]

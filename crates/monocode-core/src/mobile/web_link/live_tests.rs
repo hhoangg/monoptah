@@ -366,6 +366,7 @@ fn live(port: u16) -> Live {
         desktop_id: DESKTOP_UUID.into(),
         desktop_token: TOKEN.into(),
         relay_url: format!("http://127.0.0.1:{port}"),
+        account_handle: None,
     })
     .unwrap();
     host.add_device_for_test(Device {

@@ -215,6 +215,7 @@ fn web_identity() -> WebIdentity {
         desktop_id: "desktop-1".into(),
         desktop_token: TOKEN.into(),
         relay_url: "wss://relay.example.test/ws".into(),
+        account_handle: None,
     }
 }
 

@@ -190,6 +190,9 @@ pub(crate) struct WebIdentity {
     pub(crate) desktop_id: String,
     pub(crate) desktop_token: String,
     pub(crate) relay_url: String,
+    /// The web account's handle, shown in Settings. Rows sealed before it
+    /// existed have none.
+    pub(crate) account_handle: Option<String>,
 }
 
 impl std::fmt::Debug for WebIdentity {
@@ -200,6 +203,7 @@ impl std::fmt::Debug for WebIdentity {
             .field("desktop_id", &self.desktop_id)
             .field("desktop_token", &"<redacted>")
             .field("relay_url", &self.relay_url)
+            .field("account_handle", &self.account_handle)
             .finish()
     }
 }
@@ -220,6 +224,8 @@ struct WebIdentityJson {
     desktop_id: String,
     desktop_token: String,
     relay_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_handle: Option<String>,
 }
 
 impl Drop for WebIdentityJson {
@@ -237,6 +243,7 @@ fn encode_web(identity: &WebIdentity) -> Result<Zeroizing<Vec<u8>>, String> {
         desktop_id: identity.desktop_id.clone(),
         desktop_token: identity.desktop_token.clone(),
         relay_url: identity.relay_url.clone(),
+        account_handle: identity.account_handle.clone(),
     };
     serde_json::to_vec(&json)
         .map(Zeroizing::new)
@@ -263,6 +270,7 @@ fn decode_web(bytes: &[u8]) -> Result<WebIdentity, String> {
         desktop_id: json.desktop_id.clone(),
         desktop_token: json.desktop_token.clone(),
         relay_url: json.relay_url.clone(),
+        account_handle: json.account_handle.clone(),
     })
 }
 
