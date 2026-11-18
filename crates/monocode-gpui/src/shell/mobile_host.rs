@@ -12,7 +12,7 @@ use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
     mobile::{
-        DeviceContext, Event, Invite, MobileHost, Push, Request, Status, WatchStart,
+        DeviceContext, Event, Invite, MobileHost, Push, Request, Status, WatchStart, audit,
         denylist::DenyList, notify, policy, watch, web_link,
     },
     transcript::Row,
@@ -267,6 +267,7 @@ impl Shell {
         };
         if let Some(dir) = path.parent() {
             policy::install_settings(policy::load_settings(&dir.join(policy::SETTINGS_FILE)));
+            audit::init(dir);
         }
         let (host, events) = match MobileHost::open(path) {
             Ok(opened) => opened,
@@ -380,10 +381,26 @@ impl Shell {
     }
 
     pub(super) fn mobile_revoke(&mut self, device_id: &str, cx: &mut Context<Self>) {
-        if let Some(host) = &self.mobile.host
-            && let Err(error) = host.revoke(device_id)
-        {
-            self.error = Some(format!("Mobile access: {error}"));
+        if let Some(host) = &self.mobile.host {
+            let device = host
+                .status()
+                .devices
+                .into_iter()
+                .find(|device| device.id == device_id);
+            match host.revoke(device_id) {
+                Ok(()) => audit::record_lifecycle(
+                    audit::Lifecycle::Revoke,
+                    device_id,
+                    device
+                        .as_ref()
+                        .map_or("", |device| device.fingerprint.as_str()),
+                    device
+                        .as_ref()
+                        .map_or(audit::Transport::Quic, |device| device.kind.into()),
+                    None,
+                ),
+                Err(error) => self.error = Some(format!("Mobile access: {error}")),
+            }
         }
         self.sync_settings(cx);
     }
@@ -844,6 +861,14 @@ impl Shell {
             Err(error) => return request.reply(Err(error)),
         };
         let method = request.method.clone();
+        let file_read = (method == "project.file").then(|| {
+            (
+                request.device.clone(),
+                string(&params, "projectId"),
+                string(&params, "path").unwrap_or_default(),
+                request.command_id.clone(),
+            )
+        });
         let work = cx.background_executor().spawn(async move {
             let cwd = PathBuf::from(cwd);
             let worktree = params["worktreePath"].as_str();
@@ -870,8 +895,27 @@ impl Shell {
                 _ => Err("Unsupported mobile operation".into()),
             }
         });
-        cx.spawn(async move |_, _| request.reply(work.await))
-            .detach();
+        cx.spawn(async move |_, _| {
+            let result = work.await;
+            // The deny-list has answered by now: record the path with its outcome.
+            if let Some((device, project, path, command_id)) = file_read {
+                let outcome = match &result {
+                    Ok(_) => audit::Outcome::Ok,
+                    Err(error) => policy::code_of_error(error)
+                        .map_or(audit::Outcome::Error, audit::Outcome::Denied),
+                };
+                audit::record_file_read_with(
+                    &device,
+                    project.as_deref(),
+                    &path,
+                    Some(&command_id),
+                    device.kind.into(),
+                    outcome,
+                );
+            }
+            request.reply(result)
+        })
+        .detach();
     }
 
     /// Staging, committing, pushing and pull requests, as the Changes panel
