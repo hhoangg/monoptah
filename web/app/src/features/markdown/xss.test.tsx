@@ -1,4 +1,7 @@
-import { render } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { Markdown } from "./Markdown";
 import { parseMarkdown } from "./parser";
@@ -119,6 +122,43 @@ describe("XSS corpus", () => {
   });
 });
 
+describe("Unicode link tricks (W13-5)", () => {
+  it.each([
+    "[x](https://a.dev/\u202Egpj.exe)",
+    "[x](https://\u0430pple.com/)",
+    "[x](https://\uFF41pple.com/)",
+    "[x](https://\u202Eevil.test/)",
+  ])("renders %j as plain text, no anchor", (payload) => {
+    const { container } = render(<Markdown text={payload} />);
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).toBe("x");
+  });
+
+  it("shows a punycode host as ASCII in the sheet, never as the Unicode lookalike", async () => {
+    const user = userEvent.setup();
+    render(<Markdown text="[https://apple.com](https://xn--pple-43d.com/login)" />);
+    await user.click(screen.getByRole("link"));
+    expect(screen.getByTestId("external-link-host")).toHaveTextContent("xn--pple-43d.com");
+    expect(screen.getByTestId("external-link-label")).toHaveTextContent("https://apple.com");
+  });
+
+  it("keeps an RLO in the link text inside the link: the text stays, the sheet isolates it and still shows the true host", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Markdown text={"before [\u202Egpj.exe](https://evil.example/a) after"} />);
+    const anchor = container.querySelector("a");
+    expect(anchor?.textContent).toBe("\u202Egpj.exe");
+    expect(anchor?.className).toContain("md-link");
+    await user.click(screen.getByRole("link"));
+    expect(screen.getByTestId("external-link-host")).toHaveTextContent("evil.example");
+    expect(screen.getByTestId("external-link-label").tagName).toBe("BDI");
+  });
+
+  it("isolates link text from the surrounding text in the stylesheet", () => {
+    const css = readFileSync(join(__dirname, "../../styles/markdown.css"), "utf8");
+    expect(css).toMatch(/\.md-link[^{]*\{[^}]*unicode-bidi:\s*isolate/);
+  });
+});
+
 describe("hostile sizes", () => {
   const bound = (name: string, input: string, ms = 1500) => {
     const started = performance.now();
@@ -145,6 +185,19 @@ describe("hostile sizes", () => {
     bound("bare urls", "https://a.dev/x ".repeat(50_000));
     bound("urls glued", "https://".repeat(50_000));
     bound("rules", "- ".repeat(50_000) + "\n");
+  });
+
+  it("parses 1 MB of open brackets in linear time (W13-6)", () => {
+    // Quadratic parsing took 500 regex steps per bracket; the bound is generous for a slow CI machine.
+    bound("1 MB of [", "[".repeat(1_000_000), 2000);
+    bound("1 MB of [ then one ]", `${"[".repeat(1_000_000)}]`, 2000);
+    bound("1 MB of ![", "![".repeat(500_000), 2000);
+    bound("1 MB of [[ ]] pairs", "[[".repeat(250_000) + "]]".repeat(250_000), 3000);
+  });
+
+  it("still parses a link after many brackets", () => {
+    const { container } = render(<Markdown text={`${"[".repeat(5000)} [ok](https://a.dev)`} />);
+    expect(container.querySelector("a")?.getAttribute("href")).toBe("https://a.dev/");
   });
 
   it("renders a deeply nested input without overflowing the stack", () => {

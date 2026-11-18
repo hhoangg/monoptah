@@ -295,6 +295,14 @@ export function parseInline(text: string, depth = 0, inLink = false): Inline[] {
     plain = "";
   };
   let index = 0;
+  // Next `]` at or after the last look-up: a link or image label is at most 500 characters, so a `[` whose next `]`
+  // is farther away (or missing) cannot start one. Without this a run of `[` costs 500 steps each (W13-6).
+  let nextClose = -2;
+  const labelCanClose = (from: number): boolean => {
+    if (nextClose !== -1 && nextClose < from) nextClose = text.indexOf("]", from);
+    else if (nextClose === -2) nextClose = text.indexOf("]", from);
+    return nextClose !== -1 && nextClose - from <= 501;
+  };
   while (index < text.length) {
     const char = text[index];
     if (char === "\\" && index + 1 < text.length && /[\\`*_~[\]()#>+-.!|]/.test(text[index + 1] ?? "")) {
@@ -318,7 +326,7 @@ export function parseInline(text: string, depth = 0, inLink = false): Inline[] {
       index = run;
       continue;
     }
-    if (char === "[") {
+    if (char === "[" && labelCanClose(index + 1)) {
       const link = sticky(LINK, text, index);
       if (link) {
         flush();
@@ -327,7 +335,7 @@ export function parseInline(text: string, depth = 0, inLink = false): Inline[] {
         continue;
       }
     }
-    if (char === "!" && text[index + 1] === "[") {
+    if (char === "!" && text[index + 1] === "[" && labelCanClose(index + 2)) {
       // Images are never loaded: the alt text is shown instead.
       const image = sticky(IMAGE, text, index);
       if (image) {
