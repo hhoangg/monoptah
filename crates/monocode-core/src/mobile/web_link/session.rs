@@ -601,13 +601,15 @@ impl SessionTable {
         keys
     }
 
-    /// Every ready session with its device's permission, in key order.
-    pub fn ready_sessions(&self) -> Vec<(SessionKey, policy::Permission)> {
-        let mut ready: Vec<(SessionKey, policy::Permission)> = self
+    /// Every ready session with its device fingerprint, in key order. The
+    /// permission is not returned: the copy stored at connect time goes stale
+    /// when the desktop changes it, so callers look the current one up.
+    pub fn ready_sessions(&self) -> Vec<(SessionKey, String)> {
+        let mut ready: Vec<(SessionKey, String)> = self
             .sessions
             .iter()
             .filter_map(|(k, s)| match &s.mode {
-                Mode::Ready(device) => Some((*k, device.permission)),
+                Mode::Ready(_) => Some((*k, s.fingerprint.clone())),
                 Mode::Pending { .. } => None,
             })
             .collect();
@@ -860,10 +862,7 @@ mod tests {
         let dev = Dev::new(3);
         h.confirmed(&dev);
         let _ = h.connect(&dev, 7, 1_000);
-        assert_eq!(
-            h.table.ready_sessions(),
-            vec![(dev.key(7), Permission::Read)]
-        );
+        assert_eq!(h.table.ready_sessions(), vec![(dev.key(7), dev.fp())]);
         let mode = Mode::Pending { since: 0 };
         policy::set_flags(PolicyFlags::default());
         assert_eq!(

@@ -702,8 +702,13 @@ fn run_command(
             close_fingerprint(&fingerprint, table, requests, link, now, frames);
         }
         LinkCommand::ResendAll => {
-            for (key, permission) in table.ready_sessions() {
-                match table.send(key, &confirmed_state(permission), now) {
+            // The permission comes from the desktop's current row, as for
+            // `Resend`, never from the copy stored when the tab connected.
+            for (key, fingerprint) in table.ready_sessions() {
+                let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
+                    continue;
+                };
+                match table.send(key, &confirmed_state(device.permission), now) {
                     Ok(sent) => frames.extend(sent),
                     Err(SendError::Encrypt) => {
                         frames.push(SessionTable::bye_frame(key));

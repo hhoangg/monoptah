@@ -1864,6 +1864,33 @@ mod seam {
             assert_eq!(state["permission"], "control");
         });
         assert_eq!(world.row_of(&pending).projects, Some(vec!["p".to_string()]));
+        // A policy toggle re-sends every tab its CURRENT permission, both
+        // after a lowering and after a raising.
+        for (set, expected) in [(Permission::Read, "read"), (Permission::Control, "control")] {
+            world
+                .host
+                .set_device_access(
+                    &device.id,
+                    DeviceKind::Web,
+                    set,
+                    Some(vec!["p".into()]),
+                    None,
+                )
+                .unwrap();
+            world.hub.rt.block_on(async {
+                let state = pending.read(&mut conn).await;
+                assert_eq!(state["permission"], expected);
+            });
+            world
+                .host
+                .web_link()
+                .command(crate::mobile::web_link::LinkCommand::ResendAll);
+            world.hub.rt.block_on(async {
+                let state = pending.read(&mut conn).await;
+                assert_eq!(state["state"], "confirmed");
+                assert_eq!(state["permission"], expected, "ResendAll must not be stale");
+            });
+        }
     }
 
     #[test]
