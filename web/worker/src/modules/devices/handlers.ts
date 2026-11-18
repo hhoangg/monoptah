@@ -26,6 +26,7 @@ export const DEVICE_GRANTS_SQL = "SELECT desktop_id, state FROM device_grants WH
 const LIVE_OWN = "EXISTS (SELECT 1 FROM devices WHERE id = ? AND user_id = ? AND revoked_at IS NULL)";
 export const FORGET_GRANTS_SQL = `UPDATE device_grants SET state = 'revoked', updated_at = ? WHERE device_id = ? AND state != 'revoked' AND ${LIVE_OWN}`;
 export const FORGET_PUSH_SQL = `DELETE FROM push_subscriptions WHERE device_id = ? AND ${LIVE_OWN}`;
+export const FORGOTTEN_OWN_SQL = "SELECT 1 FROM devices WHERE id = ? AND user_id = ? AND revoked_at IS NOT NULL";
 export const FORGET_DEVICE_SQL = "UPDATE devices SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at IS NULL";
 
 interface DeviceRow {
@@ -106,8 +107,13 @@ export const forgetDevice: Handler<AppEnv> = async (c) => {
       PREVIOUS_CHANGED,
     ),
   ]);
-  if (results[2]?.meta.changes !== 1) return notFound(c);
   const desktopIds = grants.results.map((g) => g.desktop_id);
+  if (results[2]?.meta.changes !== 1) {
+    // Already forgotten by this user: tell the rooms again, the first call may have failed (idempotent, R13B-1).
+    const forgotten = await c.env.DB.prepare(FORGOTTEN_OWN_SQL).bind(id, user.id).first();
+    if (forgotten) await revokeInRooms(c.env, desktopIds, { deviceId: id }, REVOKED);
+    return notFound(c);
+  }
   await revokeInRooms(c.env, desktopIds, { deviceId: id }, REVOKED);
   await Promise.all(desktopIds.map((desktopId) => notifyGrants(c.env, desktopId)));
   return c.json({ ok: true as const });

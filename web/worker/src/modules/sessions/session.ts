@@ -21,7 +21,7 @@ export const FRESH_SECONDS = 300;
 export const TOUCH_INTERVAL_SECONDS = 3600;
 export const USER_AGENT_MAX_LENGTH = 200;
 
-/** Upper bound of `room.revoke` calls of one admin block, to stay inside the subrequest limit of a request. */
+/** Rooms called in parallel per batch by an admin block; the batches run one after the other, so no room is skipped. */
 export const MAX_REVOKE_CALLS = 40;
 
 export type SessionAmr = "passkey" | "recovery";
@@ -195,7 +195,9 @@ export async function closeSessionSockets(env: Pick<Env, "DB" | "ROOM">, userId:
   if (idHashes.length === 0) return;
   const { results } = await env.DB.prepare(LIST_DESKTOP_IDS_SQL).bind(userId).all<{ id: string }>();
   const target = { sessionIdHashes: [...idHashes] };
-  const settled = await Promise.allSettled(results.map((desktop) => env.ROOM.get(env.ROOM.idFromName(desktop.id)).revoke(target, CloseCodes.UNAUTHORIZED)));
+  // One retry: a failed call is the only enforcement of a sign-out on a live socket (R13B-1); the room also remembers the hashes.
+  const call = (id: string) => env.ROOM.get(env.ROOM.idFromName(id)).revoke(target, CloseCodes.UNAUTHORIZED);
+  const settled = await Promise.allSettled(results.map((desktop) => call(desktop.id).catch(() => call(desktop.id))));
   const failed = settled.filter((r) => r.status === "rejected").length;
   if (failed > 0) console.error(`room.revoke failed: calls=${settled.length} failed=${failed}`);
 }

@@ -156,7 +156,8 @@ describe("PUT /api/desktops/:id/grants/:deviceId", () => {
     expect(room.calls.notifies).toEqual([desktop.desktopId]);
     // Repeating it is idempotent: no second room revoke.
     await authedCall(mine.session, `/api/desktops/${desktop.desktopId}/grants/${device.deviceId}`, json({ state: "revoked" }, "PUT"), roomEnv);
-    expect(room.calls.revokes).toHaveLength(1);
+    // The room is told again when D1 already shows the revocation (R13B-1): idempotent, the room remembers it.
+    expect(room.calls.revokes).toHaveLength(2);
     // A requested permission on a revoked grant is a conflict.
     expect((await authedCall(mine.session, `/api/desktops/${desktop.desktopId}/grants/${device.deviceId}`, json({ requestedPermission: "read" }, "PUT"), roomEnv)).status).toBe(409);
   });
