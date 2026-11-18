@@ -876,11 +876,12 @@ impl Shell {
     pub(crate) fn mobile_session_project(&self, session: i64, cx: &App) -> Option<String> {
         let summary = self.session_summaries.get(&session)?;
         let key = monocode_core::files::path_key(&summary.cwd);
-        self.mobile_projects(cx)
+        let projects = self.mobile_projects(cx);
+        projects
             .iter()
             .find(|path| monocode_core::files::path_key(path) == key)
             .map(|path| project_id(path))
-            .or_else(|| cloud::catalog_project_of(summary))
+            .or_else(|| cloud::catalog_project_of(self, session, summary, &projects))
     }
 
     /// The open conversation of a session, for the approvals module.
