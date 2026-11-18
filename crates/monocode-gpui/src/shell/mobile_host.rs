@@ -86,6 +86,8 @@ struct CatalogEntry {
     project: String,
     summary: Session,
     live: Option<mobile_catalog::LiveSession>,
+    /// Where the session runs, for web devices (None when it is not known).
+    cloud: Option<cloud::CardView>,
 }
 
 enum Receipt {
@@ -462,6 +464,7 @@ impl Shell {
         if !in_selection(&device.projects, id) {
             return Err(not_selected());
         }
+        cloud::reject_non_local_project(device, id)?;
         self.mobile_projects(cx)
             .into_iter()
             .find(|path| project_id(path) == id)
@@ -499,11 +502,17 @@ impl Shell {
                     return None;
                 }
                 let key = monocode_core::files::path_key(&summary.cwd);
-                let project = paths
+                let rail = paths
                     .iter()
                     .find(|path| monocode_core::files::path_key(path) == key)
-                    .map(|path| project_id(path))
-                    .or_else(|| cloud::catalog_project_of(summary))?;
+                    .map(|path| project_id(path));
+                // Only web devices are told of a session a phone never saw.
+                let web_only = rail.is_none();
+                let project = rail.or_else(|| {
+                    cloud::catalog_project_of(self, id, summary, paths)
+                        .map(|path| project_id(&path))
+                })?;
+                let cloud = cloud::card_view(self, id, web_only);
                 let live = self.sessions.get(&id).map(|view| {
                     let view = view.read(cx);
                     mobile_catalog::LiveSession {
@@ -528,6 +537,7 @@ impl Shell {
                     project,
                     summary: summary.clone(),
                     live,
+                    cloud,
                 })
             })
             .collect()
@@ -541,8 +551,15 @@ impl Shell {
             return;
         }
         let paths = self.mobile_projects(cx);
+        let entries = self.mobile_catalog_sessions(&paths, cx);
+        let extra = cloud::web_only_projects(
+            entries
+                .iter()
+                .filter_map(|entry| Some((entry.cloud.as_ref()?, entry.summary.cwd.as_str()))),
+        );
         let projects: Vec<Value> = paths
             .iter()
+            .chain(&extra)
             .map(|path| {
                 let appearance = self.appearance(path);
                 let (kind, model, access) = self.mobile_defaults(path, cx);
@@ -565,10 +582,12 @@ impl Shell {
                 if let Some(mascot) = appearance.mascot {
                     project["mascot"] = json!(mascot);
                 }
+                if extra.contains(path) {
+                    cloud::mark_web_only(&mut project);
+                }
                 project
             })
             .collect();
-        let entries = self.mobile_catalog_sessions(&paths, cx);
         let monos: Vec<(monocode_core::mono::Mono, Option<Value>)> = self
             .monos
             .as_ref()
@@ -653,7 +672,9 @@ impl Shell {
                 let branch = if !metadata.worktree_removed && metadata.branch.as_ref().is_none_or(|branch| branch.is_empty()) {
                     mobile_catalog::checkout_branch(metadata.worktree_cwd.as_deref().unwrap_or(&entry.summary.cwd), &mut branches)
                 } else { String::new() };
-                sessions.push(mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch));
+                let mut card = mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch);
+                cloud::annotate_card(&mut card, entry.cloud.as_ref());
+                sessions.push(card);
             }
             sessions.sort_by_key(|s| std::cmp::Reverse(s["updatedAt"].as_u64()));
             let monos: Vec<Value> = monos
@@ -781,11 +802,15 @@ impl Shell {
             // A session that maps to no project is refused for a narrowed device.
             let project = self.session_summaries.get(&session).and_then(|summary| {
                 let key = monocode_core::files::path_key(&summary.cwd);
-                self.mobile_projects(cx)
+                let paths = self.mobile_projects(cx);
+                paths
                     .iter()
                     .find(|path| monocode_core::files::path_key(path) == key)
                     .map(|path| project_id(path))
-                    .or_else(|| cloud::catalog_project_of(summary))
+                    .or_else(|| {
+                        cloud::target_project_of(self, device, session, summary, &paths)
+                            .map(|path| project_id(&path))
+                    })
             });
             if !project.is_some_and(|project| in_selection(&device.projects, &project)) {
                 return Err(not_selected());
@@ -887,7 +912,7 @@ impl Shell {
             "project.gitAction" => self.mobile_git_action(request, cx),
             "cloud.instances" | "cloud.startOptions" => {
                 let result = cloud::dispatch(self, &request.device, &method, &request.params, cx);
-                request.reply(result.map_err(Failure::from));
+                request.reply(result);
             }
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
@@ -1122,7 +1147,7 @@ impl Shell {
         let Target::Session(id) = target else {
             return Map::new();
         };
-        let mut fields = cloud::read_fields(*id, device, cx);
+        let mut fields = cloud::read_fields(self, *id, device, cx);
         fields.extend(approvals::read_fields(self, *id, device, cx));
         fields
     }
@@ -1132,7 +1157,7 @@ impl Shell {
         let Target::Session(id) = target else {
             return Value::Null;
         };
-        let mut fields = cloud::frame_fields(*id, device, cx);
+        let mut fields = cloud::frame_fields(self, *id, device, cx);
         fields.extend(approvals::frame_fields(self, *id, device, cx));
         Value::Object(fields)
     }
@@ -1558,8 +1583,7 @@ impl Shell {
                 finish(self, request, result);
             }
             method if method.starts_with("cloud.") => {
-                let result = cloud::dispatch(self, &request.device, method, &request.params, cx)
-                    .map_err(Failure::from);
+                let result = cloud::dispatch(self, &request.device, method, &request.params, cx);
                 finish(self, request, result);
             }
             _ => {
@@ -1725,11 +1749,11 @@ impl Shell {
                 Target::Session(id) => Some(*id),
                 Target::Mono(_) => None,
             };
-            cloud::before_send(self, &request.device, session, &request.params, cx)?;
+            let plan = cloud::before_send(self, &request.device, session, &request.params, cx)?;
             let text = message_text(&request.params)?;
-            Ok::<_, Failure>((target, text))
+            Ok::<_, Failure>((target, text, plan))
         })();
-        let (target, text) = match staged {
+        let (target, text, plan) = match staged {
             Ok(staged) => staged,
             Err(error) => return finish(self, request, Err(error)),
         };
@@ -1763,7 +1787,13 @@ impl Shell {
                         }),
                 });
                 let result = result
-                    .map(|()| json!({"sessionId": conversation}))
+                    .map(|()| {
+                        if plan.wake {
+                            json!({"sessionId": conversation, "wake": true, "queued": true})
+                        } else {
+                            json!({"sessionId": conversation})
+                        }
+                    })
                     .map_err(Failure::from);
                 this.schedule_mobile_push(cx);
                 finish(this, request, result);
@@ -2831,6 +2861,9 @@ fn hidden_providers(prefs: &crate::settings::Preferences, cwd: &str) -> Vec<Stri
 }
 
 #[cfg(test)]
+mod cloud_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use monocode_core::mobile::{DeviceKind, Permission};
@@ -3217,7 +3250,7 @@ mod tests {
                 assert!(shell.mobile_read_fields(&target, &phone(), cx).is_empty());
                 let read = json!({"id": "c", "turns": [], "busy": false});
                 assert_eq!(merge_fields(read.clone(), Map::new()), read);
-                // A watch frame with the stub fields equals one with none.
+                // A watch frame with the cloud fields equals one with none.
                 let extra = shell.mobile_frame_fields(&target, &phone(), cx);
                 assert_eq!(extra, json!({}));
                 let none = Value::Null;
@@ -3225,7 +3258,14 @@ mod tests {
                 let plain = watch::update(None, true, false, &none, &turns, false, &none, &none);
                 let hooked = watch::update(None, true, false, &none, &turns, false, &none, &extra);
                 assert_eq!(plain.unwrap().0, hooked.unwrap().0);
-                // The new methods answer as an unknown method did.
+                // A phone has no cloud methods: each is answered as an unknown
+                // method was, now with the stable code. A web device's stubs
+                // answer the same until their tickets land.
+                let unsupported = Err(policy::Code::Unsupported.failure());
+                assert_eq!(
+                    policy::Code::Unsupported.failure().error,
+                    "Unsupported mobile operation"
+                );
                 for method in [
                     "cloud.instances",
                     "cloud.startOptions",
@@ -3236,10 +3276,11 @@ mod tests {
                     "cloud.moveToCloud",
                     "cloud.moveToLocal",
                     "cloud.cancelMove",
+                    "cloud.unknown",
                 ] {
                     assert_eq!(
                         cloud::dispatch(shell, &phone(), method, &json!({}), cx),
-                        Err("Unsupported mobile operation".into()),
+                        unsupported,
                         "{method}"
                     );
                 }
@@ -3247,22 +3288,28 @@ mod tests {
                     approvals::dispatch(shell, &phone(), "session.answerApproval", &json!({}), cx),
                     Err(policy::Code::Disabled.failure())
                 );
-                // Archive, delete, send and start are never refused by the stubs.
+                // Archive, delete, send and start are never refused by the
+                // hooks, and a send never wakes anything.
                 assert_eq!(
                     cloud::before_archive(shell, &phone(), id, &json!({}), cx),
                     Ok(())
                 );
                 assert_eq!(cloud::before_delete(shell, &phone(), id, cx), Ok(()));
                 assert_eq!(
-                    cloud::before_send(shell, &phone(), Some(id), &json!({}), cx),
-                    Ok(())
+                    cloud::before_send(shell, &phone(), Some(id), &json!({"wake": true}), cx),
+                    Ok(cloud::SendPlan::default())
                 );
+                assert!(!cloud::SendPlan::default().wake);
                 assert_eq!(
                     cloud::start_target(shell, &phone(), "/tmp", &json!({}), cx),
                     Ok(())
                 );
+                // A phone's session has no cloud binding and no extra project.
                 let summary = shell.session_metadata(id, cx).summary;
-                assert_eq!(cloud::catalog_project_of(summary), None);
+                let paths = shell.mobile_projects(cx);
+                assert_eq!(cloud::catalog_project_of(shell, id, summary, &paths), None);
+                assert_eq!(cloud::read_fields(shell, id, &phone(), cx), Map::new());
+                assert_eq!(cloud::frame_fields(shell, id, &phone(), cx), Map::new());
             })
             .unwrap();
     }
