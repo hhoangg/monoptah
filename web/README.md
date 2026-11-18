@@ -30,6 +30,11 @@ pnpm check
 overriding the official `zptah.app` values of `wrangler.jsonc`, so passkeys and the Origin checks work locally.
 With `wrangler dev` (port 8787) use `RP_ORIGIN=http://localhost:8787` instead.
 
+`wrangler.jsonc` has a `custom_domain` route, so a bare `wrangler dev` treats the zone host as upstream and rewrites
+`Origin` to `https://zptah.app`: every browser POST then answers `403 bad_origin`. Always pass
+`--local-upstream localhost:<port>` with the port you serve on (the worker `dev` script, the API smoke and the E2E
+harness do). `vite dev` with the Cloudflare plugin does not need it.
+
 `pnpm check` runs, in order and stopping at the first failure: `typecheck`, `lint`, `test` over every package
 (`pnpm -r`, one at a time). Read its exit status directly, not through a pipe.
 

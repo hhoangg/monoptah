@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "predev": "node scripts/ensure-assets.mjs",
-    "dev": "wrangler dev -c ../wrangler.jsonc",
+    "dev": "wrangler dev --port 8787 --local-upstream localhost:8787 -c ../wrangler.jsonc",
     "db:migrate:local": "wrangler d1 migrations apply monoptah --local -c ../wrangler.jsonc",
     "db:migrate:remote": "wrangler d1 migrations apply monoptah --remote -c ../wrangler.jsonc",
     "bootstrap": "node ../scripts/bootstrap.mjs",

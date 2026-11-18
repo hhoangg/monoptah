@@ -204,6 +204,8 @@ async function main() {
       const args = [
         "dev", "--local", "--persist-to", persist, "--port", String(port), "--ip", "127.0.0.1", "-c", wranglerConfig,
         "--show-interactive-dev-session=false",
+        // wrangler.jsonc has a custom_domain route: without this, wrangler rewrites Origin to the zone host (403 bad_origin).
+        "--local-upstream", `localhost:${port}`,
         "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:${origin}`,
         ...Object.entries(fake).flatMap(([name, value]) => ["--var", `${name}:${value}`]),
       ];
