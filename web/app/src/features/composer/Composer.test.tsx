@@ -1,6 +1,6 @@
 // W-08: the composer on its own (F-47, F-48): Enter and Shift+Enter, Send and Stop, attachments, read-only,
 // offline, a refused send, the error takeover bar.
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Composer, DESKTOP_LAYOUT_QUERY, OFFLINE_PLACEHOLDER, READ_ONLY_REASON, type ComposerProps } from "./Composer";
@@ -192,5 +192,53 @@ describe("attachments (F-48)", () => {
     const field = screen.getByRole("textbox", { name: "Message" });
     fireEvent.paste(field, { clipboardData: { files: [file("shot.png", 10, "image/png")], items: [] } });
     expect(await screen.findByRole("list", { name: "Attachments" })).toBeInTheDocument();
+  });
+});
+
+describe("dictation (F-49)", () => {
+  class FakeRecognition {
+    static last: FakeRecognition | null = null;
+    lang = "";
+    continuous = false;
+    interimResults = false;
+    onresult: ((event: unknown) => void) | null = null;
+    onerror: unknown = null;
+    onend: (() => void) | null = null;
+    constructor() {
+      FakeRecognition.last = this;
+    }
+    start() {}
+    stop() {
+      this.onend?.();
+    }
+    abort() {}
+  }
+  const phrase = (text: string) => ({ resultIndex: 0, results: { length: 1, 0: { isFinal: true, length: 1, 0: { transcript: text } } } });
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).webkitSpeechRecognition;
+  });
+
+  it("has no microphone where the Web Speech API is missing", () => {
+    setup();
+    expect(screen.queryByRole("button", { name: "Dictation" })).toBeNull();
+  });
+
+  it("adds each finished phrase to the draft after what is typed, without sending", async () => {
+    (window as unknown as Record<string, unknown>).webkitSpeechRecognition = FakeRecognition;
+    const user = userEvent.setup();
+    const { onSubmit, field } = setup();
+    await user.type(field, "Fix");
+    await user.click(screen.getByRole("button", { name: "Dictation" }));
+    act(() => FakeRecognition.last?.onresult?.(phrase("the build")));
+    expect(field.value).toBe("Fix the build");
+    act(() => FakeRecognition.last?.onresult?.(phrase("please")));
+    expect(field.value).toBe("Fix the build please");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("is off for a read-only device", () => {
+    (window as unknown as Record<string, unknown>).webkitSpeechRecognition = FakeRecognition;
+    setup({ readOnly: true });
+    expect(screen.getByRole("button", { name: "Dictation" })).toBeDisabled();
   });
 });
