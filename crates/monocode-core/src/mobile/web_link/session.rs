@@ -773,8 +773,7 @@ mod tests {
         );
     }
 
-    /// The policy toggles are process-wide: tests that move them run one at a time.
-    static FLAGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::mobile::policy::TEST_SETTINGS_LOCK as FLAGS;
 
     /// S1: the `state` message a web device receives carries what the desktop
     /// supports: `cloud` always, and `cloudStart` while that toggle is on.

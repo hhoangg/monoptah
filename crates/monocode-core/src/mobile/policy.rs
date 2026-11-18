@@ -148,6 +148,10 @@ pub fn flags() -> PolicyFlags {
     settings().flags
 }
 
+/// Tests that move the process-wide settings or toggles hold this, so they run one at a time.
+#[cfg(test)]
+pub(crate) static TEST_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Replaces the process-wide toggles, keeping the deny patterns.
 pub fn set_flags(flags: PolicyFlags) {
     SETTINGS.write().unwrap_or_else(|e| e.into_inner()).flags = flags;
