@@ -21,6 +21,7 @@ import { queryOptions, useQuery, type QueryClient } from "@tanstack/react-query"
 import { apiFetch, endpoint, isApiError } from "@/features/accounts/api";
 import { withFreshAuth } from "@/features/accounts/queries";
 import { clearPersistedCache } from "@/data/persist";
+import { forgetDesktopLocally } from "@/features/settings/desktopLink";
 import { getLinkConnection, resetLinkConnections } from "@/link";
 import { forgetDeviceKey, getDeviceKeyInfo } from "@/link/keys";
 import { forgetPins } from "@/link/pins";
@@ -161,6 +162,13 @@ export async function revokeDesktop(queryClient: QueryClient, id: string, option
     // A connection that cannot stop must not keep the cache around.
   }
   await clearPersistedCache(id);
+  // The same wipe as "remove this desktop from this device": the per-desktop records of the other features
+  // (last place, Mono seen map, reactions) go too.
+  try {
+    await forgetDesktopLocally(id);
+  } catch {
+    // One handler failing must not keep the revoked desktop's screen from closing.
+  }
   await options.afterRevoke?.();
   queryClient.removeQueries({ queryKey: desktopKeys.detail(id) });
   queryClient.removeQueries({ queryKey: desktopKeys.grants(id) });

@@ -37,6 +37,7 @@ import {
   useDesktops,
   useDevices,
 } from "./api";
+import { onForgetDesktop } from "@/features/settings/desktopLink";
 import { createFakeServer, desktop, device, grant, type FakeServer } from "./testServer";
 
 const ASSERTION = { status: "ok", response: { id: "cred", rawId: "cred", type: "public-key", response: {}, clientExtensionResults: {} } };
@@ -177,6 +178,30 @@ describe("mutations", () => {
     expect(side.stop).toHaveBeenCalledTimes(1);
     expect(queryClient.getQueryData(["link", "d1", "catalog"])).toBeUndefined();
     expect(queryClient.getQueryData(["link", "d2", "catalog"])).toBe(1);
+  });
+
+  it("revokeDesktop runs the forget handlers of the other features, so their records of the desktop go too", async () => {
+    const forgotten: string[] = [];
+    const off = onForgetDesktop((id) => void forgotten.push(id));
+    try {
+      await revokeDesktop(queryClient, "d1");
+    } finally {
+      off();
+    }
+    expect(forgotten).toEqual(["d1"]);
+  });
+
+  it("revokeDesktop still finishes when a forget handler fails", async () => {
+    const off = onForgetDesktop(() => {
+      throw new Error("boom");
+    });
+    const afterRevoke = vi.fn();
+    try {
+      await revokeDesktop(queryClient, "d1", { afterRevoke });
+    } finally {
+      off();
+    }
+    expect(afterRevoke).toHaveBeenCalledTimes(1);
   });
 
   it("revokeDesktop runs afterRevoke before the queries are removed, and never fetches the deleted desktop again", async () => {
