@@ -6,7 +6,7 @@
 // (the model controls). The chat colour is phone-local: kept in this browser, never sent to the desktop.
 import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ModelCatalog, ParamsOf } from "@monoptah/protocol";
 import { catalogKey, useCatalog, useLinkMutation } from "@/data";
 import { ModelControls } from "@/features/models/ModelControls";
@@ -219,14 +219,14 @@ function SubsessionsGroup({ monoId, subsessions, onSave }: { monoId: string; sub
   const catalog = useModelCatalog();
   const [open, setOpen] = useState(false);
   const data: ModelCatalog | undefined = catalog.data;
-  const value = useMemo<ModelSelectionInput | null>(() => {
+  const value = ((): ModelSelectionInput | null => {
     if (!data) return null;
     const harness = subsessions?.harness ?? data.current.harness;
     const model = subsessions?.model ?? data.current.model;
     const entry = data.models.find((candidate) => candidate.id === model);
     const effortId = modelEffortSetting(entry)?.id;
     return { harness, model, modelSettings: effortId && subsessions?.effort ? { [effortId]: subsessions.effort } : data.current.modelSettings, runtimeMode: data.current.runtimeMode };
-  }, [data, subsessions]);
+  })();
   const summary = data && value ? summarizeSelection(data, value) : null;
   const pick = (selection: ModelSelection) => {
     const entry = data?.models.find((candidate) => candidate.id === selection.model);

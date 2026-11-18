@@ -12,7 +12,7 @@ import { useLinkReady } from "@/features/composer/SessionComposer";
 import { useSendGuard } from "@/features/composer/useSendGuard";
 import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
-import { markMonoSeen } from "@/features/sessions/monoSeen";
+import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { DocumentDialog } from "@/features/transcript/DocumentDialog";
 import { Transcript } from "@/features/transcript/Transcript";
@@ -26,8 +26,14 @@ import { Glass } from "@/ui/Glass";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { useMonoAccentStyle } from "./monoAccent";
+import { MessageActions, type HeldMessage } from "./MessageActions";
 import { MonoMascot } from "./MonoMascot";
 import { MonoMenu } from "./MonoMenu";
+
+const EXCERPT = 140;
+const excerpt = (text: string) => (text.length > EXCERPT ? `${text.slice(0, EXCERPT - 1)}...` : text);
+/** The replied-to message as a Markdown quote, so the Mono sees what the reply answers. */
+const quote = (text: string) => excerpt(text).split("\n").map((line) => `> ${line}`).join("\n");
 
 export const monoConversationId = (monoId: string) => `mono:${monoId}`;
 
@@ -47,6 +53,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const cancel = useLinkMutation("session.cancel");
   const accentStyle = useMonoAccentStyle(desktopId, monoId);
   const [document, setDocument] = useState<DocumentItem | null>(null);
+  // F-71: the message being replied to; the reply is sent with it quoted.
+  const [replyTo, setReplyTo] = useState<HeldMessage | null>(null);
 
   // F-17: the chat on screen is seen, and so is a reply that arrives while it is open.
   useEffect(() => {
@@ -80,13 +88,16 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
     assertFitsRequest(text, attachments);
     await guard.check({ desktopId, sessionId: conversationId, target: null });
     const wire = toWire(attachments);
-    void send(text, wire.length > 0 ? wire : undefined);
+    const quoted = replyTo ? `${quote(replyTo.text)}\n\n${text}` : text;
+    setReplyTo(null);
+    void send(quoted, wire.length > 0 ? wire : undefined);
   };
 
   const name = mono?.name ?? "Mono";
   const working = mono?.status === "working" || state?.busy === true;
   const empty = !!state && older.turns.length === 0 && (state.optimistic ?? []).length === 0;
-  const agent = useMemo(() => ({ name, ...(mono?.color ? { color: safeHexColor(mono.color) } : {}) }), [name, mono?.color]);
+  const monoColor = mono?.color;
+  const agent = useMemo(() => ({ name, ...(monoColor ? { color: safeHexColor(monoColor) } : {}) }), [name, monoColor]);
 
   return (
     // "route-stub" and `data-route` are the outlet marker that test/routes.test.tsx (WS-L) looks for.
@@ -146,19 +157,32 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
           <p className="max-w-sm text-body text-muted-text">{readOnly ? "No messages yet." : `Say hello. ${name} works in the background and replies here.`}</p>
         </div>
       ) : (
-        <Transcript
-          turns={older.turns}
-          optimistic={state?.optimistic ?? []}
-          loading={!state}
-          hasOlder={older.hasOlder}
-          loadingOlder={older.loading}
-          olderError={older.error}
-          loadOlder={older.loadOlder}
-          onRetry={readOnly ? undefined : retry}
-          agent={agent}
-          busy={state?.busy ?? false}
-          actions={actions}
-        />
+        <MessageActions
+          desktopId={desktopId}
+          monoId={monoId}
+          readOnly={readOnly}
+          className="relative flex min-h-0 flex-1 flex-col"
+          onReply={setReplyTo}
+          onMarkUnread={() => {
+            if (!mono) return;
+            markMonoUnread(desktopId, mono);
+            void navigate({ to: "/d/$desktopId", params: { desktopId } });
+          }}
+        >
+          <Transcript
+            turns={older.turns}
+            optimistic={state?.optimistic ?? []}
+            loading={!state}
+            hasOlder={older.hasOlder}
+            loadingOlder={older.loading}
+            olderError={older.error}
+            loadOlder={older.loadOlder}
+            onRetry={readOnly ? undefined : retry}
+            agent={agent}
+            busy={state?.busy ?? false}
+            actions={actions}
+          />
+        </MessageActions>
       )}
       <DocumentDialog document={document} onClose={() => setDocument(null)} />
       <ComposerRegion desktopId={desktopId} sessionId={conversationId}>
@@ -170,6 +194,18 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
           }}
           readOnly={readOnly}
           offline={!ready}
+          topRow={
+            replyTo ? (
+              <>
+                <span className="min-w-0 flex-1 truncate text-small text-muted-text" data-testid="reply-bar">
+                  Replying to: {excerpt(replyTo.text)}
+                </span>
+                <button type="button" aria-label="Cancel reply" className="inline-flex size-8 items-center justify-center rounded-pill hover:bg-selection" onClick={() => setReplyTo(null)}>
+                  <Icon name="close" size={14} />
+                </button>
+              </>
+            ) : null
+          }
         />
         {guard.dialog}
       </ComposerRegion>

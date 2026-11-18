@@ -5,7 +5,8 @@ import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FIXTURE_HANDLERS, type MockDesktop } from "@monoptah/mock-desktop";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { IDBFactory } from "fake-indexeddb";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
 import { resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
@@ -18,6 +19,7 @@ import { createAppRouter } from "@/router";
 import { clearHooks } from "@/ui/hooks";
 import { clearSlots } from "@/ui/slots";
 import { WsPSettingsSections } from "@/features/themes/SettingsSections";
+import { REACTIONS_DB, REACTIONS_STORE, REACTION_EMOJIS, loadReactions, resetReactions } from "./reactions";
 import { MONOS_ONLY_KEY, reloadMonoPrefs, useMonoPrefs } from "./monoPrefs";
 import { MONO_ACCENTS_KEY, reloadMonoAccents, setMonoAccent } from "./monoAccent";
 
@@ -34,6 +36,8 @@ const original = { ...FIXTURE_HANDLERS };
 let previous: PersistAdapter;
 let link: MockLink;
 beforeEach(() => {
+  globalThis.indexedDB = new IDBFactory();
+  resetReactions();
   localStorage.clear();
   reloadMonoPrefs();
   reloadMonoAccents();
@@ -187,5 +191,76 @@ describe("Monos only setting (F-13)", () => {
     expect(toggle).toHaveAttribute("aria-checked", "true");
     expect(localStorage.getItem(MONOS_ONLY_KEY)).toBe("1");
     expect(useMonoPrefs.getState().monosOnly).toBe(true);
+  });
+});
+
+/** What this browser stored for `desktopId` in the reactions database. */
+function storedReactions(desktopId: string): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open(REACTIONS_DB, 1);
+    open.onsuccess = () => {
+      const request = open.result.transaction(REACTIONS_STORE, "readonly").objectStore(REACTIONS_STORE).get(desktopId);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    };
+    open.onerror = () => reject(open.error);
+  });
+}
+
+describe("message actions (F-71)", () => {
+  const reply = () => screen.findByText("Done. This is canned example output.");
+
+  it("offers 12 reactions on a Mono message and keeps the pick in IndexedDB, not on the desktop", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}`);
+    fireEvent.contextMenu(await reply());
+    const menu = await screen.findByRole("menu");
+    const group = within(menu).getByRole("group", { name: "Reactions" });
+    expect(within(group).getAllByRole("menuitem")).toHaveLength(12);
+    expect(REACTION_EMOJIS).toHaveLength(12);
+    await user.click(within(group).getByRole("menuitem", { name: "React \u{1F525}" }));
+    const badge = await screen.findByTestId("message-reaction");
+    expect(badge).toHaveTextContent("\u{1F525}");
+    expect(badge.closest("[data-chat-message-role]")).not.toBeNull();
+    await waitFor(async () => expect(JSON.stringify(await storedReactions(DESKTOP_ID))).toContain("\u{1F525}"));
+    // Never sent to the desktop: the conversation holds no reaction.
+    expect(JSON.stringify(link.desktop.world.sessions.get(`mono:${MONO}`)!.turns)).not.toContain("\u{1F525}");
+    // A reload of the page reads it back.
+    resetReactions();
+    loadReactions(DESKTOP_ID);
+    await waitFor(() => expect(screen.getByTestId("message-reaction")).toHaveTextContent("\u{1F525}"));
+  });
+
+  it("replies with the message quoted and marks the Mono unread", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(`/monos/${MONO}`);
+    fireEvent.contextMenu(await reply());
+    await user.click(await screen.findByRole("menuitem", { name: "Reply" }));
+    expect(await screen.findByTestId("reply-bar")).toHaveTextContent("Replying to: Done. This is canned example output.");
+    await user.type(await field(), "Thanks");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(JSON.stringify(link.desktop.world.sessions.get(`mono:${MONO}`)!.turns)).toContain("> Done. This is canned example output.\\n\\nThanks"));
+    expect(screen.queryByTestId("reply-bar")).toBeNull();
+    fireEvent.contextMenu(await reply());
+    await user.click(await screen.findByRole("menuitem", { name: "Mark unread" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}`));
+  });
+
+  it("copies the message text", async () => {
+    const user = userEvent.setup();
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    mount(`/monos/${MONO}`);
+    fireEvent.contextMenu(await reply());
+    await user.click(await screen.findByRole("menuitem", { name: "Copy" }));
+    expect(writeText).toHaveBeenCalledWith("Done. This is canned example output.");
+  });
+
+  it("gives a read-only device Mark unread and Copy only: no reactions, no reply", async () => {
+    mount(`/monos/${MONO}`, { permission: "read" });
+    fireEvent.contextMenu(await reply());
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).queryByRole("group", { name: "Reactions" })).toBeNull();
+    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Mark unread", "Copy"]);
   });
 });

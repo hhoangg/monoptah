@@ -125,7 +125,7 @@ export function Cartesian({ kind, series, labels, height }: { kind: "bar" | "lin
   const tintOf = (index: number) => tints[index] ?? "var(--accent-color)";
   const stride = Math.max(1, Math.ceil(count / Math.max(1, Math.floor(plotW / 72))));
 
-  let marks: ReactNode = null;
+  let marks: ReactNode;
   let lastValue: ReactNode = null;
   if (bars) {
     const n = Math.max(1, series.length);
@@ -459,7 +459,14 @@ export function Heatmap({ values, rows, columns, tint }: { values: number[][]; r
     if (v <= 0) return track;
     return inked(x, y, step(0.25 + 0.75 * (v / high))) ? tint : track;
   });
-  let previous: [string, number] | null = null;
+  // Column labels that fit: not a repeat of the one before, and 36 units clear of it.
+  const columnLabels: Array<[string, number]> = [];
+  columns.slice(skip).forEach((label, i) => {
+    const x = i * pitch;
+    const previous = columnLabels[columnLabels.length - 1];
+    if (previous && (previous[0] === label || x - previous[1] < 36)) return;
+    columnLabels.push([label, x]);
+  });
   return (
     <Chart width={AVAILABLE} height={height} label="Heatmap">
       <Cells paths={paths} x={gutter} y={top} />
@@ -470,16 +477,11 @@ export function Heatmap({ values, rows, columns, tint }: { values: number[][]; r
           </text>
         ),
       )}
-      {columns.slice(skip).map((label, i) => {
-        const x = i * pitch;
-        if (previous && (previous[0] === label || x - previous[1] < 36)) return null;
-        previous = [label, x];
-        return (
-          <text key={i} {...AXIS} x={gutter + x} y={top / 2 + 3.5}>
-            {label}
-          </text>
-        );
-      })}
+      {columnLabels.map(([label, x]) => (
+        <text key={x} {...AXIS} x={gutter + x} y={top / 2 + 3.5}>
+          {label}
+        </text>
+      ))}
     </Chart>
   );
 }
