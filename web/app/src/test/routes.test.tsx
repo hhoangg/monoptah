@@ -172,6 +172,17 @@ const SCREENS: Record<string, string> = {
   "/d/:desktopId/monos": "Monos",
   "/d/dk1/monos/m1": "Mono",
   "/d/:desktopId/monos/:monoId": "Mono",
+  // U-09 (WS-P, P2): the Mono profile pages. Without a connected desktop they show their loading state.
+  "/d/dk1/monos/m1/profile": "Profile",
+  "/d/:desktopId/monos/:monoId/profile": "Profile",
+  "/d/dk1/monos/m1/profile/edit": "Edit Mono",
+  "/d/:desktopId/monos/:monoId/profile/edit": "Edit Mono",
+  "/d/dk1/monos/m1/profile/habit/h3": "Habit",
+  "/d/:desktopId/monos/:monoId/profile/habit/:id": "Habit",
+  "/d/dk1/monos/m1/profile/documents": "Documents",
+  "/d/:desktopId/monos/:monoId/profile/documents": "Documents",
+  "/d/dk1/monos/m1/profile/file/notes.md": "Document",
+  "/d/:desktopId/monos/:monoId/profile/file/:name": "Document",
   // The default test account is a member, so the admin routes show their guard screen (U-04).
   "/admin": "Not available",
   "/admin/users": "Not available",

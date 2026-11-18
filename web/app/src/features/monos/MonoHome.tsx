@@ -14,12 +14,16 @@ import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
+import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "./contextMenu";
+import { CreateMonoDialog } from "./CreateMonoDialog";
 import { MonoMascot } from "./MonoMascot";
 import { useMonoPrefs } from "./monoPrefs";
 
 export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: string; /** The heading element: "h1" when the list is a page of its own. */ titleAs?: "h1" | "h2" }) {
   const catalog = useCatalog();
+  const readOnly = useReadOnly();
+  const [creating, setCreating] = useState(false);
   const [showHidden, setShowHidden] = useState(false);
   const hiddenIds = useMonoPrefs((state) => state.hidden[desktopId]);
   const setHidden = useMonoPrefs((state) => state.setHidden);
@@ -27,6 +31,7 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
   const unread = useUnreadMonos(desktopId, monos ?? []);
   const hidden = useMemo(() => new Set(hiddenIds ?? []), [hiddenIds]);
   const sorted = useMemo(() => [...(monos ?? [])].sort((a, b) => (b.lastActiveAt ?? 0) - (a.lastActiveAt ?? 0)), [monos]);
+  const canCreate = catalog.data?.monoTools === true && !readOnly;
   const shown = sorted.filter((mono) => !hidden.has(mono.id));
   const hiddenMonos = sorted.filter((mono) => hidden.has(mono.id));
 
@@ -34,6 +39,12 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
     <section data-testid="mono-home" aria-label="Monos" className="mx-auto flex w-full max-w-[768px] flex-col gap-2 px-3 py-3">
       <div className="flex items-center gap-2 px-2">
         <Title className="flex-1 text-headline font-semibold">Monos</Title>
+        {canCreate ? (
+          <Button type="button" size="sm" variant="outline" onClick={() => setCreating(true)}>
+            <Icon name="add" size={16} />
+            New Mono
+          </Button>
+        ) : null}
       </div>
       {!monos ? (
         catalog.isError ? <Notice variant="error">Could not load your Monos.</Notice> : <DelayedSpinner label="Loading Monos" className="m-6" />
@@ -69,6 +80,7 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
           ) : null}
         </div>
       ) : null}
+      {canCreate ? <CreateMonoDialog desktopId={desktopId} open={creating} onOpenChange={setCreating} /> : null}
     </section>
   );
 }
