@@ -9,6 +9,9 @@ on:
     paths:
       - "web/**"
       - "crates/monocode-core/**"
+      - "crates/monocode-gpui/Cargo.toml"
+      - "crates/monocode-gpui/Cargo.lock"
+      - "crates/monocode-gpui/.cargo/config.toml"
       - "scripts/e2e-web.sh"
       - ".github/workflows/web-e2e.yml"
   pull_request:
@@ -16,6 +19,9 @@ on:
     paths:
       - "web/**"
       - "crates/monocode-core/**"
+      - "crates/monocode-gpui/Cargo.toml"
+      - "crates/monocode-gpui/Cargo.lock"
+      - "crates/monocode-gpui/.cargo/config.toml"
       - "scripts/e2e-web.sh"
       - ".github/workflows/web-e2e.yml"
   workflow_dispatch:
