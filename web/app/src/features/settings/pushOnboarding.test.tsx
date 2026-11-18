@@ -179,6 +179,13 @@ describe("push onboarding (P-05)", () => {
     expect(events.indexOf("unsubscribe")).toBeLessThan(events.indexOf("POST /api/auth/logout"));
   });
 
+  it("sign out still ends the session when removing the push subscription fails", async () => {
+    const queryClient = createQueryClient();
+    push.unsubscribeFromPush.mockRejectedValueOnce(new Error("DELETE /api/push/subscriptions/sub_1 failed"));
+    await expect(signOut(queryClient)).resolves.toBeUndefined();
+    expect(events).toContain("POST /api/auth/logout");
+  });
+
   const CATS = { agentFinished: false, agentInput: true, monoMessages: true };
   const known = (queryClient: ReturnType<typeof createQueryClient>, id: string, prefs: { enabled: boolean; categories: typeof CATS }) => queryClient.setQueryData(pushPrefsKey(id), prefs);
 

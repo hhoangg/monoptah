@@ -69,8 +69,32 @@ export async function subscribeToPush(deviceId: string, userId: string): Promise
   const { id } = await apiFetch(pushEndpoints.subscribe, {
     body: { endpoint: subscription.endpoint, keys: { p256dh: toBase64Url(p256dh), auth: toBase64Url(auth) }, deviceId, vapidKeyId: vapid.keyId },
   });
-  await savePushState({ deviceId, subscriptionId: id, userId });
+  await savePushState({ deviceId, subscriptionId: id, userId, vapidKeyId: vapid.keyId });
   return id;
+}
+
+/**
+ * Makes the subscription again when the server's VAPID `keyId` is not the one it was made with (the key was
+ * rotated, architecture.md 8): a push signed with the new key would not reach the old subscription. Does nothing
+ * when this browser never enabled push, the permission is gone or the key is the same. A state saved before the
+ * key id was kept counts as changed once. Resolves to true after a new subscription; never throws.
+ */
+export async function resubscribeIfVapidKeyChanged(userId: string): Promise<boolean> {
+  try {
+    if (!isPushSupported() || Notification.permission !== "granted") return false;
+    const state = await loadPushState();
+    if (!state || (state.userId !== null && state.userId !== userId)) return false;
+    const vapid = await apiFetch(pushEndpoints.vapidKey);
+    if (state.vapidKeyId === vapid.keyId) return false;
+    // `subscribeToPush` replaces a browser subscription made with another key and upserts the Worker row.
+    const id = await subscribeToPush(state.deviceId, userId);
+    if (id !== state.subscriptionId) {
+      await apiFetch(pushEndpoints.unsubscribe, { params: { id: state.subscriptionId } }).catch(() => undefined);
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Removes the browser-side subscription of the service worker registration. Never throws. */

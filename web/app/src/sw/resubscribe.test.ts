@@ -51,7 +51,7 @@ describe("resubscribe", () => {
 
     const del = fetch.mock.calls.find(([url]) => url === "/api/push/subscriptions/sub-old")!;
     expect(del[1]).toMatchObject({ method: "DELETE", headers: { "X-Monoptah-CSRF": "1" } });
-    expect(await loadPushState()).toEqual({ deviceId: "dev-1", subscriptionId: "sub-new", userId: "usr-1" });
+    expect(await loadPushState()).toEqual({ deviceId: "dev-1", subscriptionId: "sub-new", userId: "usr-1", vapidKeyId: "k2" });
   });
 
   it("keeps the row when the endpoint is unchanged (same id)", async () => {
