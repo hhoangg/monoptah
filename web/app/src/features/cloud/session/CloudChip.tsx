@@ -1,8 +1,9 @@
 // W-06 and W-08: where a session runs and in which state, as text. The list card shows it only for a
 // session that is not local (a local session shows nothing, which keeps the list calm); the header chip
 // is live from `useCloud` and falls back to the catalog card.
+import { useState } from "react";
 import type { SessionCard } from "@monoptah/protocol";
-import { useCloud } from "@/data";
+import { useCatalog, useCloud } from "@/data";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/ui/badge";
 import { useCapability } from "@/version";
@@ -34,16 +35,21 @@ export function SessionHeaderChip({ desktopId, session }: { desktopId: string; s
   const enabled = useCapability("cloud");
   const cloud = useCloud(session.id);
   const placement = placementOf(session, cloud);
-  useLivePlacement(desktopId, session.id, placementSources(session, cloud));
-  if (!enabled) return null;
+  const catalogFresh = useCatalog().dataUpdatedAt > 0;
+  useLivePlacement(desktopId, session.id, placementSources(session, cloud, catalogFresh));
   const visible = placement !== null && isNonLocalKind(placement.kind);
+  const text = visible ? (placement.state ? `${kindLabel(placement.kind)}: ${stateLabel(placement.state)}` : kindLabel(placement.kind)) : "";
+  // Announce a change, not the first text: the region mounts empty and fills only after the text changed.
+  const [seen, setSeen] = useState({ text, changed: false });
+  if (seen.text !== text) setSeen({ text, changed: true });
+  if (!enabled) return null;
   return (
     <>
       <CloudChip placement={placement} />
       {/* A state change (Starting to Available) is announced, not only repainted. */}
       {visible ? (
         <span role="status" aria-live="polite" className="sr-only">
-          {placement.state ? `${kindLabel(placement.kind)}: ${stateLabel(placement.state)}` : kindLabel(placement.kind)}
+          {seen.changed ? text : ""}
         </span>
       ) : null}
     </>

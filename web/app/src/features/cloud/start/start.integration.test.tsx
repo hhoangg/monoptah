@@ -251,7 +251,7 @@ describe("sanitizeTarget (BILL M-4)", () => {
 
   it("drops what the options no longer offer", () => {
     expect(sanitizeTarget(buildTarget({ kind: "sandbox", branch: "gone", size: "huge" }), options, [])).toEqual({ kind: "sandbox", instance: "new" });
-    expect(sanitizeTarget(buildTarget({ kind: "sandbox", instance: "vanished" }), options, [{ kind: "sandbox", instance: "other" }])).toEqual({ kind: "sandbox", instance: "new" });
+    expect(sanitizeTarget(buildTarget({ kind: "sandbox", instance: "vanished" }), options, [{ kind: "sandbox", instance: "other" }])).toBeNull();
   });
 
   it("keeps a picked instance while the instance list is not loaded", () => {

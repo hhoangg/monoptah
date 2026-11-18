@@ -3,7 +3,7 @@ import { render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { MOVE_STEP_IDS, STARTUP_STEP_IDS, STEP_STATUSES, type CloudState, type StepStatus } from "@monoptah/protocol";
 import { COST_NOTICES, STARTING_REFUSAL, UNAVAILABLE_REFUSAL } from "./copy";
-import { KIND_LABELS, STATE_LABELS, placementOf } from "./model";
+import { KIND_LABELS, STATE_LABELS, placementOf, placementSources } from "./model";
 import { CloudChip } from "./session/CloudChip";
 import { cloudSendGuard } from "./session/guard";
 import { clearLivePlacements, publishPlacement } from "./session/liveState";
@@ -108,6 +108,25 @@ describe("cloudSendGuard", () => {
   it("confirms the start cost for a cloud start from the New session page (empty session id)", async () => {
     expect(await send("codespace", undefined, "")).toEqual({ kind: "confirm", notice: COST_NOTICES.start });
     expect(await send("local", undefined, "")).toEqual({ kind: "allow" });
+  });
+
+  describe("persisted catalog (not refreshed yet)", () => {
+    const card = { target: { kind: "codespace", state: "available" }, cloudState: "available" } as never;
+    it("does not trust a cloud card as available without a live field", async () => {
+      const sources = placementSources(card, undefined, false);
+      expect(sources.states).toContain("unknown");
+      publishPlacement("d", "s1", "w1", sources);
+      expect(await send("codespace", "available")).toEqual({ kind: "confirm", notice: COST_NOTICES.wakeUnknown });
+    });
+
+    it("trusts it once the catalog is fresh, or when a live field arrived", () => {
+      expect(placementSources(card, undefined, true).states).toEqual(["available"]);
+      expect(placementSources(card, { kind: "codespace", instance: "i", state: "available" }, false).states).toEqual(["available"]);
+    });
+
+    it("leaves a local card alone", () => {
+      expect(placementSources({ target: { kind: "local" } } as never, undefined, false).states).toEqual([]);
+    });
   });
 
   describe("live sources", () => {

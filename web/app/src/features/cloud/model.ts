@@ -79,9 +79,17 @@ export function placementOf(session: Pick<SessionCard, "target" | "cloudState"> 
 }
 
 /** Every kind and state the live `cloud` field and the catalog card report; the send guard checks all of them. */
-export function placementSources(session: Pick<SessionCard, "target" | "cloudState"> | undefined, cloud?: CloudField): { kinds: string[]; states: CloudState[] } {
+export function placementSources(
+  session: Pick<SessionCard, "target" | "cloudState"> | undefined,
+  cloud?: CloudField,
+  /** False while the catalog is still the persisted copy (not yet refreshed by a live reply). */
+  catalogFresh = true,
+): { kinds: string[]; states: CloudState[] } {
   const kinds = [cloud?.kind, session?.target?.kind].filter((kind): kind is NonNullable<typeof kind> => !!kind);
   const states = [cloud?.state, session?.target?.state, session?.cloudState].filter((state): state is CloudState => !!state);
+  // A persisted card can be days old: with no live `cloud` field to confirm it, a cloud card is not trusted as
+  // `available` (or anything else). `unknown` makes the send guard ask with the wake cost notice.
+  if (!catalogFresh && !cloud && kinds.some((kind) => kind === "codespace" || kind === "sandbox")) states.push("unknown");
   return { kinds: [...new Set<string>(kinds)], states: [...new Set(states)] };
 }
 

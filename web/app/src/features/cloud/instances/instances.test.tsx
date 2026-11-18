@@ -426,3 +426,28 @@ describe("rows: labels, untrusted text, resume session and own actions", () => {
     }
   });
 });
+
+describe("updates paused (round 2, item 3)", () => {
+  it("pauses after 3 failed refreshes in a row and Refresh resumes it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: (ms) => vi.advanceTimersByTime(ms) });
+      let failing = false;
+      FIXTURE_HANDLERS["cloud.instances"] = (() => {
+        if (failing) throw new FixtureError("down", "busy");
+        return { instances: [{ kind: "sandbox", instance: "s", displayName: "Moving", state: "starting", sessions: [] }] };
+      }) as never;
+      mount();
+      await rowOf("Moving");
+      expect(screen.queryByText(/Updates paused/)).toBeNull();
+      failing = true;
+      await act(async () => void (await vi.advanceTimersByTimeAsync(INSTANCES_POLL_MS * 5)));
+      expect(await screen.findByText(/Updates paused/)).toBeInTheDocument();
+      failing = false;
+      await user.click(screen.getByRole("button", { name: "Refresh" }));
+      await waitFor(() => expect(screen.queryByText(/Updates paused/)).toBeNull());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { ResultOf } from "@monoptah/protocol";
 import { useLinkQuery } from "@/data";
 
@@ -41,30 +41,49 @@ export interface UseCloudInstancesOptions {
   epoch?: number;
 }
 
-export function useCloudInstances({ watching, epoch = 0 }: UseCloudInstancesOptions = {}) {
+/**
+ * The instance list with its poll. `paused` is true when polling stopped although the list still looks like it
+ * is changing (the cap, or `INSTANCES_MAX_ERRORS` failed refreshes in a row): the screen offers a refresh.
+ */
+export function useCloudInstancesPolled({ watching, epoch = 0 }: UseCloudInstancesOptions = {}) {
   const startedAt = useRef<number | null>(null);
   const lastEpoch = useRef(epoch);
-  return useLinkQuery(
+  // `errorUpdateCount` never resets, so the streak is counted from its value at the last good refresh.
+  const errorBase = useRef(0);
+  const [paused, setPaused] = useState(false);
+  const query = useLinkQuery(
     "cloud.instances",
     {},
     {
       refetchInterval: (query) => {
-        // A new own action restarts the polling clock.
+        // A new own action restarts the polling clock and the error streak.
         if (lastEpoch.current !== epoch) {
           lastEpoch.current = epoch;
           startedAt.current = null;
+          errorBase.current = query.state.errorUpdateCount;
         }
-        if (query.state.status === "error" && query.state.errorUpdateCount >= INSTANCES_MAX_ERRORS) return false;
+        if (query.state.status === "success") errorBase.current = query.state.errorUpdateCount;
         const own = watching?.(query.state.data) ?? false;
-        const idle = instancesRefetchInterval(query.state.data, { watching: own });
-        if (idle === false) {
+        const wants = instancesRefetchInterval(query.state.data, { watching: own });
+        let next: number | false = false;
+        if (wants === false) {
           startedAt.current = null;
-          return false;
+        } else if (query.state.errorUpdateCount - errorBase.current >= INSTANCES_MAX_ERRORS) {
+          next = false;
+        } else {
+          startedAt.current ??= Date.now();
+          next = instancesRefetchInterval(query.state.data, { watching: own, elapsedMs: Date.now() - startedAt.current });
         }
-        startedAt.current ??= Date.now();
-        return instancesRefetchInterval(query.state.data, { watching: own, elapsedMs: Date.now() - startedAt.current });
+        const stopped = wants !== false && next === false;
+        queueMicrotask(() => setPaused(stopped));
+        return next;
       },
       refetchIntervalInBackground: false,
     },
   );
+  return { query, paused };
+}
+
+export function useCloudInstances(options: UseCloudInstancesOptions = {}) {
+  return useCloudInstancesPolled(options).query;
 }

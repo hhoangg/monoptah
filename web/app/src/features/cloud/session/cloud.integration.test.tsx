@@ -393,7 +393,9 @@ describe("composer-top: more states (SPEC M-4, M-5, X-10, BILL M-1, M-9)", () =>
   it("the header chip announces a state change in a live region", async () => {
     mount("/s/sess-codespace-starting");
     const announce = async (text: string) => await waitFor(() => expect(screen.getAllByRole("status").some((node) => node.textContent === text && node.className.includes("sr-only"))).toBe(true));
-    await announce("GitHub codespace: Starting");
+    await screen.findByTestId("cloud-chip");
+    // Not on mount: the region is empty until the state changes.
+    expect(screen.getAllByRole("status").some((node) => node.textContent === "GitHub codespace: Starting")).toBe(false);
     for (let i = 0; i < 9; i += 1) await act(async () => void link.desktop.advance("sess-codespace-starting"));
     await announce("GitHub codespace: Available");
   });
@@ -444,6 +446,20 @@ describe("send guard with the live conversation state (BILL I-1, SPEC I-1)", () 
     await user.type(await field(), "hello{Enter}");
     expect(await screen.findByText("This instance is unavailable right now. Check it on your desktop, then send again.")).toBeInTheDocument();
     expect(sent).not.toHaveBeenCalled();
+  });
+});
+
+describe("Stop dialog stays the instance dialog (round 2, item 5)", () => {
+  it("keeps naming the sharing sessions when a refetch drops the instance row", async () => {
+    const user = userEvent.setup();
+    const { queryClient } = mount("/s/sess-sandbox-stopped", { seed: withCloud("sess-sandbox-stopped", { state: "unavailable", kept: true }) });
+    const region = await top();
+    await user.click(await within(region).findByRole("button", { name: "Stop instance" }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog).toHaveTextContent(/"Stopped sandbox work"/));
+    FIXTURE_HANDLERS["cloud.instances"] = (() => ({ instances: [] })) as never;
+    await act(async () => void (await queryClient.invalidateQueries()));
+    expect(screen.getByRole("dialog")).toHaveTextContent(/"Stopped sandbox work"/);
   });
 });
 

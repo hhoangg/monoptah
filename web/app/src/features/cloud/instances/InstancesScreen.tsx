@@ -12,7 +12,7 @@ import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
 import { otherLabel } from "./copy";
 import { InstanceRow } from "./InstanceRow";
-import { OWN_ACTION_WATCH_MS, useCloudInstances, type CloudInstance } from "./useCloudInstances";
+import { OWN_ACTION_WATCH_MS, useCloudInstancesPolled, type CloudInstance } from "./useCloudInstances";
 
 const keyOf = (instance: Pick<CloudInstance, "kind" | "instance">) => `${instance.kind}:${instance.instance}`;
 
@@ -32,7 +32,7 @@ export function InstancesScreen({ desktopId }: { desktopId: string }) {
     const action = own[keyOf(instance)];
     return !!action && action.state === instance.state && action.stopReport === instance.stopReport;
   };
-  const query = useCloudInstances({ watching: (data) => data?.instances.some(isPending) ?? false, epoch });
+  const { query, paused } = useCloudInstancesPolled({ watching: (data) => data?.instances.some(isPending) ?? false, epoch });
   // The `warning` of the last stop per instance, shown on its row until the user leaves the screen.
   const [warnings, setWarnings] = useState<Record<string, string>>({});
 
@@ -82,6 +82,22 @@ export function InstancesScreen({ desktopId }: { desktopId: string }) {
   return (
     <div className="flex flex-col gap-4">
       {query.isError ? <Notice variant="error">Could not refresh the list. Showing the last result.</Notice> : null}
+      {paused ? (
+        <Notice>
+          Updates paused. The list no longer refreshes by itself.{" "}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              setEpoch((current) => current + 1);
+              void query.refetch();
+            }}
+          >
+            Refresh
+          </Button>
+        </Notice>
+      ) : null}
       {instances.length === 0 ? (
         <p data-testid="cloud-empty" className="py-6 text-center text-body text-muted-text">
           No cloud instances yet. Instances appear here when a session runs in the cloud.

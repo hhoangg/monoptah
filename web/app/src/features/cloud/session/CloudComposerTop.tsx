@@ -57,7 +57,12 @@ function SessionStopDialog({ cloud, sessionId, onClose, onStopped }: { cloud: Cl
   const canControl = useCanControl();
   const list = useLinkQuery("cloud.instances", {});
   const stop = useLinkMutation("cloud.stop");
-  const instance = list.data?.instances.find((candidate) => candidate.kind === cloud?.kind && candidate.instance === cloud?.instance);
+  const found = list.data?.instances.find((candidate) => candidate.kind === cloud?.kind && candidate.instance === cloud?.instance);
+  // Once matched, the dialog stays the instance dialog even if a refetch drops the row: switching components
+  // would unmount an in-flight `cloud.stop` and lose its warning.
+  const [pinned, setPinned] = useState<typeof found>(undefined);
+  if (found && !pinned) setPinned(found);
+  const instance = pinned ?? found;
   if (instance) return <StopInstanceDialog instance={instance} onOpenChange={(open) => !open && onClose()} onStopped={onStopped} />;
   const loading = list.isPending;
   return (
@@ -90,11 +95,12 @@ function SessionStopDialog({ cloud, sessionId, onClose, onStopped }: { cloud: Cl
 export function CloudComposerTop({ desktopId, sessionId }: CloudComposerTopProps) {
   const enabled = useCapability("cloud");
   const cloud = useCloud(sessionId);
-  const card = useCatalog().data?.sessions.find((candidate) => candidate.id === sessionId);
+  const catalog = useCatalog();
+  const card = catalog.data?.sessions.find((candidate) => candidate.id === sessionId);
   const canControl = useCanControl();
   const placement = placementOf(card, cloud);
   const state: CloudState | undefined = placement?.state;
-  useLivePlacement(desktopId, sessionId, placementSources(card, cloud));
+  useLivePlacement(desktopId, sessionId, placementSources(card, cloud, catalog.dataUpdatedAt > 0));
 
   // "Waking, your message is queued" only after THIS device sent: this device has a message in flight (sent or
   // sending, not yet in the transcript) while the instance starts. The send guard refuses a send to an instance

@@ -49,8 +49,8 @@ export function buildTarget(fields: { kind: BillableKind; instance?: string | un
 }
 
 /**
- * Drops what the current options no longer offer: a backend that is not ready (the whole target goes back to
- * local), an instance that no longer exists, a branch, machine or size that is not in the lists. `instances`
+ * Drops what the current options no longer offer: a backend that is not ready or an instance that no longer
+ * exists (the whole target goes back to local: never silently to a NEW billable instance, the user picks again), a branch, machine or size that is not in the lists. `instances`
  * is undefined while the instance list is not loaded, and then an instance is kept. Returns the same object
  * when nothing changed.
  */
@@ -63,8 +63,8 @@ export function sanitizeTarget(
   const kind = value.kind;
   if (kind !== "codespace" && kind !== "sandbox") return null;
   if (!readyKinds(options).includes(kind)) return null;
-  let instance = value.instance;
-  if (instance && instance !== NEW_INSTANCE && instances && !instances.some((candidate) => candidate.kind === kind && candidate.instance === instance)) instance = NEW_INSTANCE;
+  const instance = value.instance;
+  if (instance && instance !== NEW_INSTANCE && instances && !instances.some((candidate) => candidate.kind === kind && candidate.instance === instance)) return null;
   const branch = value.branch !== undefined && (options.branches ?? []).includes(value.branch) ? value.branch : undefined;
   const machine = value.machine !== undefined && choicesOf(options.machines).some((choice) => choice.id === value.machine) ? value.machine : undefined;
   const size = value.size !== undefined && choicesOf(options.sizes).some((choice) => choice.id === value.size) ? value.size : undefined;
