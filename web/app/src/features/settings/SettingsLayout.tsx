@@ -72,7 +72,8 @@ function useActiveSection(ids: readonly string[]): [string | undefined, (id: str
         const first = atBottom && window.scrollY > 0 ? ids[ids.length - 1] : ids.find((id) => visible.has(id));
         if (first) setActive(first);
       },
-      { rootMargin: "-3.5rem 0px -60% 0px" },
+      // rootMargin accepts only px or percent (a rem value throws): 56px is the 3.5rem header offset.
+      { rootMargin: "-56px 0px -60% 0px" },
     );
     // The last area can be too short to reach the observed band: the bottom of the page then selects it.
     const onScroll = () => {
