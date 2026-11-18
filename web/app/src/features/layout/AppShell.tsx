@@ -9,17 +9,20 @@
 //                not fit it opens as the overlay instead.
 // A right panel belongs to a project: it shows only on that project's screens (`p/$projectId/...` and the
 // sessions of that project).
-// The shell also mounts the global shortcuts (shortcuts.ts) and the command palette (F-15).
+// The shell also mounts the global shortcuts (shortcuts.ts), the command palette (F-15), the project bar (from
+// 640px: toggles Files, Changes and Git and opens the background picker) and the background dialog.
 import { useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { useCatalog } from "@/data";
 import { WorkspaceNav } from "@/features/sessions/WorkspaceNav";
 import { Icon } from "@/ui/Icon";
 import { useMediaQuery } from "@/ui/useMediaQuery";
+import { BackgroundDialog } from "./BackgroundDialog";
 import { CommandPalette } from "./CommandPalette";
 import { SIDEBAR_WIDTH, TABLET_SIDEBAR_WIDTH, dockedPanelMax, useLayoutPrefs } from "./layoutPrefs";
 import { openCommandPalette } from "./palette";
 import { setPanelScope } from "./panels";
+import { ProjectBar } from "./ProjectBar";
 import { RightPanel, type PanelMode } from "./RightPanel";
 import { routeHasOwnSidebar } from "./shellRoutes";
 import { isMac, useGlobalShortcuts } from "./shortcuts";
@@ -109,13 +112,16 @@ function useViewportWidth(): number {
   return useSyncExternalStore(subscribeResize, () => window.innerWidth, () => 1280);
 }
 
-/** The project the current screen belongs to: a project route, or the session's project on a session route. */
-function useCurrentProjectId(): string | null {
+/**
+ * The project the current screen belongs to (a project route, or the session's project on a session route) and, on
+ * a session route, the session's target kind (what the session-capabilities predicate needs).
+ */
+function useCurrentScope(): { projectId: string | null; targetKind: string | null } {
   const { projectId, sessionId } = useParams({ strict: false }) as { projectId?: string; sessionId?: string };
   const catalog = useCatalog();
-  if (projectId) return projectId;
-  if (sessionId) return catalog.data?.sessions.find((session) => session.id === sessionId)?.projectId ?? null;
-  return null;
+  if (projectId) return { projectId, targetKind: null };
+  const session = sessionId ? catalog.data?.sessions.find((candidate) => candidate.id === sessionId) : undefined;
+  return { projectId: session?.projectId ?? null, targetKind: session?.target?.kind ?? null };
 }
 
 function Shell({ desktopId, children }: { desktopId: string; children?: ReactNode }) {
@@ -124,13 +130,13 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
   const desktop = useMediaQuery(DESKTOP_QUERY);
   const viewport = useViewportWidth();
   const sidebarWidth = useLayoutPrefs((state) => state.sidebarWidth);
-  const projectId = useCurrentProjectId();
+  const { projectId, targetKind } = useCurrentScope();
   useGlobalShortcuts();
 
   useEffect(() => {
-    setPanelScope(projectId ? { desktopId, projectId } : null);
+    setPanelScope(projectId ? { desktopId, projectId } : null, targetKind ? { kind: targetKind } : null);
     return () => setPanelScope(null);
-  }, [desktopId, projectId]);
+  }, [desktopId, projectId, targetKind]);
 
   const sidebar = wide && !routeHasOwnSidebar(pathname);
   const dockMax = desktop ? dockedPanelMax(viewport, sidebar ? sidebarWidth : FRAME_SIDEBAR_WIDTH) : null;
@@ -140,11 +146,15 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
     <>
       <div data-testid="app-shell" data-layout={!wide ? "mobile" : desktop ? "desktop" : "tablet"} className="flex w-full">
         {sidebar ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
-        <div className="@container min-w-0 flex-1">{children}</div>
+        <div className="@container min-w-0 flex-1">
+          {wide ? <ProjectBar /> : null}
+          {children}
+        </div>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}
       </div>
       {mode === "docked" ? null : <RightPanel mode={mode} desktopId={desktopId} projectId={projectId} />}
       <CommandPalette desktopId={desktopId} />
+      <BackgroundDialog />
     </>
   );
 }

@@ -15,8 +15,9 @@
 //                                               refuses it (the kinds are capability names, so non-local
 //                                               sessions hide them)
 //   closePanel(): void, togglePanel(kind, target, context): void, closeTopmostPanel(): boolean
-//   usePanels: zustand store `{ open, scope }`; `open` is the last opened panel (a PanelTarget and a kind),
-//     `scope` the project the shell currently shows (setPanelScope, set by AppShell). A panel is visible
+//   usePanels: zustand store `{ open, scope, scopeTarget }`; `open` is the last opened panel (a PanelTarget and a
+//     kind), `scope` the project the shell currently shows and `scopeTarget` the target of the session shown
+//     there (setPanelScope, set by AppShell). A panel is visible
 //     only while its target equals the scope, and Esc closes only a visible one. clearPanels() for tests
 import type { ComponentType } from "react";
 import { create } from "zustand";
@@ -62,18 +63,25 @@ export function usePanelRegistered(kind: PanelKind): boolean {
 /** Drops every registration and closes the open panel. For tests. */
 export function clearPanels(): void {
   registry.clear();
-  usePanels.setState({ open: null, scope: null });
+  usePanels.setState({ open: null, scope: null, scopeTarget: null });
 }
 
 export interface OpenPanel extends PanelTarget {
   kind: PanelKind;
 }
 
-export const usePanels = create<{ open: OpenPanel | null; scope: PanelTarget | null }>(() => ({ open: null, scope: null }));
+/** The `target` of the session the shell shows (null on a project screen), for the session-capabilities predicate. */
+export type ScopeTarget = { kind: string } | null;
 
-/** The project the shell currently shows (null outside a project or session screen). */
-export function setPanelScope(scope: PanelTarget | null): void {
-  usePanels.setState({ scope });
+export const usePanels = create<{ open: OpenPanel | null; scope: PanelTarget | null; scopeTarget: ScopeTarget }>(() => ({
+  open: null,
+  scope: null,
+  scopeTarget: null,
+}));
+
+/** The project the shell currently shows (null outside a project or session screen) and, on a session screen, its target. */
+export function setPanelScope(scope: PanelTarget | null, target: ScopeTarget = null): void {
+  usePanels.setState({ scope, scopeTarget: scope ? target : null });
 }
 
 /** True when `open` belongs to the project in `scope`. */

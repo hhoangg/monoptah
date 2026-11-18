@@ -12,12 +12,14 @@ import { Input } from "@/ui/input";
 import { MatchText } from "@/ui/MatchText";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
 import { closeCommandPalette, openCommandPalette, useCommandPalette } from "./palette";
+import { PANEL_LABELS, useProjectTools } from "./projectTools";
+import type { PanelKind } from "./panels";
 
 export { openCommandPalette };
 
 const RECENT_SESSIONS = 20;
 
-type ItemKind = "project" | "mono" | "session";
+type ItemKind = "action" | "project" | "mono" | "session";
 
 export interface PaletteItem {
   id: string;
@@ -28,12 +30,15 @@ export interface PaletteItem {
 }
 
 const GROUPS: ReadonlyArray<{ kind: ItemKind; label: string; icon: IconName }> = [
+  { kind: "action", label: "This project", icon: "folder" },
   { kind: "project", label: "Projects", icon: "folder" },
   { kind: "mono", label: "Monos", icon: "bot" },
   { kind: "session", label: "Recent sessions", icon: "chat" },
 ];
 
 interface Source {
+  /** Actions on the current project (Files, Changes, Git, Background); absent outside a project screen. */
+  actions?: ReadonlyArray<{ id: string; label: string; icon?: IconName }>;
   projects: ReadonlyArray<{ id: string; name: string; path: string }>;
   monos: ReadonlyArray<{ id: string; name: string }>;
   sessions: ReadonlyArray<{ id: string; projectId: string; title: string; updatedAt: number }>;
@@ -47,6 +52,10 @@ export function paletteItems(source: Source, query: string): PaletteItem[] {
     list.sort((a, b) => b.score - a.score);
     for (const entry of list.slice(0, limit)) items.push(entry.item);
   };
+  for (const action of source.actions ?? []) {
+    const hit = rank(action.label);
+    if (hit) items.push({ id: action.id, kind: "action", label: action.label, positions: hit.positions });
+  }
   const projectNames = new Map(source.projects.map((project) => [project.id, project.name]));
 
   const projects: Array<{ item: PaletteItem; score: number }> = [];
@@ -97,11 +106,21 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
 
+  const tools = useProjectTools();
+  const toolPanels = tools.panels.join("\0");
+  const hasScope = tools.scope !== null;
+
   const data = catalog.data;
-  const items = useMemo(
-    () => (data ? paletteItems({ projects: data.projects, monos: data.monos, sessions: data.sessions }, query) : []),
-    [data, query],
-  );
+  const items = useMemo(() => {
+    if (!data) return [];
+    const actions = hasScope
+      ? [
+          ...(toolPanels ? toolPanels.split("\0") : []).map((kind) => ({ id: kind, label: PANEL_LABELS[kind as PanelKind] })),
+          { id: "background", label: "Background" },
+        ]
+      : [];
+    return paletteItems({ actions, projects: data.projects, monos: data.monos, sessions: data.sessions }, query);
+  }, [data, query, toolPanels, hasScope]);
   const current = Math.min(active, Math.max(0, items.length - 1));
   const optionId = (index: number) => `${listId}-${index}`;
 
@@ -111,7 +130,11 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
 
   const go = (item: PaletteItem) => {
     closeCommandPalette();
-    if (item.kind === "project") void navigate({ to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId: item.id } });
+    // The panels open as the sheet below 640px and as the docked or overlay panel above it.
+    if (item.kind === "action") {
+      if (item.id === "background") tools.openBackground();
+      else tools.open(item.id as PanelKind);
+    } else if (item.kind === "project") void navigate({ to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId: item.id } });
     else if (item.kind === "mono") void navigate({ to: "/d/$desktopId/monos/$monoId", params: { desktopId, monoId: item.id } });
     else void navigate({ to: "/d/$desktopId/s/$sessionId", params: { desktopId, sessionId: item.id } });
   };

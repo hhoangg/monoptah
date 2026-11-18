@@ -50,7 +50,12 @@ function PanelBody({ desktopId, projectId }: { desktopId: string; projectId: str
   );
 }
 
-const OTHER_OVERLAY = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-panel-trigger]';
+// Another layer owns the pointer: the dialog or menu itself, its scrim (a sibling of the content, so not
+// inside `[role=dialog]`), or the button that toggles the panel.
+const OTHER_OVERLAY =
+  '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-panel-trigger], [data-slot="dialog-overlay"], [data-vaul-overlay]';
+/** A modal layer is open somewhere: a click outside the panel belongs to it, not to the panel. */
+const MODAL_OPEN = '[role="dialog"], [role="alertdialog"], [role="menu"]';
 
 function OverlayPanel({ title, children }: { title: string; children: ReactNode }) {
   const ref = useRef<HTMLElement>(null);
@@ -67,6 +72,7 @@ function OverlayPanel({ title, children }: { title: string; children: ReactNode 
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Element) || ref.current?.contains(target) || target.closest(OTHER_OVERLAY)) return;
+      if (document.querySelector(MODAL_OPEN)) return;
       closePanel();
     };
     document.addEventListener("pointerdown", onPointerDown);
@@ -105,7 +111,7 @@ export function RightPanel({ mode, desktopId, projectId, maxWidth = PANEL_WIDTH.
   if (mode === "sheet") {
     return (
       <Drawer open={!!visible} onOpenChange={(next) => (next ? undefined : closePanel())}>
-        <DrawerContent aria-describedby={undefined} className="h-[92dvh]">
+        <DrawerContent aria-describedby={undefined} data-right-panel-sheet="" className="h-[92dvh]">
           {definition ? <DrawerTitle className="sr-only">{definition.title}</DrawerTitle> : null}
           <div className="min-h-0 flex-1">
             <PanelBody desktopId={desktopId} projectId={projectId} />

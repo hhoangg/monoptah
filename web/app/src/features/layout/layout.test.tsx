@@ -5,6 +5,10 @@ import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/features/backgrounds", () => ({
+  BackgroundControls: ({ projectName }: { projectName: string }) => <p>Background controls of {projectName}</p>,
+}));
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
 import { resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
@@ -18,6 +22,7 @@ import { AppShell } from "./AppShell";
 import { PANEL_WIDTH_KEY, SIDEBAR_COLLAPSED_KEY, SIDEBAR_WIDTH_KEY, dockedPanelMax, reloadLayoutPrefs, useLayoutPrefs } from "./layoutPrefs";
 import { closeCommandPalette, isCommandPaletteOpen, openCommandPalette } from "./palette";
 import { clearPanels, closePanel, openPanel, registerPanel, usePanels } from "./panels";
+import { closeBackgroundDialog } from "./projectTools";
 import { clearShortcuts, isMod, registerShortcut } from "./shortcuts";
 
 const mediaListeners = new Set<() => void>();
@@ -85,6 +90,7 @@ afterEach(() => {
   clearPanels();
   clearShortcuts();
   closeCommandPalette();
+  closeBackgroundDialog();
   localStorage.clear();
   stubViewport(1280);
 });
@@ -450,7 +456,7 @@ describe("shortcuts do not stack overlays", () => {
     return event;
   }
 
-  it("Mod+K and Mod+P do nothing while another dialog is open", async () => {
+  it("Mod+K and Mod+P do nothing while another dialog is open, but the browser does not get the key", async () => {
     mount(1280);
     await screen.findByTestId("app-sidebar");
     const handler = vi.fn();
@@ -458,8 +464,9 @@ describe("shortcuts do not stack overlays", () => {
     const dialog = document.createElement("div");
     dialog.setAttribute("role", "dialog");
     document.body.appendChild(dialog);
-    expect(press({ key: "k", ctrlKey: true }).defaultPrevented).toBe(false);
-    expect(press({ key: "p", ctrlKey: true }).defaultPrevented).toBe(false);
+    // Taken, so no address bar or print dialog opens over the app's dialog.
+    expect(press({ key: "k", ctrlKey: true }).defaultPrevented).toBe(true);
+    expect(press({ key: "p", ctrlKey: true }).defaultPrevented).toBe(true);
     expect(isCommandPaletteOpen()).toBe(false);
     expect(handler).not.toHaveBeenCalled();
     dialog.remove();
@@ -584,5 +591,154 @@ describe("panel registry", () => {
     expect(openPanel("files", target, { target: { kind: "cloud" }, desktopCapabilities: [] })).toBe(false);
     expect(openPanel("files", target, local)).toBe(true);
     closePanel();
+  });
+});
+
+describe("Mod+K and Mod+P over the Files sheet", () => {
+  function press(init: KeyboardEventInit) {
+    const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+    window.dispatchEvent(event);
+    return event;
+  }
+
+  it("work below 640px while the right-panel sheet is open", async () => {
+    registerPanel("files", { title: "Files", component: FilesPanel });
+    mount(390, ALPHA);
+    await screen.findByTestId("app-shell");
+    act(() => void openPanel("files", target, local));
+    await screen.findByRole("dialog", { name: "Files" });
+    const handler = vi.fn();
+    registerShortcut("quick-open", handler);
+    expect(press({ key: "p", ctrlKey: true }).defaultPrevented).toBe(true);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(press({ key: "k", ctrlKey: true }).defaultPrevented).toBe(true);
+    expect(isCommandPaletteOpen()).toBe(true);
+  });
+});
+
+describe("right panel overlay and other layers", () => {
+  beforeEach(() => registerPanel("files", { title: "Files", component: FilesPanel }));
+
+  it("stays open when the scrim of a dialog is pressed at 768", async () => {
+    mount(768, ALPHA);
+    await screen.findByTestId("app-shell");
+    act(() => void openPanel("files", target, local));
+    await screen.findByTestId("panel-overlay");
+    act(() => openCommandPalette());
+    await screen.findByRole("combobox");
+    const scrim = document.querySelector('[data-slot="dialog-overlay"]');
+    expect(scrim).not.toBeNull();
+    fireEvent.pointerDown(scrim!);
+    expect(usePanels.getState().open).not.toBeNull();
+    expect(screen.getByTestId("panel-overlay")).toBeInTheDocument();
+  });
+
+  it("still closes on a press outside when no layer is open", async () => {
+    mount(768, ALPHA);
+    await screen.findByTestId("app-shell");
+    act(() => void openPanel("files", target, local));
+    await screen.findByTestId("panel-overlay");
+    fireEvent.pointerDown(document.body);
+    expect(usePanels.getState().open).toBeNull();
+  });
+});
+
+const localOnly = (capability: string, context: { target?: { kind: string } | null }) =>
+  !["files", "changes", "git"].includes(capability) || !context.target || context.target.kind === "local";
+
+describe("project tools (project bar and palette)", () => {
+  beforeEach(() => {
+    for (const [kind, title] of [["files", "Files"], ["changes", "Changes"], ["git", "Git"]] as const) {
+      registerPanel(kind, { title, component: () => <p>{title} body</p> });
+    }
+  });
+
+  it("toggles Files, Changes and Git for the project, with trigger buttons that stay out of the outside-press rule", async () => {
+    const user = userEvent.setup();
+    mount(1280, ALPHA);
+    const bar = await screen.findByRole("toolbar", { name: "Project tools" });
+    const files = within(bar).getByRole("button", { name: "Files" });
+    for (const name of ["Files", "Changes", "Git"]) expect(within(bar).getByRole("button", { name })).toHaveAttribute("data-panel-trigger");
+    expect(files).toHaveAttribute("aria-pressed", "false");
+    await user.click(files);
+    expect(await screen.findByTestId("right-panel")).toHaveAttribute("data-kind", "files");
+    expect(files).toHaveAttribute("aria-pressed", "true");
+    await user.click(within(bar).getByRole("button", { name: "Git" }));
+    expect(screen.getByTestId("right-panel")).toHaveAttribute("data-kind", "git");
+    await user.click(within(bar).getByRole("button", { name: "Git" }));
+    expect(screen.queryByTestId("right-panel")).toBeNull();
+  });
+
+  it("toggles the overlay at 768 without the outside press closing and reopening it", async () => {
+    const user = userEvent.setup();
+    mount(768, ALPHA);
+    const bar = await screen.findByRole("toolbar", { name: "Project tools" });
+    await user.click(within(bar).getByRole("button", { name: "Changes" }));
+    await screen.findByTestId("panel-overlay");
+    await user.click(within(bar).getByRole("button", { name: "Changes" }));
+    expect(screen.queryByTestId("panel-overlay")).toBeNull();
+  });
+
+  it("is absent below 640px and outside a project", async () => {
+    mount(390, ALPHA);
+    await screen.findByTestId("app-shell");
+    expect(screen.queryByRole("toolbar", { name: "Project tools" })).toBeNull();
+  });
+
+  it("is absent on a screen without a project", async () => {
+    mount(1280, "/settings");
+    await screen.findByTestId("app-shell");
+    expect(screen.queryByRole("toolbar", { name: "Project tools" })).toBeNull();
+  });
+
+  it("follows the session's project and hides what the predicate refuses for a cloud session", async () => {
+    registerSessionCapabilities(localOnly);
+    const { router } = mount(1280, "/s/sess-local-1");
+    const bar = await screen.findByRole("toolbar", { name: "Project tools" });
+    expect(within(bar).getAllByRole("button").map((button) => button.textContent)).toEqual(["Files", "Changes", "Git", "Background"]);
+    await act(async () => router.history.push(`/d/${DESKTOP_ID}/s/sess-codespace-1`));
+    await waitFor(() => expect(within(screen.getByRole("toolbar", { name: "Project tools" })).getAllByRole("button").map((button) => button.textContent)).toEqual(["Background"]));
+  });
+
+  it("opens the background picker for the project in a dialog", async () => {
+    const user = userEvent.setup();
+    mount(1280, ALPHA);
+    await user.click(await screen.findByRole("button", { name: "Background" }));
+    const dialog = await screen.findByRole("dialog", { name: "Background" });
+    await waitFor(() => expect(within(dialog).getByText("Background controls of Example Alpha")).toBeInTheDocument());
+  });
+
+  it("offers the same actions in the command palette and opens a panel from it", async () => {
+    const user = userEvent.setup();
+    mount(1280, ALPHA);
+    await screen.findByTestId("app-shell");
+    act(() => openCommandPalette());
+    const box = await screen.findByRole("combobox");
+    await waitFor(() => expect(screen.getAllByRole("group", { name: "This project" })).toHaveLength(1));
+    const group = screen.getByRole("group", { name: "This project" });
+    expect(within(group).getAllByRole("option").map((option) => option.textContent)).toEqual(["Files", "Changes", "Git", "Background"]);
+    await user.type(box, "changes");
+    await user.keyboard("{Enter}");
+    expect(await screen.findByTestId("right-panel")).toHaveAttribute("data-kind", "changes");
+  });
+
+  it("opens a panel from the palette as the sheet below 640px", async () => {
+    const user = userEvent.setup();
+    mount(390, ALPHA);
+    await screen.findByTestId("app-shell");
+    act(() => openCommandPalette());
+    await screen.findByRole("combobox");
+    await user.click(await screen.findByRole("option", { name: "Git" }));
+    expect(await screen.findByRole("dialog", { name: "Git" })).toBeInTheDocument();
+  });
+
+  it("offers no panel action for a refused session in the palette", async () => {
+    registerSessionCapabilities(localOnly);
+    mount(1280, "/s/sess-codespace-1");
+    await screen.findByTestId("app-shell");
+    act(() => openCommandPalette());
+    await screen.findByRole("combobox");
+    const group = await screen.findByRole("group", { name: "This project" });
+    expect(within(group).getAllByRole("option").map((option) => option.textContent)).toEqual(["Background"]);
   });
 });

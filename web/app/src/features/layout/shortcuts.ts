@@ -4,9 +4,10 @@
 // right panel. Mod+P runs the handler registered for "quick-open", and does nothing (the browser keeps
 // the key) while none is registered. Mod is Cmd on macOS and Ctrl elsewhere. The letter is matched by
 // `event.key` and, for layouts that type another script, by the physical `event.code` (KeyK, KeyP).
-// Mod+K / Mod+P never stack a second overlay: while a dialog, sheet or menu other than the palette is open
-// they do nothing, and Mod+P closes the palette before it runs quick-open. Nothing fires while an IME
-// composes. A handled shortcut calls preventDefault.
+// Mod+K / Mod+P never stack a second overlay: while a dialog or menu other than the palette is open they do
+// nothing (the key is still taken, so the browser opens no address bar or print dialog), and Mod+P closes the
+// palette before it runs quick-open. The right-panel sheet below 640px is not "another" overlay: Mod+K and
+// Mod+P work over it. Nothing fires while an IME composes. A handled shortcut calls preventDefault.
 //
 // Public API:
 //   type ShortcutId = "quick-open"
@@ -64,6 +65,8 @@ function otherOverlayOpen(): boolean {
     if (palette && (element.querySelector("[data-command-palette]") || element.closest("[data-command-palette]"))) continue;
     // A closed radix/vaul layer unmounts; a hidden one must not block the shortcut.
     if (element.closest("[hidden], [aria-hidden='true']")) continue;
+    // The right-panel sheet (vaul, below 640px) is a dialog too, but it is the surface Mod+K and Mod+P work from.
+    if (element.closest("[data-right-panel-sheet]")) continue;
     return true;
   }
   return false;
@@ -100,15 +103,18 @@ export function handleGlobalKeydown(event: KeyboardEvent): boolean {
   if (!isMod(event) || event.altKey || event.shiftKey) return false;
   const key = pressedLetter(event);
   if (key === "k") {
-    if (otherOverlayOpen()) return false;
+    // The key is the app's: the browser must not get it (address bar), even while an overlay blocks it.
     event.preventDefault();
+    if (otherOverlayOpen()) return true;
     toggleCommandPalette();
     return true;
   }
   if (key === "p") {
     const handler = handlers.get("quick-open");
-    if (!handler || otherOverlayOpen()) return false;
+    if (!handler) return false;
+    // Same for Mod+P (print dialog): swallowed and ignored while another overlay is open.
     event.preventDefault();
+    if (otherOverlayOpen()) return true;
     closeCommandPalette();
     handler();
     return true;
