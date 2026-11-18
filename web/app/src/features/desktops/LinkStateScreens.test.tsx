@@ -239,6 +239,28 @@ describe("revoked block after the first open", () => {
     expect(h.reconnect).not.toHaveBeenCalled();
   });
 
+  it.each([404, 403])("shows no revoked screen when the grant POST answers %i and the link is not refused (a deleted or unowned desktop)", async (status) => {
+    install();
+    const inner = server.transport;
+    restore?.();
+    let posts = 0;
+    restore = setApiTransport(async (url, init) => {
+      if (url.endsWith("/grants") && init.method === "POST") {
+        posts += 1;
+        return new Response(JSON.stringify({ error: "x", code: status === 404 ? "not_found" : "forbidden" }), { status, headers: { "Content-Type": "application/json" } });
+      }
+      return inner(url, init);
+    });
+    setLink({ status: "connecting" });
+    mountSlot(<LinkStateScreens />);
+    await waitFor(() => expect(posts).toBe(1));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.queryByText("Access to this desktop was revoked")).toBeNull();
+    expect(getLinkStore("d1").getState()).toMatchObject({ revoked: false });
+    expect(h.reconnect).not.toHaveBeenCalled();
+  });
+
   it("never renders the requesting layer when the request answers fast", async () => {
     install();
     let everShown = false;

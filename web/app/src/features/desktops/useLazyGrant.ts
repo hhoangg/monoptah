@@ -27,8 +27,14 @@ export type GrantPhase =
   | "requesting"
   /** The grant exists (pending or confirmed). */
   | "posted"
-  /** The server answered 409 (revoked grant) or 403/404 (device forgotten or unknown): no access. */
+  /** The server answered 409: the grant itself is revoked. */
   | "revoked"
+  /**
+   * The server answered 404 or 403: it does not know the desktop (deleted, not on this account) or the device.
+   * Not a revoke: no screen of its own. The directory read ends a missing desktop quietly, and a forgotten device
+   * is refused by the relay with 4003, which is the verdict that shows the revoked screen.
+   */
+  | "missing"
   /** The request failed for another reason (network, server). */
   | "failed";
 
@@ -100,7 +106,7 @@ export function useLazyGrant(desktopId: string): LazyGrant {
     async (deviceId: string) => {
       setPhase("requesting");
       const outcome = await requestOnce(queryClient, desktopId, deviceId);
-      if (alive.current) setPhase(outcome === "missing" ? "revoked" : outcome);
+      if (alive.current) setPhase(outcome);
     },
     [queryClient, desktopId],
   );

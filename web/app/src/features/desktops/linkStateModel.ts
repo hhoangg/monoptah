@@ -22,7 +22,7 @@ export function blockingScreen(link: LinkSlice, phase: GrantPhase, raceOpen: boo
       if (!raceOpen) return "revoked";
       if (phase === "failed") return "grant_failed";
       // The grant exists and the relay still refused with 4003: a real revoke, and nothing reconnects by itself.
-      return phase === "posted" ? "revoked" : "requesting";
+      return phase === "posted" || phase === "missing" ? "revoked" : "requesting";
     }
     case "account_blocked":
     case "key_changed":

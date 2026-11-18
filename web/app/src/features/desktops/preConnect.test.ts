@@ -8,11 +8,12 @@ import { createGrantHook } from "./preConnect";
 import { markGrantRequested } from "./storage";
 
 const queryClient = new QueryClient();
-const hook = createGrantHook(queryClient);
+let hook = createGrantHook(queryClient);
 
 beforeEach(() => {
   localStorage.clear();
   grant.requestOnce.mockReset();
+  hook = createGrantHook(queryClient);
 });
 
 describe("pre-connect grant hook", () => {
@@ -22,10 +23,19 @@ describe("pre-connect grant hook", () => {
     expect(grant.requestOnce).toHaveBeenCalledWith(queryClient, "d1", "dev1");
   });
 
-  it("skips the request when this device already asked", async () => {
+  it("asks again on the first connect of a load even when the marker is set, so a deleted pending grant is recreated", async () => {
     markGrantRequested("d1", "dev1");
+    grant.requestOnce.mockResolvedValue("posted");
     expect(await hook({ desktopId: "d1", deviceId: "dev1" })).toBe("ok");
-    expect(grant.requestOnce).not.toHaveBeenCalled();
+    expect(grant.requestOnce).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips the request on a later reconnect of the same load when the marker is set", async () => {
+    markGrantRequested("d1", "dev1");
+    grant.requestOnce.mockResolvedValue("posted");
+    await hook({ desktopId: "d1", deviceId: "dev1" });
+    await hook({ desktopId: "d1", deviceId: "dev1" });
+    expect(grant.requestOnce).toHaveBeenCalledTimes(1);
   });
 
   it("lets a desktop or device the server does not know go on, so the link ends quietly as before", async () => {
