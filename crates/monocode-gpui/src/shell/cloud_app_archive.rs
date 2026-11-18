@@ -395,10 +395,11 @@ impl Shell {
             .values()
             .filter(|mark| mark.cloud() == cloud)
             .collect();
-        // Only an instance this app knows: one a session uses, or one the last
-        // listing (the cached overviews) shows. Any other name could be a
-        // codespace or sandbox the app does not own.
-        if users.is_empty() && !self.mobile_cached_instance(&cloud, cx) {
+        // Only an instance this app knows: one a session uses, or one a recent
+        // `cloud.instances` reply listed (under a project the device may see). Any other
+        // name could be a codespace or sandbox the app does not own.
+        let listed = crate::mobile::cloud::instance_listed_project(&cloud);
+        if users.is_empty() && listed.is_none() {
             return Err(Code::UnsupportedTarget.failure());
         }
         let allowed = device.projects.is_none()
@@ -407,11 +408,23 @@ impl Shell {
                     &device.projects,
                     &super::mobile_host::project_id(&mark.local_project),
                 )
+            })
+            || listed.as_ref().is_some_and(|project| {
+                super::mobile_host::in_selection(
+                    &device.projects,
+                    &super::mobile_host::project_id(project),
+                )
             });
         if !allowed {
             return Err(Code::NotSelected.failure());
         }
-        Ok((cloud, users.first().map(|mark| mark.local_project.clone())))
+        Ok((
+            cloud,
+            users
+                .first()
+                .map(|mark| mark.local_project.clone())
+                .or(listed),
+        ))
     }
 
     /// The cloud instance of session `id`, if it runs on one.
@@ -556,11 +569,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// The instance appeared in a `cloud.instances` reply (the cached overviews). No call out.
-    fn mobile_cached_instance(&self, cloud: &CloudRef, _cx: &App) -> bool {
-        crate::mobile::cloud::instance_was_listed(cloud)
-    }
-
     /// What a `cloud.stop` of `cloud` reports at once, from the store and the live views (the
     /// same reading the stop itself makes, `CloudApi::busy_sessions_on`): the sessions of
     /// this app on it with their titles and whether they work now. The stop runs on a
@@ -604,6 +612,12 @@ impl Shell {
             .flatten()
             .is_some_and(|remote| remote.project.cloud().is_some())
             || monocode_core::cloud_sessions::start_record(&store, id).is_some()
+    }
+
+    /// The session is the conversation of a cloud workspace: its folder is remote and it is
+    /// bound to an instance, as far as the app knows (also before the marks are loaded).
+    pub(crate) fn mobile_is_cloud_conversation(&self, id: i64) -> bool {
+        self.mobile_remote_cwd(id) && self.mobile_cloud_bound(id)
     }
 
     /// The session's own folder is on a remote machine (`remote://`).

@@ -17,45 +17,19 @@ use super::*;
 use monocode_core::mobile::cloud_policy::WAKE_SLOT_TIMEOUT;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
-
-/// How long a send that may not wake a cloud workspace waits for the history of a session
-/// that was not loaded (it only waits for the load, never for a wake). A send that is still
-/// waiting after this is dropped, so it cannot go out hours later when somebody reconnects.
-pub(super) const NO_WAKE_DEFER: Duration = Duration::from_secs(2 * 60);
+use std::time::Instant;
 
 thread_local! {
     static PENDING: RefCell<HashMap<i64, (Instant, u64)>> = RefCell::new(HashMap::new());
     static NEXT_TOKEN: Cell<u64> = const { Cell::new(1) };
 }
 
-/// How a remote device's send may proceed.
-#[derive(Clone, Copy)]
-pub(super) struct SendGate {
-    /// The device confirmed waking the instance.
-    pub wake: bool,
-    /// The pending wake-send this message is, when it is one.
+/// The message of a confirmed wake-send, waiting for the link.
+pub(super) struct WakeSend {
+    pub prompt: String,
+    pub attachments: Vec<std::path::PathBuf>,
+    /// The pending flag this message is, when there is one.
     pub token: Option<u64>,
-    /// A message that may not wake anything is dropped after this.
-    pub deadline: Option<Instant>,
-}
-
-impl SendGate {
-    pub(super) fn no_wake() -> Self {
-        Self {
-            wake: false,
-            token: None,
-            deadline: None,
-        }
-    }
-
-    pub(super) fn wake(id: i64) -> Self {
-        Self {
-            wake: true,
-            token: live_token(id),
-            deadline: None,
-        }
-    }
 }
 
 /// Marks a wake-send of session `id` as pending. False when one already is.
@@ -86,7 +60,7 @@ fn is_live(since: Instant) -> bool {
     since.elapsed() < WAKE_SLOT_TIMEOUT
 }
 
-fn live_token(id: i64) -> Option<u64> {
+pub(super) fn live_token(id: i64) -> Option<u64> {
     PENDING.with(|pending| {
         pending
             .borrow()
@@ -97,13 +71,13 @@ fn live_token(id: i64) -> Option<u64> {
 }
 
 /// Whether the wake-send `token` of session `id` is still the pending one.
-pub(super) fn wake_send_current(id: i64, token: u64) -> bool {
+fn wake_send_current(id: i64, token: u64) -> bool {
     live_token(id) == Some(token)
 }
 
 /// The deferred wake-send `token` runs now: clears its flag. False when it was dropped,
 /// replaced or timed out, and so must not go out.
-pub(super) fn finish_wake_send(id: i64, token: u64) -> bool {
+fn finish_wake_send(id: i64, token: u64) -> bool {
     let current = wake_send_current(id, token);
     if current {
         end(id);
@@ -189,6 +163,30 @@ impl Conversation {
     /// waits for the history (the desktop's own or a Mono's action) is left alone.
     pub(crate) fn drop_deferred_sends(&mut self) {
         end(self.summary.id);
+        self.wake_send = None;
+    }
+
+    /// Sends the message of a confirmed wake-send once the history is loaded and the link is
+    /// up. Nothing happens before that; the message stays in its slot, and a message whose
+    /// flag was dropped or timed out never goes out. Never re-queues anything.
+    pub(super) fn flush_wake_send(&mut self, cx: &mut Context<Self>) {
+        if self.wake_send.is_none()
+            || !self.history_ready()
+            || (self.is_cloud_session() && !self.remote_state.online)
+        {
+            return;
+        }
+        let Some(send) = self.wake_send.take() else {
+            return;
+        };
+        if send
+            .token
+            .is_some_and(|token| !finish_wake_send(self.summary.id, token))
+        {
+            return;
+        }
+        self.mobile_no_wake = false;
+        self.submit_from_remote_now(send.prompt, send.attachments, cx);
     }
 }
 
@@ -222,17 +220,6 @@ mod tests {
         assert!(begin(8));
         end(7);
         assert!(live_token(8).is_some());
-        reset();
-    }
-
-    #[test]
-    fn the_gate_of_a_wake_send_carries_its_token_and_a_plain_one_none() {
-        reset();
-        assert!(begin(3));
-        let gate = SendGate::wake(3);
-        assert!(gate.wake && gate.token == live_token(3) && gate.deadline.is_none());
-        let plain = SendGate::no_wake();
-        assert!(!plain.wake && plain.token.is_none());
         reset();
     }
 }

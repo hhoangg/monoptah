@@ -73,8 +73,8 @@ fn session_id(params: &Value) -> Result<&str, Failure> {
 /// remote start (`kind`, `instance`, `branch`, `machine`, `size`, see
 /// `cloud_policy::validate_start_target`); anything else is `forbidden`. The move itself is
 /// the app API's, which takes only the kind and the instance and runs against the targets
-/// the desktop's own dialog offers, so `branch`, `machine` and `size` are checked for shape
-/// and the desktop's own choices apply. No `target` is the desktop's default: the first
+/// the desktop's own dialog offers, so `branch`, `machine` and `size` are refused
+/// (`unsupported_target`) after the shape check. No `target` is the desktop's default: the first
 /// target its dialog offers for the session.
 fn move_to_cloud_input(
     shell: &Shell,
@@ -94,6 +94,14 @@ fn move_to_cloud_input(
         }
         Some(target) => {
             let target = cloud_policy::validate_start_target(target).map_err(Code::failure)?;
+            // The move engine takes only the kind and the instance: a choice it cannot honour
+            // is refused, not silently ignored.
+            if target.branch.is_some() || target.machine.is_some() || target.size.is_some() {
+                return Err(Failure::coded(
+                    Code::UnsupportedTarget.as_str(),
+                    "This choice is not available for a move",
+                ));
+            }
             let kind = match target.kind {
                 cloud_policy::StartKind::Codespace => "codespace",
                 cloud_policy::StartKind::Sandbox => "sandbox",

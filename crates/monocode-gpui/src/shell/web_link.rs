@@ -282,7 +282,9 @@ impl Shell {
         self.sync_settings(cx);
         let task = cx.background_executor().spawn(async move {
             let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+            // One retry: a busy disk or a short-lived lock should not cost the setting.
             policy::save_settings(&path, &policy::settings())
+                .or_else(|_| policy::save_settings(&path, &policy::settings()))
         });
         cx.spawn(async move |this, cx| {
             let saved = task.await;
@@ -290,8 +292,9 @@ impl Shell {
                 let notice = saved.err().map(|error| {
                     // Only this flag moves: another toggle may have changed meanwhile.
                     policy::set_flags(with_flag(policy::flags(), flag, false));
+                    eprintln!("web app: could not save the remote-action settings: {error}");
                     format!(
-                        "Web app: could not save the setting ({error}). It stays off until it can be saved."
+                        "Web app: could not save the setting ({error}). It stays off for now, but the change is not saved and will revert when the app restarts."
                     )
                 });
                 monocode_core::mobile::web_link::resend_state();
@@ -588,6 +591,7 @@ mod tests {
                 let notice = shell.web_notice(cx).expect("a notice");
                 assert!(notice.contains("could not save"), "{notice}");
                 assert!(notice.contains("stays off"), "{notice}");
+                assert!(notice.contains("revert when the app restarts"), "{notice}");
             })
             .unwrap();
         policy::install_settings(Default::default());

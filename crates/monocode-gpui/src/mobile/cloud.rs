@@ -37,7 +37,7 @@ mod start;
 mod tests;
 mod view;
 
-pub(crate) use instances::instance_was_listed;
+pub(crate) use instances::instance_listed_project;
 pub(crate) use lifecycle::Archive;
 #[cfg(test)]
 pub(crate) use moves::STEP_IDS as MOVE_STEP_IDS;
@@ -318,6 +318,15 @@ pub(crate) fn before_send(
     cx: &mut Context<Shell>,
 ) -> Result<SendPlan, Failure> {
     send::before_send(shell, device, session, params, cx)
+}
+
+/// Just before a plain message is submitted: a cloud conversation must still be connected
+/// (a coded failure otherwise), so an ok reply always means the message is delivered.
+pub(crate) fn before_send_again(shell: &Shell, session: i64, cx: &App) -> Result<(), Failure> {
+    if shell.mobile_is_cloud_conversation(session) {
+        send::still_connected(shell, session, cx)?;
+    }
+    Ok(())
 }
 
 /// Starts the wake of a consented send (see `send::start_wake_send`).

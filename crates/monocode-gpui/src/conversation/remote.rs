@@ -708,6 +708,7 @@ impl Conversation {
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);
                         }
+                        this.flush_wake_send(cx);
                         if running && !this.busy && !this.stopping {
                             this.settings.remote_action = Some(json!({"type":"attach"}));
                             this.launch_prompt(String::new(), cx);

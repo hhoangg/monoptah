@@ -23,14 +23,19 @@ const SLOT_POLL: Duration = Duration::from_secs(2);
 /// with `{accepted, starting}` (the host stops waiting for a reply after 25 s).
 pub(super) const START_REPLY_BOUND: Duration = Duration::from_secs(20);
 
-/// Answers once: the first of the start's own reply and the time bound. A later one is dropped.
+/// Answers once: the first of the start's own reply and the time bound. A later one is dropped
+/// (false).
 pub(super) fn answer_once<F: FnOnce(&mut Shell, Result<Value, Failure>)>(
     done: &std::cell::RefCell<Option<F>>,
     shell: &mut Shell,
     reply: Result<Value, Failure>,
-) {
-    if let Some(done) = done.borrow_mut().take() {
-        done(shell, reply);
+) -> bool {
+    match done.borrow_mut().take() {
+        Some(done) => {
+            done(shell, reply);
+            true
+        }
+        None => false,
     }
 }
 
@@ -216,7 +221,14 @@ impl Shell {
                 Err(error) => {
                     cloud_policy::release_wake(&slot);
                     // The desktop's own text can hold a path or a command.
-                    answer_once(&done, this, Err(sanitize_startup_error(&error).into()));
+                    let text = sanitize_startup_error(&error);
+                    // After the `starting` answer nobody is waiting for this failure: the
+                    // desktop user sees it on the error line, as for any failed start.
+                    if !answer_once(&done, this, Err(text.clone().into())) {
+                        this.error =
+                            Some(format!("A cloud start from a remote device failed: {text}"));
+                        cx.notify();
+                    }
                 }
             });
         })

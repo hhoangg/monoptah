@@ -1,6 +1,6 @@
 //! A paired phone's view of and commands for this chat, through the same paths
 //! the composer and its pickers use.
-use super::mobile_pending_send::{NO_WAKE_DEFER, SendGate, finish_wake_send, wake_send_current};
+use super::mobile_pending_send::{WakeSend, live_token};
 use super::*;
 use crate::notifications::approvals::InputKind;
 use monocode_core::agent::{Question, QuestionItem, QuestionOption};
@@ -127,83 +127,61 @@ impl Conversation {
 
     /// A remote device's message, as if typed: it starts a turn, or while one runs it
     /// steers or queues. The desktop composer's own draft and files stay put. It never
-    /// wakes a stopped cloud workspace (see [`Self::mobile_wake_submit`] for the one send
-    /// that may): sent to one, it is dropped with a status line.
+    /// wakes a stopped cloud workspace: the host checks beforehand that a cloud
+    /// conversation is connected (and answers a coded failure when it is not), so a message
+    /// is only ever sent to one that is live. Used with a cloud conversation that is not
+    /// connected (a race with a drop), it is dropped with a status line.
+    /// [`Self::mobile_wake_submit`] is the one send that may wait for a wake.
     pub(crate) fn mobile_submit(
         &mut self,
         prompt: String,
         attachments: Vec<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        self.submit_from_remote(prompt, attachments, SendGate::no_wake(), cx);
+        self.mobile_send_begins();
+        if !self.history_ready() {
+            self.defer_history_action(
+                move |this, cx| this.mobile_submit(prompt, attachments, cx),
+                cx,
+            );
+            return;
+        }
+        if self.is_cloud_session() && !self.remote_state.online {
+            self.status =
+                "The cloud workspace is not connected. Open it on the desktop first.".into();
+            cx.notify();
+            return;
+        }
+        self.mobile_no_wake = true;
+        self.submit_from_remote_now(prompt, attachments, cx);
+        self.mobile_no_wake = false;
     }
 
-    /// The message of a web device that confirmed waking the stopped workspace (H-10): it
-    /// waits in the history deferral and goes out once the reload after the wake flushes
-    /// it, unless the wake failed or timed out first (`drop_deferred_sends`).
+    /// The message of a web device that confirmed waking the stopped workspace (H-10). It
+    /// waits in its own slot, not in the history deferral (a deferral that finds the
+    /// workspace still down would have to queue itself again, and the loop that runs the
+    /// deferrals would spin on it), and goes out once the history is loaded and the link is
+    /// up: the reload after the wake runs `flush_wake_send`. A failed wake or the timeout
+    /// drops it (`drop_deferred_sends`).
     pub(crate) fn mobile_wake_submit(
         &mut self,
         prompt: String,
         attachments: Vec<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        let gate = SendGate::wake(self.summary.id);
-        self.submit_from_remote(prompt, attachments, gate, cx);
-    }
-
-    fn submit_from_remote(
-        &mut self,
-        prompt: String,
-        attachments: Vec<std::path::PathBuf>,
-        mut gate: SendGate,
-        cx: &mut Context<Self>,
-    ) {
         self.mobile_send_begins();
-        let offline_cloud = self.is_cloud_session() && !self.remote_state.online;
-        if !self.history_ready() || (gate.wake && offline_cloud) {
-            if !gate.wake && gate.deadline.is_none() && self.is_cloud_session() {
-                gate.deadline = Some(std::time::Instant::now() + NO_WAKE_DEFER);
-            }
-            let id = self.summary.id;
-            self.defer_history_action(
-                move |this, cx| {
-                    // A wake-send that was dropped or replaced does not go out.
-                    if gate
-                        .token
-                        .is_some_and(|token| !wake_send_current(id, token))
-                    {
-                        return;
-                    }
-                    this.submit_from_remote(prompt, attachments, gate, cx)
-                },
-                cx,
-            );
-            return;
+        self.wake_send = Some(WakeSend {
+            prompt,
+            attachments,
+            token: live_token(self.summary.id),
+        });
+        if !self.history_ready() {
+            self.load(cx);
         }
-        if gate
-            .token
-            .is_some_and(|token| !finish_wake_send(self.summary.id, token))
-        {
-            return;
-        }
-        if gate
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() > deadline)
-        {
-            return;
-        }
-        if !gate.wake && offline_cloud {
-            self.status =
-                "The cloud workspace is stopped. Resume it from the desktop first.".into();
-            cx.notify();
-            return;
-        }
-        self.mobile_no_wake = !gate.wake;
-        self.submit_from_remote_now(prompt, attachments, cx);
-        self.mobile_no_wake = false;
+        self.flush_wake_send(cx);
     }
 
-    fn submit_from_remote_now(
+    pub(super) fn submit_from_remote_now(
         &mut self,
         prompt: String,
         attachments: Vec<std::path::PathBuf>,

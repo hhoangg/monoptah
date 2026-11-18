@@ -47,17 +47,19 @@ pub(super) fn before_send(
     params: &Value,
     cx: &mut Context<Shell>,
 ) -> Result<SendPlan, Failure> {
-    if device.kind != DeviceKind::Web {
-        return Ok(SendPlan::default());
-    }
     let Some(id) = session else {
         return Ok(SendPlan::default());
     };
-    let Some(view) = super::card_view(shell, id, false).filter(|view| view.is_cloud()) else {
+    // The conversation of a cloud session (also before the marks are loaded) is sent to
+    // only while its link is live, for every device: a reply that says ok means the
+    // message is delivered.
+    if !shell.mobile_is_cloud_conversation(id) {
         return Ok(SendPlan::default());
-    };
-    let Some(cloud) = shell.mobile_cloud_ref_of(id) else {
-        return Ok(SendPlan::default());
+    }
+    let card = super::card_view(shell, id, false).filter(|view| view.is_cloud());
+    let cloud = shell.mobile_cloud_ref_of(id);
+    let (true, Some(view), Some(cloud)) = (device.kind == DeviceKind::Web, card, cloud) else {
+        return still_connected(shell, id, cx).map(|()| SendPlan::default());
     };
     if let Some(text) = shell.mobile_start_refusal(id) {
         return Err(starting_failure(&text));
@@ -75,12 +77,14 @@ pub(super) fn before_send(
     if shell.mobile_instance_busy(&cloud) {
         return Err(Code::InstanceBusy.failure());
     }
-    // The cache can be stale: a loaded view that is not connected is not available.
+    // The cache can be stale (an idle stop, a sandbox TTL, a restart of the desktop): only a
+    // live, connected view is available. A view that is not loaded or not connected is not.
     let live = shell
         .mobile_session_view(id)
         .and_then(|view| view.read(cx).mobile_cloud_connected());
     let state = match (state, live) {
-        (CloudState::Available, Some(false)) => CloudState::Stopped,
+        (CloudState::Available, Some(true)) => CloudState::Available,
+        (CloudState::Available, _) => CloudState::Stopped,
         (state, _) => state,
     };
     match state {
@@ -97,6 +101,21 @@ pub(super) fn before_send(
             Ok(SendPlan { wake: true })
         }
     }
+}
+
+/// Whether a cloud conversation is connected now. A phone, or any device when the web
+/// path does not apply, gets a coded failure instead of a message that cannot be sent.
+pub(crate) fn still_connected(shell: &Shell, id: i64, cx: &gpui::App) -> Result<(), Failure> {
+    let live = shell
+        .mobile_session_view(id)
+        .and_then(|view| view.read(cx).mobile_cloud_connected());
+    if live == Some(true) {
+        return Ok(());
+    }
+    Err(Failure::coded(
+        Code::UnsupportedTarget.as_str(),
+        "The cloud instance is not connected; open it on the desktop",
+    ))
 }
 
 /// Starts the wake of a send that was consented to, right before its message
@@ -119,7 +138,10 @@ pub(crate) fn start_wake_send(
             return Err(failure);
         }
     };
-    lifecycle::start_wake(shell, id, slot, Wake::Send, cx);
+    if let Err(failure) = lifecycle::start_wake(shell, id, slot, Wake::Send, cx) {
+        crate::conversation::Conversation::end_wake_send(id);
+        return Err(failure);
+    }
     Ok(())
 }
 

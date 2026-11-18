@@ -224,6 +224,16 @@ fn load_view(fx: &Fx, cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// Brings the codespace session's link up or down.
+fn connect(fx: &Fx, cx: &mut TestAppContext, online: bool) {
+    let cs = fx.cs;
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, _| chat.set_online_for_test(online));
+        })
+        .unwrap();
+}
+
 /// The prompts the session's view sent to its workspace.
 fn launched(fx: &Fx, cx: &mut TestAppContext) -> Vec<String> {
     let cs = fx.cs;
@@ -917,6 +927,11 @@ fn a_send_needs_consent_to_wake_and_an_available_instance_sends_as_today(cx: &mu
     let refused = before_send(&fx, cx, &fx.web(), json!({"wake": true})).unwrap_err();
     assert_eq!(code_of(&refused), Some("unsupported_target"));
     set_state(&fx, cx, CloudState::Available);
+    // N1: a cached `available` is not enough: the view must be loaded and connected.
+    let refused = before_send(&fx, cx, &fx.web(), json!({})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("wake_required"));
+    load_view(&fx, cx);
+    connect(&fx, cx, true);
     assert_eq!(
         before_send(&fx, cx, &fx.web(), json!({})),
         Ok(cloud::SendPlan { wake: false })
@@ -924,7 +939,7 @@ fn a_send_needs_consent_to_wake_and_an_available_instance_sends_as_today(cx: &mu
     assert_eq!(
         before_send(&fx, cx, &fx.web(), json!({"wake": true})),
         Ok(cloud::SendPlan { wake: false }),
-        "an available instance needs no wake"
+        "a connected instance needs no wake"
     );
     assert_eq!(
         cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
@@ -994,18 +1009,7 @@ fn a_wake_send_wakes_once_queues_the_message_and_a_second_send_is_busy(cx: &mut 
         1
     );
     assert!(crate::conversation::Conversation::wake_send_pending(cs));
-    fx.window
-        .update(cx, |shell, _, cx| {
-            assert!(
-                shell.sessions[&cs]
-                    .read(cx)
-                    .remote_debug()
-                    .contains("actions=1"),
-                "the message waits in the deferral: {}",
-                shell.sessions[&cs].read(cx).remote_debug()
-            );
-        })
-        .unwrap();
+    // The message waits in its own slot, not in the history deferral (N2).
     // A second send while one is pending is busy and takes no slot.
     let refused = send(&fx, cx, &fx.web(), cs, json!({"wake": true})).unwrap_err();
     assert_eq!(code_of(&refused), Some("busy"));
@@ -1194,6 +1198,10 @@ fn a_refused_message_never_wakes_or_leaves_a_busy_flag(cx: &mut TestAppContext) 
 fn a_stale_available_cache_does_not_let_a_send_wake_the_instance(cx: &mut TestAppContext) {
     let fx = fixture(cx, "Shutdown", CloudState::Available);
     let cs = fx.cs;
+    // N1: a view that is not loaded (after a restart of the desktop) is not connected either.
+    let refused = send(&fx, cx, &fx.web(), cs, json!({"text": "hi"})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("wake_required"));
+    assert!(launched(&fx, cx).is_empty());
     load_view(&fx, cx);
     let refused = send(&fx, cx, &fx.web(), cs, json!({"text": "hi"})).unwrap_err();
     assert_eq!(code_of(&refused), Some("wake_required"));
@@ -1255,6 +1263,137 @@ fn a_send_without_the_wake_plan_never_reconnects_the_workspace(cx: &mut TestAppC
             );
         })
         .unwrap();
+}
+
+/// N2: running the deferred history actions while the link is still down neither spins nor
+/// loses the wake-send; it goes out once, when the link is up.
+#[gpui::test]
+fn history_actions_run_while_the_link_is_down_do_not_loop_or_lose_the_wake_send(
+    cx: &mut TestAppContext,
+) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let cs = fx.cs;
+    load_view(&fx, cx);
+    send(
+        &fx,
+        cx,
+        &fx.web(),
+        cs,
+        json!({"wake": true, "text": "later"}),
+    )
+    .unwrap();
+    for _ in 0..3 {
+        fx.window
+            .update(cx, |shell, _, cx| {
+                shell.sessions[&cs].update(cx, |chat, cx| chat.flush_history_for_test(cx));
+            })
+            .unwrap();
+    }
+    assert!(launched(&fx, cx).is_empty());
+    assert!(crate::conversation::Conversation::wake_send_pending(cs));
+    connect(&fx, cx, true);
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| chat.flush_history_for_test(cx));
+        })
+        .unwrap();
+    assert_eq!(launched(&fx, cx), ["later"]);
+    assert!(!crate::conversation::Conversation::wake_send_pending(cs));
+}
+
+/// N3 and L5: a phone that reaches a cloud conversation (its remote project is on the rail)
+/// gets a coded failure while the link is down, never ok and a dropped message; with the
+/// link up the message is delivered as today.
+#[gpui::test]
+fn a_phone_send_to_a_cloud_conversation_fails_coded_unless_connected(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let cs = fx.cs;
+    fx.window
+        .update(cx, |shell, _, _| {
+            let cwd = shell.session_summaries[&cs].cwd.clone();
+            shell.workspace.add_project(&cwd);
+        })
+        .unwrap();
+    let phone = fx.phone();
+    let wire = persisted(&fx, cx, cs);
+    for loaded in [false, true] {
+        if loaded {
+            load_view(&fx, cx);
+        }
+        let refused = send(&fx, cx, &phone, cs, json!({"text": "hi"})).unwrap_err();
+        assert_eq!(code_of(&refused), Some("unsupported_target"), "{loaded}");
+        assert!(refused.error.contains("not connected"), "{}", refused.error);
+    }
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    assert!(fx.host.0.lock().unwrap().is_empty(), "nothing woke");
+    assert_eq!(changes(&fx.gh), 0);
+    assert!(launched(&fx, cx).is_empty());
+    connect(&fx, cx, true);
+    let reply = send(&fx, cx, &phone, cs, json!({"text": "hi"})).unwrap();
+    assert_eq!(reply, json!({"sessionId": wire}));
+}
+
+/// N7: a wake that cannot open its conversation is a coded failure and holds nothing.
+#[gpui::test]
+fn a_wake_that_cannot_open_the_session_fails_coded_and_holds_nothing(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let web = fx.web();
+    let refused = fx
+        .window
+        .update(cx, |shell, _, cx| {
+            cloud::start_wake_send(shell, &web, 9_999_999, cx).unwrap_err()
+        })
+        .unwrap();
+    assert_eq!(code_of(&refused), Some("unsupported_target"));
+    assert!(!crate::conversation::Conversation::wake_send_pending(
+        9_999_999
+    ));
+    assert_eq!(
+        cloud_policy::limiter().in_flight(&fx.id, std::time::Instant::now()),
+        0
+    );
+}
+
+/// N4: a narrowed device may stop an instance it was shown (listed under its project), and
+/// one listed under another project is not selected.
+#[gpui::test]
+fn a_narrowed_device_stops_by_name_only_what_was_listed_under_its_project(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Available", CloudState::Available);
+    call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
+    call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
+    fx.window
+        .update(cx, |shell, _, _| shell.cloud_marks.clear())
+        .unwrap();
+    let mine = device_of(
+        &format!("{}-7", fx.id),
+        DeviceKind::Web,
+        Some(vec![project_id(&fx.project())]),
+    );
+    let reply = call(
+        &fx,
+        cx,
+        &mine,
+        "cloud.stop",
+        json!({"kind": "codespace", "instance": CS}),
+    )
+    .unwrap();
+    assert_eq!(reply["stopped"], true);
+    let other = device_of(
+        &format!("{}-8", fx.id),
+        DeviceKind::Web,
+        Some(vec![project_id("/work/another-project")]),
+    );
+    let refused = call(
+        &fx,
+        cx,
+        &other,
+        "cloud.stop",
+        json!({"kind": "codespace", "instance": CS}),
+    )
+    .unwrap_err();
+    assert_eq!(code_of(&refused), Some("not_selected"));
+    assert!(cloud::instance_listed_project(&CloudRef::codespace(CS)).is_some());
 }
 
 /// S10: a phone's send goes through the host's own path and gets today's reply, with no

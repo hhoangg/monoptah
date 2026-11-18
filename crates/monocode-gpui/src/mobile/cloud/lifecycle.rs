@@ -75,11 +75,10 @@ pub(super) fn start_wake(
     slot: WakeSlot,
     kind: Wake,
     cx: &mut Context<Shell>,
-) {
+) -> Result<(), Failure> {
     let Some(view) = shell.mobile_open_cloud_session(id, cx) else {
         cloud_policy::release_wake(&slot);
-        crate::conversation::Conversation::end_wake_send(id);
-        return;
+        return Err(Code::UnsupportedTarget.failure());
     };
     let store = shell.mobile_database();
     cx.spawn(async move |this, cx| {
@@ -114,6 +113,7 @@ pub(super) fn start_wake(
         });
     })
     .detach();
+    Ok(())
 }
 
 /// `cloud.stop {sessionId}` or `{kind, instance}`: asks the instance to stop
@@ -288,7 +288,7 @@ pub(super) fn resume(
         return Ok(json!({"accepted": true}));
     }
     let slot = cloud_policy::acquire_wake(&device.id)?;
-    start_wake(shell, id, slot, Wake::Resume, cx);
+    start_wake(shell, id, slot, Wake::Resume, cx)?;
     Ok(json!({"accepted": true}))
 }
 

@@ -273,6 +273,8 @@ pub(crate) struct Conversation {
     /// True while a remote device's send runs without the consent to wake the instance
     /// (`mobile_submit`): the send never reconnects a cloud workspace by itself.
     pub(super) mobile_no_wake: bool,
+    /// The message of a confirmed wake-send, waiting for the link (`mobile_wake_submit`).
+    wake_send: Option<mobile_pending_send::WakeSend>,
     /// True while the Resume pill's own click runs: only that may resume with an empty prompt.
     pub(super) resume_click: bool,
     /// Every prompt `launch_prompt` was asked to send, for tests that count sends.
@@ -775,6 +777,7 @@ impl Conversation {
             cloud_locked: false,
             user_send: false,
             mobile_no_wake: false,
+            wake_send: None,
             resume_click: false,
             #[cfg(test)]
             launched: Vec::new(),

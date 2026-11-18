@@ -410,12 +410,15 @@ fn a_start_answers_once_and_within_the_hosts_reply_wait(cx: &mut TestAppContext)
             let done = RefCell::new(Some(move |_: &mut Shell, reply| {
                 sink.borrow_mut().push(reply)
             }));
-            super::cloud_start::answer_once(
+            assert!(super::cloud_start::answer_once(
                 &done,
                 shell,
                 Ok(json!({"accepted": true, "starting": true})),
+            ));
+            assert!(
+                !super::cloud_start::answer_once(&done, shell, Ok(json!({"sessionId": "late"}))),
+                "a late answer says it was not delivered, so the caller can show it"
             );
-            super::cloud_start::answer_once(&done, shell, Ok(json!({"sessionId": "late"})));
             assert_eq!(
                 *got.borrow(),
                 [Ok(json!({"accepted": true, "starting": true}))],

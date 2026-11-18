@@ -24,31 +24,41 @@ use monocode_core::mono::cloud_api::CloudApi;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Projects whose overview is being loaded in the background now, so a device
 /// that asks again while a load runs does not start a second one.
 static REFRESHING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-/// The instances the cached overviews showed in a reply, for `cloud.stop`: a
-/// name the app never listed is not stopped by name. Bounded.
-static LISTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// The instances a `cloud.instances` reply showed, with the project each was listed
+/// under and when, for `cloud.stop` by name: a name the app never listed is not stopped.
+/// An entry is good for [`LISTED_TTL`] and is bounded in number.
+static LISTED: Mutex<BTreeMap<String, (String, Instant)>> = Mutex::new(BTreeMap::new());
 const LISTED_MAX: usize = 500;
+/// How long after a listing the instance may still be stopped by name: long enough for a
+/// person to read the list and decide, far shorter than forever.
+pub(crate) const LISTED_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// Whether `cloud` was shown by a `cloud.instances` reply.
-pub(crate) fn instance_was_listed(cloud: &CloudRef) -> bool {
+/// The project `cloud` was listed under in the last [`LISTED_TTL`], if it was.
+pub(crate) fn instance_listed_project(cloud: &CloudRef) -> Option<String> {
     LISTED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&cloud.key())
+        .get(&cloud.key())
+        .filter(|(_, at)| at.elapsed() < LISTED_TTL)
+        .map(|(project, _)| project.clone())
 }
 
 fn remember(loads: &[WorkspaceOverview]) {
     let mut listed = LISTED.lock().unwrap_or_else(|e| e.into_inner());
+    listed.retain(|_, (_, at)| at.elapsed() < LISTED_TTL);
     if listed.len() > LISTED_MAX {
         listed.clear();
     }
     for load in loads {
-        listed.extend(load.rows.iter().map(|row| row.cloud.key()));
+        for row in &load.rows {
+            listed.insert(row.cloud.key(), (load.project.clone(), Instant::now()));
+        }
     }
 }
 
