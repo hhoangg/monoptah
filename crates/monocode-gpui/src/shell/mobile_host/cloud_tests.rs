@@ -803,6 +803,14 @@ fn a_no_wake_run_only_probes_the_host_and_fails_visibly() {
         !run_without_waking(false, no_wake_run),
         "a consented or desktop run is free"
     );
+    // A panicking run does not leave the flag on its thread.
+    let leftover = std::thread::spawn(|| {
+        let _ = std::panic::catch_unwind(|| run_without_waking(true, || panic!("run failed")));
+        no_wake_run()
+    })
+    .join()
+    .unwrap();
+    assert!(!leftover);
     assert!(
         !std::thread::spawn(no_wake_run).join().unwrap(),
         "another thread never sees it"

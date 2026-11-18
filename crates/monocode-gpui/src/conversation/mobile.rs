@@ -69,7 +69,7 @@ impl Conversation {
         // The run this starts wakes a stopped cloud workspace only when the device
         // consented (the host checked and counted it).
         self.mobile_no_wake = !wake;
-        let result = self.resume_usage_checked(token, automatic, cx);
+        let result = self.resume_usage_checked(token, automatic, wake, cx);
         self.mobile_no_wake = false;
         result
     }
@@ -78,6 +78,7 @@ impl Conversation {
         &mut self,
         token: &serde_json::Value,
         automatic: Option<bool>,
+        wake: bool,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if self.settings.worktree_removed {
@@ -120,6 +121,11 @@ impl Conversation {
         }
         if let Some(enabled) = automatic {
             self.set_usage_resume_at_reset(enabled, cx);
+            // The later resume wakes only if this arm consented to it.
+            if let Some(limit) = &mut self.settings.usage_limit {
+                limit.no_wake = enabled && !wake;
+            }
+            self.save_settings(cx);
         } else {
             self.resume_usage(cx);
         }
@@ -129,6 +135,8 @@ impl Conversation {
     pub(super) fn set_usage_resume_at_reset(&mut self, enabled: bool, cx: &mut Context<Self>) {
         if let Some(limit) = &mut self.settings.usage_limit {
             limit.resume_at_reset = enabled;
+            // A desktop (re)arm may wake; a remote arm sets this again after.
+            limit.no_wake = false;
             // Any manual disarm (desktop button or phone) opts the session out
             // of the global switch, even while the switch is off, so turning
             // it on later does not re-arm a session the user cancelled.
@@ -621,6 +629,7 @@ mod usage_tests {
         let limit = Limit {
             resets_at: Some(reset),
             resume_at_reset: false,
+            no_wake: false,
         };
         let state = usage_state(
             1,
@@ -683,6 +692,7 @@ mod usage_tests {
                 let limit = Limit {
                     resets_at: reset,
                     resume_at_reset: armed,
+                    no_wake: false,
                 };
                 let state = usage_state(
                     1,
@@ -743,6 +753,63 @@ mod usage_tests {
         });
     }
 
+    /// A resume a remote device armed without consent runs without waking the workspace when
+    /// the scheduler fires it; with consent, or armed on the desktop, it may wake.
+    #[gpui::test]
+    fn a_scheduled_usage_resume_honours_the_consent_given_when_it_was_armed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let store = Arc::new(std::sync::Mutex::new(
+            monocode_core::store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let summary = locked(&store)
+            .unwrap()
+            .create("claude", "/fixture")
+            .unwrap();
+        let view = cx.new(|cx| Conversation::new(summary, store.clone(), cx));
+        cx.run_until_parked();
+        let fire = |v: &mut Conversation, cx: &mut Context<Conversation>| {
+            v.settings.usage_limit.as_mut().unwrap().resets_at = Some(usage::now_ms() - 31_000);
+            v.tick_usage(cx);
+        };
+        view.update(cx, |v, cx| {
+            v.loaded = true;
+            let limit = || {
+                Some(Limit {
+                    resets_at: Some(usage::now_ms() + 60_000),
+                    resume_at_reset: false,
+                    no_wake: false,
+                })
+            };
+            // Armed from a remote device without consent: the scheduled run never wakes.
+            v.settings.usage_limit = limit();
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            v.mobile_resume_usage(&token, Some(true), false, cx)
+                .unwrap();
+            assert!(v.settings.usage_limit.as_ref().unwrap().no_wake);
+            fire(v, cx);
+            assert_eq!(v.launched_no_wake_for_test(), [true]);
+            // Armed with consent: the later resume may wake.
+            v.set_busy_for_test(false);
+            v.settings.usage_limit = limit();
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            v.mobile_resume_usage(&token, Some(true), true, cx).unwrap();
+            assert!(!v.settings.usage_limit.as_ref().unwrap().no_wake);
+            fire(v, cx);
+            assert_eq!(v.launched_no_wake_for_test(), [true, false]);
+            // A desktop arm clears a remote no-wake mark.
+            v.set_busy_for_test(false);
+            v.settings.usage_limit = limit();
+            let token = v.mobile_usage_limit(cx)["token"].clone();
+            v.mobile_resume_usage(&token, Some(true), false, cx)
+                .unwrap();
+            v.set_usage_resume_at_reset(true, cx);
+            assert!(!v.settings.usage_limit.as_ref().unwrap().no_wake);
+            fire(v, cx);
+            assert_eq!(v.launched_no_wake_for_test(), [true, false, false]);
+        });
+    }
+
     #[gpui::test]
     fn mobile_controls_persist_the_desktop_preference_and_use_its_mono_resume_and_scheduler(
         cx: &mut gpui::TestAppContext,
@@ -772,6 +839,7 @@ mod usage_tests {
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(usage::now_ms() + 60_000),
                 resume_at_reset: false,
+                no_wake: false,
             });
             let token = v.mobile_usage_limit(cx)["token"].clone();
             assert!(v.mobile_resume_usage(&token, None, true, cx).is_err());
@@ -827,6 +895,7 @@ mod usage_tests {
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(usage::now_ms() + 60_000),
                 resume_at_reset: false,
+                no_wake: false,
             });
             let token = v.mobile_usage_limit(cx)["token"].clone();
             v.mobile_resume_usage(&token, Some(true), true, cx).unwrap();

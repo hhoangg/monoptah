@@ -3464,6 +3464,7 @@ mod tests {
                     v.settings.usage_limit = Some(monocode_core::usage::Limit {
                         resets_at: Some(monocode_core::usage::now_ms() + 60_000),
                         resume_at_reset: false,
+                        no_wake: false,
                     });
                     let token = v.mobile_usage_limit(cx)["token"].clone();
                     v.mobile_resume_usage(&token, Some(true), true, cx).unwrap();
@@ -3507,6 +3508,7 @@ mod tests {
                 usage_limit: Some(monocode_core::usage::Limit {
                     resets_at: Some(reset),
                     resume_at_reset: true,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

@@ -1338,6 +1338,11 @@ impl Conversation {
                 None
             };
             self.enqueue_follow_up(prompt, mode.map(str::to_owned), cx);
+            if self.mobile_no_wake
+                && let Some(message) = self.follow_ups.state.messages.last()
+            {
+                self.mobile_no_wake_ids.insert(message.id.clone());
+            }
             if let Some(id) = self
                 .follow_ups
                 .state
@@ -1353,7 +1358,16 @@ impl Conversation {
             return;
         }
         if !self.history_ready() {
-            self.defer_history_action(move |this, cx| this.launch_prompt(prompt, cx), cx);
+            // The no-wake flag of a remote message survives the wait for the history.
+            let no_wake = self.mobile_no_wake;
+            self.defer_history_action(
+                move |this, cx| {
+                    let outer = std::mem::replace(&mut this.mobile_no_wake, no_wake);
+                    this.launch_prompt(prompt, cx);
+                    this.mobile_no_wake = outer;
+                },
+                cx,
+            );
             return;
         }
         if self.account_switching {
@@ -1509,6 +1523,9 @@ impl Conversation {
         // A run of a remote device's message that did not consent to waking the workspace
         // never starts it (the flag travels with the message, see `pump_follow_ups`).
         let no_wake = self.mobile_no_wake;
+        if let Some(id) = &self.settings.mono_message_id {
+            self.mobile_no_wake_ids.remove(id);
+        }
         #[cfg(test)]
         self.launched_no_wake.push(no_wake);
         cx.background_executor()

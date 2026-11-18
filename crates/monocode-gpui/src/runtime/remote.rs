@@ -517,10 +517,16 @@ thread_local! {
 
 /// Runs `run` (a whole turn) as a no-wake one when `no_wake` is set.
 pub(crate) fn run_without_waking<T>(no_wake: bool, run: impl FnOnce() -> T) -> T {
+    /// Clears the flag when the run ends, also by a panic: a pool thread must not keep it.
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            NO_WAKE_RUN.with(|flag| flag.set(false));
+        }
+    }
     NO_WAKE_RUN.with(|flag| flag.set(no_wake));
-    let result = run();
-    NO_WAKE_RUN.with(|flag| flag.set(false));
-    result
+    let _clear = Clear;
+    run()
 }
 
 /// Whether the run on this thread may not wake its instance.

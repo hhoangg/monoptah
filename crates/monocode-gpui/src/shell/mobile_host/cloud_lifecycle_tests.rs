@@ -1487,6 +1487,44 @@ fn a_remote_send_queued_behind_a_busy_turn_still_runs_without_waking(cx: &mut Te
     assert_eq!(no_wake_runs(&fx, cx), [true, false]);
 }
 
+/// A queued remote message keeps its no-wake flag when sending it returns early (the link is
+/// down at that moment): the id stays until the run actually launches.
+#[gpui::test]
+fn a_queued_no_wake_flag_survives_an_early_return_of_the_send(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Available", CloudState::Available);
+    let cs = fx.cs;
+    load_view(&fx, cx);
+    connect(&fx, cx, true);
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, _| chat.set_busy_for_test(true))
+        })
+        .unwrap();
+    send(&fx, cx, &fx.web(), cs, json!({"text": "queued"})).unwrap();
+    // The turn ends while the link is down: the pump returns without launching.
+    connect(&fx, cx, false);
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| {
+                chat.set_busy_for_test(false);
+                chat.pump_for_test(cx);
+            })
+        })
+        .unwrap();
+    assert!(
+        no_wake_runs(&fx, cx).is_empty(),
+        "nothing launched while the link is down"
+    );
+    // The link is back: the same message runs, still marked.
+    connect(&fx, cx, true);
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| chat.pump_for_test(cx))
+        })
+        .unwrap();
+    assert_eq!(no_wake_runs(&fx, cx), [true]);
+}
+
 /// A remote send that is refused before any run leaves nothing behind: the desktop's next
 /// send is not marked.
 #[gpui::test]

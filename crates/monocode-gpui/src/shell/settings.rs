@@ -773,6 +773,7 @@ mod tests {
                         v.settings.usage_limit = Some(Limit {
                             resets_at: reset,
                             resume_at_reset: false,
+                            ..Default::default()
                         });
                         v.settings.auto_resume_opt_out = opt_out;
                     });
