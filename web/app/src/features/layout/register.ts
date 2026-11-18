@@ -11,3 +11,5 @@ import "@/features/themes/register";
 import "@/features/files/register";
 
 registerSlot("app-shell", AppShell);
+// The Changes and Git panels (U-06).
+import "@/features/changes/register";

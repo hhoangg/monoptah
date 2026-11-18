@@ -156,6 +156,11 @@ const SCREENS: Record<string, string> = {
   // U-05 (WS-P): the file browser, with its "Files" h1 (the splat stays in the route params).
   "/d/dk1/p/p1/files/src/main.rs": "Files",
   "/d/:desktopId/p/:projectId/files/*": "Files",
+  // U-06 (WS-P): the changes list or diff and the git status, each with its own h1.
+  "/d/dk1/p/p1/changes/src/lib.rs": "Changes",
+  "/d/:desktopId/p/:projectId/changes/*": "Changes",
+  "/d/dk1/p/p1/git": "Git",
+  "/d/:desktopId/p/:projectId/git": "Git",
   // The default test account is a member, so the admin routes show their guard screen (U-04).
   "/admin": "Not available",
   "/admin/users": "Not available",
