@@ -99,23 +99,56 @@ describe("essential text uses the muted token, not the decorative faint one", ()
   }
 });
 
+/**
+ * Every use of the faint colour, as `file:line: tag`, whose element is neither an `<Icon>` nor `aria-hidden`.
+ * It reads the element that owns the class (the opening tag around the match), not the whole line, so a text span
+ * next to an icon on the same line is still caught. A match outside any JSX tag (a `.ts` helper, a `cn()` string
+ * in a variable) has no element to vouch for it and is always reported.
+ */
+function essentialFaintUses(file: string, source: string): string[] {
+  const hits: string[] = [];
+  const pattern = /(?<![-\w])(?:placeholder:|hover:|focus:)?text-faint\b/g;
+  for (let match = pattern.exec(source); match; match = pattern.exec(source)) {
+    const before = source.slice(0, match.index);
+    const open = before.search(/<[A-Za-z][^<]*$/);
+    let tag = "";
+    if (open >= 0) {
+      let depth = 0;
+      let end = open;
+      for (; end < source.length; end++) {
+        const ch = source[end];
+        if (ch === "{") depth++;
+        else if (ch === "}") depth--;
+        else if (ch === ">" && depth <= 0 && source[end - 1] !== "=") break;
+      }
+      tag = source.slice(open, end + 1);
+    }
+    const name = /^<([A-Za-z][\w.]*)/.exec(tag)?.[1] ?? "";
+    const decorative = tag !== "" && (name === "Icon" || /aria-hidden/.test(tag));
+    if (!decorative) hits.push(`${file}:${before.split("\n").length}: ${(tag || source.split("\n")[before.split("\n").length - 1] || "").replace(/\s+/g, " ").trim()}`);
+  }
+  return hits;
+}
+
 describe("text-faint is for decorative elements only", () => {
   const srcRoot = path.resolve(import.meta.dirname, "../..");
   const sources = (dir: string): string[] =>
     readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) return entry.name === "node_modules" ? [] : sources(full);
-      return /\.tsx$/.test(entry.name) && !/\.test\.tsx$/.test(entry.name) ? [full] : [];
+      return /\.tsx?$/.test(entry.name) && !/\.(test|d)\.tsx?$/.test(entry.name) ? [full] : [];
     });
-  // A faint hit is allowed on an icon or an aria-hidden element (a gutter number), never on text a person reads.
-  const decorative = (line: string) => /<Icon\b/.test(line) || /aria-hidden/.test(line);
 
-  it("finds no essential text with text-faint or placeholder:text-faint", () => {
-    const offenders = sources(srcRoot).flatMap((file) =>
-      readFileSync(file, "utf8")
-        .split("\n")
-        .flatMap((line, index) => (/(?<![-\w])(placeholder:)?text-faint\b/.test(line) && !decorative(line) ? [`${path.relative(srcRoot, file)}:${index + 1}: ${line.trim()}`] : [])),
-    );
+  it("the scan reads the element, not the line", () => {
+    expect(essentialFaintUses("a.tsx", '<Icon name="x" className="text-faint" />')).toEqual([]);
+    expect(essentialFaintUses("a.tsx", '<span aria-hidden="true" className="text-faint">1</span>')).toEqual([]);
+    expect(essentialFaintUses("a.tsx", '<p><Icon name="x" /><span className="text-faint">Hello</span></p>')).toHaveLength(1);
+    expect(essentialFaintUses("a.tsx", '<span aria-hidden="true">1</span><span className="text-faint">Hi</span>')).toHaveLength(1);
+    expect(essentialFaintUses("a.ts", 'export const tone = "text-faint";')).toHaveLength(1);
+  });
+
+  it("finds no essential text with text-faint, in .tsx or .ts", () => {
+    const offenders = sources(srcRoot).flatMap((file) => essentialFaintUses(path.relative(srcRoot, file), readFileSync(file, "utf8")));
     expect(offenders).toEqual([]);
   });
 });
