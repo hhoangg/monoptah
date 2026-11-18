@@ -532,6 +532,23 @@ impl MobileHost {
     }
 
     pub fn revoke(&self, device_id: &str) -> Result<(), String> {
+        // A web row has more to end than a phone: its live channel (BYE) and
+        // the durable `revoked` report. Never remove it by the phone path.
+        // Ids of different kinds are unrelated: a phone with that id wins.
+        let is_web = {
+            let inner = self.inner.lock().map_err(unavailable)?;
+            let kinds = |kind| {
+                inner
+                    .config
+                    .devices
+                    .iter()
+                    .any(|device| device.id == device_id && device.kind == kind)
+            };
+            kinds(DeviceKind::Web) && !kinds(DeviceKind::Phone)
+        };
+        if is_web {
+            return self.web_revoke(device_id);
+        }
         let mut inner = self.inner.lock().map_err(unavailable)?;
         let mut config = inner.config.clone();
         let removed = config
@@ -1215,6 +1232,17 @@ impl MobileHost {
         Ok(identity)
     }
 
+    /// Like `load_web_identity`, but leaves the cached facts alone, so a
+    /// background reader cannot bring back what Unpair wiped meanwhile.
+    pub(crate) fn read_web_identity_quietly(
+        &self,
+    ) -> Result<Option<identity_store::WebIdentity>, String> {
+        identity_store::load_web(
+            &self.web_database()?,
+            &identity_store::web_account_for(&self.path),
+        )
+    }
+
     /// Seals the web identity. Its token never goes to `mobile-access.json`.
     pub(crate) fn save_web_identity(
         &self,
@@ -1285,6 +1313,7 @@ impl MobileHost {
             &challenge,
         )?;
         let code_ok = !started.user_code.is_empty()
+            && started.user_code.len() <= 16
             && started
                 .user_code
                 .chars()

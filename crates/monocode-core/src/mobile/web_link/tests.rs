@@ -2146,6 +2146,9 @@ mod seam {
         for report in world.hub.requests("POST", &path) {
             assert_eq!(report.body, json!({"state": "revoked"}));
         }
+        for report in world.hub.requests("POST", &deny_path) {
+            assert_eq!(report.body, json!({"state": "revoked"}));
+        }
         assert!(world.status().pending.is_empty());
         assert!(world.status().devices.is_empty());
         // Once the server lists both `revoked`, they are forgotten.
@@ -2157,6 +2160,126 @@ mod seam {
         world.wait_for("the ids to settle", |_| {
             !saved().contains(&gone.relay_id()) && !saved().contains(&denied.relay_id())
         });
+    }
+
+    #[test]
+    fn the_phone_revoke_path_hands_a_web_row_to_the_web_revoke() {
+        let grants = Grants::default();
+        let world = world(failing_reports(grants.clone()), true);
+        let (web, phone_peer) = (world.peer(131), world.peer(132));
+        world
+            .host
+            .add_device_for_test(confirmed_row(&web, "row-x", Permission::Control));
+        let phone = Device {
+            id: "phone-2".into(),
+            fingerprint: phone_peer.fingerprint(),
+            kind: DeviceKind::Phone,
+            server_device_id: None,
+            ..web_row(&phone_peer)
+        };
+        world.host.add_device_for_test(phone);
+        let path = format!("/api/desktop/grants/{}/state", web.relay_id());
+        world.host.revoke("row-x").unwrap();
+        world.wait_for("the revoked report", |w| w.hub.count("POST", &path) == 1);
+        assert_eq!(
+            world.hub.requests("POST", &path)[0].body,
+            json!({"state": "revoked"})
+        );
+        let saved = std::fs::read_to_string(world._dir.path().join("mobile-access.json")).unwrap();
+        // The durable revoked list holds the server id, and the phone stays.
+        assert!(saved.contains(&web.relay_id()) && saved.contains("phone-2"));
+        assert!(!saved.contains("row-x"));
+        let ids: Vec<String> = world
+            .host
+            .status()
+            .devices
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, ["phone-2"]);
+    }
+
+    #[test]
+    fn a_blip_while_polling_keeps_the_pairing_until_it_is_approved() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = calls.clone();
+        let handler: Handler = Arc::new(move |req| {
+            match req.path.as_str() {
+            "/api/pair/start" => (
+                200,
+                r#"{"userCode":"ABCD-2345","deviceCode":"fake-device-code","confirmationCode":"123456","expiresIn":600,"interval":3}"#.into(),
+            ),
+            "/api/pair/poll" => {
+                let mut n = seen.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    return (502, "{}".into());
+                }
+                (
+                    200,
+                    json!({"status":"approved","desktopId":DESKTOP_UUID,"desktopToken":TOKEN,
+                        "account":{"handle":"alice"},
+                        "relayUrl":format!("ws://127.0.0.1:{}/relay/desktop/{DESKTOP_UUID}", req.port)})
+                    .to_string(),
+                )
+            }
+            _ => (404, "{}".into()),
+        }
+        });
+        let world = world(handler, false);
+        let host_url = format!("http://127.0.0.1:{}", world.hub.port);
+        world.host.web_pair_start(&host_url, "Mac").unwrap();
+        assert_eq!(world.host.web_pair_poll().unwrap(), PairPoll::Pending);
+        assert!(matches!(
+            world.host.web_pair_poll().unwrap(),
+            PairPoll::Approved { .. }
+        ));
+    }
+
+    #[test]
+    fn a_404_on_poll_is_still_final() {
+        let handler: Handler = Arc::new(|req| {
+            match req.path.as_str() {
+            "/api/pair/start" => (
+                200,
+                r#"{"userCode":"ABCD-2345","deviceCode":"fake-device-code","confirmationCode":"123456","expiresIn":600,"interval":3}"#.into(),
+            ),
+            _ => (404, "{}".into()),
+        }
+        });
+        let world = world(handler, false);
+        let host_url = format!("http://127.0.0.1:{}", world.hub.port);
+        world.host.web_pair_start(&host_url, "Mac").unwrap();
+        let error = world.host.web_pair_poll().unwrap_err();
+        assert!(error.contains("404"), "{error}");
+    }
+
+    #[test]
+    fn a_pairing_code_that_is_too_long_is_refused() {
+        let long = "A".repeat(17);
+        let handler: Handler = Arc::new(move |req| {
+            match req.path.as_str() {
+            "/api/pair/start" => (
+                200,
+                json!({"userCode":long,"deviceCode":"fake-device-code","confirmationCode":"123456","expiresIn":600,"interval":3}).to_string(),
+            ),
+            _ => (404, "{}".into()),
+        }
+        });
+        let world = world(handler, false);
+        let host_url = format!("http://127.0.0.1:{}", world.hub.port);
+        let error = world.host.web_pair_start(&host_url, "Mac").unwrap_err();
+        assert!(error.contains("invalid pairing"), "{error}");
+    }
+
+    #[test]
+    fn a_push_has_no_target_once_unpaired_and_never_brings_the_facts_back() {
+        let world = world(grant_handler(Grants::default()), true);
+        assert!(world.status().paired);
+        assert!(crate::mobile::notify::push_target(&world.host).is_some());
+        world.host.web_unpair().unwrap();
+        assert!(crate::mobile::notify::push_target(&world.host).is_none());
+        assert!(!world.status().paired);
     }
 
     #[test]

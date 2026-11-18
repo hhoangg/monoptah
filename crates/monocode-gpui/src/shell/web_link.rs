@@ -32,6 +32,9 @@ struct WebBridge {
     seen: HashSet<String>,
     /// Devices and requests waiting for the user, for the Connections badge.
     badge: usize,
+    /// Bumped whenever a pairing is cancelled or Settings closes, so a ticket
+    /// that arrives late is dropped instead of reopening the dialog.
+    pairing_generation: u64,
 }
 
 impl Global for WebBridge {}
@@ -57,6 +60,37 @@ fn fresh_pending<'a>(seen: &HashSet<String>, status: &'a WebStatus) -> Vec<&'a P
         .iter()
         .filter(|device| !seen.contains(&device.fingerprint))
         .collect()
+}
+
+/// Takes one watcher reading into the bridge. Returns the devices to announce
+/// and whether the badge count changed (the caller repaints then).
+fn take_reading(bridge: &mut WebBridge, status: &WebStatus) -> (Vec<(String, String)>, bool) {
+    let fresh = fresh_pending(&bridge.seen, status)
+        .into_iter()
+        .map(|device| (device.name.clone(), device.fingerprint.clone()))
+        .collect();
+    bridge.seen = status
+        .pending
+        .iter()
+        .map(|device| device.fingerprint.clone())
+        .collect();
+    let badge = status.pending.len() + status.requests.len();
+    let changed = bridge.badge != badge;
+    bridge.badge = badge;
+    (fresh, changed)
+}
+
+/// What one poll answer means for the pairing on show: `None` keeps polling,
+/// `Some(notice)` ends it (with that notice, if any). Every end that is not an
+/// approval also makes the shell cancel the host's pairing.
+fn poll_step(polled: &Result<PairPoll, String>) -> Option<Option<String>> {
+    match polled {
+        Ok(PairPoll::Pending) => None,
+        Ok(PairPoll::Approved { .. }) => Some(None),
+        Ok(PairPoll::Denied) => Some(Some("Pairing was denied in the browser.".to_owned())),
+        Ok(PairPoll::Expired) => Some(Some("The pairing code expired.".to_owned())),
+        Err(error) => Some(Some(format!("Web app: {error}"))),
+    }
 }
 
 /// (id, name) pairs of the projects and the Monos the host publishes.
@@ -96,17 +130,10 @@ impl Shell {
     fn web_status_watched(&mut self, status: &WebStatus, cx: &mut Context<Self>) {
         let notify = self.settings.is_none() && self.workspace.preferences.notifications;
         let sounds = self.workspace.preferences.sounds;
-        let bridge = cx.default_global::<WebBridge>();
-        let fresh: Vec<(String, String)> = fresh_pending(&bridge.seen, status)
-            .into_iter()
-            .map(|device| (device.name.clone(), device.fingerprint.clone()))
-            .collect();
-        bridge.seen = status
-            .pending
-            .iter()
-            .map(|device| device.fingerprint.clone())
-            .collect();
-        bridge.badge = status.pending.len() + status.requests.len();
+        let (fresh, changed) = take_reading(cx.default_global::<WebBridge>(), status);
+        if changed {
+            cx.notify();
+        }
         if !notify {
             return;
         }
@@ -268,7 +295,9 @@ impl Shell {
             self.web_set_notice(Some("The web app is not available.".into()), cx);
             return;
         };
-        cx.default_global::<WebBridge>().notice = None;
+        let bridge = cx.default_global::<WebBridge>();
+        bridge.notice = None;
+        let generation = bridge.pairing_generation;
         let name = machine_name();
         let task = cx
             .background_executor()
@@ -276,7 +305,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| match result {
-                Ok(ticket) => this.web_pair_started(ticket, cx),
+                Ok(ticket) => this.web_pair_started(ticket, generation, cx),
                 Err(error) => this.web_set_notice(Some(format!("Web app: {error}")), cx),
             });
         })
@@ -284,7 +313,12 @@ impl Shell {
     }
 
     /// Shows the code and polls until approved, denied, expired or cancelled.
-    fn web_pair_started(&mut self, ticket: PairTicket, cx: &mut Context<Self>) {
+    fn web_pair_started(&mut self, ticket: PairTicket, generation: u64, cx: &mut Context<Self>) {
+        if cx.default_global::<WebBridge>().pairing_generation != generation {
+            // Cancelled or closed while the code was being fetched: forget it.
+            self.web_forget_pairing(cx);
+            return;
+        }
         let interval = Duration::from_secs(ticket.interval.max(1));
         let expires_at = ticket.expires_at;
         let poll = cx.spawn(async move |this, cx| {
@@ -295,6 +329,7 @@ impl Shell {
                 };
                 if unix_now() >= expires_at {
                     let _ = this.update(cx, |this, cx| {
+                        this.web_forget_pairing(cx);
                         this.web_pair_finished(Some("The pairing code expired.".into()), cx)
                     });
                     break;
@@ -326,13 +361,12 @@ impl Shell {
         if cx.default_global::<WebBridge>().pairing.is_none() {
             return true;
         }
-        let notice = match polled {
-            Ok(PairPoll::Pending) => return false,
-            Ok(PairPoll::Approved { .. }) => None,
-            Ok(PairPoll::Denied) => Some("Pairing was denied in the browser.".to_owned()),
-            Ok(PairPoll::Expired) => Some("The pairing code expired.".to_owned()),
-            Err(error) => Some(format!("Web app: {error}")),
+        let Some(notice) = poll_step(&polled) else {
+            return false;
         };
+        if !matches!(polled, Ok(PairPoll::Approved { .. })) {
+            self.web_forget_pairing(cx);
+        }
         self.web_pair_finished(notice, cx);
         true
     }
@@ -351,16 +385,23 @@ impl Shell {
         let bridge = cx.default_global::<WebBridge>();
         let showing = bridge.pairing.take().is_some();
         bridge.poll = None;
+        // A ticket still being fetched is dropped when it arrives.
+        bridge.pairing_generation += 1;
+        self.web_forget_pairing(cx);
         if !showing {
             return;
         }
+        self.sync_settings(cx);
+        cx.notify();
+    }
+
+    /// Tells the host to forget its pairing (off the UI thread).
+    fn web_forget_pairing(&mut self, cx: &mut Context<Self>) {
         if let Some(host) = attached_host() {
             cx.background_executor()
                 .spawn(async move { host.web_pair_cancel() })
                 .detach();
         }
-        self.sync_settings(cx);
-        cx.notify();
     }
 }
 
@@ -388,5 +429,39 @@ mod tests {
         assert_eq!(fresh.len(), 1);
         assert_eq!(fresh[0].fingerprint, "bb");
         assert!(fresh_pending(&HashSet::from(["aa".into(), "bb".into()]), &status).is_empty());
+    }
+
+    #[test]
+    fn a_changed_badge_count_asks_for_a_repaint() {
+        let mut bridge = WebBridge::default();
+        let mut status = WebStatus {
+            pending: vec![pending("aa")],
+            ..Default::default()
+        };
+        let (fresh, changed) = take_reading(&mut bridge, &status);
+        assert!(changed && fresh.len() == 1 && bridge.badge == 1);
+        let (fresh, changed) = take_reading(&mut bridge, &status);
+        assert!(!changed && fresh.is_empty());
+        status.pending.clear();
+        let (_, changed) = take_reading(&mut bridge, &status);
+        assert!(changed && bridge.badge == 0);
+    }
+
+    #[test]
+    fn a_failed_poll_ends_the_pairing_and_only_a_pending_one_keeps_it() {
+        assert_eq!(poll_step(&Ok(PairPoll::Pending)), None);
+        assert_eq!(
+            poll_step(&Ok(PairPoll::Approved {
+                account: "a".into()
+            })),
+            Some(None)
+        );
+        assert!(matches!(poll_step(&Ok(PairPoll::Denied)), Some(Some(_))));
+        assert!(matches!(poll_step(&Ok(PairPoll::Expired)), Some(Some(_))));
+        let ended = poll_step(&Err("The web server answered 404".into()));
+        assert_eq!(
+            ended,
+            Some(Some("Web app: The web server answered 404".into()))
+        );
     }
 }

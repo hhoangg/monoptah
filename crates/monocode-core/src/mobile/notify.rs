@@ -40,7 +40,7 @@ pub fn notify_web(notice: &WebNotice) {
     let Some(host) = super::web_link::attached_host() else {
         return;
     };
-    if !host.web_enabled() {
+    if !host.web_enabled() || !host.web_status().paired {
         return;
     }
     let status = host.web_status();
@@ -52,17 +52,25 @@ pub fn notify_web(notice: &WebNotice) {
     let _ = std::thread::Builder::new()
         .name("monocode-web-push".into())
         .spawn(move || {
-            let load = || {
-                let identity = host.load_web_identity().ok().flatten()?;
-                let base = super::web_link::desktop_api::base_url(
-                    &identity.relay_url,
-                    cfg!(debug_assertions),
-                )
-                .ok()?;
-                Some((base, identity.desktop_token.clone()))
-            };
+            let load = || push_target(&host);
             deliver(load, &body, RETRY_PAUSE);
         });
+}
+
+/// The base URL and token to post to, or None when the desktop is not paired.
+/// Checked before and after the identity read, and the read leaves the cached
+/// facts alone, so a push in flight cannot bring back what Unpair wiped.
+pub(crate) fn push_target(host: &super::MobileHost) -> Option<(String, String)> {
+    if !host.web_status().paired {
+        return None;
+    }
+    let identity = host.read_web_identity_quietly().ok().flatten()?;
+    if !host.web_status().paired {
+        return None;
+    }
+    let base =
+        super::web_link::desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)).ok()?;
+    Some((base, identity.desktop_token.clone()))
 }
 
 const RETRY_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);

@@ -13,7 +13,7 @@ use gpui::{
     HighlightStyle, MouseButton, Role, SharedString, Stateful, StyledText, Subscription, Task,
     Window, canvas, div, prelude::*, px, relative, rgb,
 };
-use monocode_core::mobile::Status;
+use monocode_core::mobile::{DeviceKind, Status};
 use std::{
     collections::HashSet,
     sync::Arc,
@@ -221,7 +221,7 @@ impl SettingsView {
         let Some(status) = &self.ctx.mobile else {
             return;
         };
-        self.mobile.known = Some(status.devices.iter().map(|d| d.id.clone()).collect());
+        self.mobile.known = Some(phones(status).map(|d| d.id.clone()).collect());
         self.mobile.notice = None;
         self.mobile.pairing = Some(Instant::now());
         cx.emit(SettingsEvent::MobilePair);
@@ -234,7 +234,7 @@ impl SettingsView {
         self.mobile.pairing = None;
         cx.emit(SettingsEvent::MobileCancelInvite);
         if let Some(status) = &self.ctx.mobile
-            && status.devices.is_empty()
+            && phones(status).next().is_none()
         {
             cx.emit(SettingsEvent::MobileConfigure {
                 enabled: false,
@@ -345,7 +345,7 @@ impl SettingsView {
             );
             return page;
         };
-        if !status.devices.is_empty() {
+        if phones(&status).next().is_some() {
             page.push(self.mobile_access(&status, cx));
         }
         page.push(self.mobile_devices(&status, showing, cx));
@@ -590,7 +590,7 @@ impl SettingsView {
     }
 
     fn mobile_devices(&self, status: &Status, showing: bool, cx: &mut Context<Self>) -> AnyElement {
-        if status.devices.is_empty() {
+        if phones(status).next().is_none() {
             return div()
                 .mt_5()
                 .rounded_xl()
@@ -604,7 +604,7 @@ impl SettingsView {
                 .child("Pair your iPhone or Android phone to get started.")
                 .into_any_element();
         }
-        let last = status.devices.len() == 1;
+        let last = phones(status).count() == 1;
         let (open_router, remote) = (status.open_router, status.remote_address.clone());
         div()
             .mt_5()
@@ -614,7 +614,7 @@ impl SettingsView {
             .border_color(content(0.1))
             .flex()
             .flex_col()
-            .children(status.devices.iter().enumerate().map(|(ix, device)| {
+            .children(phones(status).enumerate().map(|(ix, device)| {
                 let id = device.id.clone();
                 let name = device.name.clone();
                 let confirming = self.mobile.removing.as_deref() == Some(id.as_str());
@@ -681,6 +681,10 @@ impl SettingsView {
                                     0.4,
                                     false,
                                 )
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("mobile-remove-{id}")
+                                })
                                 .on_click({
                                     let id = id.clone();
                                     cx.listener(move |this, _, _, cx| {
@@ -732,6 +736,7 @@ impl SettingsView {
                                                 true,
                                                 false,
                                             )
+                                            .debug_selector(|| "mobile-confirm-remove".to_owned())
                                             .child("Remove phone")
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 cx.emit(SettingsEvent::MobileRevoke(id.clone()));
@@ -1383,6 +1388,15 @@ fn mascot_glow() -> impl IntoElement {
         },
     )
     .size_full()
+}
+
+/// The rows under "Your phones": web devices have their own list on the Web
+/// app page, and removing one there also ends its live channel.
+fn phones(status: &Status) -> impl Iterator<Item = &monocode_core::mobile::host::Device> {
+    status
+        .devices
+        .iter()
+        .filter(|device| device.kind == DeviceKind::Phone)
 }
 
 #[cfg(test)]

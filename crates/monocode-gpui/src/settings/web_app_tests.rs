@@ -63,6 +63,8 @@ fn tag(event: &SettingsEvent) -> Option<String> {
             device_id,
             projects,
         } => format!("phone-projects:{device_id}:{projects:?}"),
+        SettingsEvent::MobileRevoke(id) => format!("mobile-revoke:{id}"),
+        SettingsEvent::MobileConfigure { enabled, .. } => format!("mobile-configure:{enabled}"),
         _ => return None,
     })
 }
@@ -683,6 +685,28 @@ fn a_phone_with_no_selection_shows_all_projects_and_narrowing_emits_the_rest(
     assert_eq!(
         events(&window, visual),
         ["phone-projects:ph1:Some([\"p2\"])"]
+    );
+}
+
+#[gpui::test]
+fn your_phones_lists_only_phones_and_the_last_phone_ignores_web_rows(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.mobile = Some(monocode_core::mobile::Status {
+            devices: vec![device("w1", Permission::Control), phone(None)],
+            ..Default::default()
+        });
+    });
+    assert!(visual.debug_bounds("mobile-remove-ph1").is_some());
+    assert!(visual.debug_bounds("mobile-remove-w1").is_none());
+    // The one phone is the last phone though a web row exists: removing it
+    // switches mobile access off.
+    click(visual, "mobile-remove-ph1");
+    click(visual, "mobile-confirm-remove");
+    assert_eq!(
+        events(&window, visual),
+        ["mobile-revoke:ph1", "mobile-configure:false"]
     );
 }
 

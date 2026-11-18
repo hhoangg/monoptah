@@ -125,6 +125,8 @@ fn parse_permission(value: &Value) -> Option<Permission> {
     }
 }
 
+const UNREACHABLE: &str = "Cannot reach the web server";
+
 struct Answer {
     status: u16,
     body: Value,
@@ -160,7 +162,7 @@ fn call(
     let response = match result {
         Ok(response) => response,
         Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(_)) => return Err("Cannot reach the web server".into()),
+        Err(ureq::Error::Transport(_)) => return Err(UNREACHABLE.into()),
     };
     let status = response.status();
     let retry_after = response
@@ -244,7 +246,16 @@ pub fn pair_start(
 /// `POST /api/pair/poll`. A 429 counts as `slow_down`.
 pub fn pair_poll(base: &str, device_code: &str, verifier: &str) -> Result<PollOutcome, String> {
     let body = json!({"deviceCode": device_code, "verifier": verifier});
-    let answer = call("POST", base, "/api/pair/poll", None, Some(&body), TIMEOUT)?;
+    // A blip (no answer, or a 5xx from the edge) must not end a pairing the
+    // user may just have approved: keep polling until the code expires.
+    let answer = match call("POST", base, "/api/pair/poll", None, Some(&body), TIMEOUT) {
+        Ok(answer) => answer,
+        Err(error) if error == UNREACHABLE => return Ok(PollOutcome::Pending),
+        Err(error) => return Err(error),
+    };
+    if answer.status >= 500 {
+        return Ok(PollOutcome::Pending);
+    }
     if answer.status == 429 {
         return Ok(PollOutcome::SlowDown {
             retry_after: answer.retry_after,
