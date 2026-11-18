@@ -142,6 +142,14 @@ const SCREENS: Record<string, string> = {
   // W-08 (WS-T): the new-session page.
   "/d/dk1/p/p1/new": "New session",
   "/d/:desktopId/p/:projectId/new": "New session",
+  // W-04 (WS-M): the desktops list, a desktop the account does not have, and the key verify page.
+  // `/` redirects to the desktops list when there is no last place.
+  "/": "Desktops",
+  "/desktops": "Desktops",
+  "/desktops/dk1": "Desktop not found",
+  "/desktops/:id": "Desktop not found",
+  "/desktops/dk1/verify": "Verify desktop",
+  "/desktops/:id/verify": "Verify desktop",
   // The default test account is a member, so the admin routes show their guard screen (U-04).
   "/admin": "Not available",
   "/admin/users": "Not available",
