@@ -390,6 +390,11 @@ describe("project screen wide layout (F-18, design-system.md section 11)", () =>
     // One h1 only, and no button that points at the page already open.
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
     expect(screen.queryByRole("link", { name: "New session" })).toBeNull();
+    // The split is a fill frame: the list column scrolls on its own and the pane fills the row.
+    expect(split).toHaveClass("min-h-0", "flex-1");
+    expect(split.firstElementChild).toHaveClass("overflow-y-auto");
+    expect(detail).toHaveClass("h-full");
+    expect(screen.getByTestId("workspace-frame")).toHaveClass("h-full");
   });
 
   it("from 1024 px the /new URL shows the same split, so a bookmark or a link still lands on both panes", async () => {

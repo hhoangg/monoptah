@@ -1,5 +1,5 @@
 // F-28: the "Now working" pill, ported from mobile/src/features/sessions/LiveSessions.tsx. One glass pill
-// rests at the bottom of the project screen with the sessions at work: the one in front's agent mark,
+// rests (sticky) at the bottom of the session list column with the sessions at work: the one in front's agent mark,
 // its title and status ("Needs your approval", "Has a question for you"), a Stop button and, with more
 // than one, "2 of 3" with a Skip button. A tap opens the session when there is one, or fans the sessions
 // out above the pill as a row each. Stop is `session.cancel` and is disabled for read-only devices.
@@ -91,7 +91,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
   if (live.length === 0 && finished.length === 0) return null;
   if (live.length === 0) {
     return (
-      <div data-testid="now-working" className="pointer-events-none fixed inset-x-0 bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3">
+      <div data-testid="now-working" className="pointer-events-none sticky bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3 pt-3">
         <FinishedDeck desktopId={desktopId} entries={finished} />
       </div>
     );
@@ -115,7 +115,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
   return (
     <div
       data-testid="now-working"
-      className="pointer-events-none fixed inset-x-0 bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3"
+      className="pointer-events-none sticky bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3 pt-3"
     >
       <FinishedDeck desktopId={desktopId} entries={finished} />
       {expanded ? (

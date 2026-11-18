@@ -16,12 +16,12 @@ export interface SectionLink {
 export function SettingsLayout({ children, className, sections }: { children: ReactNode; className?: string; sections?: readonly SectionLink[] }) {
   const gutters = "px-[max(1.25rem,env(safe-area-inset-left))] pr-[max(1.25rem,env(safe-area-inset-right))]";
   if (!sections) {
-    return <div className={cn("mx-auto flex w-full max-w-[760px] flex-col gap-6 pt-6 pb-4 sm:pt-10", gutters, className)}>{children}</div>;
+    return <div className={cn("mx-auto flex w-full max-w-[760px] flex-col gap-6 pt-6 pb-[calc(env(safe-area-inset-bottom)+1rem)] sm:pt-10", gutters, className)}>{children}</div>;
   }
   return (
-    <div className={cn("mx-auto w-full max-w-[760px] pt-6 pb-4 sm:pt-10 lg:grid lg:max-w-[1040px] lg:grid-cols-[11rem_minmax(0,760px)] lg:gap-10", gutters)}>
+    <div className={cn("mx-auto w-full max-w-[760px] pt-6 pb-[calc(env(safe-area-inset-bottom)+1rem)] sm:pt-10 lg:grid lg:max-w-[1040px] lg:grid-cols-[11rem_minmax(0,760px)] lg:gap-10", gutters)}>
       <aside className="hidden lg:block">
-        <div className="sticky top-10">
+        <div className="sticky top-[calc(env(safe-area-inset-top)+3.5rem)]">
           <SectionIndex sections={sections} orientation="column" />
         </div>
       </aside>
@@ -43,16 +43,27 @@ function useActiveSection(ids: readonly string[]): [string | undefined, (id: str
           if (entry.isIntersecting) visible.add(entry.target.id);
           else visible.delete(entry.target.id);
         }
-        const first = key.split("|").find((id) => visible.has(id));
+        const ids = key.split("|");
+        const atBottom = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2;
+        const first = atBottom && window.scrollY > 0 ? ids[ids.length - 1] : ids.find((id) => visible.has(id));
         if (first) setActive(first);
       },
-      { rootMargin: "0px 0px -60% 0px" },
+      { rootMargin: "-3.5rem 0px -60% 0px" },
     );
+    // The last area can be too short to reach the observed band: the bottom of the page then selects it.
+    const onScroll = () => {
+      const ids = key.split("|");
+      if (window.scrollY > 0 && window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) setActive(ids[ids.length - 1]);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
     for (const id of key.split("|")) {
       const node = document.getElementById(id);
       if (node) observer.observe(node);
     }
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("scroll", onScroll);
+    };
   }, [key]);
   return [active, setActive];
 }

@@ -208,7 +208,7 @@ export function ProjectScreen({
   );
 
   return (
-    <WorkspaceFrame desktopId={desktopId} title={project?.name ?? "Project"} subtitle={project?.path} actions={missing ? null : newSession}>
+    <WorkspaceFrame desktopId={desktopId} title={project?.name ?? "Project"} subtitle={project?.path} actions={missing ? null : newSession} fill={split}>
       {wide ? null : (
         <div className="-mx-4 min-[24rem]:-mx-5">
           <ProjectBar variant="bar" />
@@ -225,8 +225,8 @@ export function ProjectScreen({
           </Button>
         </section>
       ) : (
-        <div className={split ? "grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-6" : undefined} data-testid={split ? "project-split" : undefined}>
-          <div className="min-w-0">
+        <div className={split ? "grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] grid-rows-[minmax(0,1fr)] gap-6" : undefined} data-testid={split ? "project-split" : undefined}>
+          <div className={split ? "min-h-0 min-w-0 overflow-y-auto pb-6" : "min-w-0"}>
           {project ? (
             <div className="pb-2">
               <WorkspaceMenu
@@ -248,7 +248,7 @@ export function ProjectScreen({
           <NowWorking desktopId={desktopId} projectId={projectId} readOnly={readOnly} />
           </div>
           {split ? (
-            <section ref={detailRef} aria-label="New session" data-testid="project-split-detail" className="flex min-h-0 min-w-0 flex-col" />
+            <section ref={detailRef} aria-label="New session" data-testid="project-split-detail" className="flex h-full min-h-0 min-w-0 flex-col" />
           ) : null}
         </div>
       )}
