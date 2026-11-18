@@ -1,7 +1,9 @@
 // A document a Mono wrote (F-72), read through `mono.document`. Its text is rendered as Markdown (an AST,
-// no HTML sink). A visual document (HTML) is never rendered here: it opens on the desktop.
+// no HTML sink). A visual document is drawn by the SVG renderer from its `tree`; HTML is never rendered here.
 import { useLinkQuery } from "@/data";
 import { Markdown } from "@/features/markdown/Markdown";
+import { readDocument } from "@/features/monos/profile";
+import { VisualTree, parseVisualTree } from "@/features/visuals/VisualTree";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
@@ -21,12 +23,16 @@ export function DocumentDialog({ document, onClose }: { document: DocumentItem |
 }
 
 function DocumentBody({ document }: { document: DocumentItem }) {
-  const visual = document.kind === "html" || document.kind === "visual";
-  const query = useLinkQuery("mono.document", { documentId: document.documentId }, { enabled: !visual });
-  if (visual) return <Notice variant="info">This is a visual document. Open it on your desktop to see it.</Notice>;
+  const query = useLinkQuery("mono.document", { documentId: document.documentId });
   if (query.isError) return <Notice variant="error">Could not load this document.</Notice>;
-  if (!query.data) return <DelayedSpinner label="Loading the document" />;
-  const text = typeof query.data.text === "string" ? query.data.text : typeof query.data.content === "string" ? query.data.content : null;
-  if (text === null) return <Notice variant="info">Open this document on your desktop to read it.</Notice>;
-  return <Markdown text={text} />;
+  const loaded = query.data === undefined ? null : readDocument(query.data);
+  if (!loaded) return <DelayedSpinner label="Loading the document" />;
+  // The desktop sends `body` (Markdown) and, for a visual, `tree` (its component tree), as the Mono page reads them.
+  const tree = parseVisualTree(loaded.tree);
+  if (tree) return <VisualTree node={tree} />;
+  if (loaded.kind === "html" || loaded.kind === "visual" || document.kind === "html" || document.kind === "visual") {
+    return <Notice variant="info">{loaded.treeError ?? "This is a visual document. Open it on your desktop to see it."}</Notice>;
+  }
+  if (loaded.body === "") return <Notice variant="info">Open this document on your desktop to read it.</Notice>;
+  return <Markdown text={loaded.body} />;
 }

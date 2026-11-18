@@ -615,6 +615,14 @@ Contrast measured with WCAG relative luminance on the real tokens (background `#
 
 Implement the override as `:root[data-scheme="light"] { --muted: #666666; --content-a35: var(--content-a72); --content-a40: var(--content-a72); --content-a45: var(--content-a72); --content-a50: var(--content-a72); ... }` with an added `--content-a72` step, and `:root[data-scheme="dark"] { --content-a35: var(--content-a50); --content-a40: var(--content-a50); --content-a45: var(--content-a50); }`. Non-text strokes (`stroke`, `rail`) stay as is (decorative); interactive component boundaries rely on `stroke` plus a state change, and selection is never color-only (check marks, filled radio, active background).
 
+As built, the override is three layers, all in CSS variables so components never branch on the scheme:
+
+1. `src/styles/tokens.css`, `:root[data-scheme="light"]`: `--muted: #666666` and every text alpha step from `--content-a35` to `--content-a65` points at `--content-a72`. `:root[data-scheme="dark"]`: `--content-a35`, `--content-a40` and `--content-a45` point at `--content-a50`.
+2. `src/features/themes/contrast-overrides.css` (imported after the tokens by `features/themes/register.ts`): dark raises the `--content-a50` floor to `--content-a55`, because `.50` measures 4.4 on `surface` in 5 of 6 themes. No theme or accent needs an override of its own. `contrast.test.ts` measures `tokens.css` plus this file for every theme, scheme and accent with the helpers of `contrast.ts`, so a new theme or token that falls under the minimum fails the test.
+3. `@media (prefers-contrast: more)` in `tokens.css`: `--stroke` becomes `content` at 30% and every content alpha from `--content-a35` to `--content-a85` becomes the full `--content`.
+
+To change a text colour, change the token or the override, never a component. Add a new theme only together with its row in `contrast.test.ts`.
+
 Rules:
 
 - **Focus**: `:focus-visible` outline 2px `accent-color`, offset 2px, on every interactive element; never remove outline without replacement. Inputs show the same ring (outline, not shadow). Mobile has no focus style, web must.

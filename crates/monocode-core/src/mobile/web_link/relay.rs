@@ -230,6 +230,28 @@ pub(crate) fn react(end: End, budget: &mut Budget) -> Step {
     }
 }
 
+/// The WebSocket address to connect to: always the canonical one built from
+/// the host and the desktop id (`wss` for https, lowercase hyphenated id). The
+/// stored string is used only when it is exactly that address; any other form
+/// (an `https` scheme, an upper-case id, a bare host from an older install)
+/// falls back to the canonical one. `base` is the checked HTTP base of `stored`.
+pub(crate) fn connect_url(
+    stored: &str,
+    base: &str,
+    desktop_uuid: &uuid::Uuid,
+) -> Result<String, String> {
+    let canonical = relay_url(
+        base,
+        &desktop_uuid.hyphenated().to_string(),
+        cfg!(debug_assertions),
+    )?;
+    Ok(if stored.trim() == canonical {
+        stored.trim().to_owned()
+    } else {
+        canonical
+    })
+}
+
 /// The client task: connect, serve, react to the close, repeat. Returns only
 /// when the relay refuses the desktop for good or the identity is unusable.
 pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, timing: Timing) {
@@ -237,8 +259,8 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
         link.set(WebState::Off, Some("The web identity is invalid".into()));
         return;
     };
-    // The stored address is a bare host; the full `.../relay/desktop/<id>`
-    // form the server hands out at pairing is reduced to its host too.
+    // The stored address is the full `.../relay/desktop/<id>` form the server
+    // returned at pairing (an older install stored the bare host).
     let base = match desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) {
         Ok(base) => base,
         Err(error) => {
@@ -246,11 +268,7 @@ pub(crate) async fn run(host: MobileHost, link: WebLink, identity: WebIdentity, 
             return;
         }
     };
-    let url = match relay_url(
-        &base,
-        &desktop_uuid.hyphenated().to_string(),
-        cfg!(debug_assertions),
-    ) {
+    let url = match connect_url(&identity.relay_url, &base, &desktop_uuid) {
         Ok(url) => url,
         Err(error) => {
             link.set(WebState::Off, Some(error));
@@ -341,10 +359,19 @@ async fn connect(url: &str, token: &str) -> Result<Socket, End> {
     .await
     {
         Ok(Ok((socket, _))) => Ok(socket),
-        Ok(Err(WsError::Http(response))) if response.status().as_u16() == 401 => {
-            Err(End::Unauthorized)
-        }
+        Ok(Err(WsError::Http(response))) => Err(handshake_end(response.status().as_u16())),
         _ => Err(End::Lost),
+    }
+}
+
+/// How a refused WebSocket handshake ends the attempt: 401 is a revoked
+/// token, 429 is the relay's `slow_down` (the same wait as close 4008), any
+/// other status is a lost connection to retry with backoff.
+pub(crate) fn handshake_end(status: u16) -> End {
+    match status {
+        401 => End::Unauthorized,
+        429 => End::Closed(Some(4008)),
+        _ => End::Lost,
     }
 }
 

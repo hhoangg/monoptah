@@ -50,6 +50,11 @@
     // Which VAPID key the public key above is (stored in push_subscriptions.vapid_key_id, for rotation).
     "VAPID_KEY_ID": "v1",
     "VAPID_SUBJECT": "mailto:admin@zptah.app",
+    // VAPID key rotation only (docs/deploy-runbook.md "VAPID key rotation"): add the OLD public key and its key id
+    // here for the rotation period, and the old private key as the secret VAPID_PREVIOUS_PRIVATE_KEY. Never put a
+    // key in this file that is not public. Remove all three when the rotation ends. Not set normally:
+    //   "VAPID_PREVIOUS_PUBLIC_KEY": "<old public key, base64url>",
+    //   "VAPID_PREVIOUS_KEY_ID": "v1",
     // Registered users for the whole instance, incl. blocked. "0" means unlimited (self-host default).
     "MAX_USERS": "150",
     "MAX_DESKTOPS_PER_USER": "5",
@@ -59,6 +64,7 @@
   // Secrets are NEVER in `vars`. Set each with `wrangler secret put <NAME>` (local dev: web/.dev.vars,
   // git-ignored; web/.dev.vars.example lists them with fake values):
   //   VAPID_PRIVATE_KEY  private half of the VAPID key pair (P-256, base64url)
+  //   VAPID_PREVIOUS_PRIVATE_KEY  (rotation only) private half of the previous pair, removed when the rotation ends
   //   RECOVERY_PEPPER    HMAC key for recovery code hashes (32 random bytes, base64; back it up)
   //   AUDIT_IP_SALT      salt for the IP hashes in audit_log and pairing_requests (32 random bytes, base64)
 }

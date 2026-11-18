@@ -129,7 +129,7 @@ describe("approve and deny", () => {
     const { desktopId, name } = (await res.json()) as { desktopId: string; name: string };
     expect(name).toBe("Studio");
     const desktop = await env.DB.prepare("SELECT * FROM desktops WHERE id = ?").bind(desktopId).first<Record<string, unknown>>();
-    expect(desktop).toMatchObject({ user_id: account.user.id, name: "Studio", os: "linux", public_key: pairing.publicKey, app_version: null, revoked_at: null });
+    expect(desktop).toMatchObject({ user_id: account.user.id, name: "Studio", os: "linux", public_key: pairing.publicKey, app_version: "1.0.0", revoked_at: null });
     expect(desktop?.fingerprint).toBe(await sha256HexBytes(pairing.publicKeyBytes));
     const row = await pairingRow(pairing.deviceCode);
     expect(row).toMatchObject({ status: "approved", user_id: account.user.id, desktop_id: desktopId });

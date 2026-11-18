@@ -10,7 +10,7 @@
 // The owner marker is only the opaque user id in localStorage (not a secret); a cleared marker means
 // "unknown owner", which wipes on the next sign-in. Never throws.
 import { clearPersistedCache } from "@/data";
-import { forgetPushLocally } from "@/features/push/subscribe";
+import { forgetPushLocally, resubscribeIfVapidKeyChanged } from "@/features/push/subscribe";
 import { clearPauseRecord } from "@/features/push/pauseRecord";
 import { loadPushState } from "@/sw/pushState";
 
@@ -57,6 +57,7 @@ export async function bindDeviceToUser(userId: string): Promise<void> {
     // Same owner: a push state of another account (or of an old build) still has to go.
     const push = await loadPushState().catch(() => null);
     if (push && push.userId !== userId) await forgetPushLocally();
+    else if (push) void resubscribeIfVapidKeyChanged(userId);
   } catch {
     // Nothing more to do.
   }

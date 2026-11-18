@@ -1,16 +1,26 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  AckRecoveryBody,
   API_AUTH,
   API_MODULES,
   API_ROUTES,
   ApiErrorSchema,
   CreateInviteResponse,
   HealthResponse,
+  MAX_INVITE_INPUT,
+  MAX_RECOVERY_CODE_INPUT,
+  MAX_TRANSPORT_INPUT,
+  MAX_TRANSPORTS_INPUT,
+  LogoutBody,
+  MeResponse,
   PairPollResponse,
   PairStartBody,
   PushNotifyBody,
   PushPayloadSchema,
+  RecoverBody,
+  RegisterOptionsBody,
+  RegisterVerifyBody,
   RegisterVerifyResponse,
   findRoute,
   routesOfModule,
@@ -148,8 +158,8 @@ describe("schemas", () => {
 
   it("registration returns exactly 10 recovery codes", () => {
     const user = { id: "u1", handle: "alice", displayName: "Alice", role: "user" };
-    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: Array(10).fill("abcd-abcd-abcd-abcd") }).success).toBe(true);
-    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: ["abcd"] }).success).toBe(false);
+    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: Array(10).fill("abcd-abcd-abcd-abcd"), batch: 1 }).success).toBe(true);
+    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: ["abcd"], batch: 1 }).success).toBe(false);
     expect(CreateInviteResponse.shape.code).toBeDefined();
   });
 
@@ -175,5 +185,40 @@ describe("rate limit groups (security.md 3.5)", () => {
       "POST /api/pair/poll": "pair-poll",
       "POST /api/push/notify": "push-notify",
     });
+  });
+});
+
+describe("outer input bounds and the Me contract (fix-up point 8)", () => {
+  it("bounds the recovery code, the invite and the reported transports", () => {
+    expect(RecoverBody.safeParse({ handle: "bob-1", code: "A".repeat(MAX_RECOVERY_CODE_INPUT) }).success).toBe(true);
+    expect(RecoverBody.safeParse({ handle: "bob-1", code: "A".repeat(MAX_RECOVERY_CODE_INPUT + 1) }).success).toBe(false);
+    const options = { handle: "bob-1", displayName: "Bob" };
+    expect(RegisterOptionsBody.safeParse({ ...options, invite: "i".repeat(MAX_INVITE_INPUT) }).success).toBe(true);
+    expect(RegisterOptionsBody.safeParse({ ...options, invite: "i".repeat(MAX_INVITE_INPUT + 1) }).success).toBe(false);
+    const withTransports = (transports: string[]) => RegisterVerifyBody.safeParse({ challengeId: "c", response: { id: "a", type: "public-key", response: { transports } } });
+    expect(withTransports(Array.from({ length: MAX_TRANSPORTS_INPUT }, (_, i) => `t${i}`)).success).toBe(true);
+    expect(withTransports(Array.from({ length: MAX_TRANSPORTS_INPUT + 1 }, (_, i) => `t${i}`)).success).toBe(false);
+    expect(withTransports(["x".repeat(MAX_TRANSPORT_INPUT + 1)]).success).toBe(false);
+  });
+
+  it("MeResponse carries the unused recovery code count", () => {
+    const me = { user: { id: "u", handle: "bob-1", displayName: "Bob", role: "user" }, invitesLeft: 3, recoveryOnly: false, recoveryAckAt: null };
+    expect(MeResponse.safeParse(me).success).toBe(false);
+    expect(MeResponse.safeParse({ ...me, recoveryCodesLeft: 10 }).success).toBe(true);
+    expect(MeResponse.safeParse({ ...me, recoveryCodesLeft: -1 }).success).toBe(false);
+  });
+
+  it("the ack and logout bodies are bounded", () => {
+    expect(AckRecoveryBody.safeParse({ batch: 2 }).success).toBe(true);
+    expect(AckRecoveryBody.safeParse({}).success).toBe(false);
+    expect(AckRecoveryBody.safeParse({ batch: 0 }).success).toBe(false);
+    expect(LogoutBody.safeParse(undefined).success).toBe(true);
+    expect(LogoutBody.safeParse({ deviceId: "d".repeat(64) }).success).toBe(true);
+    expect(LogoutBody.safeParse({ deviceId: "d".repeat(65) }).success).toBe(false);
+  });
+
+  it("registers the ack route as a session route and the device forget as a fresh one", () => {
+    expect(findRoute("POST", "/api/recovery-codes/ack")?.auth).toBe("session");
+    expect(findRoute("DELETE", "/api/devices/:id")?.auth).toBe("fresh");
   });
 });

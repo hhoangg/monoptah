@@ -41,6 +41,17 @@ export function rememberPlace(path: string): void {
   }
 }
 
+/** Remembers `desktopId` as the last used desktop, whatever screen of it is open (settings and cloud included). */
+export function rememberDesktop(desktopId: string): void {
+  const store = storage();
+  if (!desktopId || !store) return;
+  try {
+    store.setItem(LAST_DESKTOP_KEY, desktopId);
+  } catch {
+    // Storage full or blocked: the next visit simply has no last desktop.
+  }
+}
+
 /** The path to restore: the last place of the last used desktop, or that desktop's home; null when none. */
 export function readLastPlace(): string | null {
   const store = storage();

@@ -170,6 +170,7 @@ export const registerVerify: Handler<AppEnv> = async (c) => {
   return respond(c, RegisterVerifyResponse, {
     user: { id: userId, handle, displayName, role: await roleOf(c, userId) },
     recoveryCodes: recovery.codes,
+    batch: 1,
   });
 };
 

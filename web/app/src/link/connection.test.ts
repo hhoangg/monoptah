@@ -6,6 +6,7 @@ import { base64UrlEncode } from "./base64url.ts";
 import {
   BACKOFF_LONG_MS,
   LinkConnection,
+  MAX_WATCH_ENDED_REOPENS,
   backoffDelay,
   planForClose,
   type LinkConnectionDeps,
@@ -13,7 +14,7 @@ import {
 import { DeviceRegistrationError, type DeviceIdentity } from "./device.ts";
 import { DeviceKeyError } from "./keys.ts";
 import { RelayConnectError, RelayConnection } from "./relay.ts";
-import { LinkSession, LinkSessionError } from "./session.ts";
+import { LinkRequestError, LinkSession, LinkSessionError } from "./session.ts";
 import { clearLinkStores, type LinkState, type LinkStatus } from "./store.ts";
 
 const DESKTOP_ID = "11111111-1111-4111-8111-111111111111";
@@ -913,5 +914,153 @@ describe("review fixes: watches on pending", () => {
     expect(r.state().status).toBe("ready");
     expect(opened).toBe(2);
     expect(stops).toBe(1);
+  });
+});
+
+describe("pre-connect grant hook (fix-up point 6a)", () => {
+  it("runs before the relay is joined, with the desktop and device ids", async () => {
+    const calls: string[] = [];
+    const r = rig({
+      deps: {
+        preConnect: async ({ desktopId, deviceId }) => {
+          calls.push(`hook ${desktopId} ${deviceId}`);
+          return "ok";
+        },
+      },
+    });
+    await settle();
+    expect(r.state().status).toBe("ready");
+    expect(calls).toEqual([`hook ${DESKTOP_ID} ${DEVICE_ID}`]);
+  });
+
+  it("runs again before every reconnect", async () => {
+    let runs = 0;
+    const r = await ready({
+      deps: {
+        preConnect: async () => {
+          runs += 1;
+        },
+      },
+    });
+    expect(runs).toBe(1);
+    r.relay.revokeDevice(DEVICE_ID, 1000);
+    await settle(1000);
+    expect(r.state().status).toBe("ready");
+    expect(runs).toBe(2);
+  });
+
+  it("a denied grant blocks as revoked and never opens the relay", async () => {
+    const r = rig({ deps: { preConnect: async () => "denied" } });
+    await settle();
+    expect(r.opens()).toBe(0);
+    expect(r.state()).toMatchObject({ status: "closed", blocked: "revoked", revoked: true });
+    await settle(120_000);
+    expect(r.opens()).toBe(0);
+  });
+
+  it("a failed check retries with backoff and goes on once it passes", async () => {
+    let runs = 0;
+    const r = rig({
+      deps: {
+        preConnect: async () => {
+          runs += 1;
+          if (runs === 1) throw new Error("offline");
+          return "ok";
+        },
+      },
+    });
+    await settle();
+    expect(r.state()).toMatchObject({ status: "reconnecting", lastError: { code: "grant_check" } });
+    expect(r.opens()).toBe(0);
+    await settle(1000);
+    expect(r.state().status).toBe("ready");
+    expect(runs).toBe(2);
+  });
+});
+
+describe("close 4003 never reconnects by itself (fix-up point 6a)", () => {
+  it("stays closed through timers, visibility changes and the network coming back", async () => {
+    const r = await ready();
+    r.relay.revokeDevice(DEVICE_ID, CloseCodes.REVOKED);
+    await settle();
+    expect(r.state()).toMatchObject({ status: "closed", blocked: "revoked", revoked: true });
+    expect(r.opens()).toBe(1);
+    await settle(120_000);
+    setHidden(true);
+    setHidden(false);
+    win.dispatchEvent(new Event("online"));
+    r.clock.now += 200_000;
+    setHidden(true);
+    setHidden(false);
+    await settle(120_000);
+    expect(r.opens()).toBe(1);
+    expect(r.state()).toMatchObject({ status: "closed", blocked: "revoked" });
+  });
+});
+
+describe("a watch that ends is reopened with from (fix-up point 6b)", () => {
+  /** Captures the options of every `LinkSession.watch` so a test can end the watch the way the desktop does. */
+  function captureWatches(silent = false) {
+    const original = LinkSession.prototype.watch;
+    const opened: Array<{ params: Record<string, unknown>; onError: (error: LinkRequestError) => void }> = [];
+    vi.spyOn(LinkSession.prototype, "watch").mockImplementation(async function (this: LinkSession, ...args: Parameters<LinkSession["watch"]>) {
+      opened.push({ params: args[1] as Record<string, unknown>, onError: (error) => args[3]?.onError?.(error) });
+      // A silent desktop acknowledges the watch and never sends a frame.
+      if (silent) return { stop: () => undefined } as unknown as Awaited<ReturnType<LinkSession["watch"]>>;
+      return original.apply(this, args);
+    });
+    return opened;
+  }
+
+  it("reopens on 'Watch ended' with the params of reopenParams, which carry from, and reports nothing", async () => {
+    const opened = captureWatches();
+    const r = await ready();
+    let from = "";
+    const errors: string[] = [];
+    r.connection.registerWatch({
+      method: "conversation.watch",
+      reopenParams: () => ({ conversationId: "sess-local-approval", ...(from ? { from } : {}) }),
+      onFrame: () => undefined,
+      onError: (error) => errors.push(error.message),
+    });
+    await settle();
+    expect(opened).toHaveLength(1);
+    expect(opened[0]!.params).not.toHaveProperty("from");
+
+    from = "turn-7";
+    opened[0]!.onError(new LinkRequestError("Watch ended"));
+    await settle();
+    expect(opened).toHaveLength(2);
+    expect(opened[1]!.params).toMatchObject({ conversationId: "sess-local-approval", from: "turn-7" });
+    expect(errors).toEqual([]);
+    expect(r.opens()).toBe(1);
+  });
+
+  it("does not reopen on another error, and reports a watch that keeps ending without a frame", async () => {
+    const opened = captureWatches(true);
+    const r = await ready();
+    const errors: string[] = [];
+    r.connection.registerWatch({
+      method: "conversation.watch",
+      reopenParams: () => ({ conversationId: "sess-local-approval" }),
+      onFrame: () => undefined,
+      onError: (error) => errors.push(error.message),
+    });
+    await settle();
+    opened[0]!.onError(new LinkRequestError("Too many open watches", "busy"));
+    await settle();
+    expect(opened).toHaveLength(1);
+    expect(errors).toEqual(["Too many open watches"]);
+
+    errors.length = 0;
+    for (let i = 0; i < 10; i += 1) {
+      const last = opened[opened.length - 1]!;
+      last.onError(new LinkRequestError("Watch ended"));
+      await settle();
+    }
+    // The first open plus MAX_WATCH_ENDED_REOPENS reopens, then the error is handed to the owner.
+    expect(opened).toHaveLength(1 + MAX_WATCH_ENDED_REOPENS);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.every((message) => message === "Watch ended")).toBe(true);
   });
 });

@@ -1,12 +1,25 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { setApiTransport } from "@/features/accounts/api";
+import { createFakeServer, desktop } from "@/features/desktops/testServer";
+import { LAST_DESKTOP_KEY, lastPlaceKey } from "@/features/sessions/lastPlace";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { registerLastPlaceResolver, resolveLastPlace } from "./lastPlace";
 
-afterEach(() => registerLastPlaceResolver());
+let restoreApi: (() => void) | undefined;
+beforeEach(() => {
+  localStorage.clear();
+  // The account holds one desktop, dk1 (`/` checks the last used desktop against the account's list).
+  restoreApi = setApiTransport(createFakeServer({ desktops: [desktop({ id: "dk1" })] }).transport);
+});
+afterEach(() => {
+  restoreApi?.();
+  localStorage.clear();
+  registerLastPlaceResolver();
+});
 
 function renderAt(url: string) {
   const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }) });
@@ -39,6 +52,27 @@ describe("last place registry", () => {
 });
 
 describe("/ redirect", () => {
+  it("drops a last used desktop that is no longer in the account and goes to /desktops (N-12)", async () => {
+    localStorage.setItem(LAST_DESKTOP_KEY, "gone");
+    localStorage.setItem(lastPlaceKey("gone"), "/d/gone/s/s9");
+    registerLastPlaceResolver(() => "/d/gone/s/s9");
+    const router = renderAt("/");
+    await screen.findByRole("heading", { level: 1, name: "Desktops" });
+    expect(router.state.location.pathname).toBe("/desktops");
+    expect(localStorage.getItem(LAST_DESKTOP_KEY)).toBeNull();
+    expect(localStorage.getItem(lastPlaceKey("gone"))).toBeNull();
+  });
+
+  it("still goes to the last place when the desktop list cannot be loaded", async () => {
+    restoreApi?.();
+    restoreApi = setApiTransport(async () => {
+      throw new Error("offline");
+    });
+    registerLastPlaceResolver(() => "/d/dk1/s/s9");
+    const router = renderAt("/");
+    await waitFor(() => expect(router.state.location.pathname).toBe("/d/dk1/s/s9"));
+  });
+
   it("goes to /desktops when there is no last place", async () => {
     const router = renderAt("/");
     await screen.findByRole("heading", { level: 1, name: "Desktops" });

@@ -10,9 +10,8 @@
 // A right panel belongs to a project: it shows only on that project's screens (`p/$projectId/...` and the
 // sessions of that project).
 // The shell also mounts the global shortcuts (shortcuts.ts), the command palette (F-15), the project bar (from
-// 640px, in the sidebar foot or, on the screens with their own sidebar, above the page: toggles Files, Changes and
-// Git and opens the background picker) and the background dialog.
-import { useParams, useRouterState } from "@tanstack/react-router";
+// 640px, in the sidebar foot: toggles Files, Changes and Git and opens the background picker) and the background dialog.
+import { useParams } from "@tanstack/react-router";
 import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { useCatalog } from "@/data";
 import { WorkspaceNav } from "@/features/sessions/WorkspaceNav";
@@ -25,7 +24,6 @@ import { openCommandPalette } from "./palette";
 import { setPanelScope } from "./panels";
 import { ProjectBar } from "./ProjectBar";
 import { RightPanel, type PanelMode } from "./RightPanel";
-import { routeHasOwnSidebar } from "./shellRoutes";
 import { isMac, useGlobalShortcuts } from "./shortcuts";
 import { Splitter } from "./Splitter";
 
@@ -34,9 +32,6 @@ const DESKTOP_QUERY = "(min-width: 1024px)";
 
 /** The sticky offset the WS-T sidebar uses below the 2.75rem bar. */
 const STICKY = "sticky top-[calc(2.75rem+env(safe-area-inset-top))] h-[calc(100dvh-2.75rem-env(safe-area-inset-top))]";
-
-/** The width of the sidebar WS-T's `WorkspaceFrame` draws itself (`w-80`) on the screens that own one. */
-const FRAME_SIDEBAR_WIDTH = 320;
 
 const barButton =
   "inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill text-content hover:bg-selection pointer-fine:size-9";
@@ -130,7 +125,6 @@ function useCurrentScope(): { projectId: string | null; targetKind: string | nul
 }
 
 function Shell({ desktopId, children }: { desktopId: string; children?: ReactNode }) {
-  const pathname = useRouterState({ select: (state) => state.location.pathname });
   const wide = useMediaQuery(TABLET_QUERY);
   const desktop = useMediaQuery(DESKTOP_QUERY);
   const viewport = useViewportWidth();
@@ -143,16 +137,14 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
     return () => setPanelScope(null);
   }, [desktopId, projectId, targetKind]);
 
-  const sidebar = wide && !routeHasOwnSidebar(pathname);
-  const dockMax = desktop ? dockedPanelMax(viewport, sidebar ? sidebarWidth : FRAME_SIDEBAR_WIDTH) : null;
+  const dockMax = desktop ? dockedPanelMax(viewport, sidebarWidth) : null;
   const mode: PanelMode = !wide ? "sheet" : dockMax !== null ? "docked" : "overlay";
 
   return (
     <>
       <div data-testid="app-shell" data-layout={!wide ? "mobile" : desktop ? "desktop" : "tablet"} className="flex w-full">
-        {sidebar ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
+        {wide ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
         <div className="@container min-w-0 flex-1">
-          {wide && !sidebar ? <ProjectBar /> : null}
           {children}
         </div>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}

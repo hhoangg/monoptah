@@ -19,7 +19,7 @@ use super::frame::{
 };
 use super::noise::{fingerprint, is_low_order, Responder, Transport};
 use crate::mobile::host::Device;
-use crate::mobile::policy::{self, DeviceKind};
+use crate::mobile::policy::{self, DeviceKind, PolicyFlags};
 
 /// Channels one device may hold at once (architecture 4.4).
 pub const MAX_CHANNELS_PER_DEVICE: usize = 4;
@@ -409,7 +409,12 @@ impl SessionTable {
     }
 
     fn state_message(&self, mode: &Mode) -> Value {
-        let capabilities = policy::capabilities(&policy::flags());
+        self.state_message_with(mode, &policy::flags())
+    }
+
+    /// `state_message` for the given toggles: the capabilities follow them.
+    fn state_message_with(&self, mode: &Mode, flags: &PolicyFlags) -> Value {
+        let capabilities = policy::capabilities(flags);
         let desktop = json!({ "name": self.desktop_name, "version": self.desktop_version });
         match mode {
             Mode::Ready(device) => json!({
@@ -833,6 +838,25 @@ mod tests {
         assert_eq!(device.kind, DeviceKind::Web);
         assert_eq!(envelope, &req);
         assert_eq!(h.table.live_channels(&dev.fp()), vec![key]);
+    }
+
+    #[test]
+    fn the_state_message_advertises_the_capabilities_of_the_toggles() {
+        let h = h();
+        let flags = PolicyFlags {
+            remote_git_push: true,
+            ..PolicyFlags::default()
+        };
+        let pending = Mode::Pending { since: 0 };
+        assert_eq!(
+            h.table.state_message_with(&pending, &flags)["capabilities"],
+            json!(["cloud", "gitPush"])
+        );
+        assert_eq!(
+            h.table
+                .state_message_with(&pending, &PolicyFlags::default())["capabilities"],
+            json!(["cloud"])
+        );
     }
 
     #[test]

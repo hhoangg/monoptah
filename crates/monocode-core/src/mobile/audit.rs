@@ -19,6 +19,26 @@ const MAX_BYTES: u64 = 5 * 1024 * 1024;
 const KEEP: usize = 5;
 /// Fingerprint characters written.
 const FINGERPRINT_CHARS: usize = 8;
+/// Longest value written for each field, in characters. A device chooses
+/// these strings, so an unbounded line would let it push every earlier record
+/// out of the rotation (security finding M1).
+const METHOD_CHARS: usize = 64;
+const ID_CHARS: usize = 128;
+const PATH_CHARS: usize = 1024;
+const DETAIL_CHARS: usize = 256;
+
+/// `text` cut to `max` characters (never inside one) with control characters
+/// replaced, so a line stays short and readable.
+fn capped(text: &str, max: usize) -> String {
+    text.chars()
+        .take(max)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+fn capped_opt(text: &Option<String>, max: usize) -> Option<String> {
+    text.as_deref().map(|text| capped(text, max))
+}
 
 /// How a request reached the desktop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +121,50 @@ pub struct AuditEvent {
     pub project_id: Option<String>,
     pub outcome: Outcome,
     pub command_id: Option<String>,
+    /// The call is not a read once its parameters are looked at (a
+    /// `mono.file` carrying `text` is a save), so it is written when it
+    /// succeeds.
+    pub writes: bool,
+    /// The call was admitted and reached the app, which answered it. Set by
+    /// the host after the call; a refusal in the core leaves it false.
+    pub from_app: bool,
+}
+
+impl AuditEvent {
+    /// The event of a request: only the method and the ids, never the
+    /// parameters or their content. The host builds every call's event here.
+    pub fn for_call(
+        fingerprint: &str,
+        transport: Transport,
+        method: &str,
+        request: &Value,
+    ) -> Self {
+        Self {
+            fingerprint_prefix: prefix(fingerprint),
+            transport,
+            method: method.into(),
+            project_id: request["params"]["projectId"].as_str().map(Into::into),
+            outcome: Outcome::Ok,
+            command_id: request["id"].as_str().map(Into::into),
+            writes: !matches!(
+                policy::classify(method, &request["params"]),
+                Some(Access::Read)
+            ),
+            from_app: false,
+        }
+    }
+}
+
+/// A file read to record: the device's fingerprint, where, what and how it
+/// ended.
+#[derive(Clone, Copy)]
+pub struct FileRead<'a> {
+    pub fingerprint: &'a str,
+    pub project_id: Option<&'a str>,
+    pub path: &'a str,
+    pub command_id: Option<&'a str>,
+    pub transport: Transport,
+    pub outcome: Outcome,
 }
 
 /// Methods whose class depends on parameters `record` does not get. They are
@@ -121,13 +185,28 @@ fn should_write(event: &AuditEvent) -> bool {
     if event.outcome != Outcome::Ok {
         return true;
     }
-    if param_dependent(&event.method) {
+    if param_dependent(&event.method) || event.writes {
         return true;
     }
     !matches!(
         policy::classify(&event.method, &Value::Null),
         Some(Access::Read)
     )
+}
+
+/// A file read is written once, by the app, with its path and the outcome the
+/// deny-list gave. The host's own line for it would be a second one, so it is
+/// dropped when the app has answered (`ok`, or a refusal the app words:
+/// `not_selected`, `path_denied`, `unsupported_target`). A refusal from the
+/// core before the app, and any other failure, still write theirs.
+fn written_by_the_app(event: &AuditEvent) -> bool {
+    event.method == "project.file"
+        && event.from_app
+        && matches!(
+            event.outcome,
+            Outcome::Ok
+                | Outcome::Denied(Code::NotSelected | Code::PathDenied | Code::UnsupportedTarget)
+        )
 }
 
 fn now_ms() -> u64 {
@@ -173,43 +252,51 @@ impl Log {
 
     /// Writes the call when it is worth keeping (see [`should_write`]).
     pub fn record(&self, device: &DeviceContext, event: &AuditEvent) {
-        if !should_write(event) {
+        if !should_write(event) || written_by_the_app(event) {
             return;
         }
-        self.append(&json!({
+        // A method the table does not know is device-chosen text: its name is
+        // kept short, in `detail`, and the method says only that it is unknown.
+        let known = policy::classify(&event.method, &Value::Null).is_some();
+        let mut line = json!({
             "ts": now_ms(),
-            "deviceId": device.id,
+            "deviceId": capped(&device.id, ID_CHARS),
             "fingerprint": prefix(&event.fingerprint_prefix),
             "transport": event.transport.as_str(),
             "event": "call",
-            "method": event.method,
-            "projectId": event.project_id,
+            "method": if known { capped(&event.method, METHOD_CHARS) } else { "unknown".into() },
+            "projectId": capped_opt(&event.project_id, ID_CHARS),
             "outcome": event.outcome.text(),
-            "commandId": event.command_id,
-        }));
+            "commandId": capped_opt(&event.command_id, ID_CHARS),
+        });
+        if !known {
+            line["detail"] = capped(&event.method, METHOD_CHARS).into();
+        }
+        self.append(&line);
     }
 
-    /// A file read, the one event that carries a path.
-    pub fn record_file_read(
-        &self,
-        device: &DeviceContext,
-        project_id: Option<&str>,
-        path: &str,
-        command_id: Option<&str>,
-        transport: Transport,
-        outcome: Outcome,
-    ) {
+    /// A file read, the one event that carries a path. The app writes it, with
+    /// the outcome the deny-list gave; see [`written_by_the_app`].
+    pub fn record_file_read(&self, device: &DeviceContext, read: &FileRead) {
+        let FileRead {
+            fingerprint,
+            project_id,
+            path,
+            command_id,
+            transport,
+            outcome,
+        } = *read;
         self.append(&json!({
             "ts": now_ms(),
-            "deviceId": device.id,
-            "fingerprint": "",
+            "deviceId": capped(&device.id, ID_CHARS),
+            "fingerprint": prefix(fingerprint),
             "transport": transport.as_str(),
             "event": "call",
             "method": "project.file",
-            "projectId": project_id,
+            "projectId": project_id.map(|id| capped(id, ID_CHARS)),
             "outcome": outcome.text(),
-            "commandId": command_id,
-            "path": path,
+            "commandId": command_id.map(|id| capped(id, ID_CHARS)),
+            "path": capped(path, PATH_CHARS),
         }));
     }
 
@@ -223,7 +310,7 @@ impl Log {
     ) {
         let mut line = json!({
             "ts": now_ms(),
-            "deviceId": device_id,
+            "deviceId": capped(device_id, ID_CHARS),
             "fingerprint": prefix(fingerprint),
             "transport": transport.as_str(),
             "event": kind.as_str(),
@@ -233,7 +320,7 @@ impl Log {
             "commandId": null,
         });
         if let Some(detail) = detail {
-            line["detail"] = detail.into();
+            line["detail"] = capped(detail, DETAIL_CHARS).into();
         }
         self.append(&line);
     }
@@ -289,28 +376,10 @@ pub fn record(device: &DeviceContext, event: &AuditEvent) {
 }
 
 /// Records a file read with the requested path, the only place a path is
-/// logged. The outcome is `ok` here; see [`record_file_read_with`].
-pub fn record_file_read(
-    device: &DeviceContext,
-    project_id: Option<&str>,
-    path: &str,
-    command_id: Option<&str>,
-    transport: Transport,
-) {
-    record_file_read_with(device, project_id, path, command_id, transport, Outcome::Ok);
-}
-
-/// [`record_file_read`] with the outcome the read had.
-pub fn record_file_read_with(
-    device: &DeviceContext,
-    project_id: Option<&str>,
-    path: &str,
-    command_id: Option<&str>,
-    transport: Transport,
-    outcome: Outcome,
-) {
+/// logged, the outcome the read had and the device's fingerprint.
+pub fn record_file_read_with(device: &DeviceContext, read: &FileRead) {
     if let Some(log) = global() {
-        log.record_file_read(device, project_id, path, command_id, transport, outcome);
+        log.record_file_read(device, read);
     }
 }
 
@@ -325,6 +394,33 @@ pub fn record_lifecycle(
     if let Some(log) = global() {
         log.record_lifecycle(kind, device_id, fingerprint, transport, detail);
     }
+}
+
+/// Holds the process-wide log on a test's directory; dropping it switches the
+/// log off again, so later tests neither write into a deleted directory nor
+/// recreate it.
+#[cfg(test)]
+pub(crate) struct TestLog(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for TestLog {
+    fn drop(&mut self) {
+        if let Ok(mut log) = LOG.lock() {
+            *log = None;
+        }
+    }
+}
+
+/// Points the process-wide log at `dir` until the guard drops. Tests that read
+/// the log back take turns here, so one cannot redirect another's lines.
+/// Lines of tests that do not take a turn can still land in `dir`: filter by
+/// the device's own fingerprint.
+#[cfg(test)]
+pub(crate) fn test_log(dir: &Path) -> TestLog {
+    static TURN: Mutex<()> = Mutex::new(());
+    let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    init(dir);
+    TestLog(turn)
 }
 
 /// The newest `limit` lines of the log in `dir`, newest first, across the
@@ -371,6 +467,8 @@ mod tests {
             project_id: Some("p1".into()),
             outcome,
             command_id: Some("c1".into()),
+            writes: false,
+            from_app: false,
         }
     }
 
@@ -439,17 +537,114 @@ mod tests {
         let log = Log::new(dir.path());
         log.record_file_read(
             &device(),
-            Some("p1"),
-            "src/main.rs",
-            Some("c9"),
-            Transport::Quic,
-            Outcome::Denied(Code::PathDenied),
+            &FileRead {
+                fingerprint: "abcdef0123456789",
+                project_id: Some("p1"),
+                path: "src/main.rs",
+                command_id: Some("c9"),
+                transport: Transport::Quic,
+                outcome: Outcome::Denied(Code::PathDenied),
+            },
         );
         let line = &lines(dir.path())[0];
         assert_eq!(line["method"], "project.file");
         assert_eq!(line["path"], "src/main.rs");
         assert_eq!(line["transport"], "quic");
         assert_eq!(line["outcome"], "denied:path_denied");
+        assert_eq!(line["fingerprint"], "abcdef01");
+    }
+
+    #[test]
+    fn a_file_read_writes_one_line_not_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        // The host's line for what the app already wrote is dropped.
+        for outcome in [
+            Outcome::Ok,
+            Outcome::Denied(Code::PathDenied),
+            Outcome::Denied(Code::NotSelected),
+        ] {
+            let mut answered = event("project.file", outcome);
+            answered.from_app = true;
+            log.record(&device(), &answered);
+        }
+        assert!(lines(dir.path()).is_empty());
+        // A refusal the core made before the app (the request never reached
+        // it, so nothing else writes a line), and a failure, still write.
+        log.record(
+            &device(),
+            &event("project.file", Outcome::Denied(Code::NotSelected)),
+        );
+        assert_eq!(lines(dir.path()).len(), 1);
+        assert_eq!(lines(dir.path())[0]["outcome"], "denied:not_selected");
+        let mut revoked = event("project.file", Outcome::Denied(Code::Revoked));
+        revoked.from_app = true;
+        log.record(&device(), &revoked);
+        log.record(&device(), &event("project.file", Outcome::Error));
+        assert_eq!(lines(dir.path()).len(), 3);
+    }
+
+    #[test]
+    fn a_mono_file_save_is_written_and_a_read_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        let call = |params: Value| {
+            let request = json!({"id": "c", "params": params});
+            AuditEvent::for_call("abcdef0123456789", Transport::Quic, "mono.file", &request)
+        };
+        log.record(&device(), &call(json!({"monoId": "m", "file": "soul"})));
+        assert!(lines(dir.path()).is_empty());
+        log.record(
+            &device(),
+            &call(json!({"monoId": "m", "file": "soul", "text": "x"})),
+        );
+        let written = lines(dir.path());
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0]["method"], "mono.file");
+        assert_eq!(written[0]["outcome"], "ok");
+        assert!(!fs::read_to_string(dir.path().join(FILE))
+            .unwrap()
+            .contains("\"x\""));
+    }
+
+    #[test]
+    fn device_chosen_text_is_capped_and_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        let long = "\u{e9}x".repeat(4_000_000);
+        let mut flood = event(&long, Outcome::Denied(Code::Forbidden));
+        flood.project_id = Some(long.clone());
+        flood.command_id = Some(long.clone());
+        log.record(&device(), &flood);
+        log.record_file_read(
+            &device(),
+            &FileRead {
+                fingerprint: "abcdef0123456789",
+                project_id: Some(&long),
+                path: &"a/\n\u{0}b".repeat(10_000),
+                command_id: Some(&long),
+                transport: Transport::Web,
+                outcome: Outcome::Ok,
+            },
+        );
+        log.record_lifecycle(
+            Lifecycle::PermissionChange,
+            &long,
+            "ab",
+            Transport::Web,
+            Some(&long),
+        );
+        let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.len() < 8 * 1024, "{} bytes", text.len());
+        let all = lines(dir.path());
+        assert_eq!(all.len(), 3);
+        // An unknown method is "unknown", with only its capped name beside it.
+        assert_eq!(all[0]["method"], "unknown");
+        assert_eq!(all[0]["detail"].as_str().unwrap().chars().count(), 64);
+        assert_eq!(all[0]["projectId"].as_str().unwrap().chars().count(), 128);
+        assert_eq!(all[1]["path"].as_str().unwrap().chars().count(), 1024);
+        assert!(!all[1]["path"].as_str().unwrap().contains('\n'));
+        assert_eq!(all[2]["detail"].as_str().unwrap().chars().count(), 256);
     }
 
     #[test]
@@ -513,8 +708,26 @@ mod tests {
         // with the markers where a careless caller would put them.
         let dir = tempfile::tempdir().unwrap();
         let log = Log::new(dir.path());
-        let mut e = event("conversation.send", Outcome::Ok);
-        e.method = "conversation.send".into();
+        // The event is built by the function the host builds every call's
+        // event with, from a request whose parameters hold the markers.
+        let request = json!({
+            "version": 1,
+            "id": "c1",
+            "method": "conversation.send",
+            "params": {
+                "projectId": "p1",
+                "text": "SECRET-MARKER-123",
+                "prompt": "prompt: please do the thing",
+                "nested": {"content": "SECRET-MARKER-123"},
+            },
+        });
+        let e = AuditEvent::for_call(
+            "abcdef0123456789",
+            Transport::Web,
+            "conversation.send",
+            &request,
+        );
+        assert_eq!(e.project_id.as_deref(), Some("p1"));
         log.record(&device(), &e);
         log.record_lifecycle(
             Lifecycle::Connect,
@@ -524,6 +737,7 @@ mod tests {
             None,
         );
         let text = fs::read_to_string(dir.path().join(FILE)).unwrap();
+        assert!(text.contains("conversation.send"));
         for marker in ["SECRET-MARKER-123", "prompt: please do the thing"] {
             assert!(!text.contains(marker));
         }

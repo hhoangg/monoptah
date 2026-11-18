@@ -303,3 +303,20 @@ describe("mock server: pairing (R-03, R-14)", () => {
 });
 
 beforeEach(() => sessionStorage.clear());
+
+describe("mock server: recovery code acknowledgement", () => {
+  it("leaves recoveryAckAt null after registration and regenerate until the ack route runs, like the Worker", async () => {
+    setup({ signedIn: false });
+    await register(SEED_INVITE_CODE);
+    expect((await apiFetch(endpoints.me)).recoveryAckAt).toBeNull();
+    await apiFetch(endpoints.ackRecoveryCodes, { body: { batch: 1 } });
+    expect((await apiFetch(endpoints.me)).recoveryAckAt).toBeGreaterThan(0);
+
+    await reauth();
+    expect((await apiFetch(endpoints.regenerateRecoveryCodes)).batch).toBe(2);
+    await expect(apiFetch(endpoints.ackRecoveryCodes, { body: { batch: 1 } })).rejects.toMatchObject({ status: 409 });
+    const afterRegenerate = await apiFetch(endpoints.me);
+    expect(afterRegenerate.recoveryAckAt).toBeNull();
+    expect(afterRegenerate.recoveryCodesLeft).toBe(10);
+  });
+});

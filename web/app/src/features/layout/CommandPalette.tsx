@@ -101,7 +101,7 @@ export function paletteItems(source: Source, query: string): PaletteItem[] {
 export function CommandPalette({ desktopId }: { desktopId: string }) {
   const open = useCommandPalette((state) => state.open);
   return (
-    <ResponsiveOverlay open={open} onOpenChange={(next) => (next ? openCommandPalette() : closeCommandPalette())} title="Search">
+    <ResponsiveOverlay open={open} onOpenChange={(next) => (next ? openCommandPalette() : closeCommandPalette())} title="Search" fullHeight>
       <PaletteBody desktopId={desktopId} />
     </ResponsiveOverlay>
   );

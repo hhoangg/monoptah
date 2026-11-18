@@ -88,7 +88,34 @@ export const TAB_CHANNEL = (() => {
   return ((bytes[0] ?? 0) << 8) | (bytes[1] ?? 0);
 })();
 
+/**
+ * The pre-connect grant hook: runs before every (re)connect of the relay, once the device is registered and before the
+ * relay is joined. `"denied"` means the server refuses this device for this desktop (a revoked grant, a forgotten
+ * device): the link blocks as `revoked` and does not retry. `"ok"` (or nothing) goes on. A throw is a failed check
+ * (network): the link retries with backoff. The relay stays the authority: a hook that cannot decide returns `"ok"`.
+ */
+export type GrantCheck = "ok" | "denied";
+export type PreConnectHook = (context: { desktopId: string; deviceId: string }) => Promise<GrantCheck | void>;
+
+let preConnectHook: PreConnectHook | null = null;
+
+/** Installs the pre-connect hook of every connection in this tab; returns a function that restores the previous one. */
+export function setPreConnectHook(hook: PreConnectHook | null): () => void {
+  const previous = preConnectHook;
+  preConnectHook = hook;
+  return () => {
+    preConnectHook = previous;
+  };
+}
+
+/** The error text of a watch the desktop ended after it was acknowledged (`web_link/pacer.rs` `WATCH_ENDED`). */
+export const WATCH_ENDED_MESSAGE = "Watch ended";
+/** A watch that ends again and again without delivering a frame in between is reported, not reopened forever. */
+export const MAX_WATCH_ENDED_REOPENS = 3;
+
 export interface LinkConnectionDeps {
+  /** Replaces the module's pre-connect hook (tests). */
+  preConnect?: PreConnectHook;
   fetch?: typeof fetch;
   openRelay?: (desktopId: string, deviceId: string) => Promise<RelayConnection>;
   ensureDevice?: () => Promise<DeviceIdentity>;
@@ -148,6 +175,8 @@ interface WatchSlot {
   opening: boolean;
   /** Bumped on every open and every drop: an ack of an older open is stopped, not kept. */
   token: number;
+  /** Reopens after "Watch ended" since the last frame. */
+  endedReopens: number;
 }
 
 export class LinkConnection {
@@ -240,7 +269,7 @@ export class LinkConnection {
   /** Registers a watch: opened now when `ready`, and reopened after every reconnect. */
   registerWatch(registration: WatchRegistration): WatchRegistrationHandle {
     const id = this.#nextWatchId++;
-    this.#watches.set(id, { registration, handle: null, opening: false, token: 0 });
+    this.#watches.set(id, { registration, handle: null, opening: false, token: 0, endedReopens: 0 });
     this.#syncWatchInfo();
     if (this.status === "ready") this.#openWatch(id);
     return {
@@ -355,6 +384,20 @@ export class LinkConnection {
     if (this.#isStale(gen)) return;
     this.store.setState({ deviceFingerprint: device.fingerprint });
 
+    // Ensure the grant before the relay is joined: a revoked grant blocks here, a failed check retries.
+    const hook = this.#deps.preConnect ?? preConnectHook;
+    if (hook) {
+      let check: GrantCheck | void;
+      try {
+        check = await hook({ desktopId: this.desktopId, deviceId: device.deviceId });
+      } catch {
+        if (this.#isStale(gen)) return;
+        return this.#fail({ code: "grant_check" }, { kind: "retry", delay: "backoff" });
+      }
+      if (this.#isStale(gen)) return;
+      if (check === "denied") return this.#block("revoked", { revoked: true, error: { code: "grant_denied" } });
+    }
+
     let directory: Directory;
     try {
       directory = await this.#fetchDirectory();
@@ -442,7 +485,7 @@ export class LinkConnection {
     if (pin.status === "new" && !this.#deps.checkPin) {
       let committed: Awaited<ReturnType<typeof commitPin>>;
       try {
-        committed = await (this.#deps.commitPin ?? commitPin)(this.desktopId, directory.publicKey);
+        committed = await (this.#deps.commitPin ?? commitPin)(this.desktopId, directory.publicKey, device.deviceId);
       } catch {
         return this.#dropNewSession(gen, session, () => this.#fail({ code: "pin_storage" }, { kind: "retry", delay: "backoff" }));
       }
@@ -712,15 +755,24 @@ export class LinkConnection {
     const token = ++slot.token;
     const params = registration.reopenParams();
     session
-      .watch(registration.method, params, registration.onFrame, {
-        onDead: () => this.#onWatchDead(gen, id),
-        onError: (error) => {
-          if (gen !== this.#gen) return;
-          const current = this.#watches.get(id);
-          if (current) current.handle = null;
-          registration.onError?.(error);
+      .watch(
+        registration.method,
+        params,
+        (frame) => {
+          slot.endedReopens = 0;
+          registration.onFrame(frame);
         },
-      })
+        {
+          onDead: () => this.#onWatchDead(gen, id),
+          onError: (error) => {
+            if (gen !== this.#gen) return;
+            const current = this.#watches.get(id);
+            if (current) current.handle = null;
+            if (current && this.#reopenEndedWatch(id, current, error)) return;
+            registration.onError?.(error);
+          },
+        },
+      )
       .then((handle) => {
         if (slot.token === token) slot.opening = false;
         if (gen !== this.#gen || this.#watches.get(id) !== slot || slot.token !== token) {
@@ -734,6 +786,21 @@ export class LinkConnection {
         if (gen !== this.#gen || slot.token !== token) return;
         registration.onError?.(error instanceof LinkRequestError ? error : new LinkRequestError("The watch could not be opened", "session_ended"));
       });
+  }
+
+  /**
+   * The desktop ended an open watch without a code ("Watch ended", `web_link/pacer.rs`): open it again with the
+   * params of `reopenParams()`, which carry `from` (the turns already held), so nothing is missed or duplicated.
+   * Returns false when the error is something else or the watch ended too often without a frame in between.
+   */
+  #reopenEndedWatch(id: number, slot: WatchSlot, error: LinkRequestError): boolean {
+    if (error.message !== WATCH_ENDED_MESSAGE || error.code !== undefined) return false;
+    if (slot.endedReopens >= MAX_WATCH_ENDED_REOPENS) return false;
+    slot.endedReopens += 1;
+    queueMicrotask(() => {
+      if (this.#watches.get(id) === slot && this.status === "ready") this.#openWatch(id);
+    });
+    return true;
   }
 
   #onWatchDead(gen: number, id: number): void {

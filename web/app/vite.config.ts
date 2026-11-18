@@ -6,6 +6,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import { headersPlugin } from "./vite-plugins/headers.ts";
+import { staticLibraryCss } from "./vite-plugins/staticLibraryCss.ts";
 
 // `vite dev` runs the SPA, the Worker, the Durable Objects and local D1 together through
 // @cloudflare/vite-plugin, which reads the Worker config one level up (web/wrangler.jsonc).
@@ -24,6 +25,8 @@ export default defineConfig({
     tailwindcss(),
     cloudflare({ configPath: "../wrangler.jsonc" }),
     headersPlugin("../wrangler.jsonc"),
+    // S-08: Sonner and vaul must not append a runtime <style> (blocked by style-src 'self'); see staticLibraryCss.ts.
+    staticLibraryCss(),
     // Workbox injectManifest: src/sw.ts is compiled to /sw.js with the precache list injected. The
     // manifest stays public/manifest.webmanifest and registration is src/features/offline/registerSw.ts
     // (Trusted Types aware), so the plugin only builds the worker.
@@ -42,5 +45,12 @@ export default defineConfig({
       devOptions: { enabled: false },
     }),
   ],
-  resolve: { alias: { "@": path.resolve(import.meta.dirname, "src") } },
+  resolve: {
+    alias: [
+      { find: "@", replacement: path.resolve(import.meta.dirname, "src") },
+      // S-08: Radix scroll lock (through vaul) would append a runtime <style>; src/patches/style-singleton.ts adopts a
+      // constructed stylesheet instead.
+      { find: /^react-style-singleton$/, replacement: path.resolve(import.meta.dirname, "src/patches/style-singleton.ts") },
+    ],
+  },
 });

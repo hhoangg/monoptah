@@ -5,6 +5,7 @@ pub(in crate::settings) mod devices;
 mod modals;
 
 use super::mobile::Qr;
+use super::web_activity;
 use crate::{
     input::{self, Input},
     settings::{
@@ -15,6 +16,7 @@ use crate::{
 };
 use gpui::{AnyElement, Context, Entity, FontWeight, Subscription, Task, div, prelude::*, px, rgb};
 use monocode_core::mobile::{WebState, WebStatus, web_link::relay};
+use serde_json::Value;
 use std::{sync::Arc, time::Instant};
 
 /// Where a fresh install pairs.
@@ -46,6 +48,8 @@ pub(in crate::settings) struct WebAppState {
     copied_reset: Option<Task<()>>,
     /// The QR on show, with the exact text it encodes.
     pub(in crate::settings) qr: Option<(String, Arc<Qr>)>,
+    /// The activity log on show (newest first), read when it was opened.
+    pub(in crate::settings) activity: Option<Vec<Value>>,
     _host_events: Vec<Subscription>,
 }
 
@@ -164,6 +168,7 @@ impl SettingsView {
         self.web_app.revoking = None;
         self.web_app.confirm = None;
         self.web_app.host_error = None;
+        self.web_app.activity = None;
     }
 
     /// Escape closes the innermost Web app dialog.
@@ -232,6 +237,13 @@ impl SettingsView {
     }
 
     pub(super) fn web_app_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut page = self.web_app_sections(cx);
+        // The audit log covers phones too, so it never depends on the web link.
+        page.push(self.web_app_activity(cx));
+        page
+    }
+
+    fn web_app_sections(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut page = vec![self.web_app_header()];
         let Some(status) = self.ctx.web.clone() else {
             page.push(
@@ -263,6 +275,55 @@ impl SettingsView {
             page.extend(self.web_app_devices(&status, cx));
         }
         page
+    }
+
+    /// "Activity log: Open": the newest lines of the desktop's audit log, read
+    /// when it is opened (not on every frame).
+    fn web_app_activity(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let dir = self.ctx.data_dir.clone();
+        let open = self.web_app.activity.is_some();
+        let list = self.web_app.activity.as_ref().map(|lines| {
+            div()
+                .debug_selector(|| "web-activity-list".into())
+                .child(web_activity::activity_list(lines))
+        });
+        div()
+            .debug_selector(|| "web-activity".into())
+            .mt_5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Activity log"),
+                    )
+                    .child(
+                        secondary_button(
+                            "web-activity-toggle",
+                            if open { "Hide" } else { "Open" },
+                            false,
+                            dir.is_none(),
+                        )
+                        .debug_selector(|| "web-activity-toggle".into())
+                        .child(if open { "Hide" } else { "Open" })
+                        .when_some(dir, |d, dir| {
+                            d.on_click(cx.listener(move |this, _, _, cx| {
+                                this.web_app.activity = if open {
+                                    None
+                                } else {
+                                    Some(web_activity::load(&dir))
+                                };
+                                cx.notify();
+                            }))
+                        }),
+                    ),
+            )
+            .children(list)
+            .into_any_element()
     }
 
     /// "Remote push in Git" and "Remote cloud start": off by default. The

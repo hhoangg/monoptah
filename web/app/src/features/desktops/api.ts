@@ -21,6 +21,7 @@ import { queryOptions, useQuery, type QueryClient } from "@tanstack/react-query"
 import { apiFetch, endpoint, isApiError } from "@/features/accounts/api";
 import { withFreshAuth } from "@/features/accounts/queries";
 import { clearPersistedCache } from "@/data/persist";
+import { forgetDesktopLocally } from "@/features/settings/desktopLink";
 import { getLinkConnection, resetLinkConnections } from "@/link";
 import { forgetDeviceKey, getDeviceKeyInfo } from "@/link/keys";
 import { forgetPins } from "@/link/pins";
@@ -161,6 +162,13 @@ export async function revokeDesktop(queryClient: QueryClient, id: string, option
     // A connection that cannot stop must not keep the cache around.
   }
   await clearPersistedCache(id);
+  // The same wipe as "remove this desktop from this device": the per-desktop records of the other features
+  // (last place, Mono seen map, reactions) go too.
+  try {
+    await forgetDesktopLocally(id);
+  } catch {
+    // One handler failing must not keep the revoked desktop's screen from closing.
+  }
   await options.afterRevoke?.();
   queryClient.removeQueries({ queryKey: desktopKeys.detail(id) });
   queryClient.removeQueries({ queryKey: desktopKeys.grants(id) });
@@ -223,7 +231,7 @@ async function runAll(steps: Array<() => Promise<unknown> | unknown>): Promise<v
 
 /**
  * Forgets a device: the server revokes every grant of it and deletes its push subscriptions. When it
- * is this browser's own device, the local state goes too: the device key, every pin, the persisted
+ * is this browser's own device, the local state goes too: the device key, the pins of this device, the persisted
  * (encrypted) cache of every desktop, the live link connections and the link queries. A 404 for this
  * browser's own device means an earlier attempt already deleted it on the server (and failed locally),
  * so the local cleanup still runs.
@@ -232,14 +240,14 @@ export async function forgetDevice(queryClient: QueryClient, deviceId: string): 
   const local = await getDeviceKeyInfo().catch(() => null);
   const wasThisDevice = local?.deviceId === deviceId;
   try {
-    await apiFetch(desktopEndpoints.forgetDevice, { params: { id: deviceId } });
+    await withFreshAuth(() => apiFetch(desktopEndpoints.forgetDevice, { params: { id: deviceId } }));
   } catch (error) {
     if (!(wasThisDevice && isApiError(error, "not_found"))) throw error;
   }
   const cleanup = wasThisDevice
     ? runAll([
         () => forgetDeviceKey(),
-        () => forgetPins(),
+        () => forgetPins(deviceId),
         () => clearPersistedCache(),
         () => resetLinkConnections(),
         () => queryClient.removeQueries({ queryKey: ["link"] }),

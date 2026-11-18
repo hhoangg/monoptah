@@ -18,6 +18,14 @@
   --color-brand-text: var(--accent-text);
   --color-additions: var(--additions);
   --color-deletions: var(--deletions);
+  --color-viz-positive: var(--viz-positive);
+  --color-viz-negative: var(--viz-negative);
+  --color-viz-warning: var(--viz-warning);
+  --color-viz-series-2: var(--viz-series-2);
+  --color-viz-series-3: var(--viz-series-3);
+  --color-viz-series-4: var(--viz-series-4);
+  --color-viz-series-5: var(--viz-series-5);
+  --color-viz-series-6: var(--viz-series-6);
   --color-caution: var(--caution);
   --color-file-ref: var(--file-ref);
   --color-inverse: var(--inverse);

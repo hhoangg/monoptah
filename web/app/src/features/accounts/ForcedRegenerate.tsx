@@ -5,11 +5,12 @@ import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
-import { apiFetch } from "./api";
-import { passkeyErrorMessage } from "./authCopy";
+import { apiFetch, isApiError } from "./api";
+import { CODES_REPLACED_MESSAGE, passkeyErrorMessage } from "./authCopy";
 import { endpoints } from "./endpoints";
 import { clearLowCodes } from "./lowCodes";
-import { ME_KEY, ReauthCancelledError, withFreshAuth } from "./queries";
+import { setRecoveryBatch } from "./pendingRecoveryCodes";
+import { acknowledgeRecoveryCodes, ReauthCancelledError, withFreshAuth } from "./queries";
 import { RecoveryCodes } from "./RecoveryCodes";
 
 /**
@@ -33,6 +34,7 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
     setCancelled(false);
     try {
       const result = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
+      setRecoveryBatch(result.batch);
       setCodes(result.recoveryCodes);
     } catch (caught) {
       if (caught instanceof ReauthCancelledError) setCancelled(true);
@@ -44,15 +46,27 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
 
   async function done() {
     // Cleared on Continue only: until then the codes stay on screen and nothing may unmount this component.
+    // The server records "I saved these" first; on a failure the codes stay on screen so they are not lost.
+    setError(null);
+    try {
+      await acknowledgeRecoveryCodes(queryClient);
+    } catch (caught) {
+      if (isApiError(caught, "conflict")) {
+        // The codes on screen are dead (a newer batch exists): drop them so Generate comes back.
+        setCodes(null);
+        setError(CODES_REPLACED_MESSAGE);
+      } else setError(passkeyErrorMessage(caught));
+      return;
+    }
     clearLowCodes();
     setCodes(null);
-    await queryClient.invalidateQueries({ queryKey: ME_KEY });
   }
 
   if (codes) {
     return (
       <AuthLayout>
         <PageHeader title="Save your new recovery codes" description="Older codes no longer work." />
+        {error ? <Notice variant="error">{error}</Notice> : null}
         <RecoveryCodes handle={handle} codes={codes} onContinue={() => void done()} />
       </AuthLayout>
     );

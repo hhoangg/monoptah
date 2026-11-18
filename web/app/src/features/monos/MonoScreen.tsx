@@ -4,12 +4,12 @@
 // chat marks the Mono seen (F-17). The Mono's own header cards, chips and documents render through the WS-T
 // transcript components (F-43, F-72).
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { Composer } from "@/features/composer/Composer";
 import { SessionQuestionCard, SessionUsageCard, useLinkReady } from "@/features/composer/SessionComposer";
-import { useSendGuard } from "@/features/composer/useSendGuard";
+import { useGuardedReplies, useSendGuard } from "@/features/composer/useSendGuard";
 import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
@@ -62,7 +62,9 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
     if (mono) markMonoSeen(desktopId, mono);
   }, [desktopId, mono]);
 
-  const { send } = conversation;
+  const { send, retry: retryTurn } = conversation;
+  // Retry and a tapped choice go through the send-guard like a typed message.
+  const replies = useGuardedReplies({ desktopId, sessionId: conversationId, target: null, send, retry: retryTurn });
   const actions = useMemo<TranscriptActions>(
     () => ({
       onNavigate: (href) => void navigate({ to: href as never }),
@@ -77,16 +79,12 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
       ...(readOnly
         ? {}
         : {
-            onChoose: async (text: string) => {
-              const result = await send(text);
-              if (!result.sent) throw new Error(result.error ?? "not_sent");
-            },
+            onChoose: replies.onChoose,
           }),
     }),
-    [catalog, desktopId, monoId, navigate, readOnly, send],
+    [catalog, desktopId, monoId, navigate, readOnly, replies.onChoose],
   );
 
-  const retry = useCallback((id: string) => void conversation.retry(id), [conversation]);
 
   const submit = async (text: string, attachments: Parameters<typeof toWire>[0]) => {
     assertFitsRequest(text, attachments);
@@ -94,6 +92,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
     const wire = toWire(attachments);
     const quoted = replyTo ? `${quote(replyTo.text)}\n\n${text}` : text;
     setReplyTo(null);
+    replies.clearError();
     void send(quoted, wire.length > 0 ? wire : undefined);
   };
 
@@ -191,7 +190,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             loadingOlder={older.loading}
             olderError={older.error}
             loadOlder={older.loadOlder}
-            onRetry={readOnly ? undefined : retry}
+            onRetry={readOnly ? undefined : replies.onRetry}
             agent={agent}
             busy={state?.busy ?? false}
             actions={actions}
@@ -204,6 +203,11 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
         above={
           <>
             {state?.usageLimit ? <SessionUsageCard sessionId={conversationId} state={state.usageLimit} readOnly={readOnly} /> : null}
+            {replies.error ? (
+              <p role="alert" className="px-4 pb-2 text-meta text-deletions" data-testid="send-refused">
+                {replies.error}
+              </p>
+            ) : null}
             {state?.question ? <SessionQuestionCard sessionId={conversationId} prompt={state.question} readOnly={readOnly} /> : null}
           </>
         }
@@ -230,6 +234,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
           }
         />
         {guard.dialog}
+        {replies.dialog}
       </ComposerRegion>
     </div>
   );

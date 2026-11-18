@@ -133,6 +133,27 @@ describe("sidebar", () => {
     expect(screen.queryByTestId("app-sidebar")).toBeNull();
   });
 
+  it.each(["", ALPHA, "/cloud"])("is the only sidebar on the home, project and cloud screens too (%s)", async (path) => {
+    mount(1280, path);
+    await screen.findByTestId("app-sidebar");
+    expect(screen.getAllByRole("navigation", { name: "Workspace" })).toHaveLength(1);
+    expect(screen.getAllByRole("complementary")).toHaveLength(1);
+    expect(within(screen.getByTestId("app-sidebar")).getByRole("navigation", { name: "Workspace" })).toBeInTheDocument();
+  });
+
+  it("has a Search button in the header below 640px that opens the palette, and none from 640px up", async () => {
+    const user = userEvent.setup();
+    mount(390, ALPHA);
+    await screen.findByTestId("app-shell");
+    const header = screen.getByRole("navigation", { name: "Main" });
+    await user.click(within(header).getByRole("button", { name: "Search" }));
+    expect(isCommandPaletteOpen()).toBe(true);
+    expect(await screen.findByTestId("command-palette")).toBeInTheDocument();
+    closeCommandPalette();
+    resizeViewport(768);
+    await waitFor(() => expect(within(screen.getByRole("navigation", { name: "Main" })).queryByRole("button", { name: "Search" })).toBeNull());
+  });
+
   it("is a persistent 300px sidebar at 768 that collapses to a rail and remembers it", async () => {
     const user = userEvent.setup();
     const first = mount(768);
@@ -184,13 +205,6 @@ describe("sidebar", () => {
     reloadLayoutPrefs();
     mount(1280);
     expect(await screen.findByTestId("app-sidebar")).toHaveStyle({ width: "360px" });
-  });
-
-  it.each(["", "/p/proj-alpha", "/cloud"])("adds no second sidebar on %j, which renders WorkspaceFrame", async (path) => {
-    mount(1280, path);
-    await screen.findByTestId("app-shell");
-    await waitFor(() => expect(screen.getAllByTestId("workspace-nav")).toHaveLength(1));
-    expect(screen.queryByTestId("app-sidebar")).toBeNull();
   });
 
   it("opens the palette from the sidebar button", async () => {

@@ -116,6 +116,7 @@ function meBody(state: MockState) {
     user: state.user,
     invitesLeft: invitesRemaining(state),
     recoveryOnly: state.recoveryOnly,
+    recoveryCodesLeft: state.recoveryCodes.size,
     recoveryAckAt: state.recoveryAckAt,
   };
 }
@@ -204,15 +205,15 @@ const handlers: Record<string, Handler> = {
     }
     state.user = { id: randomId("user"), handle: challenge.handle ?? "new-user", displayName: challenge.displayName ?? "New User", role: "user" };
     state.passkeys = [];
+    state.recoveryBatch = 0;
     addPasskey(state, undefined);
     state.invites = [];
     state.inviteCodes = new Map();
     startSession(state, "passkey");
     const recoveryCodes = newRecoveryBatch(state);
-    // KNOWN DIVERGENCE: the Worker leaves `recovery_ack_at` NULL here and has no ack route, which
-    // would force the regenerate screen forever. The mock acks so the dev flow stays usable.
-    state.recoveryAckAt = now;
-    return { user: state.user, recoveryCodes };
+    // Like the Worker: `recovery_ack_at` stays NULL until `POST /api/recovery-codes/ack`.
+    state.recoveryAckAt = null;
+    return { user: state.user, recoveryCodes, batch: state.recoveryBatch };
   },
 
   "POST /api/auth/login/options": ({ state }) => {
@@ -299,9 +300,15 @@ const handlers: Record<string, Handler> = {
 
   "POST /api/recovery-codes/regenerate": ({ state }) => {
     const recoveryCodes = newRecoveryBatch(state);
-    // KNOWN DIVERGENCE: the Worker CLEARS `recovery_ack_at` here and has no route to set it again.
-    state.recoveryAckAt = nowSeconds();
-    return { recoveryCodes };
+    // Like the Worker: regenerating clears `recovery_ack_at` until `POST /api/recovery-codes/ack`.
+    state.recoveryAckAt = null;
+    return { recoveryCodes, batch: state.recoveryBatch };
+  },
+  "POST /api/recovery-codes/ack": ({ state, body }) => {
+    // Like the Worker: only the current batch is acknowledged; a repeat for it is a no-op.
+    if (body.batch !== state.recoveryBatch) throw new MockHttpError(409, "conflict", "These recovery codes are not the current ones");
+    if (state.recoveryAckAt === null) state.recoveryAckAt = nowSeconds();
+    return { ok: true };
   },
 
   "GET /api/invites": ({ state }) => ({ invites: state.invites, granted: state.invitesGranted, remaining: invitesRemaining(state) }),

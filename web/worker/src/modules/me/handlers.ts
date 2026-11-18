@@ -9,20 +9,24 @@ import { requireAuth } from "../../middleware/auth.ts";
  */
 export const INVITES_USED_SQL = "SELECT count(*) AS n FROM invites WHERE created_by = ? AND NOT (revoked_at IS NOT NULL AND used_at IS NULL)";
 export const ME_ROW_SQL = "SELECT invites_granted, recovery_ack_at FROM users WHERE id = ?";
+/** Unused recovery codes of the user. Uses `recovery_codes_user_id_idx`. */
+export const RECOVERY_LEFT_SQL = "SELECT count(*) AS n FROM recovery_codes WHERE user_id = ? AND used_at IS NULL";
 export const PATCH_DISPLAY_NAME_SQL = "UPDATE users SET display_name = ? WHERE id = ?";
 
 /** `GET /api/me`: the user, the invites left, whether the session is recovery-only, and the recovery ack. */
 export const getMe: Handler<AppEnv> = async (c) => {
   const { user, session } = requireAuth(c);
-  const [row, used] = await Promise.all([
+  const [row, used, codes] = await Promise.all([
     c.env.DB.prepare(ME_ROW_SQL).bind(user.id).first<{ invites_granted: number; recovery_ack_at: number | null }>(),
     c.env.DB.prepare(INVITES_USED_SQL).bind(user.id).first<{ n: number }>(),
+    c.env.DB.prepare(RECOVERY_LEFT_SQL).bind(user.id).first<{ n: number }>(),
   ]);
   if (!row) return apiError(c, 401, "unauthorized", "Sign in required");
   return respond(c, MeResponse, {
     user: { id: user.id, handle: user.handle, displayName: user.displayName, role: user.role },
     invitesLeft: Math.max(0, row.invites_granted - (used?.n ?? 0)),
     recoveryOnly: session.recoveryOnly,
+    recoveryCodesLeft: codes?.n ?? 0,
     recoveryAckAt: row.recovery_ack_at,
   });
 };

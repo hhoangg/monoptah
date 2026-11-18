@@ -27,7 +27,27 @@ const Base64Url = z.string().min(1);
 
 /** WebAuthn JSON from `@simplewebauthn`: kept open, the Worker library validates it. */
 const WebAuthnOptions = z.looseObject({ challenge: z.string() });
-const WebAuthnResponse = z.looseObject({ id: z.string(), type: z.literal("public-key") });
+/**
+ * Outer bounds of the free-form strings the Worker hashes or stores, checked by the handler that parses the body (a larger value
+ * is `400 invalid`); the body itself is capped at 32 KiB by the Worker before any handler reads it. The handlers keep tighter, uniform-answer bounds inside them: a recovery code is 16 characters
+ * (19 with hyphens) and the Worker refuses over 64, an invite code is 22 characters (16 bytes, base64url) and the
+ * Worker refuses over 128, and at most 8 transports of 32 characters are stored per passkey.
+ */
+export const MAX_RECOVERY_CODE_INPUT = 256;
+export const MAX_INVITE_INPUT = 256;
+export const MAX_TRANSPORTS_INPUT = 32;
+export const MAX_TRANSPORT_INPUT = 512;
+/** True when the authenticator's reported `response.transports`, if any, are within the outer bounds. */
+function transportsWithinBounds(value: Record<string, unknown>): boolean {
+  const inner = value.response;
+  if (typeof inner !== "object" || inner === null || !("transports" in inner)) return true;
+  const transports: unknown = inner.transports;
+  if (transports === undefined) return true;
+  return Array.isArray(transports) && transports.length <= MAX_TRANSPORTS_INPUT && transports.every((t) => typeof t === "string" && t.length <= MAX_TRANSPORT_INPUT);
+}
+const WebAuthnResponse = z
+  .looseObject({ id: z.string(), type: z.literal("public-key") })
+  .refine(transportsWithinBounds, { message: "Too many or too long transports" });
 
 export const UserSchema = z.object({
   id: Id,
@@ -48,14 +68,20 @@ export const HealthResponse = z.object({ ok: z.literal(true) });
 
 export const RegisterOptionsBody = z.object({
   /** The invite code from the registration link fragment. */
-  invite: z.string().min(1),
+  invite: z.string().min(1).max(MAX_INVITE_INPUT),
   handle: Handle,
   displayName: DisplayName,
 });
 export const RegisterOptionsResponse = WebAuthnChallenge;
 export const RegisterVerifyBody = WebAuthnVerifyBody;
 /** `recoveryCodes` (10) are returned once. The session cookie is set by the response. */
-export const RegisterVerifyResponse = z.object({ user: UserSchema, recoveryCodes: z.array(z.string()).length(10) });
+export const RegisterVerifyResponse = z.object({ user: UserSchema, recoveryCodes: z.array(z.string()).length(10), batch: z.number().int().positive() });
+
+/**
+ * `POST /api/auth/logout`. `deviceId` (optional) is this browser's registered device: its push subscriptions are
+ * deleted with the session, so a signed-out browser stops getting pushes even when it could not unsubscribe first.
+ */
+export const LogoutBody = z.object({ deviceId: Id.max(64).optional() }).optional();
 
 export const LoginOptionsBody = z.object({}).optional();
 export const LoginOptionsResponse = WebAuthnChallenge;
@@ -67,7 +93,7 @@ export const ReauthVerifyBody = WebAuthnVerifyBody;
 /** `reauthAt` starts the 5 minute "fresh" window. */
 export const ReauthVerifyResponse = z.object({ ok: z.literal(true), reauthAt: z.number() });
 
-export const RecoverBody = z.object({ handle: Handle, code: z.string().min(1) });
+export const RecoverBody = z.object({ handle: Handle, code: z.string().min(1).max(MAX_RECOVERY_CODE_INPUT) });
 /** The session is `recoveryOnly` (adds a passkey only). `codesLeft` triggers the regenerate prompt at 2 or fewer. */
 export const RecoverResponse = z.object({ user: UserSchema, recoveryOnly: z.literal(true), codesLeft: z.number().int().nonnegative() });
 
@@ -77,6 +103,8 @@ export const MeResponse = z.object({
   user: UserSchema,
   invitesLeft: z.number().int().nonnegative(),
   recoveryOnly: z.boolean(),
+  /** Unused recovery codes left. The app prompts a regenerate at 2 or fewer. */
+  recoveryCodesLeft: z.number().int().nonnegative(),
   /** null forces a recovery-code regenerate at sign-in. */
   recoveryAckAt: z.number().nullable(),
 });
@@ -129,7 +157,9 @@ export const RenamePasskeyBody = z.object({ name: z.string().trim().min(1).max(6
 // --- Recovery codes ---
 
 /** The 10 new codes are returned once; all older codes stop working. */
-export const RegenerateRecoveryResponse = z.object({ recoveryCodes: z.array(z.string()).length(10) });
+export const RegenerateRecoveryResponse = z.object({ recoveryCodes: z.array(z.string()).length(10), batch: z.number().int().positive() });
+/** "I saved these" for the batch the user saw (the `batch` of the register or regenerate response). */
+export const AckRecoveryBody = z.object({ batch: z.number().int().positive() });
 
 // --- Invites ---
 
@@ -426,7 +456,7 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "POST", path: "/api/auth/reauth/options", auth: "session", module: "auth", request: {}, response: ReauthOptionsResponse }),
   r({ method: "POST", path: "/api/auth/reauth/verify", auth: "session", module: "auth", request: { body: ReauthVerifyBody }, response: ReauthVerifyResponse }),
   r({ method: "POST", path: "/api/auth/recover", rateLimit: "recover", auth: "public", module: "auth", request: { body: RecoverBody }, response: RecoverResponse }),
-  r({ method: "POST", path: "/api/auth/logout", auth: "session", module: "auth", request: {}, response: Ok }),
+  r({ method: "POST", path: "/api/auth/logout", auth: "session", module: "auth", request: { body: LogoutBody }, response: Ok }),
 
   r({ method: "GET", path: "/api/me", auth: "session", module: "me", request: {}, response: MeResponse }),
   r({ method: "PATCH", path: "/api/me", auth: "session", module: "me", request: { body: PatchMeBody }, response: PatchMeResponse }),
@@ -444,6 +474,7 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "DELETE", path: "/api/passkeys/:id", auth: "fresh", module: "passkeys", request: { params: idParam }, response: Ok }),
 
   r({ method: "POST", path: "/api/recovery-codes/regenerate", auth: "fresh", module: "recovery", request: {}, response: RegenerateRecoveryResponse }),
+  r({ method: "POST", path: "/api/recovery-codes/ack", auth: "session", module: "recovery", request: { body: AckRecoveryBody }, response: Ok }),
 
   r({ method: "GET", path: "/api/invites", auth: "session", module: "invites", request: {}, response: InvitesResponse }),
   r({ method: "POST", path: "/api/invites", auth: "session", module: "invites", request: {}, response: CreateInviteResponse }),
@@ -463,7 +494,7 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "POST", path: "/api/devices", auth: "session", module: "devices", request: { body: RegisterDeviceBody }, response: RegisterDeviceResponse }),
   r({ method: "GET", path: "/api/devices", auth: "session", module: "devices", request: {}, response: DevicesResponse }),
   r({ method: "PATCH", path: "/api/devices/:id", auth: "session", module: "devices", request: { params: idParam, body: PatchDeviceBody }, response: PatchDeviceResponse }),
-  r({ method: "DELETE", path: "/api/devices/:id", auth: "session", module: "devices", request: { params: idParam }, response: Ok }),
+  r({ method: "DELETE", path: "/api/devices/:id", auth: "fresh", module: "devices", request: { params: idParam }, response: Ok }),
 
   r({ method: "POST", path: "/api/desktops/:id/grants", auth: "session", module: "grants", owner: true, request: { params: idParam, body: RequestGrantBody }, response: GrantResponse }),
   r({ method: "GET", path: "/api/desktops/:id/grants", auth: "session", module: "grants", owner: true, request: { params: idParam }, response: GrantsResponse }),

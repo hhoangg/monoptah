@@ -34,6 +34,7 @@ import {
   INSERT_FIRST_CODE_SQL,
   INSERT_NEXT_CODE_SQL,
   MAX_BATCH_SQL,
+  ACKED_BATCH_SQL,
   SET_ACK_SQL,
 } from "../src/modules/recovery/regenerate.ts";
 import {
@@ -57,10 +58,10 @@ import {
 } from "../src/modules/admin/branch.ts";
 import { INSERT_INVITE_SQL, INVITE_BY_ID_SQL, LIST_INVITES_SQL, REVOKE_INVITE_SQL } from "../src/modules/invites/handlers.ts";
 import { CONSUME_CHALLENGE_SQL, INSERT_CHALLENGE_SQL } from "../src/modules/passkeys/challenges.ts";
-import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL } from "../src/modules/me/handlers.ts";
+import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL, RECOVERY_LEFT_SQL } from "../src/modules/me/handlers.ts";
 import { CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
 import { OUTSTANDING_PAIRINGS_SQL } from "../src/modules/ratelimit/pairings.ts";
-import { LIST_USER_SESSIONS_SQL } from "../src/modules/sessions/handlers.ts";
+import { LIST_USER_SESSIONS_SQL, LOGOUT_PUSH_SQL } from "../src/modules/sessions/handlers.ts";
 import {
   DELETE_ALL_SESSIONS_EXCEPT_SQL,
   DELETE_ALL_SESSIONS_SQL,
@@ -112,9 +113,11 @@ const CASES: PlanCase[] = [
   { name: "session row of the request cookie", sql: SESSION_BY_HASH_SQL, bind: ["h"] },
   { name: "list session hashes", sql: LIST_SESSION_HASHES_SQL, bind: ["u"] },
   { name: "list session hashes except one", sql: LIST_SESSION_HASHES_EXCEPT_SQL, bind: ["u", "h"] },
-  { name: "list desktops of a user", sql: LIST_DESKTOP_IDS_SQL, bind: ["u", 5] },
+  { name: "list desktops of a user", sql: LIST_DESKTOP_IDS_SQL, bind: ["u"] },
   { name: "me row", sql: ME_ROW_SQL, bind: ["u"] },
   { name: "invites used by a user", sql: INVITES_USED_SQL, bind: ["u"] },
+  { name: "unused recovery codes of a user", sql: RECOVERY_LEFT_SQL, bind: ["u"] },
+  { name: "logout: delete the push subscriptions of a device", sql: LOGOUT_PUSH_SQL, bind: ["d", "u"] },
   { name: "patch display name", sql: PATCH_DISPLAY_NAME_SQL, bind: ["n", "u"] },
   { name: "invite lookup by code hash", sql: INVITE_LOOKUP_SQL, bind: ["h", 1] },
   { name: "handle taken", sql: HANDLE_TAKEN_SQL, bind: ["h"] },
@@ -170,7 +173,8 @@ const CASES: PlanCase[] = [
   { name: "regenerate: next code", sql: INSERT_NEXT_CODE_SQL, bind: ["i", "u", "h", 2, 1, "i"] },
   { name: "regenerate: delete old codes", sql: DELETE_OLD_CODES_SQL, bind: ["u", 1, "i"] },
   { name: "regenerate: clear ack", sql: CLEAR_ACK_SQL, bind: ["u", "i"] },
-  { name: "recovery ack", sql: SET_ACK_SQL, bind: [1, "u"] },
+  { name: "recovery ack", sql: SET_ACK_SQL, bind: [1, "u", "u", 1] },
+  { name: "recovery ack, repeated", sql: ACKED_BATCH_SQL, bind: ["u", "u", 1] },
   { name: "passkeys: list own", sql: LIST_PASSKEYS_SQL, bind: ["u"] },
   { name: "passkeys: get own by id", sql: GET_PASSKEY_SQL, bind: ["c", "u"] },
   { name: "passkeys: exclude list", sql: ADD_PASSKEY_EXCLUDE_SQL, bind: ["u"] },

@@ -10,19 +10,18 @@ import { Curve, Scale, compact } from "./scale";
 import type { Series, Slice, ThemeColor } from "./types";
 
 /**
- * Desktop series hues, tuned for dark and for light surfaces. Design-system exception (WS-S owns the tokens): these
- * are the desktop's own chart colours (crates/monocode-gpui/src/visuals/charts.rs), kept literal so a chart reads the
- * same on every client; the design system has no series tokens.
+ * Desktop series hues as design tokens (`--viz-*` in styles/tokens.css, one value per scheme), so the scheme switch
+ * is CSS only. They are the desktop's own chart colours (crates/monocode-gpui/src/visuals/charts.rs).
  */
-const HUES: Partial<Record<ThemeColor, readonly [dark: string, light: string]>> = {
-  positive: ["#4fd57f", "#0a924b"],
-  negative: ["#fc5855", "#d01d21"],
-  warning: ["#fea247", "#d96700"],
-  series2: ["#4fd57f", "#0a924b"],
-  series3: ["#b77df8", "#863ad2"],
-  series4: ["#fea247", "#d96700"],
-  series5: ["#fa78b2", "#d12c80"],
-  series6: ["#3faff3", "#0077d7"],
+const HUE_TOKENS: Partial<Record<ThemeColor, string>> = {
+  positive: "var(--viz-positive)",
+  negative: "var(--viz-negative)",
+  warning: "var(--viz-warning)",
+  series2: "var(--viz-series-2)",
+  series3: "var(--viz-series-3)",
+  series4: "var(--viz-series-4)",
+  series5: "var(--viz-series-5)",
+  series6: "var(--viz-series-6)",
 };
 
 /** `color` at `percent` opacity, for any CSS colour (including a `var()`). */
@@ -30,13 +29,11 @@ export const alpha = (color: string, percent: number) => `color-mix(in srgb, ${c
 
 /** A theme colour token as the desktop resolves it, in this app's tokens. */
 export function useVisualColor(): (token?: ThemeColor) => string {
-  const dark = useAppearance((state) => state.scheme) === "dark";
   return (token = "accent") => {
     if (token === "ink") return "var(--content)";
     if (token === "muted") return alpha("var(--content)", 60);
     if (token === "faint") return alpha("var(--content)", 20);
-    const hue = HUES[token];
-    return hue ? hue[dark ? 0 : 1] : "var(--accent-color)";
+    return HUE_TOKENS[token] ?? "var(--accent-color)";
   };
 }
 

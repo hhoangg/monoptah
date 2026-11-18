@@ -14,7 +14,6 @@ import {
   deleteAllSessionsStatement,
   IDLE_SECONDS,
   listSessionIdHashes,
-  MAX_REVOKE_CALLS,
   RECOVERY_ONLY_SECONDS,
   revokeAllSessions,
   revokeSessions,
@@ -392,7 +391,7 @@ describe("DELETE /api/sessions/:id", () => {
 
     expect(room.calls.map((c) => c.desktopId).sort()).toEqual([d1, d2].sort());
     for (const c of room.calls) {
-      expect(c.target).toEqual({ sessionIdHash: victim.idHash });
+      expect(c.target).toEqual({ sessionIdHashes: [victim.idHash] });
       expect(c.code).toBe(4001);
     }
     const audit = await env.DB.prepare("SELECT action, target_id, meta FROM audit_log WHERE actor_user_id = ? AND action = 'session.revoke'").bind(user.id).first<{ target_id: string; meta: string }>();
@@ -429,7 +428,7 @@ describe("POST /api/auth/logout", () => {
     expect(res.status).toBe(200);
     expect(await sessionRow(session.idHash)).toBeNull();
     expect(await sessionRow(other.idHash)).not.toBeNull();
-    expect(room.calls).toEqual([{ desktopId: desktop, target: { sessionIdHash: session.idHash }, code: 4001 }]);
+    expect(room.calls).toEqual([{ desktopId: desktop, target: { sessionIdHashes: [session.idHash] }, code: 4001 }]);
     await expectError(await authedCall(session, "/api/me"), 401, "unauthorized");
     const audit = await env.DB.prepare("SELECT meta FROM audit_log WHERE actor_user_id = ? AND action = 'session.logout'").bind(user.id).first<{ meta: string }>();
     expect(audit?.meta).toBe("{}");
@@ -455,8 +454,10 @@ describe("revoke helpers (sign out everywhere, recovery, block)", () => {
     expect(await sessionRow(s2.idHash)).toBeNull();
     expect(await sessionRow(keep.idHash)).not.toBeNull();
     expect(await sessionRow(foreign.idHash)).not.toBeNull();
-    expect(room.calls.map((c) => (c.target as { sessionIdHash: string }).sessionIdHash).sort()).toEqual([s1.idHash, s2.idHash].sort());
-    expect(new Set(room.calls.map((c) => c.desktopId))).toEqual(new Set([desktop]));
+    // One call for the desktop carries both hashes.
+    expect(room.calls).toHaveLength(1);
+    expect(room.calls[0]?.desktopId).toBe(desktop);
+    expect((room.calls[0]?.target as { sessionIdHashes: string[] }).sessionIdHashes.sort()).toEqual([s1.idHash, s2.idHash].sort());
   });
 
   it("the block case: sessions are deleted by the helper and the next request is 401", async () => {
@@ -472,7 +473,8 @@ describe("revoke helpers (sign out everywhere, recovery, block)", () => {
     const room = fakeRoomNamespace();
     await createTestDesktop(env, user.id);
     await closeSessionSockets(withRoom(env, room), user.id, hashes);
-    expect(room.calls).toHaveLength(2);
+    expect(room.calls).toHaveLength(1);
+    expect((room.calls[0]?.target as { sessionIdHashes: string[] }).sessionIdHashes.sort()).toEqual(hashes.sort());
     for (const s of sessions) {
       expect(await sessionRow(s.idHash)).toBeNull();
       await expectError(await authedCall(s, "/api/me"), 401, "unauthorized");
@@ -486,41 +488,57 @@ describe("revoke helpers (sign out everywhere, recovery, block)", () => {
     expect(await sessionRow(foreign.idHash)).not.toBeNull();
   });
 
-  it("calls room.revoke at most MAX_REVOKE_CALLS times, round-robin across desktops, and logs a cut with counts only", async () => {
+  it("reaches every live desktop even when there are more than MAX_DESKTOPS_PER_USER, and still resolves when a room rejects", async () => {
+    const user = await createTestUser(env);
+    const desktops: string[] = [];
+    for (let i = 0; i < 4; i += 1) desktops.push(await createTestDesktop(env, user.id));
+    const room = fakeRoomNamespace();
+    const failing = {
+      idFromName: (name: string) => ({ name }),
+      get: (id: { name: string }) => ({
+        revoke: (target: unknown, code: number) => {
+          if (id.name === desktops[1]) return Promise.reject(new Error("room down"));
+          return (room.namespace.get as unknown as (id: unknown) => { revoke: (t: unknown, c: number) => Promise<void> })(id).revoke(target, code);
+        },
+      }),
+    } as unknown as typeof env.ROOM;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const capped = Object.create(withRoom(env, { namespace: failing }), { MAX_DESKTOPS_PER_USER: { value: "1" } }) as typeof env;
+      await expect(closeSessionSockets(capped, user.id, ["h1"])).resolves.toBeUndefined();
+      expect(new Set(room.calls.map((call) => call.desktopId))).toEqual(new Set([desktops[0], desktops[2], desktops[3]]));
+      expect(errors.mock.calls.map((args) => String(args[0]))).toEqual(["room.revoke failed: calls=4 failed=1"]);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  it("calls room.revoke once per desktop with every hash, however many sessions are revoked", async () => {
     const user = await createTestUser(env);
     const desktops = [];
     for (let i = 0; i < 5; i += 1) desktops.push(await createTestDesktop(env, user.id));
+    await createTestDesktop(env, user.id, { revoked: true });
     const hashes = Array.from({ length: 30 }, (_, i) => `hash-${i}`);
     const room = fakeRoomNamespace();
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     try {
       await closeSessionSockets(withRoom(env, room), user.id, hashes);
-      expect(room.calls).toHaveLength(MAX_REVOKE_CALLS);
-      // Every desktop gets a call, and session i is revoked on every desktop before session i + 1.
+      expect(room.calls).toHaveLength(desktops.length);
       expect(new Set(room.calls.map((call) => call.desktopId))).toEqual(new Set(desktops));
-      const perDesktop = desktops.map((id) => room.calls.filter((call) => call.desktopId === id).map((call) => (call.target as { sessionIdHash: string }).sessionIdHash));
-      for (const seen of perDesktop) expect(seen).toEqual(hashes.slice(0, MAX_REVOKE_CALLS / 5));
-      const order = room.calls.map((call) => (call.target as { sessionIdHash: string }).sessionIdHash);
-      expect(order.slice(0, 5)).toEqual(Array(5).fill("hash-0"));
-      expect(room.calls.every((call) => call.code === 4001)).toBe(true);
-      const logged = errors.mock.calls.map((args) => String(args[0]));
-      expect(logged).toEqual([`room.revoke truncated: wanted=150 calls=${MAX_REVOKE_CALLS} desktops=5 sessions=30`]);
-      expect(logged.join(" ")).not.toContain("hash-");
+      for (const call of room.calls) {
+        expect(call.target).toEqual({ sessionIdHashes: hashes });
+        expect(call.code).toBe(4001);
+      }
+      expect(errors).not.toHaveBeenCalled();
     } finally {
       errors.mockRestore();
     }
 
-    // Within the cap nothing is logged.
-    const quiet = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const small = fakeRoomNamespace();
-    await closeSessionSockets(withRoom(env, small), user.id, ["a", "b"]);
-    expect(small.calls).toHaveLength(10);
-    expect(quiet).not.toHaveBeenCalled();
-    quiet.mockRestore();
-
-    const failing = withRoom(env, { namespace: { idFromName: (n: string) => ({ n }), get: () => ({ revoke: () => Promise.reject(new Error("boom")) }) } as unknown as typeof env.ROOM });
-    await expect(closeSessionSockets(failing, user.id, ["h"])).resolves.toBeUndefined();
+    const none = fakeRoomNamespace();
+    await closeSessionSockets(withRoom(env, none), user.id, []);
+    expect(none.calls).toHaveLength(0);
   });
+
 
   it("makes no room call when the user has no desktop or no session was revoked", async () => {
     const user = await createTestUser(env);

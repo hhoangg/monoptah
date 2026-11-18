@@ -42,6 +42,9 @@ export function recoverErrorMessage(error: unknown): string {
   return common(error);
 }
 
+/** Shown when the ack answers 409: another tab or window issued newer codes, so the ones on screen no longer work. */
+export const CODES_REPLACED_MESSAGE = "These codes were replaced in another tab or window. Generate a new set.";
+
 export function passkeyErrorMessage(error: unknown): string {
   if (isApiError(error, "conflict")) return "This device already has a passkey for your account.";
   return common(error);

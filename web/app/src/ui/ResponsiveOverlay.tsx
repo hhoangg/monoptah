@@ -15,13 +15,18 @@ export interface ResponsiveOverlayProps {
   children: ReactNode;
   /** Pinned under the body (buttons). */
   footer?: ReactNode;
+  /** Under 640px the sheet takes the full viewport height (a search or a long list) instead of up to 92dvh. */
+  fullHeight?: boolean;
 }
+
+/** Classes of a full-height sheet: it fills the viewport, clears the notch and drops the rounded top. */
+export const FULL_HEIGHT_SHEET_CLASS = "mt-0 h-dvh max-h-dvh rounded-none border-t-0 pt-[env(safe-area-inset-top)]";
 
 /**
  * One overlay for content-heavy panels: a vaul `Drawer` under 640px, a `Dialog` from 640px
  * (design-system.md section 11). The title is the accessible name on both.
  */
-export function ResponsiveOverlay({ open, onOpenChange, title, description, children, footer }: ResponsiveOverlayProps) {
+export function ResponsiveOverlay({ open, onOpenChange, title, description, children, footer, fullHeight = false }: ResponsiveOverlayProps) {
   const wide = useMediaQuery(OVERLAY_DIALOG_QUERY, true);
   if (wide) {
     return (
@@ -39,7 +44,7 @@ export function ResponsiveOverlay({ open, onOpenChange, title, description, chil
   }
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
-      <DrawerContent {...(description ? {} : { "aria-describedby": undefined })}>
+      <DrawerContent {...(fullHeight ? { className: FULL_HEIGHT_SHEET_CLASS } : {})} {...(description ? {} : { "aria-describedby": undefined })}>
         <DrawerHeader>
           <DrawerTitle>{title}</DrawerTitle>
           {description ? <DrawerDescription>{description}</DrawerDescription> : null}

@@ -44,6 +44,7 @@ export function GitStatusView({ projectId }: { projectId: string }) {
           </span>
         </Row>
         <Row label="Default branch">{status.defaultBranch}</Row>
+        {status.remoteName ? <Row label="Remote">{status.remoteName}</Row> : null}
         <Row label="Upstream">{status.remote ? (status.upstream ? "Tracking a remote branch" : "Not published") : "No remote"}</Row>
         <Row label="Ahead / behind">
           {status.ahead} ahead, {status.behind} behind

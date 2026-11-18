@@ -14,6 +14,11 @@ export interface PushState {
    * it never matches a signed-in user, so it is dropped the first time the app sees one.
    */
   userId: string | null;
+  /**
+   * The server VAPID `keyId` the subscription was made with (`GET /api/push/vapid-key`). When the server answers
+   * another id the subscription is stale and must be made again. Absent for a state saved before this field existed.
+   */
+  vapidKeyId?: string;
 }
 
 function openDb(): Promise<IDBDatabase> {
@@ -46,8 +51,10 @@ async function run<T>(mode: IDBTransactionMode, body: (store: IDBObjectStore) =>
 export async function loadPushState(): Promise<PushState | null> {
   const value: unknown = await run("readonly", (store) => store.get(KEY));
   if (typeof value !== "object" || value === null) return null;
-  const { deviceId, subscriptionId, userId } = value as Record<string, unknown>;
-  return typeof deviceId === "string" && typeof subscriptionId === "string" ? { deviceId, subscriptionId, userId: typeof userId === "string" ? userId : null } : null;
+  const { deviceId, subscriptionId, userId, vapidKeyId } = value as Record<string, unknown>;
+  return typeof deviceId === "string" && typeof subscriptionId === "string"
+    ? { deviceId, subscriptionId, userId: typeof userId === "string" ? userId : null, ...(typeof vapidKeyId === "string" ? { vapidKeyId } : {}) }
+    : null;
 }
 
 export async function savePushState(state: PushState): Promise<void> {

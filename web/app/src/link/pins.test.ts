@@ -51,6 +51,27 @@ describe("desktop key pins", () => {
     expect(await checkPin(DESKTOP, keyA)).toBe("match");
   });
 
+  it("forgetPins(deviceId) drops only the pins of that device and the ones from before owners were recorded", async () => {
+    const OTHER = "fedcba9876543210fedcba9876543210";
+    const THIRD = "00112233445566778899aabbccddeeff";
+    await checkPin(DESKTOP, keyA, "device-1");
+    await commitPin(OTHER, keyB, "device-2");
+    await checkPin(THIRD, keyA); // a legacy pin without an owner
+    await forgetPins("device-1");
+    expect(await getPin(DESKTOP)).toBeUndefined();
+    expect(await getPin(THIRD)).toBeUndefined();
+    expect((await getPin(OTHER))?.deviceId).toBe("device-2");
+    expect(await checkPin(OTHER, keyB)).toBe("match");
+  });
+
+  it("a re-pin from verify keeps the owner of the pin it replaces", async () => {
+    await checkPin(DESKTOP, keyA, "device-1");
+    await repinFromVerify(DESKTOP, fingerprint(keyB), keyB);
+    expect((await getPin(DESKTOP))?.deviceId).toBe("device-1");
+    await forgetPins("device-2");
+    expect(await getPin(DESKTOP)).toBeDefined();
+  });
+
   it("forgetPins drops every pin", async () => {
     await checkPin(DESKTOP, keyA);
     await forgetPins();

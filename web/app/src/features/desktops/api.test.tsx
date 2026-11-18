@@ -37,6 +37,7 @@ import {
   useDesktops,
   useDevices,
 } from "./api";
+import { onForgetDesktop } from "@/features/settings/desktopLink";
 import { createFakeServer, desktop, device, grant, type FakeServer } from "./testServer";
 
 const ASSERTION = { status: "ok", response: { id: "cred", rawId: "cred", type: "public-key", response: {}, clientExtensionResults: {} } };
@@ -179,6 +180,30 @@ describe("mutations", () => {
     expect(queryClient.getQueryData(["link", "d2", "catalog"])).toBe(1);
   });
 
+  it("revokeDesktop runs the forget handlers of the other features, so their records of the desktop go too", async () => {
+    const forgotten: string[] = [];
+    const off = onForgetDesktop((id) => void forgotten.push(id));
+    try {
+      await revokeDesktop(queryClient, "d1");
+    } finally {
+      off();
+    }
+    expect(forgotten).toEqual(["d1"]);
+  });
+
+  it("revokeDesktop still finishes when a forget handler fails", async () => {
+    const off = onForgetDesktop(() => {
+      throw new Error("boom");
+    });
+    const afterRevoke = vi.fn();
+    try {
+      await revokeDesktop(queryClient, "d1", { afterRevoke });
+    } finally {
+      off();
+    }
+    expect(afterRevoke).toHaveBeenCalledTimes(1);
+  });
+
   it("revokeDesktop runs afterRevoke before the queries are removed, and never fetches the deleted desktop again", async () => {
     await queryClient.prefetchQuery({ queryKey: desktopKeys.detail("d1"), queryFn: () => 1 });
     let stillThere = false;
@@ -225,6 +250,8 @@ describe("forgetDevice", () => {
     expect(result.wasThisDevice).toBe(true);
     expect(keys.forgetDeviceKey).toHaveBeenCalledTimes(1);
     expect(pins.forgetPins).toHaveBeenCalledTimes(1);
+    // Scoped to the forgotten device, never "every pin".
+    expect(pins.forgetPins).toHaveBeenCalledWith("dev1");
   });
 
   it("also clears the persisted cache of every desktop, stops the live links and drops the link queries", async () => {

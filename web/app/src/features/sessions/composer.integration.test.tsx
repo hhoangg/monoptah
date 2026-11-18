@@ -6,7 +6,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { resetCollapsedToolCalls } from "@/features/transcript/toolCallsSetting";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { FIXTURE_HANDLERS, type MockDesktop } from "@monoptah/mock-desktop";
+import { FIXTURE_HANDLERS, FixtureError, type MockDesktop } from "@monoptah/mock-desktop";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
 import { stubTranscriptLayout } from "@/features/transcript/layoutStub";
 import { resetLinkConnections } from "@/link";
@@ -15,6 +15,8 @@ import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks, registerSendGuard, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
+import { putBackground } from "@/features/backgrounds/store";
+import { IDBFactory } from "fake-indexeddb";
 import { MAX_FILE_BYTES } from "@/features/composer/attachments";
 import { resetSessionActivity } from "./activityStore";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLink, type MockLinkOptions } from "./dev/mockLink";
@@ -168,6 +170,57 @@ describe("composer in the session screen (W-08)", () => {
   }, 40000);
 });
 
+describe("refused sends (fix-up point 4)", () => {
+  const sendOnce = (code: "starting" | "read_only") => {
+    let first = true;
+    FIXTURE_HANDLERS["conversation.send"] = (params, context) => {
+      if (first) {
+        first = false;
+        throw new FixtureError("refused", code);
+      }
+      return (original["conversation.send"] as Handlers["conversation.send"])(params, context);
+    };
+  };
+
+  it("shows the reason of the desktop code under the unsent message", async () => {
+    const user = userEvent.setup();
+    sendOnce("starting");
+    mount(`/s/${SESSION}`);
+    await user.type(await field(), "hello{Enter}");
+    expect(await screen.findByTestId("not-sent-reason", undefined, { timeout: 15000 })).toHaveTextContent("still starting");
+  }, 20000);
+
+  it("Retry goes through the send-guard: a refusal shows its reason and sends nothing", async () => {
+    const user = userEvent.setup();
+    sendOnce("starting");
+    const seen: string[] = [];
+    registerSendGuard(() => {
+      seen.push("guard");
+      return Promise.resolve(seen.length === 1 ? { kind: "allow" as const } : { kind: "refuse" as const, reason: "Still starting, wait" });
+    });
+    mount(`/s/${SESSION}`);
+    await user.type(await field(), "hello{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Not sent, retry" }));
+    expect(await screen.findByTestId("send-refused")).toHaveTextContent("Still starting, wait");
+    expect(seen).toHaveLength(2);
+    expect(sentTexts(link.desktop)).not.toContain("hello");
+  });
+
+  it("Retry asks the send-guard to confirm, then sends", async () => {
+    const user = userEvent.setup();
+    sendOnce("starting");
+    let calls = 0;
+    registerSendGuard(() => Promise.resolve(++calls === 1 ? { kind: "allow" as const } : { kind: "confirm" as const, notice: "Wake the instance?" }));
+    mount(`/s/${SESSION}`);
+    await user.type(await field(), "hello{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Not sent, retry" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("Wake the instance?");
+    await user.click(within(dialog).getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(sentTexts(link.desktop)).toContain("hello"));
+  });
+});
+
 describe("question card (W-10)", () => {
   const prompt = {
     requestId: 4,
@@ -307,6 +360,16 @@ describe("new session page (F-30, F-31)", () => {
     expect(params.runtimeMode).not.toBe("full-access");
     expect(params).not.toHaveProperty("target");
     await waitFor(() => expect(router.state.location.pathname).toMatch(new RegExp(`^/d/${DESKTOP_ID}/s/sess-new-`)));
+  });
+
+  it("shows the project's stored background behind the empty-session screen (F-90)", async () => {
+    globalThis.indexedDB = new IDBFactory();
+    await putBackground({ projectId: "proj-alpha", projectName: "Example Alpha", image: new Blob(["x"], { type: "image/png" }), opacity: 0.3, updatedAt: 1 });
+    mount(NEW);
+    const image = await screen.findByTestId("empty-session-background");
+    expect(image).toHaveStyle({ opacity: "0.3" });
+    expect(screen.getByTestId("new-session-screen")).toContainElement(image);
+    expect(screen.getByTestId("new-session-screen")).toHaveClass("isolate");
   });
 
   it("goes back to the project when Open after starting is off", async () => {

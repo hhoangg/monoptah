@@ -14,12 +14,17 @@ declare namespace Cloudflare {
     VAPID_PUBLIC_KEY: string;
     VAPID_KEY_ID: string;
     VAPID_SUBJECT: string;
+    /** Rotation only (deploy-runbook.md "VAPID key rotation"): the previous public key and its key id. Unset otherwise. */
+    VAPID_PREVIOUS_PUBLIC_KEY?: string;
+    VAPID_PREVIOUS_KEY_ID?: string;
     /** Decimal string. "0" means unlimited. */
     MAX_USERS: string;
     MAX_DESKTOPS_PER_USER: string;
     MAX_DEVICES_PER_USER: string;
     // Secrets (`wrangler secret put`, web/.dev.vars locally): never in `vars`
     VAPID_PRIVATE_KEY: string;
+    /** Rotation only: the private half of `VAPID_PREVIOUS_PUBLIC_KEY`. Remove it when the rotation ends. */
+    VAPID_PREVIOUS_PRIVATE_KEY?: string;
     RECOVERY_PEPPER: string;
     AUDIT_IP_SALT: string;
   }

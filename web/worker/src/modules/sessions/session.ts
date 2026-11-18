@@ -20,7 +20,8 @@ export const FRESH_SECONDS = 300;
 /** `last_seen_at` and `idle_expires_at` are written at most once per this many seconds per session. */
 export const TOUCH_INTERVAL_SECONDS = 3600;
 export const USER_AGENT_MAX_LENGTH = 200;
-/** Upper bound of `room.revoke` calls per revoke, to stay inside the subrequest limit of a request. */
+
+/** Upper bound of `room.revoke` calls of one admin block, to stay inside the subrequest limit of a request. */
 export const MAX_REVOKE_CALLS = 40;
 
 export type SessionAmr = "passkey" | "recovery";
@@ -135,7 +136,8 @@ export const DELETE_ALL_SESSIONS_SQL = "DELETE FROM sessions WHERE user_id = ?";
 export const DELETE_ALL_SESSIONS_EXCEPT_SQL = "DELETE FROM sessions WHERE user_id = ? AND id_hash <> ?";
 export const LIST_SESSION_HASHES_SQL = "SELECT id_hash FROM sessions WHERE user_id = ?";
 export const LIST_SESSION_HASHES_EXCEPT_SQL = "SELECT id_hash FROM sessions WHERE user_id = ? AND id_hash <> ?";
-export const LIST_DESKTOP_IDS_SQL = "SELECT id FROM desktops WHERE user_id = ? AND revoked_at IS NULL LIMIT ?";
+/** Every live desktop of the user: no cut, so a revoked session's sockets close on all of them (the quota bounds the rows). */
+export const LIST_DESKTOP_IDS_SQL = "SELECT id FROM desktops WHERE user_id = ? AND revoked_at IS NULL";
 
 /** The new session row is the proof that a conditional batch (login, registration, recovery) went through. */
 export const SESSION_CREATED_SQL = "EXISTS (SELECT 1 FROM sessions WHERE id_hash = ?)";
@@ -183,37 +185,19 @@ export async function listSessionIdHashes(env: Pick<Env, "DB">, userId: string, 
   return results.map((row) => row.id_hash);
 }
 
-function maxDesktops(env: Pick<Env, "MAX_DESKTOPS_PER_USER">): number {
-  const parsed = Number.parseInt(env.MAX_DESKTOPS_PER_USER, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : 5;
-}
-
 /**
- * Closes the open sockets of revoked sessions: for each hash and each non-revoked desktop of the user (at most
- * `MAX_DESKTOPS_PER_USER`), `room.revoke({sessionIdHash}, 4001)` (architecture.md 4.4). Best effort: the session
- * rows are already gone, so a failing room is logged (no ids) and skipped. At most `MAX_REVOKE_CALLS` calls are
- * made, spent round-robin: session 0 on every desktop, then session 1 on every desktop, and so on, so a cut
- * never leaves one desktop without a call (recovery after a compromise must reach every desktop). A cut is
- * logged with counts only; the sessions beyond it keep an open socket until the relay re-checks them (WS-R
- * re-validates the cookie session on join). Pending WS-R contract change: `RevokeTarget` takes
- * `{ sessionIdHashes: string[] }`, which makes it one call per desktop and the cap moot.
+ * Closes the open sockets of revoked sessions: for each non-revoked desktop of the user (the quota
+ * `MAX_DESKTOPS_PER_USER` bounds them), one `room.revoke({sessionIdHashes}, 4001)` call carrying every hash (architecture.md
+ * 4.4), so the cost is one DO call per desktop however many sessions are revoked. Best effort: the session rows
+ * are already gone, so a failing room is logged (no ids) and skipped.
  */
-export async function closeSessionSockets(env: Pick<Env, "DB" | "ROOM" | "MAX_DESKTOPS_PER_USER">, userId: string, idHashes: readonly string[]): Promise<void> {
+export async function closeSessionSockets(env: Pick<Env, "DB" | "ROOM">, userId: string, idHashes: readonly string[]): Promise<void> {
   if (idHashes.length === 0) return;
-  const { results } = await env.DB.prepare(LIST_DESKTOP_IDS_SQL).bind(userId, maxDesktops(env)).all<{ id: string }>();
-  const rooms = results.map((desktop) => env.ROOM.get(env.ROOM.idFromName(desktop.id)));
-  const wanted = rooms.length * idHashes.length;
-  const calls: Promise<void>[] = [];
-  for (const sessionIdHash of idHashes) {
-    for (const room of rooms) {
-      if (calls.length >= MAX_REVOKE_CALLS) break;
-      calls.push(room.revoke({ sessionIdHash }, CloseCodes.UNAUTHORIZED));
-    }
-  }
-  if (wanted > calls.length) console.error(`room.revoke truncated: wanted=${wanted} calls=${calls.length} desktops=${rooms.length} sessions=${idHashes.length}`);
-  const settled = await Promise.allSettled(calls);
+  const { results } = await env.DB.prepare(LIST_DESKTOP_IDS_SQL).bind(userId).all<{ id: string }>();
+  const target = { sessionIdHashes: [...idHashes] };
+  const settled = await Promise.allSettled(results.map((desktop) => env.ROOM.get(env.ROOM.idFromName(desktop.id)).revoke(target, CloseCodes.UNAUTHORIZED)));
   const failed = settled.filter((r) => r.status === "rejected").length;
-  if (failed > 0) console.error(`room.revoke failed: calls=${calls.length} failed=${failed}`);
+  if (failed > 0) console.error(`room.revoke failed: calls=${settled.length} failed=${failed}`);
 }
 
 /**

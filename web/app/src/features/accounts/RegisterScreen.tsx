@@ -13,7 +13,7 @@ import { AddPasskeyStep } from "./AddPasskeyStep";
 import { registerErrorMessage, UNSUPPORTED_ERROR } from "./authCopy";
 import { RecoveryCodes } from "./RecoveryCodes";
 import { postSignInTarget } from "./redirect";
-import { registerAccount } from "./queries";
+import { acknowledgeRecoveryCodes, registerAccount } from "./queries";
 import { passkeysSupported } from "./webauthn";
 
 type Step = "form" | "codes" | "passkey";
@@ -103,7 +103,11 @@ export function RegisterScreen() {
     return (
       <AuthLayout>
         <PageHeader title="Save your recovery codes" description="They are the only way back in if you lose every passkey." />
-        <RecoveryCodes handle={accountHandle} codes={codes} onContinue={() => setStep("passkey")} />
+        <RecoveryCodes handle={accountHandle} codes={codes} onContinue={() => {
+            // Best effort: without it the next sign-in asks for new codes, which is safe.
+            void acknowledgeRecoveryCodes(queryClient).catch(() => undefined);
+            setStep("passkey");
+          }} />
       </AuthLayout>
     );
   }

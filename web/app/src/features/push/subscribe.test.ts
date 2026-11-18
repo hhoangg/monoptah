@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
 import { createMockServer, MOCK_VAPID_KEY_ID, MOCK_VAPID_PUBLIC_KEY } from "@/features/accounts/mock/transport";
 import { fromBase64Url, toBase64Url } from "@/sw/base64url";
-import { loadPushState } from "@/sw/pushState";
-import { PushUnavailableError, forgetPushLocally, getSavedPushSubscription, hasBrowserSubscription, subscribeToPush, SW_READY_TIMEOUT_MS, unsubscribeFromPush } from "./subscribe";
+import { loadPushState, savePushState } from "@/sw/pushState";
+import { PushUnavailableError, forgetPushLocally, getSavedPushSubscription, hasBrowserSubscription, resubscribeIfVapidKeyChanged, subscribeToPush, SW_READY_TIMEOUT_MS, unsubscribeFromPush } from "./subscribe";
 
 const keyBytes = fromBase64Url(MOCK_VAPID_PUBLIC_KEY);
 
@@ -73,8 +73,8 @@ describe("subscribeToPush", () => {
     const id = await subscribeToPush("dev-1", "usr-1");
     const options = (subscribe.mock.calls as unknown as Array<[PushSubscriptionOptionsInit]>)[0]![0];
     expect(toBase64Url(options.applicationServerKey as Uint8Array)).toBe(MOCK_VAPID_PUBLIC_KEY);
-    expect(await loadPushState()).toEqual({ deviceId: "dev-1", subscriptionId: id, userId: "usr-1" });
-    expect(await getSavedPushSubscription()).toEqual({ deviceId: "dev-1", subscriptionId: id, userId: "usr-1" });
+    expect(await loadPushState()).toEqual({ deviceId: "dev-1", subscriptionId: id, userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
+    expect(await getSavedPushSubscription()).toEqual({ deviceId: "dev-1", subscriptionId: id, userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
   });
 
   it("replaces a subscription made with another key", async () => {
@@ -152,5 +152,46 @@ describe("mock push routes", () => {
     expect((await transport("/api/push/subscriptions", { method: "POST", headers, body: body("old") })).status).toBe(400);
     expect((await transport(`/api/push/subscriptions/${first.id}`, { method: "DELETE", headers })).status).toBe(200);
     expect((await transport(`/api/push/subscriptions/${first.id}`, { method: "DELETE", headers })).status).toBe(404);
+  });
+});
+
+describe("resubscribeIfVapidKeyChanged", () => {
+  it("does nothing when this browser never enabled push", async () => {
+    const { subscribe } = install(null);
+    expect(await resubscribeIfVapidKeyChanged("usr-1")).toBe(false);
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  it("keeps the subscription while the server key id is the same", async () => {
+    const same = fakeSubscription("https://fcm.googleapis.com/send/same");
+    const { subscribe } = install(same);
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-1", userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
+    expect(await resubscribeIfVapidKeyChanged("usr-1")).toBe(false);
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(same.unsubscribe).not.toHaveBeenCalled();
+  });
+
+  it("subscribes again and records the new key id when the server key id changed", async () => {
+    const stale = fakeSubscription("https://fcm.googleapis.com/send/old", new Uint8Array([4, ...new Uint8Array(64).fill(5)]));
+    const { subscribe } = install(stale);
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-old", userId: "usr-1", vapidKeyId: "retired-key" });
+    expect(await resubscribeIfVapidKeyChanged("usr-1")).toBe(true);
+    expect(stale.unsubscribe).toHaveBeenCalledOnce();
+    expect(subscribe).toHaveBeenCalledOnce();
+    expect(await loadPushState()).toMatchObject({ deviceId: "dev-1", userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
+  });
+
+  it("treats a state saved without a key id as changed once", async () => {
+    install(fakeSubscription("https://fcm.googleapis.com/send/same"));
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-1", userId: "usr-1" });
+    expect(await resubscribeIfVapidKeyChanged("usr-1")).toBe(true);
+    expect((await loadPushState())?.vapidKeyId).toBe(MOCK_VAPID_KEY_ID);
+  });
+
+  it("leaves another account's state alone and never throws", async () => {
+    const { subscribe } = install(null);
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-1", userId: "usr-2", vapidKeyId: "retired-key" });
+    expect(await resubscribeIfVapidKeyChanged("usr-1")).toBe(false);
+    expect(subscribe).not.toHaveBeenCalled();
   });
 });

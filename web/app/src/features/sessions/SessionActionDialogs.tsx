@@ -5,6 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import type { SessionCard } from "@monoptah/protocol";
 import { catalogKey, useLinkMutation } from "@/data";
+import { isBillableKind } from "@/features/cloud/model";
 import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog";
@@ -88,8 +89,8 @@ function RenameForm({ desktopId, session, onOpenChange }: Omit<DialogProps, "ope
   );
 }
 
-/** True for a session that runs on a cloud instance, which archiving must decide to keep or stop. */
-export const isCloudSession = (session: Pick<SessionCard, "target">): boolean => !!session.target && session.target.kind !== "local";
+/** True for a session that runs on a cloud instance (a codespace or a sandbox; `remote` is a plain host machine), which archiving must decide to keep or stop. */
+export const isCloudSession = (session: Pick<SessionCard, "target">): boolean => isBillableKind(session.target?.kind);
 
 function DefaultArchiveDialog({ desktopId, session, open, onOpenChange }: DialogProps) {
   const archive = useLinkMutation("session.archive");

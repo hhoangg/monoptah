@@ -12,7 +12,7 @@ export type LinkSlice = Pick<LinkState, "status" | "blocked">;
  * `login_required`, `web_outdated` and `desktop_outdated` are handled by the `/d/:desktopId` layout and
  * never block here. While the grant request is in flight, a `revoked` block is not a verdict.
  */
-export function blockingScreen(link: LinkSlice, phase: GrantPhase, reconnected: boolean, raceOpen: boolean): BlockingScreen | null {
+export function blockingScreen(link: LinkSlice, phase: GrantPhase, raceOpen: boolean): BlockingScreen | null {
   // A fresh start of the connection has not reset a block kept from an earlier visit yet: no verdict.
   if (link.status === "idle") return null;
   if (phase === "revoked") return "revoked";
@@ -21,7 +21,8 @@ export function blockingScreen(link: LinkSlice, phase: GrantPhase, reconnected: 
       // Only the first-open 4003 race is not a verdict yet. Anything else is a real revoke.
       if (!raceOpen) return "revoked";
       if (phase === "failed") return "grant_failed";
-      return phase === "posted" && reconnected ? "revoked" : "requesting";
+      // The grant exists and the relay still refused with 4003: a real revoke, and nothing reconnects by itself.
+      return phase === "posted" || phase === "missing" ? "revoked" : "requesting";
     }
     case "account_blocked":
     case "key_changed":

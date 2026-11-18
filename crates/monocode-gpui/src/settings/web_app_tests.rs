@@ -341,6 +341,48 @@ fn verify_on_another_device_encodes_the_verify_link(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_activity_log_opens_from_the_web_app_page(cx: &mut TestAppContext) {
+    use monocode_core::mobile::audit::{Lifecycle, Log, Transport};
+    let dir = std::env::temp_dir().join(format!("monoptah-web-activity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    Log::new(&dir).record_lifecycle(
+        Lifecycle::Confirm,
+        "dev-1",
+        "abcdef0123456789",
+        Transport::Web,
+        None,
+    );
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    // Unpaired: the log is still there (it covers phones too).
+    assert!(visual.debug_bounds("web-activity").is_some());
+    let data_dir = dir.clone();
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(paired());
+        ctx.data_dir = Some(data_dir);
+    });
+    assert!(visual.debug_bounds("web-activity").is_some());
+    assert!(visual.debug_bounds("web-activity-list").is_none());
+    click(visual, "web-activity-toggle");
+    assert!(visual.debug_bounds("web-activity-list").is_some());
+    let shown = window
+        .update(visual, |preview, _, cx| {
+            preview.settings.read(cx).web_app.activity.clone()
+        })
+        .unwrap()
+        .expect("the log was read");
+    assert_eq!(shown.len(), 1);
+    assert_eq!(shown[0]["event"], "confirm");
+    click(visual, "web-activity-toggle");
+    assert!(visual.debug_bounds("web-activity-list").is_none());
+    // Unpairing keeps it open: the lines written by the unpair are the point.
+    click(visual, "web-activity-toggle");
+    set_web(&window, visual, |ctx| ctx.web = Some(WebStatus::default()));
+    assert!(visual.debug_bounds("web-activity-list").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui::test]
 fn error_and_revoked_states_show_banners(cx: &mut TestAppContext) {
     let window = preview(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);

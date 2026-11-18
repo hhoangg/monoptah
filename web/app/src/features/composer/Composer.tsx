@@ -10,7 +10,8 @@
 // - A read-only device cannot write: the field and buttons are disabled and a line says why.
 // - Offline (the link is not ready) keeps the field open for writing; only Send and Stop wait.
 // - Attachments: a file picker, paste and drop, limited as in `attachments.ts`.
-import { useEffect, useId, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
+import { DictationButton } from "@/features/dictation";
 import { cn } from "@/lib/utils";
 import { Glass } from "@/ui/Glass";
 import { Icon } from "@/ui/Icon";
@@ -122,6 +123,11 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
       setError(reason instanceof AttachmentError ? reason.message : "Could not attach.");
     }
   };
+
+  // F-49: a finished phrase joins the draft after what is already typed; it never sends.
+  const insertText = useCallback((phrase: string) => {
+    setText((current) => (current.length === 0 || /\s$/.test(current) ? current + phrase : `${current} ${phrase}`));
+  }, []);
 
   const remove = (id: string) => {
     held.current.filter((item) => item.id === id).forEach(revokeAttachment);
@@ -258,6 +264,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
           >
             <Icon name="add" size={18} />
           </button>
+          <DictationButton onText={insertText} disabled={readOnly || blocked} className="size-11 pointer-fine:size-9" />
           <div className="flex min-w-0 flex-1 items-center">{toolbar}</div>
           {showStop ? (
             <button

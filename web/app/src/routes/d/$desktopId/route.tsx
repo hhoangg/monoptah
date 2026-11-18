@@ -2,6 +2,7 @@
 import { createFileRoute, Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useRef } from "react";
 import { useLinkDataSync } from "@/data/sync";
+import { rememberDesktop } from "@/features/sessions/lastPlace";
 import { LinkProvider, useLinkState } from "@/link/LinkProvider";
 import { Slot } from "@/ui/slots";
 import { LinkBlockedScreen, isVersionBlocked } from "@/version/LinkBlockedScreen";
@@ -12,6 +13,8 @@ export const Route = createFileRoute("/d/$desktopId")({
 
 function DesktopLayout() {
   const { desktopId } = Route.useParams();
+  // N-12: any screen of a desktop makes it the one `/` goes back to.
+  useEffect(() => rememberDesktop(desktopId), [desktopId]);
   return (
     <LinkProvider desktopId={desktopId}>
       <LinkGuards />
