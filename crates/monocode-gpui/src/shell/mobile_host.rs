@@ -2177,10 +2177,14 @@ impl Shell {
             let mono = monos.read(cx).notification_mono(id)?;
             Some((mono.id.clone(), mono.label(), mono.session_id != Some(id)))
         });
-        if self.mobile.host.is_none()
-            || (mono.is_none() && !from_phone)
-            || (self.window_active && self.notice_session_visible(id, cx))
-        {
+        let is_mono = mono.is_some();
+        let watching = self.window_active && self.notice_session_visible(id, cx);
+        if mobile_notice_suppressed(
+            self.mobile.host.is_some(),
+            mono.is_some(),
+            from_phone,
+            watching,
+        ) {
             return;
         }
         let body = delivery::clip_body(body);
@@ -2249,7 +2253,17 @@ impl Shell {
             mono_id: web_mono.as_ref().map(|(id, _)| id.as_str()),
             project,
         });
-        self.send_mobile_notice(category, notice, cx);
+        // A phone is never pushed about a session only web devices see: it
+        // cannot open it, and its path or instance name stays off the wire.
+        if is_mono || self.mobile_phone_push_allowed(id, cx) {
+            self.send_mobile_notice(category, notice, cx);
+        }
+    }
+
+    /// Whether phones may be pushed about session `id`: not when only web
+    /// devices see it (a cloud or remote-machine session off the rail).
+    fn mobile_phone_push_allowed(&self, id: i64, cx: &App) -> bool {
+        !cloud::web_only_session(self, id, &self.mobile_projects(cx))
     }
 
     /// The project a session's notice is filed under, by name and path.
@@ -3117,6 +3131,18 @@ fn explicit_model(prefs: &crate::settings::Preferences, cwd: &str, kind: Kind) -
         .and_then(|model| monocode_core::store::native_model(&model, kind.id()))
 }
 
+/// Whether a push notice is dropped: no host to send it, a session that is
+/// neither a Mono's nor started from a phone (the desktop's own turns stay
+/// on the desktop), or one the user is looking at in the active window.
+fn mobile_notice_suppressed(
+    has_host: bool,
+    is_mono: bool,
+    from_phone: bool,
+    watching: bool,
+) -> bool {
+    !has_host || (!is_mono && !from_phone) || watching
+}
+
 /// The model a phone-started session gets: the phone's own pick, else the
 /// project then Settings model of an explicit provider, else the new-chat default.
 fn start_model(
@@ -3156,6 +3182,59 @@ mod cloud_tests;
 mod tests {
     use super::*;
     use monocode_core::mobile::{DeviceKind, Permission};
+
+    /// F-85: the push suppression rule, over the cases that matter.
+    #[test]
+    fn push_notices_follow_the_visible_session_and_phone_started_rule() {
+        let suppressed = mobile_notice_suppressed;
+        // Arguments: has_host, is_mono, from_phone, watching.
+        assert!(
+            !suppressed(true, false, true, false),
+            "a phone-started turn is sent"
+        );
+        assert!(
+            !suppressed(true, true, false, false),
+            "a Mono's message is sent"
+        );
+        assert!(
+            suppressed(true, false, false, false),
+            "a desktop-started turn is not"
+        );
+        assert!(
+            suppressed(true, false, true, true),
+            "a visible session is not"
+        );
+        assert!(
+            suppressed(true, true, false, true),
+            "a visible Mono chat is not"
+        );
+        assert!(
+            suppressed(false, false, true, false),
+            "no host, nothing to send"
+        );
+        assert!(
+            suppressed(false, true, true, false),
+            "no host, nothing to send"
+        );
+    }
+
+    /// F-85: a finish ends the phone's turn even when no notice is sent, while
+    /// another category leaves it alone.
+    #[gpui::test]
+    fn a_finish_clears_the_phone_started_turn_with_no_host(cx: &mut gpui::TestAppContext) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let summary = shell.session_metadata(id, cx).summary.clone();
+                assert!(shell.mobile.host.is_none());
+                shell.mobile.started.insert(id);
+                shell.notify_mobile(&summary, "agentInput", "Needs you", cx);
+                assert!(shell.mobile.started.contains(&id));
+                shell.notify_mobile(&summary, "agentFinished", "Done", cx);
+                assert!(!shell.mobile.started.contains(&id));
+            })
+            .unwrap();
+    }
 
     fn phone() -> DeviceContext {
         DeviceContext {
@@ -3614,7 +3693,9 @@ mod tests {
                     Err(policy::Code::Disabled.failure())
                 );
                 assert_eq!(pending(cx), 1);
-                const { assert!(!policy::REMOTE_APPROVALS_ENABLED) };
+                // The gate is on (U-13 passed); the desktop toggle defaults off.
+                assert!(!policy::PolicyFlags::default().remote_approvals);
+                assert!(!policy::approvals_enabled(), "the toggle defaults off");
                 assert!(approvals::read_fields(shell, id, &phone(), cx).is_empty());
                 assert!(approvals::frame_fields(shell, id, &phone(), cx).is_empty());
 
