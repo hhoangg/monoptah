@@ -186,6 +186,7 @@ impl Conversation {
             return;
         }
         self.mobile_no_wake = false;
+        crate::runtime::remote::allow_wake_for_next_run(self.summary.id);
         self.submit_from_remote_now(send.prompt, send.attachments, cx);
     }
 }

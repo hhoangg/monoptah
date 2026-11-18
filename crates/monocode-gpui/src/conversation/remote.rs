@@ -708,13 +708,14 @@ impl Conversation {
                         if let Some((row, query)) = this.pending_search.take() {
                             this.reveal_search(row, query, cx);
                         }
-                        this.flush_wake_send(cx);
                         if running && !this.busy && !this.stopping {
                             this.settings.remote_action = Some(json!({"type":"attach"}));
                             this.launch_prompt(String::new(), cx);
                         } else {
                             this.run_history_actions(cx);
                         }
+                        // After the attach to a running host turn, so the message queues behind it.
+                        this.flush_wake_send(cx);
                         this.finish_app_prompt(cx);
                         this.pump_follow_ups(cx);
                         if initial {

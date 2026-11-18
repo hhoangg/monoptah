@@ -617,7 +617,16 @@ impl Shell {
     /// The session is the conversation of a cloud workspace: its folder is remote and it is
     /// bound to an instance, as far as the app knows (also before the marks are loaded).
     pub(crate) fn mobile_is_cloud_conversation(&self, id: i64) -> bool {
-        self.mobile_remote_cwd(id) && self.mobile_cloud_bound(id)
+        (self.mobile_remote_cwd(id) && self.mobile_cloud_bound(id)) || self.mobile_cloud_located(id)
+    }
+
+    /// A moved session: a local row whose store location is Cloud, so its turns run on the
+    /// linked Host session and a send wakes the instance (`ensure_before_send`). An unreadable
+    /// location counts as Cloud (fail closed, like the store's own guards).
+    pub(crate) fn mobile_cloud_located(&self, id: i64) -> bool {
+        locked(&self.store)
+            .map(|store| store.cloud_location(id).map_or(true, |l| l.is_cloud()))
+            .unwrap_or(false)
     }
 
     /// The session's own folder is on a remote machine (`remote://`).

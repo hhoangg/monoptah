@@ -1,6 +1,7 @@
 //! H-09: what the catalog, reads and watch frames say about cloud and remote
 //! sessions, for web devices and for phones, from cached state only.
 use super::*;
+use crate::cloud_wake::fakes;
 use crate::shell::cloud::CloudMark;
 use gpui::TestAppContext;
 use monocode_core::{
@@ -785,4 +786,38 @@ fn a_launch_card_is_scoped_per_device_kind_and_selection() {
     let narrowed_phone = device(DeviceKind::Phone, Some(vec!["p".into()]));
     assert!(launch_shown(&narrowed_phone, false, "p"));
     assert!(!launch_shown(&narrowed_phone, false, "q"));
+}
+
+/// The second guard: a run marked no-wake only asks the Host whether it answers (it never
+/// calls `ensure`), fails visibly when it does not, and a mark is used up by one run.
+#[test]
+fn a_no_wake_run_only_probes_the_host_and_fails_visibly() {
+    use crate::runtime::remote::{
+        NOT_CONNECTED, allow_wake_for_next_run, forbid_wake_for_next_run, require_connected,
+        take_no_wake,
+    };
+    forbid_wake_for_next_run(41);
+    assert!(take_no_wake(41));
+    assert!(!take_no_wake(41), "one run uses the mark up");
+    forbid_wake_for_next_run(42);
+    allow_wake_for_next_run(42);
+    assert!(!take_no_wake(42), "a confirmed wake-send clears it");
+    assert!(!take_no_wake(43), "no mark, no restriction");
+
+    // A Host that does not answer: the send fails, nothing is woken.
+    let calls = Calls::default();
+    let down = CountingHost(calls.clone());
+    assert!(require_connected(&down, "env-x").is_err());
+    // A Host that answers: allowed, and only `environment.describe` was asked.
+    let host = fakes::FakeHost(Default::default(), false, Default::default());
+    assert_eq!(require_connected(&host, "env-octo-run"), Ok(()));
+    let log = host.0.lock().unwrap().clone();
+    assert!(
+        log.iter().all(|call| !call.starts_with("ensure")),
+        "{log:?}"
+    );
+    assert_eq!(
+        require_connected(&host, "env-unknown"),
+        Err(NOT_CONNECTED.to_owned())
+    );
 }

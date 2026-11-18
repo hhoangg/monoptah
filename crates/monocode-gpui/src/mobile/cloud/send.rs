@@ -79,9 +79,7 @@ pub(super) fn before_send(
     }
     // The cache can be stale (an idle stop, a sandbox TTL, a restart of the desktop): only a
     // live, connected view is available. A view that is not loaded or not connected is not.
-    let live = shell
-        .mobile_session_view(id)
-        .and_then(|view| view.read(cx).mobile_cloud_connected());
+    let live = live_link(shell, id, cx);
     let state = match (state, live) {
         (CloudState::Available, Some(true)) => CloudState::Available,
         (CloudState::Available, _) => CloudState::Stopped,
@@ -103,13 +101,24 @@ pub(super) fn before_send(
     }
 }
 
+/// Whether the link of a cloud conversation is live: its own view for a session that lives on
+/// the instance (`remote://` folder); for a moved session (a local folder whose turns run on
+/// the linked Host) the cached state of its instance, which the no-wake guard of the run
+/// re-checks against the Host itself. `None` when nothing is known yet.
+fn live_link(shell: &Shell, id: i64, cx: &gpui::App) -> Option<bool> {
+    if shell.mobile_remote_cwd(id) {
+        return shell
+            .mobile_session_view(id)
+            .and_then(|view| view.read(cx).mobile_cloud_connected());
+    }
+    let state = super::card_view(shell, id, false)?.state?;
+    Some(state == CloudState::Available)
+}
+
 /// Whether a cloud conversation is connected now. A phone, or any device when the web
 /// path does not apply, gets a coded failure instead of a message that cannot be sent.
 pub(crate) fn still_connected(shell: &Shell, id: i64, cx: &gpui::App) -> Result<(), Failure> {
-    let live = shell
-        .mobile_session_view(id)
-        .and_then(|view| view.read(cx).mobile_cloud_connected());
-    if live == Some(true) {
+    if live_link(shell, id, cx) == Some(true) {
         return Ok(());
     }
     Err(Failure::coded(

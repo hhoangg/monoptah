@@ -1857,6 +1857,8 @@ impl Shell {
                                         v.mobile_wake_submit(text, attachments, cx)
                                     });
                                 } else {
+                                    // The link may have dropped while the files were staged.
+                                    cloud::before_send_again(this, *id, cx)?;
                                     view.update(cx, |v, cx| v.mobile_submit(text, attachments, cx));
                                 }
                                 this.mobile.started.insert(*id);

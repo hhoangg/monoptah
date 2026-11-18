@@ -244,6 +244,20 @@ fn launched(fx: &Fx, cx: &mut TestAppContext) -> Vec<String> {
         .unwrap()
 }
 
+fn before_send_of(
+    fx: &Fx,
+    cx: &mut TestAppContext,
+    device: &DeviceContext,
+    id: i64,
+    params: Value,
+) -> Result<cloud::SendPlan, Failure> {
+    fx.window
+        .update(cx, |shell, _, cx| {
+            cloud::before_send(shell, device, Some(id), &params, cx)
+        })
+        .unwrap()
+}
+
 fn set_state(fx: &Fx, cx: &mut TestAppContext, state: CloudState) {
     fx.window
         .update(cx, |shell, _, _| {
@@ -1332,6 +1346,92 @@ fn a_phone_send_to_a_cloud_conversation_fails_coded_unless_connected(cx: &mut Te
     connect(&fx, cx, true);
     let reply = send(&fx, cx, &phone, cs, json!({"text": "hi"})).unwrap();
     assert_eq!(reply, json!({"sessionId": wire}));
+}
+
+/// Makes the fixture's local session a moved one: the local folder is kept, its store
+/// location is Cloud (its turns run on the linked Host) and it is bound to the instance.
+fn move_local_to_cloud(fx: &Fx, cx: &mut TestAppContext) {
+    let (cs, local, project) = (fx.cs, fx.local, fx.project());
+    fx.window
+        .update(cx, |shell, _, _| {
+            let mark = shell.cloud_marks[&cs].clone();
+            shell.cloud_marks.insert(local, mark);
+            let location = monocode_core::store::CloudLocation {
+                cloud: CloudRef::codespace(CS),
+                environment_id: format!("env-{CS}"),
+                project_id: "p".into(),
+                host_session_id: "host-1".into(),
+                remote_cwd: "/workspaces/widgets".into(),
+                local_cwd: project,
+                moved_at_row: 0,
+                pushed_branch: None,
+            };
+            locked(&shell.store)
+                .unwrap()
+                .set_cloud_location(
+                    local,
+                    &monocode_core::store::SessionLocation::Cloud(location),
+                )
+                .unwrap();
+            assert!(shell.mobile_is_cloud_conversation(local));
+        })
+        .unwrap();
+}
+
+/// The blocker: a moved session (local folder, store location Cloud) would wake its stopped
+/// instance through `ensure_before_send` with no consent. It is a cloud conversation like the
+/// others: a web device needs the wake plan, a phone is refused while the instance is down,
+/// and with the instance live a phone's message is delivered as today.
+#[gpui::test]
+fn a_moved_session_never_wakes_without_consent_for_web_or_phone(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let local = fx.local;
+    move_local_to_cloud(&fx, cx);
+    let no_calls = |fx: &Fx| {
+        assert!(
+            fx.host.0.lock().unwrap().is_empty(),
+            "{:?}",
+            fx.host.0.lock().unwrap()
+        );
+        assert_eq!(changes(&fx.gh), 0);
+    };
+    // Web without consent: free refusal, nothing called.
+    let refused = send(&fx, cx, &fx.web(), local, json!({"text": "hi"})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("wake_required"));
+    no_calls(&fx);
+    assert_eq!(
+        cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
+        0
+    );
+    // Phone while the instance is down: a coded failure, nothing called.
+    let phone = fx.phone();
+    let refused = send(&fx, cx, &phone, local, json!({"text": "hi"})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("unsupported_target"));
+    assert!(refused.error.contains("not connected"), "{}", refused.error);
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    no_calls(&fx);
+    // Web with the consent: the wake plan, counted in the rate limit.
+    let plan = before_send_of(&fx, cx, &fx.web(), local, json!({"wake": true})).unwrap();
+    assert!(plan.wake);
+    let reply = send(
+        &fx,
+        cx,
+        &fx.web(),
+        local,
+        json!({"wake": true, "text": "hi"}),
+    )
+    .unwrap();
+    assert_eq!(reply["wake"], true);
+    assert_eq!(
+        cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
+        1
+    );
+    crate::conversation::Conversation::reset_wake_sends();
+    // Phone with the instance live: delivered as today.
+    set_state(&fx, cx, CloudState::Available);
+    let reply = send(&fx, cx, &phone, local, json!({"text": "hi"})).unwrap();
+    assert_eq!(reply, json!({"sessionId": persisted(&fx, cx, local)}));
 }
 
 /// N7: a wake that cannot open its conversation is a coded failure and holds nothing.

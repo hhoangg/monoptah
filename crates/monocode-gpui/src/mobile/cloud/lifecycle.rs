@@ -88,6 +88,7 @@ pub(super) fn start_wake(
         };
         let mut failed = !started;
         if started {
+            let mut ended = false;
             let polls = cloud_policy::WAKE_SLOT_TIMEOUT.as_secs() / POLL.as_secs();
             for _ in 0..polls {
                 cx.background_executor().timer(POLL).await;
@@ -95,11 +96,18 @@ pub(super) fn start_wake(
                     Ok((true, _)) => {}
                     Ok((false, wake_failed)) => {
                         failed = wake_failed;
+                        ended = true;
                         break;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        ended = true;
+                        break;
+                    }
                 }
             }
+            // A wake that neither connected nor failed within the timeout: its message must
+            // not wait (and keep its text and files) for a link that never came.
+            failed |= !ended;
         }
         cloud_policy::release_wake(&slot);
         let _ = this.update(cx, |this, cx| {
