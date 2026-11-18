@@ -61,6 +61,14 @@ pub fn scope_catalog(device: &DeviceContext, catalog: &mut Value) {
         }
         for card in list.iter_mut().filter_map(Value::as_object_mut) {
             card.remove(WEB_ONLY);
+            // A web device never learns a remote machine's path (M2).
+            let remote = card
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.starts_with(crate::remote::REMOTE_PATH_PREFIX));
+            if !phone && remote {
+                card.remove("path");
+            }
         }
     }
 }
@@ -86,17 +94,44 @@ fn percent_decode(id: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// The opaque id a web device sees for a remote-machine project that is not on
+/// the rail: `remote-` and the first 16 hex digits of the SHA-256 of the path.
+/// It is deterministic (selections and ids stay stable) and says nothing of
+/// the path, the machine or the user name.
+pub fn remote_project_id(path: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(path.as_bytes());
+    let mut id = String::from(REMOTE_ID_PREFIX);
+    for byte in &digest[..8] {
+        id.push_str(&format!("{byte:02x}"));
+    }
+    id
+}
+
+const REMOTE_ID_PREFIX: &str = "remote-";
+
+/// Whether `project_id` is an opaque [`remote_project_id`].
+fn is_opaque_remote_id(project_id: &str) -> bool {
+    project_id
+        .strip_prefix(REMOTE_ID_PREFIX)
+        .is_some_and(|hex| {
+            hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
 /// Whether `project_id` names a remote-machine project rather than a local
-/// one (D9). The app encodes a project's path in its id, and a remote
-/// project's path starts with `remote://`, so its id starts with
-/// `remote%3A%2F%2F` in either case of the hex digits. The id is decoded
+/// one (D9). Two spellings: the opaque [`remote_project_id`] a web device is
+/// shown, and the app's percent-encoded path id of a rail remote project (a
+/// remote project's path starts with `remote://`, so its id starts with
+/// `remote%3A%2F%2F` in either case of the hex digits). The id is decoded
 /// first, so any other spelling of the same prefix is caught too. A local path
 /// that merely has "remote" in its name is not affected: an encoded absolute
 /// path starts with `%2F` or a drive letter.
 pub fn is_non_local_project(project_id: &str) -> bool {
-    percent_decode(project_id)
-        .get(..9)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("remote://"))
+    is_opaque_remote_id(project_id)
+        || percent_decode(project_id)
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("remote://"))
 }
 
 // MARK: rate limit (D5)
@@ -110,6 +145,9 @@ pub const WAKE_CONCURRENT: usize = 2;
 pub const WAKE_SLOT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Reads of `cloud.instances` and `cloud.startOptions` per device and minute.
 pub const READ_LIMIT_PER_MINUTE: usize = 30;
+/// `cloud.stop` calls per device and minute: a stop saves money, so the limit
+/// is only there so a loop cannot burn the `gh` quota.
+pub const STOP_LIMIT_PER_MINUTE: usize = 10;
 
 const HOUR: Duration = Duration::from_secs(60 * 60);
 const MINUTE: Duration = Duration::from_secs(60);
@@ -129,6 +167,7 @@ struct DeviceUse {
     /// In-flight operations, by slot id.
     slots: Vec<(u64, Instant)>,
     reads: VecDeque<Instant>,
+    stops: VecDeque<Instant>,
 }
 
 /// The per-device limit of billable calls (security.md T16). Time is passed in,
@@ -152,6 +191,9 @@ impl WakeLimiter {
         usage.slots.retain(|(_, at)| age(*at) < WAKE_SLOT_TIMEOUT);
         while usage.reads.front().is_some_and(|at| age(*at) >= MINUTE) {
             usage.reads.pop_front();
+        }
+        while usage.stops.front().is_some_and(|at| age(*at) >= MINUTE) {
+            usage.stops.pop_front();
         }
     }
 
@@ -203,6 +245,18 @@ impl WakeLimiter {
         Ok(())
     }
 
+    /// Counts one `cloud.stop` of `device`; `Busy` beyond
+    /// [`STOP_LIMIT_PER_MINUTE`] in the last minute.
+    pub fn allow_stop(&mut self, device: &str, now: Instant) -> Result<(), Code> {
+        let usage = self.devices.entry(device.to_owned()).or_default();
+        Self::forget_old(usage, now);
+        if usage.stops.len() >= STOP_LIMIT_PER_MINUTE {
+            return Err(Code::Busy);
+        }
+        usage.stops.push_back(now);
+        Ok(())
+    }
+
     /// Operations of `device` in flight now.
     pub fn in_flight(&mut self, device: &str, now: Instant) -> usize {
         self.devices.get_mut(device).map_or(0, |usage| {
@@ -251,6 +305,13 @@ pub fn release_wake(slot: &WakeSlot) {
 pub fn allow_read(device: &str) -> Result<(), Failure> {
     limiter()
         .allow_read(device, Instant::now())
+        .map_err(Code::failure)
+}
+
+/// Counts a `cloud.stop` on the process-wide limiter.
+pub fn allow_stop(device: &str) -> Result<(), Failure> {
+    limiter()
+        .allow_stop(device, Instant::now())
         .map_err(Code::failure)
 }
 

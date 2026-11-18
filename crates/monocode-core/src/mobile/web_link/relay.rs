@@ -11,7 +11,7 @@ use super::session::{Action, Directory, Lookup, SendError, SessionTable, PROTO};
 use super::{LinkCommand, WebLink, WebState};
 use crate::mobile::host::{name as desktop_name, MobileHost};
 use crate::mobile::identity_store::WebIdentity;
-use crate::mobile::policy::{self, PolicyFlags};
+use crate::mobile::policy;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -605,7 +605,7 @@ fn confirmed_state(permission: policy::Permission) -> Value {
         "state": "confirmed",
         "permission": desktop_api::permission_name(permission),
         "proto": PROTO,
-        "capabilities": policy::capabilities(&PolicyFlags::default()),
+        "capabilities": policy::capabilities(&policy::flags()),
         "desktop": { "name": desktop_name(), "version": env!("CARGO_PKG_VERSION") },
     })
 }

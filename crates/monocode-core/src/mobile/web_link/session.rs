@@ -19,7 +19,7 @@ use super::frame::{
 };
 use super::noise::{fingerprint, is_low_order, Responder, Transport};
 use crate::mobile::host::Device;
-use crate::mobile::policy::{self, DeviceKind, PolicyFlags};
+use crate::mobile::policy::{self, DeviceKind};
 
 /// Channels one device may hold at once (architecture 4.4).
 pub const MAX_CHANNELS_PER_DEVICE: usize = 4;
@@ -409,7 +409,7 @@ impl SessionTable {
     }
 
     fn state_message(&self, mode: &Mode) -> Value {
-        let capabilities = policy::capabilities(&PolicyFlags::default());
+        let capabilities = policy::capabilities(&policy::flags());
         let desktop = json!({ "name": self.desktop_name, "version": self.desktop_version });
         match mode {
             Mode::Ready(device) => json!({
@@ -773,8 +773,35 @@ mod tests {
         );
     }
 
+    /// The policy toggles are process-wide: tests that move them run one at a time.
+    static FLAGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// S1: the `state` message a web device receives carries what the desktop
+    /// supports: `cloud` always, and `cloudStart` while that toggle is on.
+    #[test]
+    fn the_state_message_carries_cloud_and_follows_the_toggles() {
+        let _serial = FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = policy::flags();
+        let capabilities = |h: &mut H| {
+            let dev = Dev::new(2);
+            h.confirmed(&dev);
+            let (_, msgs, _) = h.connect(&dev, 7, 1_000);
+            msgs[0]["capabilities"].clone()
+        };
+        policy::set_flags(policy::PolicyFlags::default());
+        assert_eq!(capabilities(&mut h()), json!(["cloud"]));
+        policy::set_flags(policy::PolicyFlags {
+            remote_cloud_start: true,
+            ..Default::default()
+        });
+        assert_eq!(capabilities(&mut h()), json!(["cloud", "cloudStart"]));
+        policy::set_flags(before);
+    }
+
     #[test]
     fn confirmed_handshake_state_and_deliver() {
+        let _serial = FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        policy::set_flags(policy::PolicyFlags::default());
         let mut h = h();
         let dev = Dev::new(1);
         h.confirmed(&dev);
@@ -787,7 +814,7 @@ mod tests {
                 "state": "confirmed",
                 "permission": "read",
                 "proto": 1,
-                "capabilities": [],
+                "capabilities": ["cloud"],
                 "desktop": {"name": "Test Desktop", "version": "1.2.3"},
             })]
         );

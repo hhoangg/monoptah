@@ -301,3 +301,62 @@ fn a_start_target_refuses_everything_else_as_forbidden() {
         assert_eq!(validate_start_target(&bad), Err(Code::Forbidden), "{bad}");
     }
 }
+
+/// M2: a web-only remote project has an opaque id and no path, so nothing of
+/// the machine's path reaches a browser, and the id is still a remote id.
+#[test]
+fn an_opaque_remote_project_id_hides_the_path_and_is_recognised() {
+    let id = remote_project_id("remote://box/home/me/work");
+    assert_eq!(id, remote_project_id("remote://box/home/me/work"), "stable");
+    assert_ne!(id, remote_project_id("remote://box/home/me/other"));
+    assert!(id.starts_with("remote-") && id.len() == "remote-".len() + 16);
+    for word in ["box", "home", "me", "work"] {
+        assert!(!id.contains(word), "{id}");
+    }
+    assert!(is_non_local_project(&id));
+    assert!(is_non_local_project("remote%3A%2F%2Fbox%2Fwork"));
+    assert!(is_non_local_project("REMOTE%3a%2f%2fbox"));
+    // A shape that only looks like it is a local id.
+    assert!(!is_non_local_project("remote-short"));
+    assert!(!is_non_local_project("remote-0123456789abcdeg"));
+    assert!(!is_non_local_project("remote-0123456789ABCDEF"));
+    assert!(!is_non_local_project(
+        "%2Fhome%2Fme%2Fremote-0123456789abcdef"
+    ));
+}
+
+#[test]
+fn a_web_device_never_gets_the_path_of_a_remote_project_card() {
+    let projects = json!([
+        {"id": "remote-0123456789abcdef", "name": "Box", "webOnly": true},
+        {"id": "remote%3A%2F%2Fbox%2Fwork", "path": "remote://box/work", "name": "Rail"},
+        {"id": "local", "path": "/work/local", "name": "Local"},
+    ]);
+    let mut web = json!({"projects": projects.clone()});
+    scope_catalog(&device(DeviceKind::Web), &mut web);
+    assert!(!web.to_string().contains("remote://"));
+    assert_eq!(web["projects"][2]["path"], "/work/local");
+    let mut phone = json!({"projects": projects});
+    scope_catalog(&device(DeviceKind::Phone), &mut phone);
+    assert_eq!(
+        phone["projects"][0]["path"], "remote://box/work",
+        "the web-only card is gone"
+    );
+}
+
+/// L3: stops are limited per device and minute, and the window rolls.
+#[test]
+fn stops_are_limited_per_device_and_minute() {
+    let mut limiter = WakeLimiter::new();
+    let start = Instant::now();
+    for _ in 0..STOP_LIMIT_PER_MINUTE {
+        assert_eq!(limiter.allow_stop("d", start), Ok(()));
+    }
+    assert_eq!(limiter.allow_stop("d", start), Err(Code::Busy));
+    assert_eq!(limiter.allow_stop("other", start), Ok(()));
+    // Wake and read budgets are not touched by stops.
+    assert!(limiter.acquire("d", start).is_ok());
+    assert_eq!(limiter.allow_read("d", start), Ok(()));
+    let later = start + Duration::from_secs(61);
+    assert_eq!(limiter.allow_stop("d", later), Ok(()));
+}
