@@ -374,11 +374,14 @@ export class MockWorld {
    */
   #wakeGate(s: SessionRecord, wake: boolean | undefined): boolean {
     if (s.target.kind === "local" || s.target.kind === "remote") return false;
-    if (s.cloudState === "starting") throw new FixtureError("The instance is still starting; try again when it is ready", "starting");
+    // A wake-send in flight leaves the cached state as it was on the desktop, so it is gated like a stopped instance.
+    const waking = s.pendingSend !== null;
+    if (s.cloudState === "starting" && !waking) throw new FixtureError("The instance is still starting; try again when it is ready", "starting");
     if (s.cloudState === "unavailable") throw new FixtureError("This instance cannot be used from the web", "unsupported_target");
     if (s.cloudState === "stopping" && s.cloud?.autoStop) throw new FixtureError("The instance is stopping", "auto_stopping");
-    if (s.cloudState === "stopped" || s.cloudState === "stopping" || s.cloudState === "unknown") {
+    if (waking || s.cloudState === "stopped" || s.cloudState === "stopping" || s.cloudState === "unknown") {
       if (wake !== true) throw new FixtureError("Sending wakes the stopped cloud instance; confirm to continue", "wake_required");
+      if (waking) throw new FixtureError("A message is already waiting for the instance to start", "busy");
       return true;
     }
     return false;
@@ -386,7 +389,6 @@ export class MockWorld {
 
   send(conversationId: string, text: string, wake?: boolean): ResultOf<"conversation.send"> {
     const s = this.session(conversationId);
-    if (s.pendingSend !== null) throw new FixtureError("A message is already waiting for the instance to start", "busy");
     if (this.#wakeGate(s, wake)) {
       s.pendingSend = text;
       this.#beginStartup(s, 0);

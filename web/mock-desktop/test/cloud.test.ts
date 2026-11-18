@@ -189,6 +189,16 @@ describe("watch frames carry cloud and approvals on change only", () => {
       expect(await client.call("conversation.send", { conversationId: "sess-codespace-1", text: "x", wake: true })).toMatchObject({ wake: true, queued: true });
     });
 
+    it("busy comes after the wake check: a pending wake-send gives wake_required without wake, busy with it, for sends and resumes", async () => {
+      const { client } = await setup();
+      await client.call("conversation.send", { conversationId: STOPPED, text: "first", wake: true });
+      await expect(client.call("conversation.send", { conversationId: STOPPED, text: "second" })).rejects.toMatchObject({ code: "wake_required" });
+      await expect(client.call("conversation.send", { conversationId: STOPPED, text: "second", wake: true })).rejects.toMatchObject({ code: "busy" });
+      await expect(client.call("session.resumeUsage", { conversationId: STOPPED, token: "t" })).rejects.toMatchObject({ code: "wake_required" });
+      await expect(client.call("session.resumeUsage", { conversationId: STOPPED, token: "t", wake: true })).rejects.toMatchObject({ code: "busy" });
+      await expect(client.call("session.resumeUsageAtReset", { conversationId: STOPPED, token: "t", enabled: true, wake: true })).rejects.toMatchObject({ code: "busy" });
+    });
+
     it("wake: true on an available instance, and a local or remote session, is an ordinary send", async () => {
       const { client } = await setup();
       for (const id of ["sess-codespace-1", "sess-local-1", "sess-remote-1"]) {

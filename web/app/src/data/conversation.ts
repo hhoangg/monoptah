@@ -27,8 +27,13 @@ import {
 import { useLinkDataSync } from "./sync.ts";
 import { applyFrames, type WatchFrameInput } from "./watchUpdates.ts";
 
-/** While the watch is down the conversation is read again this often (features.md F-32, architecture.md 3.3). */
+/** When the watch ends with an error: read once, wait this long (doubling), then open the watch again (F-32, WorkspaceProvider.tsx:363-396). */
 export const READ_POLL_MS = 1_000;
+export const READ_POLL_MAX_MS = 8_000;
+/** Recovery stops after this many failed reopens in a row; the next reconnect still reopens the watch. */
+export const WATCH_RECOVERY_MAX = 6;
+/** Errors that retrying cannot fix: the session is gone or this device may not see it. */
+const PERMANENT_WATCH_ERRORS = new Set(["not_found", "revoked", "forbidden", "not_selected", "unsupported", "unsupported_target"]);
 
 /** How many of the latest turns a watch opens on (and how many the persisted cache keeps). */
 export const WATCH_TAIL = 30;
@@ -49,6 +54,27 @@ function errorCode(error: unknown): string {
     return (error as { code: string }).code;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The desktop said `cloud: null` for this session (read or frame): it is local again. The catalog card keeps no
+ * cloud target, state or startup, so badges, the startup list and the wake notice go away now instead of at the
+ * next catalog refresh. A read that merely omits `cloud` (marks not loaded yet) never gets here.
+ */
+export function clearCardCloud(queryClient: QueryClient, desktopId: string, conversationId: string): void {
+  queryClient.setQueryData<ResultOf<"workspace.list">>(catalogKey(desktopId), (catalog) => {
+    if (!catalog?.sessions.some((card) => card.id === conversationId && (card.target || card.cloudState || card.startup))) return catalog;
+    return {
+      ...catalog,
+      sessions: catalog.sessions.map((card) => {
+        if (card.id !== conversationId) return card;
+        const { cloudState, startup, ...rest } = card;
+        void cloudState;
+        void startup;
+        return { ...rest, target: { kind: "local" as const } };
+      }),
+    };
+  });
 }
 
 export interface ConversationWatcherDeps {
@@ -74,8 +100,8 @@ export class ConversationWatcher {
   #reopening = false;
   #nextPending = 1;
   #started = false;
-  #pollTimer: ReturnType<typeof setInterval> | null = null;
-  #polling = false;
+  #recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  #recoveries = 0;
 
   constructor(deps: ConversationWatcherDeps) {
     this.#client = deps.client;
@@ -89,30 +115,7 @@ export class ConversationWatcher {
   }
 
   #update(change: (state: ConversationState) => ConversationState): void {
-    const before = this.state?.cloud;
     this.#queryClient.setQueryData<ConversationState>(this.#key, (previous) => change(previous ?? emptyConversation()));
-    if (before && !this.state?.cloud) this.#clearCardCloud();
-  }
-
-  /**
-   * The desktop stopped sending `cloud` for this session (read without it, or `cloud: null`): it is local again.
-   * The catalog card keeps no cloud target, state or startup, so the badges, the startup list and the wake
-   * notice go away now instead of at the next catalog refresh.
-   */
-  #clearCardCloud(): void {
-    this.#queryClient.setQueryData<ResultOf<"workspace.list">>(catalogKey(this.#client.desktopId), (catalog) => {
-      if (!catalog?.sessions.some((card) => card.id === this.conversationId && (card.target || card.cloudState || card.startup))) return catalog;
-      return {
-        ...catalog,
-        sessions: catalog.sessions.map((card) => {
-          if (card.id !== this.conversationId) return card;
-          const { cloudState, startup, ...rest } = card;
-          void cloudState;
-          void startup;
-          return { ...rest, target: { kind: "local" as const } };
-        }),
-      };
-    });
   }
 
   /** Registers the watch. The persisted turns show first when the cache has none (marked `cachedOnly`). */
@@ -135,7 +138,7 @@ export class ConversationWatcher {
     this.#started = false;
     globalThis.document?.removeEventListener("visibilitychange", this.#onVisibility);
     this.#gen += 1;
-    this.#stopReadPoll();
+    this.#stopRecovery();
     this.#registration?.unregister();
     this.#registration = null;
     this.#save();
@@ -170,37 +173,43 @@ export class ConversationWatcher {
       onError: (error) => {
         if (gen !== this.#gen) return;
         this.#update((state) => ({ ...state, error: error.message }));
-        // The watch is down until the next reconnect: read the conversation every second meanwhile.
-        this.#startReadPoll();
+        this.#recover(error.code);
       },
       onDead: () => {
-        if (gen === this.#gen) this.#startReadPoll();
+        // The connection reopens the watch itself; one read fills the gap meanwhile.
+        if (gen === this.#gen) void this.read().catch(() => undefined);
       },
     });
   }
 
-  /** The fallback of mobile while the watch is down: `conversation.read` every `READ_POLL_MS` until a frame arrives. */
-  #startReadPoll(): void {
-    if (this.#pollTimer || !this.#started) return;
-    this.#pollTimer = setInterval(() => {
-      if (this.#polling || this.#client.store.getState().status !== "ready" || globalThis.document?.hidden === true) return;
-      this.#polling = true;
-      this.read()
-        .catch(() => undefined)
-        .finally(() => {
-          this.#polling = false;
-        });
-    }, READ_POLL_MS);
+  /**
+   * The watch ended with an error and is not reopened until the next reconnect. Like mobile: read once, wait
+   * (1 s, doubling to 8 s), open the watch again. Bounded by `WATCH_RECOVERY_MAX`; never for a permanent error.
+   */
+  #recover(code: string | undefined): void {
+    if (!this.#started || this.#recoveryTimer || (code !== undefined && PERMANENT_WATCH_ERRORS.has(code))) return;
+    if (this.#recoveries >= WATCH_RECOVERY_MAX) return;
+    const wait = Math.min(READ_POLL_MAX_MS, READ_POLL_MS * 2 ** this.#recoveries);
+    this.#recoveries += 1;
+    if (this.#client.store.getState().status === "ready") void this.read().catch(() => undefined);
+    this.#recoveryTimer = setTimeout(() => {
+      this.#recoveryTimer = null;
+      // Not ready: the reconnect reopens every watch by itself.
+      if (!this.#started || this.#client.store.getState().status !== "ready") return;
+      this.#registration?.unregister();
+      this.#register();
+    }, wait);
   }
 
-  #stopReadPoll(): void {
-    if (this.#pollTimer) clearInterval(this.#pollTimer);
-    this.#pollTimer = null;
+  #stopRecovery(): void {
+    if (this.#recoveryTimer) clearTimeout(this.#recoveryTimer);
+    this.#recoveryTimer = null;
   }
 
   #onFrame(frame: WatchFrameInput): void {
     // A frame means the watch is alive again.
-    this.#stopReadPoll();
+    this.#stopRecovery();
+    this.#recoveries = 0;
     const current = this.state ?? emptyConversation();
     const applied = applyFrames(current.turns, [frame]);
     if (!applied) {
@@ -209,6 +218,7 @@ export class ConversationWatcher {
     }
     this.#nulls = 0;
     this.#update((state) => withFrames(state, applied));
+    if (applied.cloud === null) clearCardCloud(this.#queryClient, this.#client.desktopId, this.conversationId);
   }
 
   /** A frame named a turn the client never got: close the watch and open it again with `from`. */
@@ -231,6 +241,7 @@ export class ConversationWatcher {
   async read(): Promise<void> {
     const result = await this.#client.request("conversation.read", { conversationId: this.conversationId });
     this.#update((state) => withRead(state, result));
+    if (result.cloud === null) clearCardCloud(this.#queryClient, this.#client.desktopId, this.conversationId);
   }
 
   /**
@@ -356,6 +367,7 @@ export function conversationQueryOptions(desktopId: string, conversationId: stri
         { conversationId },
         { signal },
       );
+      if (result.cloud === null) clearCardCloud(queryClient, desktopId, conversationId);
       return withRead(queryClient.getQueryData<ConversationState>(conversationKey(desktopId, conversationId)) ?? emptyConversation(), result);
     },
   });

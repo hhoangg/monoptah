@@ -121,7 +121,7 @@ export function withFrames(state: ConversationState, applied: AppliedFrames): Co
   });
 }
 
-/** A `conversation.read` result is the whole conversation: it replaces the fields, even to clear them. */
+/** A `conversation.read` result is the whole conversation: it replaces the fields, even to clear them (`cloud` only by an explicit null). */
 export function withRead(
   state: ConversationState,
   result: {
@@ -142,7 +142,8 @@ export function withRead(
     question: result.question ?? null,
     usageLimit: result.usageLimit ?? null,
     error: null,
-    cloud: result.cloud ?? undefined,
+    // Only an explicit `cloud: null` clears it; a read that omits the field (marks not loaded yet) leaves it.
+    cloud: result.cloud === undefined ? state.cloud : (result.cloud ?? undefined),
     approvals: result.approvals ?? NO_APPROVALS,
     approvalsSeq: state.approvalsSeq + 1,
     cachedOnly: false,
