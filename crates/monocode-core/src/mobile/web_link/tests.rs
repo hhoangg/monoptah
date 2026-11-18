@@ -634,6 +634,19 @@ fn the_full_relay_url_is_used_and_a_bare_host_is_rebuilt() {
         connect_url(other, "https://relay.example.test:8443", &id).unwrap(),
         rebuilt
     );
+    // Non-canonical forms are never dialled: an https scheme or an upper-case id.
+    let https = format!("https://relay.example.test:8443/relay/desktop/{id}");
+    let upper = format!(
+        "wss://relay.example.test:8443/relay/desktop/{}",
+        id.to_string().to_uppercase()
+    );
+    for bad in [https, upper] {
+        assert_eq!(
+            connect_url(&bad, "https://relay.example.test:8443", &id).unwrap(),
+            rebuilt,
+            "{bad}"
+        );
+    }
     // A refused handshake: 401 revokes, 429 is `slow_down` (a penalty wait).
     assert_eq!(handshake_end(401), End::Unauthorized);
     assert_eq!(handshake_end(429), End::Closed(Some(4008)));
@@ -1565,7 +1578,12 @@ mod seam {
         );
         let enrolled = crate::mobile::audit::read_recent(log.path(), 20)
             .into_iter()
-            .find(|line| line["event"] == "enroll" && line["deviceId"] == DESKTOP_UUID)
+            .find(|line| {
+                line["event"] == "enroll"
+                    && line["deviceId"] == DESKTOP_UUID
+                    && line["detail"] == "pair"
+                    && line["fingerprint"] == ticket.fingerprint[..8]
+            })
             .expect("the pairing is audited");
         assert_eq!(enrolled["transport"], "web");
         assert_eq!(enrolled["detail"], "pair");
@@ -1591,7 +1609,7 @@ mod seam {
         // The identity is sealed with the handle, and the host is stored bare.
         let identity = world.host.load_web_identity().unwrap().unwrap();
         assert_eq!(identity.account_handle.as_deref(), Some("alice"));
-        // The full address the server returned is kept, not rebuilt.
+        // The canonical full address (typed host and this desktop's id) is kept.
         assert_eq!(
             identity.relay_url,
             format!(
@@ -1902,8 +1920,17 @@ mod seam {
         use crate::mobile::audit;
         let env = env(1);
         let log = tempfile::tempdir().unwrap();
-        let (kept, denied) = ("a".repeat(64), "b".repeat(64));
         let _turn = audit::test_log(log.path());
+        // Unique fingerprints, so lines of other tests in the log are ignored.
+        let kept = format!("{:064x}", 0x5ec0_de01u64);
+        let denied = format!("{:064x}", 0x5ec0_de02u64);
+        let identity = env.host.load_web_identity().unwrap().unwrap();
+        let own = [
+            kept[..8].to_owned(),
+            denied[..8].to_owned(),
+            fingerprint(&identity.static_public)[..8].to_owned(),
+            env.peer.fingerprint()[..8].to_owned(),
+        ];
         let events = {
             let pending = env.host.web_link().pending();
             pending.replace(vec![(kept.clone(), "Tab".into(), "srv-kept".into())]);
@@ -1923,6 +1950,11 @@ mod seam {
             lines.reverse();
             lines
                 .iter()
+                .filter(|line| {
+                    line["fingerprint"]
+                        .as_str()
+                        .is_some_and(|fp| own.iter().any(|own| own == fp))
+                })
                 .map(|line| {
                     (
                         line["event"].as_str().unwrap_or_default().to_owned(),
@@ -1939,22 +1971,18 @@ mod seam {
                 detail.map(str::to_owned),
             )
         };
-        let expected = [
-            line("confirm", None),
-            line("permission", Some("control")),
-            line("revoke", None),
-            line("deny", None),
-            line("revoke", Some("unpair")),
-        ];
-        // Other tests may write here too: the moments of this one stay in order.
-        let mut next = expected.iter();
-        let mut want = next.next();
-        for event in &events {
-            if Some(event) == want {
-                want = next.next();
-            }
-        }
-        assert!(want.is_none(), "missing {want:?} in {events:?}");
+        // The paired row left in `env` goes with the unpair, then the link itself.
+        assert_eq!(
+            events,
+            [
+                line("confirm", None),
+                line("permission", Some("control")),
+                line("revoke", None),
+                line("deny", None),
+                line("revoke", Some("unpair")),
+                line("revoke", Some("unpair")),
+            ]
+        );
     }
 
     #[test]
@@ -1986,9 +2014,13 @@ mod seam {
         env.host
             .apply_server_grants(&[server_grant(&env.peer, "revoked", None)], generation);
         let lines = audit::read_recent(log.path(), 50);
+        let ours = [env.peer.fingerprint(), fresh.fingerprint()];
         let has = |event: &str, id: &str, detail: &str| {
             lines.iter().any(|line| {
-                line["event"] == event
+                line["fingerprint"]
+                    .as_str()
+                    .is_some_and(|fp| ours.iter().any(|own| own[..8] == *fp))
+                    && line["event"] == event
                     && line["deviceId"] == id
                     && line["detail"] == detail
                     && line["transport"] == "web"
@@ -1997,6 +2029,51 @@ mod seam {
         assert!(has("permission", "web-1", "read"), "{lines:?}");
         assert!(has("pending", &fresh.relay_id(), "server"), "{lines:?}");
         assert!(has("revoke", "web-1", "server"), "{lines:?}");
+    }
+
+    #[test]
+    fn grant_sync_audits_only_uuid_ids_and_a_few_pending_lines() {
+        use crate::mobile::{audit, web_link::desktop_api::ServerGrant};
+        let env = env(1);
+        let grant_of = |peer: &Peer, device_id: String| ServerGrant {
+            device_id,
+            device_name: "Laptop".into(),
+            public_key: URL_SAFE_NO_PAD.encode(peer.public),
+            fingerprint: peer.fingerprint(),
+            state: "pending".into(),
+            requested: None,
+            permission: None,
+        };
+        let junk = Peer::new(1, env.peer.desktop_public);
+        let flood: Vec<Peer> = (10..40u8)
+            .map(|n| Peer::new(n, env.peer.desktop_public))
+            .collect();
+        let mut grants = vec![grant_of(&junk, "not-a-uuid\nforged".into())];
+        grants.extend(flood.iter().map(|p| grant_of(p, p.relay_id())));
+        let log = tempfile::tempdir().unwrap();
+        let _turn = audit::test_log(log.path());
+        env.host
+            .apply_server_grants(&grants, env.host.web_link().generation());
+        let mine: Vec<String> = flood
+            .iter()
+            .chain([&junk])
+            .map(|p| p.fingerprint()[..8].to_owned())
+            .collect();
+        let lines: Vec<_> = audit::read_recent(log.path(), 200)
+            .into_iter()
+            .filter(|line| {
+                line["event"] == "pending"
+                    && line["fingerprint"]
+                        .as_str()
+                        .is_some_and(|fp| mine.iter().any(|m| m == fp))
+            })
+            .collect();
+        assert_eq!(lines.len(), 20, "{lines:?}");
+        assert!(lines
+            .iter()
+            .all(|l| l["fingerprint"] != junk.fingerprint()[..8]));
+        // Every device still waits for the user: only the log is limited.
+        assert_eq!(env.host.web_status().pending.len(), 31);
     }
 
     #[test]

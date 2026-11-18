@@ -836,6 +836,13 @@ impl MobileHost {
             .collect::<String>();
         let id = uuid::Uuid::new_v4().to_string();
         let mut config = inner.config.clone();
+        for old in config
+            .devices
+            .iter()
+            .filter(|device| device.fingerprint == fingerprint)
+        {
+            audit_device(audit::Lifecycle::Revoke, old, Some("replaced"));
+        }
         config
             .devices
             .retain(|device| device.fingerprint != fingerprint);
@@ -967,6 +974,13 @@ impl MobileHost {
                         .retain(|v| !(v.id == device.id && v.kind == device.kind));
                     self.save(&config)?;
                     inner.config = config;
+                    audit::record_lifecycle(
+                        audit::Lifecycle::Revoke,
+                        &device.id,
+                        peer,
+                        via.into(),
+                        Some("leave"),
+                    );
                     if via == DeviceKind::Phone {
                         self.gate.remove(peer);
                     }
@@ -1533,6 +1547,18 @@ impl MobileHost {
             undo(&relay_base);
             return Err("The web server sent an invalid pairing".into());
         }
+        // Stored: the canonical address (typed host, lowercase hyphenated id,
+        // wss for https). The server's own string is only accepted when it is
+        // that exact address; otherwise the canonical one is used anyway.
+        let canonical_relay = match uuid::Uuid::parse_str(&approval.desktop_id).map(|id| {
+            super::web_link::relay::relay_url(&relay_base, &id.hyphenated().to_string(), dev)
+        }) {
+            Ok(Ok(url)) => url,
+            _ => {
+                undo(&relay_base);
+                return Err("The web server sent an invalid pairing".into());
+            }
+        };
         // A new pairing starts every device over: old web rows would skip the
         // re-confirmation a replaced pairing needs.
         if let Err(error) = self.remove_web_rows() {
@@ -1545,9 +1571,8 @@ impl MobileHost {
             static_public: pairing.public,
             desktop_id: approval.desktop_id.clone(),
             desktop_token: (*approval.desktop_token).clone(),
-            // The full address the server returned (checked above to be on the
-            // typed host and this desktop's id), not one rebuilt from the host.
-            relay_url: approval.relay_url.trim().to_owned(),
+            // The full canonical address, built from the typed host and id.
+            relay_url: canonical_relay,
             account_handle: Some(handle.clone()),
         };
         if let Err(error) = self.save_web_identity(&identity) {
@@ -1573,10 +1598,11 @@ impl MobileHost {
     /// Removes every web device row and its watches.
     fn remove_web_rows(&self) -> Result<(), String> {
         let mut inner = self.inner.lock().map_err(unavailable)?;
-        self.remove_web_rows_locked(&mut inner)
+        self.remove_web_rows_locked(&mut inner, "repair")
     }
 
-    fn remove_web_rows_locked(&self, inner: &mut Inner) -> Result<(), String> {
+    /// Drops every web row, one audit line each with `detail` as the reason.
+    fn remove_web_rows_locked(&self, inner: &mut Inner, detail: &str) -> Result<(), String> {
         let mut config = inner.config.clone();
         config
             .devices
@@ -1586,6 +1612,14 @@ impl MobileHost {
             || !inner.config.web_revoked.is_empty()
         {
             self.save(&config)?;
+            for row in inner
+                .config
+                .devices
+                .iter()
+                .filter(|device| device.kind == DeviceKind::Web)
+            {
+                audit_device(audit::Lifecycle::Revoke, row, Some(detail));
+            }
             inner.config = config;
         }
         inner
@@ -1874,7 +1908,7 @@ impl MobileHost {
         // cannot refill the pending set after the wipe.
         let mut inner = self.inner.lock().map_err(unavailable)?;
         self.web.forget();
-        self.remove_web_rows_locked(&mut inner)?;
+        self.remove_web_rows_locked(&mut inner, "unpair")?;
         drop(inner);
         if let Some((desktop_id, fingerprint)) = unpaired {
             audit::record_lifecycle(
@@ -1983,8 +2017,15 @@ impl MobileHost {
                 })
                 .collect();
             self.web.set_requests(requests);
+            // The server chooses these ids: only real UUIDs are written, and
+            // only a few per sync, so a flood cannot rotate the log away.
+            let mut new_pending = 0;
             for (fingerprint, _, server_id) in &plan.pending {
-                if self.web.pending().get(fingerprint).is_none() {
+                if new_pending < MAX_PENDING_AUDITS_PER_SYNC
+                    && uuid::Uuid::parse_str(server_id).is_ok()
+                    && self.web.pending().get(fingerprint).is_none()
+                {
+                    new_pending += 1;
                     audits.push((
                         audit::Lifecycle::Pending,
                         server_id.clone(),
@@ -2190,6 +2231,9 @@ impl MobileHost {
         inner.config.devices.push(device);
     }
 }
+
+/// The most `pending` audit lines one grant sync writes.
+const MAX_PENDING_AUDITS_PER_SYNC: usize = 20;
 
 /// Writes a device's moment to the audit log (WS-D3). Never fails the caller.
 fn audit_device(kind: audit::Lifecycle, device: &Device, detail: Option<&str>) {
@@ -2952,6 +2996,27 @@ mod tests {
         );
         // A habit run names both: each must be selected.
         assert_eq!(tokens(Some("p1"), Some("m2")), ["ExponentPushToken[all]"]);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_phone_that_leaves_is_audited() {
+        let (host, _events, phone) = paired();
+        let log =
+            std::env::temp_dir().join(format!("monoptah-leave-audit-{}", uuid::Uuid::new_v4()));
+        let _turn = audit::test_log(&log);
+        let leave = json!({"version":VERSION,"id":"l","method":"device.leave","params":{}});
+        host.handle(&phone, leave).await.unwrap();
+        let lines = audit::read_recent(&log, 50);
+        assert!(
+            lines.iter().any(|line| line["event"] == "revoke"
+                && line["detail"] == "leave"
+                && line["transport"] == "quic"
+                && line["fingerprint"] == phone[..8]),
+            "{lines:?}"
+        );
+        drop(_turn);
+        let _ = std::fs::remove_dir_all(&log);
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

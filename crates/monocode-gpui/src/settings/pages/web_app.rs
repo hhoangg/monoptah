@@ -138,7 +138,6 @@ impl SettingsView {
         if !paired {
             self.web_app.verify = false;
             self.web_app.revoking = None;
-            self.web_app.activity = None;
         }
         // A device answered elsewhere (denied, confirmed, gone) closes its dialog.
         let waiting = |fingerprint: &str| {
@@ -238,6 +237,13 @@ impl SettingsView {
     }
 
     pub(super) fn web_app_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut page = self.web_app_sections(cx);
+        // The audit log covers phones too, so it never depends on the web link.
+        page.push(self.web_app_activity(cx));
+        page
+    }
+
+    fn web_app_sections(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut page = vec![self.web_app_header()];
         let Some(status) = self.ctx.web.clone() else {
             page.push(
@@ -267,7 +273,6 @@ impl SettingsView {
         if status.paired {
             page.push(self.web_app_remote_actions(cx));
             page.extend(self.web_app_devices(&status, cx));
-            page.push(self.web_app_activity(cx));
         }
         page
     }

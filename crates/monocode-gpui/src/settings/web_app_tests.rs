@@ -354,8 +354,8 @@ fn the_activity_log_opens_from_the_web_app_page(cx: &mut TestAppContext) {
     );
     let window = preview(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
-    // Unpaired: no log row.
-    assert!(visual.debug_bounds("web-activity").is_none());
+    // Unpaired: the log is still there (it covers phones too).
+    assert!(visual.debug_bounds("web-activity").is_some());
     let data_dir = dir.clone();
     set_web(&window, visual, |ctx| {
         ctx.web = Some(paired());
@@ -375,15 +375,10 @@ fn the_activity_log_opens_from_the_web_app_page(cx: &mut TestAppContext) {
     assert_eq!(shown[0]["event"], "confirm");
     click(visual, "web-activity-toggle");
     assert!(visual.debug_bounds("web-activity-list").is_none());
-    // Unpairing closes it.
+    // Unpairing keeps it open: the lines written by the unpair are the point.
     click(visual, "web-activity-toggle");
     set_web(&window, visual, |ctx| ctx.web = Some(WebStatus::default()));
-    let closed = window
-        .update(visual, |preview, _, cx| {
-            preview.settings.read(cx).web_app.activity.is_none()
-        })
-        .unwrap();
-    assert!(closed);
+    assert!(visual.debug_bounds("web-activity-list").is_some());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

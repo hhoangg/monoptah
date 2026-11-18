@@ -230,21 +230,26 @@ pub(crate) fn react(end: End, budget: &mut Budget) -> Step {
     }
 }
 
-/// The WebSocket address to connect to: the full relay URL the server returned
-/// at pairing when it is for this desktop's id, else one built from the host
-/// (an identity stored before the full URL was kept). `base` is the checked
-/// HTTP base of `stored`.
+/// The WebSocket address to connect to: always the canonical one built from
+/// the host and the desktop id (`wss` for https, lowercase hyphenated id). The
+/// stored string is used only when it is exactly that address; any other form
+/// (an `https` scheme, an upper-case id, a bare host from an older install)
+/// falls back to the canonical one. `base` is the checked HTTP base of `stored`.
 pub(crate) fn connect_url(
     stored: &str,
     base: &str,
     desktop_uuid: &uuid::Uuid,
 ) -> Result<String, String> {
-    let id = desktop_uuid.hyphenated().to_string();
-    let stored = stored.trim();
-    if desktop_api::relay_path_id(stored).is_some_and(|path| path.eq_ignore_ascii_case(&id)) {
-        return Ok(stored.to_owned());
-    }
-    relay_url(base, &id, cfg!(debug_assertions))
+    let canonical = relay_url(
+        base,
+        &desktop_uuid.hyphenated().to_string(),
+        cfg!(debug_assertions),
+    )?;
+    Ok(if stored.trim() == canonical {
+        stored.trim().to_owned()
+    } else {
+        canonical
+    })
 }
 
 /// The client task: connect, serve, react to the close, repeat. Returns only

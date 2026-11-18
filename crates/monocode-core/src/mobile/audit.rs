@@ -396,14 +396,31 @@ pub fn record_lifecycle(
     }
 }
 
+/// Holds the process-wide log on a test's directory; dropping it switches the
+/// log off again, so later tests neither write into a deleted directory nor
+/// recreate it.
+#[cfg(test)]
+pub(crate) struct TestLog(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for TestLog {
+    fn drop(&mut self) {
+        if let Ok(mut log) = LOG.lock() {
+            *log = None;
+        }
+    }
+}
+
 /// Points the process-wide log at `dir` until the guard drops. Tests that read
 /// the log back take turns here, so one cannot redirect another's lines.
+/// Lines of tests that do not take a turn can still land in `dir`: filter by
+/// the device's own fingerprint.
 #[cfg(test)]
-pub(crate) fn test_log(dir: &Path) -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn test_log(dir: &Path) -> TestLog {
     static TURN: Mutex<()> = Mutex::new(());
     let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     init(dir);
-    turn
+    TestLog(turn)
 }
 
 /// The newest `limit` lines of the log in `dir`, newest first, across the
