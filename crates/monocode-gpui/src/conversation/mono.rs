@@ -198,6 +198,7 @@ impl Conversation {
             root,
             executable: std::env::current_exe().unwrap_or_default(),
         });
+        self.sync_tool_paths(cx);
         cx.notify();
     }
     /// Give a Mono chat its emoji library, or take it away with `None`. The transcript draws

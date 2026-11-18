@@ -24,7 +24,9 @@ enum Target {
     Web(String),
 }
 impl Target {
-    fn resolve(url: &str, base: Option<&str>) -> Option<Self> {
+    /// `roots` are the folders a Mono chat's relative links may belong to (empty for any other
+    /// chat); the file is looked for in them now, when the link is clicked.
+    fn resolve(url: &str, base: Option<&str>, roots: &[String]) -> Option<Self> {
         let lower = url.to_ascii_lowercase();
         if lower.starts_with("https://")
             || lower.starts_with("http://")
@@ -38,14 +40,18 @@ impl Target {
         {
             return None;
         }
-        let (path, location) = crate::file_editor::file_location(url, base.unwrap_or(""));
+        let (path, location) = crate::file_links::resolve_link(url, base.unwrap_or(""), roots);
         if !Path::new(&path).is_absolute() {
             return None;
         }
+        // "Copy Relative Path" is relative to the project the file was found in.
+        let base = crate::file_links::root_of(&path, roots)
+            .or(base)
+            .map(str::to_owned);
         Some(Self::File {
             path,
             location,
-            base: base.map(str::to_owned),
+            base,
         })
     }
     fn items(&self) -> Vec<MenuItem> {
@@ -84,7 +90,16 @@ impl TranscriptView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = Target::resolve(&request.url, self.file_link_base.as_deref()) else {
+        let roots = if self.link_roots.is_empty() {
+            Vec::new()
+        } else {
+            crate::file_links::candidate_roots(
+                crate::file_links::window_project(window, cx).as_deref(),
+                &self.link_roots,
+            )
+        };
+        let Some(target) = Target::resolve(&request.url, self.file_link_base.as_deref(), &roots)
+        else {
             return;
         };
         self.selection.hide_menu();
@@ -220,5 +235,78 @@ impl TranscriptView {
                 )
             })
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "link-menu-{name}-{}",
+            monocode_core::mono::new_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_relative_link_in_a_mono_chat_targets_the_project_file_not_the_home_folder() {
+        let (home, project) = (temp("home"), temp("project"));
+        let file = project.join("crates/x/y.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fake").unwrap();
+        let (home_s, project_s) = (
+            home.to_string_lossy().into_owned(),
+            project.to_string_lossy().into_owned(),
+        );
+        let roots = vec![project_s.clone()];
+        for (url, location) in [
+            ("crates/x/y.rs", None),
+            ("crates/x/y.rs:12:3", Some((12, 3))),
+            ("crates/x/y.rs#L12", Some((12, 1))),
+        ] {
+            let Some(Target::File {
+                path,
+                location: found,
+                base,
+            }) = Target::resolve(url, Some(&home_s), &roots)
+            else {
+                panic!("{url} is a file link");
+            };
+            assert_eq!(PathBuf::from(&path), file, "{url}");
+            assert_eq!(found, location, "{url}");
+            assert_eq!(
+                base.as_deref(),
+                Some(project_s.as_str()),
+                "copy relative path"
+            );
+            assert_eq!(files::display_path(&path, base.as_deref()), "crates/x/y.rs");
+        }
+        // Without roots (any other chat) the link is joined onto the base, as before.
+        let Some(Target::File { path, base, .. }) =
+            Target::resolve("crates/x/y.rs", Some(&home_s), &[])
+        else {
+            panic!("a file link");
+        };
+        assert_eq!(PathBuf::from(path), home.join("crates/x/y.rs"));
+        assert_eq!(base.as_deref(), Some(home_s.as_str()));
+        // A web link and an absolute link are not touched.
+        assert!(matches!(
+            Target::resolve("https://example.com/a", Some(&home_s), &roots),
+            Some(Target::Web(_))
+        ));
+        let absolute = file.to_string_lossy().into_owned();
+        let Some(Target::File { path, .. }) = Target::resolve(&absolute, Some(&home_s), &roots)
+        else {
+            panic!("a file link");
+        };
+        assert_eq!(PathBuf::from(path), file);
+        let _ = (
+            std::fs::remove_dir_all(home),
+            std::fs::remove_dir_all(project),
+        );
     }
 }

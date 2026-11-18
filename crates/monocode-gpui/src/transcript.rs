@@ -806,6 +806,8 @@ pub(crate) struct TranscriptView {
     document: bool,
     side_question: bool,
     pub(crate) file_link_base: Option<String>,
+    /// A Mono chat's local projects: the folders a relative file link may belong to.
+    link_roots: Vec<String>,
     expanded: HashSet<usize>,
     agent_panels: tasks::AgentPanels,
     /// User messages opened past their four-line clamp, by start.
@@ -892,6 +894,13 @@ impl TranscriptView {
         view
     }
     /// AgentTranscript with `agentMascot`, `bottomAligned` and `inlineWork`.
+    /// The local projects of the Mono this chat belongs to, for resolving its file links.
+    pub(crate) fn set_link_roots(&mut self, roots: Vec<String>) {
+        self.link_roots = roots;
+    }
+    pub(crate) fn link_roots(&self) -> &[String] {
+        &self.link_roots
+    }
     pub(crate) fn mono_mode(&mut self, mascot: &str, color: u32, name: &str) {
         self.mono_look = Some((mascot.into(), color, name.to_owned().into()));
         if self.mono {
@@ -2741,6 +2750,7 @@ impl TranscriptView {
             document: false,
             side_question: false,
             file_link_base: None,
+            link_roots: Vec::new(),
             expanded: HashSet::new(),
             agent_panels: Default::default(),
             expanded_prompts: HashSet::new(),

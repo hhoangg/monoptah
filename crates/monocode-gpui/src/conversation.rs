@@ -1984,11 +1984,29 @@ impl Conversation {
             .as_deref()
             .unwrap_or(&self.summary.cwd)
     }
+    /// A Mono's chat runs in the home folder, which is no place for its file links: they name
+    /// files of the projects it works on. The links are bound to its first local project, and
+    /// resolved among all of them when clicked (`file_links::resolve_link`).
+    fn link_roots(&self) -> Vec<String> {
+        self.settings
+            .mono
+            .as_ref()
+            .map(|context| crate::file_links::candidate_roots(None, &context.mono.projects))
+            .unwrap_or_default()
+    }
     fn sync_tool_paths(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.execution_cwd().to_owned();
+        let roots = self.link_roots();
+        let cwd = roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| self.execution_cwd().to_owned());
         self.transcript.update(cx, |view, cx| {
-            if view.file_link_base.as_deref() != Some(cwd.as_str()) {
+            let changed = view.file_link_base.as_deref() != Some(cwd.as_str());
+            if changed {
                 view.file_link_base = Some(cwd);
+            }
+            if changed || view.link_roots() != roots.as_slice() {
+                view.set_link_roots(roots);
                 cx.notify();
             }
         });

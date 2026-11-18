@@ -24,6 +24,40 @@ fn conversation(cx: &mut TestAppContext) -> WindowHandle<Conversation> {
 }
 
 #[gpui::test]
+fn a_mono_chat_binds_its_file_links_to_its_first_local_project_not_the_home_folder(
+    cx: &mut TestAppContext,
+) {
+    let window = conversation(cx);
+    window
+        .update(cx, |view, _, cx| {
+            // The chat is created in the home folder: `summary.cwd`.
+            assert_eq!(view.summary.cwd, "/missing/optimistic-send-project");
+            let mono = |projects: &[&str]| monocode_core::mono::Mono {
+                projects: projects.iter().map(|p| (*p).to_owned()).collect(),
+                ..Default::default()
+            };
+            view.configure_mono(
+                mono(&["remote://env/repo", "/work/first", "/work/second"]),
+                "/tmp".into(),
+                Default::default(),
+                cx,
+            );
+            let transcript = view.transcript.read(cx);
+            assert_eq!(transcript.file_link_base.as_deref(), Some("/work/first"));
+            assert_eq!(transcript.link_roots(), ["/work/first", "/work/second"]);
+            // A Mono that works on no project keeps the folder its chat runs in.
+            view.configure_mono(mono(&[]), "/tmp".into(), Default::default(), cx);
+            let transcript = view.transcript.read(cx);
+            assert_eq!(
+                transcript.file_link_base.as_deref(),
+                Some("/missing/optimistic-send-project")
+            );
+            assert!(transcript.link_roots().is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn mono_messages_steer_the_ready_provider_once_and_keep_their_send_time(cx: &mut TestAppContext) {
     let window = conversation(cx);
     let (send, receive) = std::sync::mpsc::channel();
