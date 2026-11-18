@@ -16,9 +16,9 @@ const allow: SendGuardResult = { kind: "allow" };
 export function decideSend(states: readonly CloudState[]): SendGuardResult {
   if (states.includes("starting")) return { kind: "refuse", reason: STARTING_REFUSAL };
   if (states.includes("unavailable")) return { kind: "refuse", reason: UNAVAILABLE_REFUSAL };
-  if (states.includes("stopped")) return { kind: "confirm", notice: COST_NOTICES.wake };
-  if (states.includes("stopping")) return { kind: "confirm", notice: COST_NOTICES.wakeStopping };
-  if (states.includes("unknown") || states.length === 0) return { kind: "confirm", notice: COST_NOTICES.wakeUnknown };
+  if (states.includes("stopped")) return { kind: "confirm", notice: COST_NOTICES.wake, wake: true };
+  if (states.includes("stopping")) return { kind: "confirm", notice: COST_NOTICES.wakeStopping, wake: true };
+  if (states.includes("unknown") || states.length === 0) return { kind: "confirm", notice: COST_NOTICES.wakeUnknown, wake: true };
   return allow;
 }
 

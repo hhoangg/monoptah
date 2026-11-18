@@ -12,6 +12,7 @@ export {
   useCloud,
   useConversation,
   type ConversationHandle,
+  type SendOptions,
   type SendResult,
   type UseConversationResult,
 } from "./conversation.ts";

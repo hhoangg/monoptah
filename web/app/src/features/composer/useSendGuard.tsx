@@ -3,8 +3,8 @@
 // registered it allows. `check` resolves when the send may go on and rejects with `SendRefused` (show the reason)
 // or `SendCancelled` (the user said no; nothing to show). `dialog` must be rendered by the caller.
 import { useCallback, useRef, useState, type ReactElement } from "react";
-import type { SendResult } from "@/data";
-import { runSendGuard, type SendGuardContext } from "@/ui/hooks";
+import type { SendOptions, SendResult } from "@/data";
+import { WAKE_REQUIRED_NOTICE, runSendGuard, type SendGuardContext } from "@/ui/hooks";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { sendErrorMessage } from "./sendErrors";
 
@@ -16,7 +16,24 @@ export class SendCancelled extends Error {
   override name = "SendCancelled";
 }
 
-export function useSendGuard(): { check: (context: SendGuardContext) => Promise<void>; dialog: ReactElement } {
+/** What `check` found out: `wake` is true when the user confirmed a notice that asks to wake a stopped instance. */
+export interface SendCheck {
+  wake: boolean;
+}
+
+export function useSendGuard(): {
+  check: (context: SendGuardContext) => Promise<SendCheck>;
+  /** Shows a notice and resolves when the user confirms; rejects with `SendCancelled` otherwise. */
+  confirm: (notice: string) => Promise<void>;
+  /**
+   * Guards and sends: `run` is called with `{wake: true}` only after the user confirmed a wake notice. When the
+   * desktop still answers `wake_required` (the cached state said available) the wake notice is shown and `run` is
+   * called once more with `wake: true` if the user confirms, exactly once per confirmation. Rejects with
+   * `SendRefused` or `SendCancelled`. A second `wake_required` is returned as the failed result.
+   */
+  guardedSend: (context: SendGuardContext, run: (options: SendOptions) => Promise<SendResult>) => Promise<SendResult>;
+  dialog: ReactElement;
+} {
   const [notice, setNotice] = useState<string | null>(null);
   const answer = useRef<((ok: boolean) => void) | null>(null);
 
@@ -27,17 +44,37 @@ export function useSendGuard(): { check: (context: SendGuardContext) => Promise<
     resolve?.(ok);
   };
 
-  const check = useCallback(async (context: SendGuardContext) => {
-    const result = await runSendGuard(context);
-    if (result.kind === "refuse") throw new SendRefused(result.reason);
-    if (result.kind === "confirm") {
-      const ok = await new Promise<boolean>((resolve) => {
-        answer.current = resolve;
-        setNotice(result.notice);
-      });
-      if (!ok) throw new SendCancelled("Send cancelled");
-    }
+  const confirm = useCallback(async (text: string) => {
+    const ok = await new Promise<boolean>((resolve) => {
+      answer.current = resolve;
+      setNotice(text);
+    });
+    if (!ok) throw new SendCancelled("Send cancelled");
   }, []);
+
+  const check = useCallback(
+    async (context: SendGuardContext): Promise<SendCheck> => {
+      const result = await runSendGuard(context);
+      if (result.kind === "refuse") throw new SendRefused(result.reason);
+      if (result.kind === "confirm") {
+        await confirm(result.notice);
+        return { wake: result.wake === true };
+      }
+      return { wake: false };
+    },
+    [confirm],
+  );
+
+  const guardedSend = useCallback(
+    async (context: SendGuardContext, run: (options: SendOptions) => Promise<SendResult>): Promise<SendResult> => {
+      const { wake } = await check(context);
+      const first = await run(wake ? { wake: true } : {});
+      if (first.sent || first.error !== "wake_required" || wake) return first;
+      await confirm(WAKE_REQUIRED_NOTICE);
+      return run({ wake: true });
+    },
+    [check, confirm],
+  );
 
   const dialog = (
     <ConfirmDialog
@@ -51,15 +88,15 @@ export function useSendGuard(): { check: (context: SendGuardContext) => Promise<
       onConfirm={() => settle(true)}
     />
   );
-  return { check, dialog };
+  return { check, confirm, guardedSend, dialog };
 }
 
 export interface GuardedRepliesOptions {
   desktopId: string;
   sessionId: string;
   target: SendGuardContext["target"];
-  send: (text: string) => Promise<SendResult>;
-  retry: (optimisticId: string) => Promise<SendResult>;
+  send: (text: string, attachments?: undefined, options?: SendOptions) => Promise<SendResult>;
+  retry: (optimisticId: string, options?: SendOptions) => Promise<SendResult>;
 }
 
 /**
@@ -70,16 +107,15 @@ export interface GuardedRepliesOptions {
  */
 export function useGuardedReplies({ desktopId, sessionId, target, send, retry }: GuardedRepliesOptions) {
   const guard = useSendGuard();
-  const { check } = guard;
+  const { guardedSend } = guard;
   const [error, setError] = useState<string | null>(null);
 
   const onChoose = useCallback(
     async (text: string) => {
-      await check({ desktopId, sessionId, target });
-      const result = await send(text);
+      const result = await guardedSend({ desktopId, sessionId, target }, (options) => send(text, undefined, options));
       if (!result.sent) throw new Error(sendErrorMessage(result.error));
     },
-    [check, desktopId, sessionId, target, send],
+    [guardedSend, desktopId, sessionId, target, send],
   );
 
   const onRetry = useCallback(
@@ -87,15 +123,13 @@ export function useGuardedReplies({ desktopId, sessionId, target, send, retry }:
       setError(null);
       void (async () => {
         try {
-          await check({ desktopId, sessionId, target });
+          await guardedSend({ desktopId, sessionId, target }, (options) => retry(optimisticId, options));
         } catch (reason) {
           if (reason instanceof SendRefused) setError(reason.message);
-          return;
         }
-        await retry(optimisticId);
       })();
     },
-    [check, desktopId, sessionId, target, retry],
+    [guardedSend, desktopId, sessionId, target, retry],
   );
 
   const clearError = useCallback(() => setError(null), []);

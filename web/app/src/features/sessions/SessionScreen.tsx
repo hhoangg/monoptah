@@ -119,7 +119,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
         sessionId={sessionId}
         above={
           <>
-            {state?.usageLimit ? <SessionUsageCard sessionId={sessionId} state={state.usageLimit} readOnly={readOnly} /> : null}
+            {state?.usageLimit ? <SessionUsageCard sessionId={sessionId} state={state.usageLimit} readOnly={readOnly} desktopId={desktopId} target={session?.target ?? null} /> : null}
             {replies.error ? (
               <p role="alert" className="px-4 pb-2 text-meta text-deletions" data-testid="send-refused">
                 {replies.error}
@@ -136,9 +136,9 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
           session={session}
           busy={state?.busy ?? false}
           readOnly={readOnly}
-          send={(text, attachments) => {
+          send={(text, attachments, options) => {
             replies.clearError();
-            return send(text, attachments);
+            return send(text, attachments, options);
           }}
           notice={error && errorKey !== dismissedError ? { text: error.text, dismiss: () => setDismissedError(errorKey) } : null}
         />

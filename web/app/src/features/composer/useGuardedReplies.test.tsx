@@ -19,7 +19,7 @@ describe("useGuardedReplies", () => {
     const { send, view } = setup();
     await act(() => view.result.current.onChoose("yes"));
     expect(guard).toHaveBeenCalledWith({ desktopId: "d1", sessionId: "s1", target: { kind: "remote" } });
-    expect(send).toHaveBeenCalledWith("yes");
+    expect(send).toHaveBeenCalledWith("yes", undefined, {});
   });
 
   it("onChoose rejects with the guard reason and does not send", async () => {
@@ -54,6 +54,6 @@ describe("useGuardedReplies", () => {
   it("onRetry retries when the guard allows", async () => {
     const { retry, view } = setup();
     act(() => view.result.current.onRetry("pending:1"));
-    await waitFor(() => expect(retry).toHaveBeenCalledWith("pending:1"));
+    await waitFor(() => expect(retry).toHaveBeenCalledWith("pending:1", {}));
   });
 });

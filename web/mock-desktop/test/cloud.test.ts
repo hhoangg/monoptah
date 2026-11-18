@@ -139,9 +139,9 @@ describe("watch frames carry cloud and approvals on change only", () => {
   it("send to a stopped cloud session wakes it ({ok, wake, queued}); a second send is busy; the queued text is delivered at the end", async () => {
     const { client, relay, desktop } = await setup();
     const watch = await client.openWatch({ conversationId: "sess-sandbox-stopped" });
-    const first = await client.call("conversation.send", { conversationId: "sess-sandbox-stopped", text: "wake me with this" });
+    const first = await client.call("conversation.send", { conversationId: "sess-sandbox-stopped", text: "wake me with this", wake: true });
     expect(first).toMatchObject({ ok: true, wake: true, queued: true });
-    await expect(client.call("conversation.send", { conversationId: "sess-sandbox-stopped", text: "second" })).rejects.toMatchObject({ code: "busy" });
+    await expect(client.call("conversation.send", { conversationId: "sess-sandbox-stopped", text: "second", wake: true })).rejects.toMatchObject({ code: "busy" });
     await relay.settled();
     expect(lastWithCloud(watch.frames)).toMatchObject({ state: "starting" });
 
@@ -151,6 +151,64 @@ describe("watch frames carry cloud and approvals on change only", () => {
     expect(delivered.some((item) => item.type === "user" && (item as { text?: string }).text === "wake me with this")).toBe(true);
     // The pending send is cleared: the next send is an ordinary one.
     expect((await client.call("conversation.send", { conversationId: "sess-sandbox-stopped", text: "after" })).wake).toBeUndefined();
+  });
+
+  describe("wake consent (architecture.md 6.6, send.rs before_send)", () => {
+    const STOPPED = "sess-sandbox-stopped";
+
+    it("a send to a stopped instance without wake is wake_required and changes nothing", async () => {
+      const { client, relay, desktop } = await setup();
+      const watch = await client.openWatch({ conversationId: STOPPED });
+      await relay.settled();
+      const framesBefore = watch.frames.length;
+      await expect(client.call("conversation.send", { conversationId: STOPPED, text: "no consent" })).rejects.toMatchObject({ code: "wake_required" });
+      await relay.settled();
+      expect(watch.frames).toHaveLength(framesBefore);
+      expect(desktop.advance(STOPPED)).toBe(false);
+      // Nothing is pending: the same send with consent is accepted, not busy.
+      expect(await client.call("conversation.send", { conversationId: STOPPED, text: "with consent", wake: true })).toMatchObject({ ok: true, wake: true, queued: true });
+    });
+
+    it("wake: true on a stopped instance queues the text, goes starting, and delivers the text once available", async () => {
+      const { client, relay, desktop } = await setup();
+      const watch = await client.openWatch({ conversationId: STOPPED });
+      expect(await client.call("conversation.send", { conversationId: STOPPED, text: "queued text", wake: true })).toMatchObject({ queued: true, sessionId: STOPPED });
+      await relay.settled();
+      expect(lastWithCloud(watch.frames).state).toBe("starting");
+      while (desktop.advance(STOPPED)) await relay.settled();
+      expect(lastWithCloud(watch.frames).state).toBe("available");
+      const users = watch.frames.flatMap((f) => f.turns).flatMap((t) => t.items).filter((item) => item.type === "user");
+      expect(users.map((item) => (item as { text?: string }).text)).toContain("queued text");
+    });
+
+    it("a stopping instance (not auto-stopping) also needs wake", async () => {
+      const { client, relay } = await setup();
+      await client.call("cloud.stop", { sessionId: "sess-codespace-1" });
+      await relay.settled();
+      await expect(client.call("conversation.send", { conversationId: "sess-codespace-1", text: "x" })).rejects.toMatchObject({ code: "wake_required" });
+      expect(await client.call("conversation.send", { conversationId: "sess-codespace-1", text: "x", wake: true })).toMatchObject({ wake: true, queued: true });
+    });
+
+    it("wake: true on an available instance, and a local or remote session, is an ordinary send", async () => {
+      const { client } = await setup();
+      for (const id of ["sess-codespace-1", "sess-local-1", "sess-remote-1"]) {
+        const result = await client.call("conversation.send", { conversationId: id, text: "plain", ...(id === "sess-codespace-1" ? { wake: true as const } : {}) });
+        expect(result.wake).toBeUndefined();
+        expect(result.sessionId).toBe(id);
+      }
+    });
+
+    it.each(["session.resumeUsage", "session.resumeUsageAtReset"] as const)("%s to a stopped instance is wake_required without wake and starts it with wake: true", async (method) => {
+      const { client, relay } = await setup();
+      const watch = await client.openWatch({ conversationId: STOPPED });
+      const params = method === "session.resumeUsage" ? { conversationId: STOPPED, token: "t1" } : { conversationId: STOPPED, token: "t1", enabled: true };
+      await expect(client.call(method, params as never)).rejects.toMatchObject({ code: "wake_required" });
+      await relay.settled();
+      expect(lastWithCloud(watch.frames).state).toBe("stopped");
+      await client.call(method, { ...params, wake: true } as never);
+      await relay.settled();
+      expect(lastWithCloud(watch.frames).state).toBe("starting");
+    });
   });
 
   it("cloud.stop reports stopping, then the stopped state reaches the watch", async () => {

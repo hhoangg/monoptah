@@ -1,9 +1,11 @@
+import { WAKE_REQUIRED_NOTICE } from "@/ui/hooks";
+
 // Cost notices and explanations of the cloud UI (architecture.md 6.6 billing rule). Estimates are labelled.
 // Cloud text from the desktop is never rendered here: only these strings and the sanitized error.
 export const READ_ONLY_NOTE = "This device has read-only access. Cloud actions need a device with control access.";
 
 export const COST_NOTICES = {
-  wake: "This instance is stopped. Sending wakes it, and a running instance is billable until it stops.",
+  wake: WAKE_REQUIRED_NOTICE,
   wakeStopping: "This instance is stopping. Sending may wake it again, and a running instance is billable until it stops.",
   wakeUnknown: "The desktop cannot reach this instance. Sending may wake it, and a running instance is billable until it stops.",
   resume: "Resuming starts this stopped instance. A running instance is billable until it stops.",

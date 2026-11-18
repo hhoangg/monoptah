@@ -1,9 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Turn } from "@monoptah/protocol";
 import { createQueryClient } from "@/lib/queryClient";
-import { conversationKey } from "./queries.ts";
+import { catalogKey, conversationKey } from "./queries.ts";
 import { emptyConversation, type ConversationState } from "./conversationState.ts";
-import { ConversationWatcher, WATCH_TAIL, openConversation, openConversationWatchers } from "./conversation.ts";
+import { ConversationWatcher, READ_POLL_MS, WATCH_TAIL, openConversation, openConversationWatchers } from "./conversation.ts";
 import { MemoryPersistAdapter, loadPersistedTurns, registerPersistAdapter, type PersistAdapter } from "./persist.ts";
 import { FakeClient, flush, requestError } from "./testing.ts";
 
@@ -252,5 +252,113 @@ describe("cloud and approvals", () => {
 
   it("emptyConversation has no cloud and no approvals", () => {
     expect(emptyConversation()).toMatchObject({ cloud: undefined, approvals: [] });
+  });
+});
+
+const sendCalls = () => client.request.mock.calls.filter((call) => call[0] === "conversation.send");
+
+describe("wake consent (architecture.md 6.6)", () => {
+  it("never sends wake unless the caller passes it, and a refused send leaves no Not sent turn behind", async () => {
+    const w = watcher();
+    client.request.mockRejectedValueOnce(requestError("wake_required"));
+    expect(await w.send("hello")).toEqual({ sent: false, error: "wake_required" });
+    expect(sendCalls()[0]?.[1]).toEqual({ conversationId: "c1", text: "hello" });
+    // The caller still holds the text: nothing is left in the transcript or retry list.
+    expect(state().optimistic).toEqual([]);
+  });
+
+  it("sends wake: true once when the caller passes it (a new command id, as the signature differs)", async () => {
+    const w = watcher();
+    client.request.mockRejectedValueOnce(requestError("wake_required"));
+    await w.send("hello");
+    expect(await w.send("hello", undefined, { wake: true })).toEqual({ sent: true });
+    expect(sendCalls()).toHaveLength(2);
+    expect(sendCalls()[1]?.[1]).toEqual({ conversationId: "c1", text: "hello", wake: true });
+    expect((sendCalls()[1]?.[2] as { id: string }).id).not.toBe((sendCalls()[0]?.[2] as { id: string }).id);
+    expect(state().optimistic).toMatchObject([{ text: "hello", status: "sent" }]);
+  });
+
+  it("a wake_required answer to a retry keeps the Not sent turn (its text lives only there); retry with wake sends it", async () => {
+    const w = watcher();
+    client.request.mockRejectedValueOnce(requestError("session_ended"));
+    await w.send("lost");
+    client.request.mockRejectedValueOnce(requestError("wake_required"));
+    expect(await w.retry("pending:1")).toEqual({ sent: false, error: "wake_required" });
+    expect(state().optimistic).toMatchObject([{ text: "lost", status: "not_sent", error: "wake_required" }]);
+    expect(await w.retry("pending:1", { wake: true })).toEqual({ sent: true });
+    expect(sendCalls().map((call) => (call[1] as { wake?: true }).wake)).toEqual([undefined, undefined, true]);
+  });
+});
+
+describe("a session that is local again", () => {
+  const cloud = { kind: "sandbox" as const, instance: "fake-sandbox-one", state: "stopped" as const };
+  const card = { id: "c1", projectId: "p1", title: "T", harness: "claude", model: "m", branch: "main", updatedAt: 1, target: { kind: "sandbox", instance: "fake-sandbox-one", state: "stopped" }, cloudState: "stopped", startup: { step: "create" } };
+  const seedCatalog = () => queryClient.setQueryData(catalogKey("dk1"), { projects: [], sessions: [card, { ...card, id: "other" }] });
+  const cards = () => (queryClient.getQueryData(catalogKey("dk1")) as { sessions: Array<Record<string, unknown>> }).sessions;
+
+  it("a read without cloud clears the cloud field and the card's target, state and startup", async () => {
+    const w = watcher();
+    seedCatalog();
+    client.frame({ order: [], turns: [], cloud });
+    client.request.mockResolvedValueOnce({ turns: [], older: false });
+    await w.read();
+    expect(state().cloud).toBeUndefined();
+    expect(cards().find((c) => c.id === "c1")).toMatchObject({ target: { kind: "local" } });
+    expect(cards().find((c) => c.id === "c1")).not.toHaveProperty("cloudState");
+    expect(cards().find((c) => c.id === "c1")).not.toHaveProperty("startup");
+    // Another session's card is untouched.
+    expect(cards().find((c) => c.id === "other")).toMatchObject({ cloudState: "stopped", startup: { step: "create" } });
+  });
+
+  it("a frame with cloud: null clears it, a frame without the field leaves it", () => {
+    watcher();
+    seedCatalog();
+    client.frame({ order: [], turns: [], cloud });
+    client.frame({ busy: true });
+    expect(state().cloud).toEqual(cloud);
+    expect(cards().find((c) => c.id === "c1")).toMatchObject({ cloudState: "stopped" });
+    client.frame({ cloud: null } as never);
+    expect(state().cloud).toBeUndefined();
+    expect(cards().find((c) => c.id === "c1")).toMatchObject({ target: { kind: "local" } });
+    expect(cards().find((c) => c.id === "c1")).not.toHaveProperty("cloudState");
+  });
+});
+
+describe("read poll while the watch is down (F-32)", () => {
+  afterEach(() => vi.useRealTimers());
+  const reads = () => client.request.mock.calls.filter((call) => call[0] === "conversation.read");
+
+  it("reads every second after the watch ended with an error and stops at the next frame", async () => {
+    vi.useFakeTimers();
+    watcher();
+    expect(reads()).toHaveLength(0);
+    client.live.registration.onError?.(requestError("not_found"));
+    client.request.mockResolvedValue({ turns: [text("a", "polled")], older: false });
+    await vi.advanceTimersByTimeAsync(READ_POLL_MS * 3);
+    expect(reads()).toHaveLength(3);
+    expect(state().turns.map((turn) => turn.id)).toEqual(["a"]);
+    client.frame({ order: ["a"], turns: [text("a", "polled")] });
+    await vi.advanceTimersByTimeAsync(READ_POLL_MS * 3);
+    expect(reads()).toHaveLength(3);
+  });
+
+  it("does not read while the link is not ready or the watcher is stopped, and never overlaps reads", async () => {
+    vi.useFakeTimers();
+    const w = watcher();
+    client.live.registration.onDead?.();
+    client.setStatus("reconnecting");
+    await vi.advanceTimersByTimeAsync(READ_POLL_MS * 2);
+    expect(reads()).toHaveLength(0);
+    client.setStatus("ready");
+    let release!: () => void;
+    client.request.mockImplementation(() => new Promise((resolve) => (release = () => resolve({ turns: [], older: false }))));
+    await vi.advanceTimersByTimeAsync(READ_POLL_MS * 3);
+    expect(reads()).toHaveLength(1);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    w.stop();
+    client.request.mockClear();
+    await vi.advanceTimersByTimeAsync(READ_POLL_MS * 3);
+    expect(reads()).toHaveLength(0);
   });
 });

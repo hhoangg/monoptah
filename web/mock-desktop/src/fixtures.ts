@@ -18,6 +18,7 @@ import {
   type ResultOf,
   type SessionCard,
   type Turn,
+  type UsageLimit,
   type WatchFrame,
 } from "@monoptah/protocol";
 import type { METHODS } from "@monoptah/protocol";
@@ -70,6 +71,8 @@ interface SessionRecord {
   cloud?: CloudField;
   turns: Turn[];
   approvals: Approval[];
+  /** The usage limit the conversation waits on (a test sets it); resumed through `session.resumeUsage`. */
+  usageLimit?: UsageLimit | null;
   /** Text of a `conversation.send` that woke the instance and waits for it. */
   pendingSend: string | null;
   script: (() => void)[];
@@ -219,7 +222,7 @@ export class MockWorld {
       id: s.id,
       turns: s.turns.map((t) => structuredClone(t)),
       busy: s.busy,
-      usageLimit: null,
+      usageLimit: s.usageLimit ?? null,
       older: false,
       question: null,
       ...(this.capabilities.cloud && s.cloud ? { cloud: structuredClone(s.cloud) } : {}),
@@ -245,7 +248,7 @@ export class MockWorld {
     if (!cursor.first && changedTurns.length === 0 && !cloudChanged && !approvalsChanged && cursor.busy === s.busy) return null;
 
     const frame: WatchFrame = {
-      usageLimit: null,
+      usageLimit: s.usageLimit ?? null,
       busy: s.busy,
       older: false,
       order: s.turns.map((t) => t.id),
@@ -364,12 +367,27 @@ export class MockWorld {
 
   // --- Mutations used by the handlers ---
 
-  send(conversationId: string, text: string): ResultOf<"conversation.send"> {
+  /**
+   * The wake gate of the desktop (send.rs `before_send`): a web request to a cloud session whose instance is
+   * `stopped`, `stopping` or `unknown` is refused with `wake_required` unless it carries `wake: true`. Returns
+   * true when the request consents to a wake of a stopped instance. A remote machine never needs `wake`.
+   */
+  #wakeGate(s: SessionRecord, wake: boolean | undefined): boolean {
+    if (s.target.kind === "local" || s.target.kind === "remote") return false;
+    if (s.cloudState === "starting") throw new FixtureError("The instance is still starting; try again when it is ready", "starting");
+    if (s.cloudState === "unavailable") throw new FixtureError("This instance cannot be used from the web", "unsupported_target");
+    if (s.cloudState === "stopping" && s.cloud?.autoStop) throw new FixtureError("The instance is stopping", "auto_stopping");
+    if (s.cloudState === "stopped" || s.cloudState === "stopping" || s.cloudState === "unknown") {
+      if (wake !== true) throw new FixtureError("Sending wakes the stopped cloud instance; confirm to continue", "wake_required");
+      return true;
+    }
+    return false;
+  }
+
+  send(conversationId: string, text: string, wake?: boolean): ResultOf<"conversation.send"> {
     const s = this.session(conversationId);
     if (s.pendingSend !== null) throw new FixtureError("A message is already waiting for the instance to start", "busy");
-    if (s.cloudState === "starting") throw new FixtureError("The instance is still starting; try again when it is ready", "starting");
-    if (s.cloudState === "stopping") throw new FixtureError("The instance is stopping", "auto_stopping");
-    if (s.cloudState === "stopped") {
+    if (this.#wakeGate(s, wake)) {
       s.pendingSend = text;
       this.#beginStartup(s, 0);
       this.#notify(s);
@@ -378,6 +396,15 @@ export class MockWorld {
     this.#appendExchange(s, text);
     this.#notify(s);
     return { sessionId: s.id };
+  }
+
+  /** `session.resumeUsage` and `session.resumeUsageAtReset`: the same gate as a send; `wake: true` starts the instance. */
+  resumeUsage(conversationId: string, wake?: boolean): void {
+    const s = this.session(conversationId);
+    if (this.#wakeGate(s, wake)) {
+      this.#beginStartup(s, 0);
+      this.#notify(s);
+    }
   }
 
   resume(sessionId: string): { accepted: boolean } {
@@ -527,7 +554,7 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
     if (!frame) throw new FixtureError("No frame");
     return frame;
   },
-  "conversation.send": (p, { world }) => world.send(p.conversationId, p.text),
+  "conversation.send": (p, { world }) => world.send(p.conversationId, p.text, p.wake),
 
   "models.list": () => ({
     harnesses: [
@@ -559,8 +586,14 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
 
   "session.configure": (p) => ACK(p.conversationId),
   "session.start": (p, { world }) => world.startSession(p),
-  "session.resumeUsage": (p) => ACK(p.conversationId),
-  "session.resumeUsageAtReset": (p) => ACK(p.conversationId),
+  "session.resumeUsage": (p, { world }) => {
+    world.resumeUsage(p.conversationId, p.wake);
+    return ACK(p.conversationId);
+  },
+  "session.resumeUsageAtReset": (p, { world }) => {
+    world.resumeUsage(p.conversationId, p.wake);
+    return ACK(p.conversationId);
+  },
   "session.answerQuestion": (p) => ACK(p.conversationId),
   "session.keepQuestionOpen": (p) => ACK(p.conversationId),
   "session.answerApproval": (p, { world }) => {

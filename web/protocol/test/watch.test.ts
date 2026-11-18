@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CLOUD_STATES,
   CloudFieldSchema,
+  METHODS,
   MOVE_STEP_IDS,
   SessionTargetSchema,
   STARTUP_STEP_IDS,
@@ -76,6 +77,15 @@ describe("watch frame (crates/monocode-core/src/mobile/watch.rs)", () => {
     expect(frame.cloud?.kept).toBe(true);
     expect(frame.approvals).toHaveLength(1);
     expect(WatchFrameSchema.parse({ usageLimit: null, busy: false, older: false, order: [], turns: [], approvals: [] }).approvals).toEqual([]);
+  });
+
+  it("accepts cloud: null (the session is local again) in a frame and a read, and loading in cloud.instances", () => {
+    const base = { usageLimit: null, busy: false, older: false, order: [], turns: [] };
+    expect(WatchFrameSchema.parse({ ...base, cloud: null }).cloud).toBeNull();
+    expect(WatchFrameSchema.safeParse({ ...base, cloud: { kind: "sandbox" } }).success).toBe(false);
+    expect(METHODS["conversation.read"].result.parse({ turns: [], older: false, cloud: null }).cloud).toBeNull();
+    expect(METHODS["cloud.instances"].result.parse({ instances: [], loading: true }).loading).toBe(true);
+    expect(METHODS["cloud.instances"].result.parse({ instances: [] }).loading).toBeUndefined();
   });
 
   it("types an approval request id as a string and carries the desktop's truncated flag", () => {

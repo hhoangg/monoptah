@@ -111,13 +111,14 @@ export function useUsageLimitActions(conversationId: string, latest: UsageLimit 
   const resumeNow = useLinkMutation("session.resumeUsage");
   const resumeLater = useLinkMutation("session.resumeUsageAtReset");
   return {
-    resume: async (token: string): Promise<void> => {
+    // `wake: true` only after the user confirmed the cost notice for a stopped cloud instance.
+    resume: async (token: string, options: { wake?: boolean } = {}): Promise<void> => {
       const state = validateUsageLimit(latest, token, false);
-      await resumeNow.mutateAsync({ conversationId, token: state.token });
+      await resumeNow.mutateAsync({ conversationId, token: state.token, ...(options.wake ? { wake: true as const } : {}) });
     },
-    resumeAtReset: async (token: string, enabled: boolean): Promise<void> => {
+    resumeAtReset: async (token: string, enabled: boolean, options: { wake?: boolean } = {}): Promise<void> => {
       const state = validateUsageLimit(latest, token, true);
-      await resumeLater.mutateAsync({ conversationId, token: state.token, enabled });
+      await resumeLater.mutateAsync({ conversationId, token: state.token, enabled, ...(options.wake ? { wake: true as const } : {}) });
     },
   };
 }
