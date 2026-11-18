@@ -1,6 +1,6 @@
 // The `desktop-switcher` slot of `/d/:desktopId` (W-04). Owner: WS-M.
 //
-// A slim sticky bar (current desktop color dot, name, online dot) that opens the list of the
+// A slim in-flow bar (a `shrink-0` row of the fixed /d frame) (current desktop color dot, name, online dot) that opens the list of the
 // account's desktops: a bottom sheet under 640 px, a dialog from 640 px (`ResponsiveOverlay`,
 // design-system.md 11). Desktops are sorted by last use; choosing one opens `/d/:id`. "Request
 // access" posts the grant of that one desktop on tap (never for all). The bar is hidden while a
@@ -55,8 +55,8 @@ export function DesktopSwitcher() {
   const online = presence === null ? (current?.online ?? false) : presence === "online";
 
   return (
-    <div className="sticky top-0 z-30 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
-      <div className="mx-auto flex min-h-11 w-full max-w-[1280px] items-center px-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))]">
+    <div className="shrink-0 border-b border-stroke bg-background">
+      <div className="flex min-h-11 w-full items-center pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]">
         <button
           type="button"
           aria-haspopup="dialog"

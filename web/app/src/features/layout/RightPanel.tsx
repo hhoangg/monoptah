@@ -11,20 +11,24 @@ import { sessionCan } from "@/ui/hooks";
 import { Drawer, DrawerContent, DrawerTitle } from "@/ui/drawer";
 import { Icon } from "@/ui/Icon";
 import { PANEL_WIDTH, TABLET_PANEL_WIDTH, useLayoutPrefs } from "./layoutPrefs";
+import { useRouteTool } from "./projectTools";
 import { closePanel, getPanel, panelMatchesScope, usePanels, type OpenPanel, type PanelDefinition } from "./panels";
 import { Splitter } from "./Splitter";
 
 export type PanelMode = "sheet" | "overlay" | "docked";
 
-/** The sticky offset the WS-T sidebar uses below the 2.75rem bar. */
-const STICKY = "sticky top-[calc(2.75rem+env(safe-area-inset-top))] h-[calc(100dvh-2.75rem-env(safe-area-inset-top))]";
+/** The docked panel fills the AppShell row (a flex child of the fixed-height /d frame). */
+const FULL = "h-full min-h-0";
 
 /** The panel to show for the screen's project, with its registration; undefined when there is none. */
 function useVisiblePanel(desktopId: string, projectId: string | null): { open: OpenPanel; definition: PanelDefinition } | undefined {
   const open = usePanels((state) => state.open);
   const scopeTarget = usePanels((state) => state.scopeTarget);
   const capabilities = useLinkState((state) => state.capabilities);
+  const routeTool = useRouteTool();
   if (!projectId || !panelMatchesScope(open, { desktopId, projectId })) return undefined;
+  // The screen of the route is the same tool: a docked copy would duplicate it.
+  if (open.kind === routeTool) return undefined;
   // A panel opened on the local project stays hidden on a session whose target the predicate refuses.
   if (!sessionCan(open.kind, { target: scopeTarget, desktopCapabilities: capabilities })) return undefined;
   const definition = getPanel(open.kind);
@@ -139,7 +143,7 @@ export function RightPanel({ mode, desktopId, projectId, maxWidth = PANEL_WIDTH.
   return (
     <>
       <Splitter label="Resize panel" value={width} min={PANEL_WIDTH.min} max={max} onChange={setPanelWidth} onCommit={persistPanelWidth} grow={-1} />
-      <aside aria-label={definition.title} data-testid="panel-docked" style={{ width }} className={`${STICKY} shrink-0 bg-sheet`}>
+      <aside aria-label={definition.title} data-testid="panel-docked" style={{ width }} className={`${FULL} shrink-0 bg-sheet`}>
         <PanelBody desktopId={desktopId} projectId={projectId} />
       </aside>
     </>

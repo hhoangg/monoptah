@@ -3,10 +3,12 @@
 // composer (no model controls: a Mono's model is edited on its profile) and the Mono's empty state. Opening the
 // chat marks the Mono seen (F-17). The Mono's own header cards, chips and documents render through the WS-T
 // transcript components (F-43, F-72).
+import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
+import { useRequestControl } from "@/features/composer/useRequestControl";
 import { Composer } from "@/features/composer/Composer";
 import { SessionQuestionCard, SessionUsageCard, useLinkReady } from "@/features/composer/SessionComposer";
 import { useGuardedReplies, useSendGuard } from "@/features/composer/useSendGuard";
@@ -54,6 +56,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const older = useOlderTurns(conversationId, state?.turns ?? [], state?.older ?? false);
   const cancel = useLinkMutation("session.cancel");
   const accentStyle = useMonoAccentStyle(desktopId, monoId);
+  const requestControl = useRequestControl(desktopId);
   // F-71: the message being replied to; the reply is sent with it quoted.
   const [replyTo, setReplyTo] = useState<HeldMessage | null>(null);
 
@@ -108,7 +111,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
       data-testid="route-stub"
       data-route="/d/:desktopId/monos/:monoId"
       style={accentStyle}
-      className="-mb-[calc(env(safe-area-inset-bottom)+2.5rem)] flex h-[calc(100dvh-2.75rem-env(safe-area-inset-top))] flex-col"
+      className="flex h-full min-h-0 flex-1 flex-col"
     >
       <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
@@ -182,19 +185,21 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             void navigate({ to: "/d/$desktopId", params: { desktopId } });
           }}
         >
-          <Transcript
-            turns={older.turns}
-            optimistic={state?.optimistic ?? []}
-            loading={!state}
-            hasOlder={older.hasOlder}
-            loadingOlder={older.loading}
-            olderError={older.error}
-            loadOlder={older.loadOlder}
-            onRetry={readOnly ? undefined : replies.onRetry}
-            agent={agent}
-            busy={state?.busy ?? false}
-            actions={actions}
-          />
+          <ModelNamesProvider>
+            <Transcript
+              turns={older.turns}
+              optimistic={state?.optimistic ?? []}
+              loading={!state}
+              hasOlder={older.hasOlder}
+              loadingOlder={older.loading}
+              olderError={older.error}
+              loadOlder={older.loadOlder}
+              onRetry={readOnly ? undefined : replies.onRetry}
+              agent={agent}
+              busy={state?.busy ?? false}
+              actions={actions}
+            />
+          </ModelNamesProvider>
         </MessageActions>
       )}
       <ComposerRegion
@@ -219,6 +224,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             await cancel.mutateAsync({ conversationId });
           }}
           readOnly={readOnly}
+          requestControl={requestControl}
           offline={!ready}
           topRow={
             replyTo ? (
