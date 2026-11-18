@@ -87,6 +87,19 @@ describe("/settings", () => {
     expect(screen.getByText("@dev-user")).toBeInTheDocument();
   });
 
+  it("groups the cards under headed areas and offers a section index with an anchor per area", async () => {
+    install();
+    mount("/settings");
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    const areas = ["Account and security", "Alerts", "Look and feel", "App and admin"];
+    for (const title of areas) expect(screen.getByRole("heading", { level: 2, name: title })).toBeInTheDocument();
+    for (const nav of screen.getAllByRole("navigation", { name: "Settings sections" })) {
+      for (const title of areas) expect(within(nav).getByRole("link", { name: title })).toHaveAttribute("href", expect.stringMatching(/^#settings-/));
+    }
+    const account = screen.getByRole("heading", { level: 2, name: "Account and security" }).parentElement as HTMLElement;
+    expect(within(account).getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+  });
+
   it("keeps the forced regenerate screen while the codes are unconfirmed", async () => {
     install({ recoveryAckAt: null });
     mount("/settings");
@@ -399,7 +412,11 @@ describe("/install", () => {
     expect(screen.getByText(/Install app/)).toBeInTheDocument();
     expect(screen.getByText(/install icon/)).toBeInTheDocument();
     expect(screen.queryByText("Installed")).toBeNull();
-    expect(calls.some((c) => c.url === "/api/me")).toBe(false);
+    // A-9: the header probes /api/me only to pick brand or nav. The page never redirects and the visitor gets the brand alone.
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull());
+    expect(screen.getByRole("link", { name: "Monoptah" })).toBeInTheDocument();
+    expect(calls.filter((c) => c.url === "/api/me").length).toBeGreaterThan(0);
+    expect(screen.queryByRole("heading", { name: /sign in/i })).toBeNull();
   });
 
   it("shows the Installed state in standalone display mode", async () => {

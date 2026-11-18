@@ -5,6 +5,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import { safeName, lastSeenLabel, versionLabel } from "./format";
+import { Icon } from "@/ui/Icon";
 import { forgetDevice, useDesktops, useDevices, type DesktopSummary, type DeviceSummary } from "./api";
 import { desktopErrorMessage, ColorDot, Fingerprint, PresenceBadge } from "./parts";
 import { parsePairingInput } from "./pairingLink";
@@ -32,17 +33,29 @@ export function DesktopsScreen() {
           {(data) => (data.desktops.length === 0 ? <EmptyDesktops /> : <DesktopList desktops={data.desktops} />)}
         </QueryBoundary>
       </SettingsCard>
-      <PairSection />
+      <PairSection empty={desktops.data?.desktops.length === 0} />
       <DevicesSection />
     </SettingsLayout>
   );
 }
 
+const PAIR_STEPS = [
+  "On the desktop, open Settings > Web app > Pair. It shows a link and a QR code.",
+  "Scan the QR code with this device, or paste the link or its 8 character code below.",
+  "Confirm the match on the desktop. It then shows up here.",
+] as const;
+
 function EmptyDesktops() {
   return (
-    <div className="px-1.5 py-3">
-      <p className="text-body text-content">No desktop is paired yet.</p>
-      <p className="mt-1 text-small text-muted-text">Pair one below.</p>
+    <div className="flex flex-col items-center gap-3 px-3 py-6 text-center">
+      <Icon name="computer" size={40} className="text-faint" />
+      <h2 className="text-headline font-semibold text-content">Pair your first desktop</h2>
+      <p className="max-w-prose text-small text-muted-text">A desktop must be paired before you can reach its sessions from this device.</p>
+      <ol className="m-0 flex max-w-prose list-decimal flex-col gap-1.5 pl-5 text-left text-small text-content">
+        {PAIR_STEPS.map((step) => (
+          <li key={step}>{step}</li>
+        ))}
+      </ol>
     </div>
   );
 }
@@ -65,24 +78,24 @@ function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
       <Link
         to="/d/$desktopId"
         params={{ desktopId: desktop.id }}
-        aria-label={`Open ${name}`}
-        className="flex min-h-13 min-w-0 flex-[1_1_12rem] items-center gap-3 rounded-row py-2 text-left hover:bg-selection active:opacity-60"
+        className="flex min-h-13 min-w-0 flex-[1_1_12rem] items-center gap-3 rounded-row py-2 pl-1.5 text-left hover:bg-selection active:opacity-60"
       >
-        <ColorDot color={desktop.color} className="ml-1.5" />
+        {desktop.color === null ? null : <ColorDot color={desktop.color} />}
         <span className="min-w-0 flex-1 wrap-anywhere">
           <span className="flex flex-wrap items-center gap-2 text-row text-content">
-            {name}
+            <span className="sr-only">Open</span> {name}
             <PresenceBadge online={desktop.online} />
             {desktop.pendingCount > 0 ? <Badge variant="brand">{`${desktop.pendingCount} to confirm`}</Badge> : null}
           </span>
           <span className="block text-meta text-muted-text">{[lastSeenLabel(desktop.lastSeenAt, desktop.online), version].filter(Boolean).join(" - ")}</span>
         </span>
+        <Icon name="chevronRight" size={18} className="mr-1 shrink-0 text-faint" />
       </Link>
       <Link
         to="/desktops/$id"
         params={{ id: desktop.id }}
         aria-label={`Manage ${name}`}
-        className={cn(buttonVariants({ variant: "outline", size: "sm" }), "shrink-0")}
+        className={cn(buttonVariants({ variant: "ghost", size: "sm" }), "shrink-0 text-muted-text")}
       >
         Manage
       </Link>
@@ -92,7 +105,7 @@ function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
 
 // --- Pair a desktop (F-02) ---
 
-function PairSection() {
+function PairSection({ empty }: { empty: boolean }) {
   const navigate = useNavigate();
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -111,7 +124,7 @@ function PairSection() {
   return (
     <SettingsCard
       title="Pair a desktop"
-      footnote="On the desktop, open Settings > Web app > Pair. It shows a link and a QR code. Scan the code with this device, or paste the link here."
+      footnote={empty ? undefined : "On the desktop, open Settings > Web app > Pair. It shows a link and a QR code. Scan the code with this device, or paste the link here."}
     >
       <form onSubmit={(event) => void submit(event)} className="flex flex-col gap-3 px-1.5 py-2" noValidate>
         <Field
@@ -126,9 +139,9 @@ function PairSection() {
           autoCapitalize="none"
           spellCheck={false}
           error={error}
-          hint="Optional. A link of this site, or the code shown next to it."
+          hint="Paste the link or the 8 character code shown on the desktop."
         />
-        <Button type="submit" variant="outline" className="w-full sm:w-auto sm:self-start" disabled={value.trim() === ""}>
+        <Button type="submit" className="w-full sm:w-auto sm:self-start" disabled={value.trim() === ""}>
           Continue
         </Button>
       </form>

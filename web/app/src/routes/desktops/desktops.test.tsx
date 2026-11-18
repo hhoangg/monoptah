@@ -13,7 +13,7 @@ describe("WS-M routes", () => {
   it("/desktops renders the list screen, not the stub", async () => {
     restore = setApiTransport(createFakeServer({ desktops: [desktop()] }).transport);
     mountApp("/desktops");
-    expect(await screen.findByRole("link", { name: "Open Studio Mac" })).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: /^Open Studio Mac/ })).toBeInTheDocument();
     expect(screen.queryByTestId("route-stub")).toBeNull();
   });
 
