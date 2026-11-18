@@ -80,7 +80,7 @@ export function BackgroundControls({ projectId, projectName }: BackgroundControl
               setDraft(null);
               if (value !== undefined) void setOpacity(value);
             }}
-            className="relative flex h-8 w-full touch-none items-center select-none"
+            className="relative flex h-11 w-full touch-none items-center select-none pointer-fine:h-8"
           >
             <SliderPrimitive.Track className="relative h-1.5 w-full grow rounded-pill bg-fill">
               <SliderPrimitive.Range className="absolute h-full rounded-pill bg-brand" />

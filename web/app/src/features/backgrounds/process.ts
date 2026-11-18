@@ -13,9 +13,16 @@ export interface CanvasLike {
 
 /** Decodes `file`, scales it to fit, dithers it and encodes a PNG (lossless: JPEG would blur the dots). */
 export async function processImage(file: Blob, makeCanvas: (width: number, height: number) => CanvasLike): Promise<Blob> {
-  const bitmap = await createImageBitmap(file);
+  const probe = await createImageBitmap(file);
+  const { width, height } = fitSize(probe.width, probe.height);
+  let bitmap = probe;
   try {
-    const { width, height } = fitSize(bitmap.width, bitmap.height);
+    if (width < probe.width || height < probe.height) {
+      // A large photo is decoded again at the size it is kept at: the browser scales it with its own filter, which
+      // is far better than drawImage shrinking a 12 megapixel bitmap.
+      probe.close();
+      bitmap = await createImageBitmap(file, { resizeWidth: width, resizeHeight: height, resizeQuality: "high" });
+    }
     const canvas = makeCanvas(width, height);
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) throw new Error("Canvas is not available");

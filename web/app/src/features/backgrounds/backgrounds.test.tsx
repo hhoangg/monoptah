@@ -5,7 +5,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BackgroundControls } from "./BackgroundControls";
 import { BackgroundsSection } from "./BackgroundsSection";
-import { EmptySessionBackground } from "./EmptySessionBackground";
+import { BACKGROUND_CONTAINER_CLASS, EmptySessionBackground } from "./EmptySessionBackground";
 import { getBackground, listBackgrounds, putBackground, removeBackground, setBackgroundOpacity } from "./store";
 
 const renderBackground = vi.hoisted(() => vi.fn());
@@ -59,6 +59,19 @@ describe("EmptySessionBackground", () => {
     expect(img).toHaveAttribute("aria-hidden", "true");
     expect(img).toHaveStyle({ opacity: "0.3" });
   });
+
+  it("revokes its object URL when it unmounts", async () => {
+    await putBackground({ projectId: "p1", projectName: "P", image: png(), opacity: 0.3, updatedAt: 1 });
+    const view = render(<EmptySessionBackground projectId="p1" />);
+    await screen.findByTestId("empty-session-background");
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    view.unmount();
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:test");
+  });
+
+  it("names the container class that keeps its negative z-index inside the container", () => {
+    expect(BACKGROUND_CONTAINER_CLASS.split(" ")).toEqual(expect.arrayContaining(["relative", "isolate"]));
+  });
 });
 
 describe("BackgroundControls", () => {
@@ -93,6 +106,28 @@ describe("BackgroundControls", () => {
   });
 });
 
+describe("BackgroundControls failures", () => {
+  it("says so when the opacity cannot be saved or the background cannot be removed", async () => {
+    const user = userEvent.setup();
+    await putBackground({ projectId: "p1", projectName: "Proj", image: png(), opacity: 0.4, updatedAt: 1 });
+    render(<BackgroundControls projectId="p1" projectName="Proj" />);
+    const remove = await screen.findByRole("button", { name: "Remove background for Proj" });
+    const open = vi.spyOn(globalThis.indexedDB, "open").mockImplementation(() => {
+      throw new Error("storage blocked");
+    });
+    await user.click(remove);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not remove the background.");
+    open.mockRestore();
+  });
+
+  it("gives the opacity slider a 44px touch target", async () => {
+    await putBackground({ projectId: "p1", projectName: "Proj", image: png(), opacity: 0.4, updatedAt: 1 });
+    render(<BackgroundControls projectId="p1" projectName="Proj" />);
+    const thumb = await screen.findByRole("slider", { name: "Opacity for Proj" });
+    expect(thumb.closest(".touch-none")?.className).toContain("h-11");
+  });
+});
+
 describe("BackgroundsSection", () => {
   it("is empty by default and lists stored backgrounds", async () => {
     render(<BackgroundsSection />);
@@ -100,5 +135,7 @@ describe("BackgroundsSection", () => {
     await act(() => putBackground({ projectId: "p1", projectName: "Alpha", image: png(), opacity: 0.4, updatedAt: 1 }));
     expect(await screen.findByLabelText("Background photo for Alpha")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Backgrounds" })).toBeInTheDocument();
+    // The footnote names the real entry point: the Background action of a project.
+    expect(screen.getByText(/use Background in the project bar/)).toBeInTheDocument();
   });
 });

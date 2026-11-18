@@ -92,7 +92,25 @@ export function useBackgroundActions(projectId: string, projectName: string, cur
     [projectId, projectName, opacity],
   );
 
-  const setOpacity = useCallback((value: number) => setBackgroundOpacity(projectId, value), [projectId]);
-  const remove = useCallback(() => removeBackground(projectId), [projectId]);
+  // A store that refuses (storage full or blocked) is said on screen, not dropped.
+  const setOpacity = useCallback(
+    async (value: number) => {
+      try {
+        await setBackgroundOpacity(projectId, value);
+        setError(null);
+      } catch {
+        setError("Could not change the opacity.");
+      }
+    },
+    [projectId],
+  );
+  const remove = useCallback(async () => {
+    try {
+      await removeBackground(projectId);
+      setError(null);
+    } catch {
+      setError("Could not remove the background.");
+    }
+  }, [projectId]);
   return { busy, error, pick, setOpacity, remove };
 }
