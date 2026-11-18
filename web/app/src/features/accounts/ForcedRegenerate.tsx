@@ -5,8 +5,8 @@ import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
-import { apiFetch } from "./api";
-import { passkeyErrorMessage } from "./authCopy";
+import { apiFetch, isApiError } from "./api";
+import { CODES_REPLACED_MESSAGE, passkeyErrorMessage } from "./authCopy";
 import { endpoints } from "./endpoints";
 import { clearLowCodes } from "./lowCodes";
 import { setRecoveryBatch } from "./pendingRecoveryCodes";
@@ -51,7 +51,11 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
     try {
       await acknowledgeRecoveryCodes(queryClient);
     } catch (caught) {
-      setError(passkeyErrorMessage(caught));
+      if (isApiError(caught, "conflict")) {
+        // The codes on screen are dead (a newer batch exists): drop them so Generate comes back.
+        setCodes(null);
+        setError(CODES_REPLACED_MESSAGE);
+      } else setError(passkeyErrorMessage(caught));
       return;
     }
     clearLowCodes();

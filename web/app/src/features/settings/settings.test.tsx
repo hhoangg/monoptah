@@ -211,6 +211,23 @@ describe("recovery codes and a me refetch", () => {
   });
 });
 
+describe("recovery codes replaced in another tab", () => {
+  it("an ack 409 shows its own message and drops the dead codes", async () => {
+    const state = install();
+    const user = userEvent.setup();
+    mount("/settings");
+    await user.click(await screen.findByRole("button", { name: "Generate new codes" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Generate new codes" }));
+    await screen.findByRole("list", { name: "Recovery codes" });
+    state.recoveryBatch += 1;
+    await user.click(screen.getByLabelText("I saved these codes"));
+    await user.click(screen.getByRole("button", { name: "Done" }));
+    expect(await screen.findByText("These codes were replaced in another tab or window. Generate a new set.")).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Recovery codes" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Generate new codes" })).toBeInTheDocument();
+  });
+});
+
 describe("signed-in browsers", () => {
   it("marks the current browser and gives it no sign-out button", async () => {
     install();

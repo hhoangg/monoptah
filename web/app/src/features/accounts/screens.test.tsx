@@ -297,6 +297,27 @@ describe("recover", () => {
     expect(sessionStorage.getItem("monoptah.lowCodes")).toBeNull();
   });
 
+  it("an ack 409 (codes replaced in another tab) shows its own message and brings Generate back", async () => {
+    const state = install({ signedIn: true, recoveryAckAt: null });
+    const user = userEvent.setup();
+    mount("/settings");
+    await user.click(await screen.findByRole("button", { name: /Generate recovery codes/ }));
+    await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
+    // Another tab issued newer codes meanwhile.
+    state.recoveryBatch += 1;
+    await user.click(screen.getByLabelText("I saved these codes"));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(await screen.findByText("These codes were replaced in another tab or window. Generate a new set.")).toBeInTheDocument();
+    expect(screen.queryByText(/already has a passkey/)).toBeNull();
+    expect(screen.queryByRole("list", { name: "Recovery codes" })).toBeNull();
+    // Generate is back, and a new set can be saved.
+    await user.click(screen.getByRole("button", { name: /Generate recovery codes/ }));
+    await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
+    await user.click(screen.getByLabelText("I saved these codes"));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await screen.findByRole("heading", { level: 1, name: "Settings" });
+  });
+
   it("ignores and clears a low-codes flag that belongs to another account", async () => {
     install({ signedIn: true });
     sessionStorage.setItem("monoptah.lowCodes", "someone-else");

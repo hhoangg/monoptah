@@ -7,7 +7,11 @@ import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Notice } from "@/ui/Notice";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { isApiError } from "@/features/accounts/api";
+import { CODES_REPLACED_MESSAGE } from "@/features/accounts/authCopy";
 import { useAction } from "./useAction";
+
+const describeError = (error: unknown): string | null => (isApiError(error, "conflict") ? CODES_REPLACED_MESSAGE : null);
 
 /**
  * Recovery codes (N-04). Regenerating is a fresh-auth action and invalidates every older code. The
@@ -16,7 +20,7 @@ import { useAction } from "./useAction";
  */
 export function RecoveryCodesSection({ handle }: { handle: string }) {
   const queryClient = useQueryClient();
-  const action = useAction();
+  const action = useAction(describeError);
   const [confirming, setConfirming] = useState(false);
   const [codes, setCodes] = useState<string[] | null>(null);
 
@@ -36,7 +40,15 @@ export function RecoveryCodesSection({ handle }: { handle: string }) {
 
   async function done() {
     // The Worker cleared the ack when it issued the codes: set it again now that the user saved them.
-    const ok = await action.run(() => acknowledgeRecoveryCodes(queryClient));
+    const ok = await action.run(async () => {
+      try {
+        await acknowledgeRecoveryCodes(queryClient);
+      } catch (caught) {
+        // A newer batch exists (another tab regenerated): the codes on screen are dead, so drop them.
+        if (isApiError(caught, "conflict")) setCodes(null);
+        throw caught;
+      }
+    });
     if (ok) setCodes(null);
   }
 
@@ -55,6 +67,11 @@ export function RecoveryCodesSection({ handle }: { handle: string }) {
 
   return (
     <SettingsCard title="Recovery codes" footnote="Recovery codes get you back in if you lose every passkey. Keep them somewhere safe.">
+      {action.error && !confirming ? (
+        <div className="px-3.5 pt-3">
+          <Notice variant="error">{action.error}</Notice>
+        </div>
+      ) : null}
       <SettingsRow icon="lock" title="Replace recovery codes" description="Creates 10 new one-time codes and turns off the old ones." />
       <div className="px-1.5 py-2">
         <Button
