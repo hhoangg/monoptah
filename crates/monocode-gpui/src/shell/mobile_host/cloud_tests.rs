@@ -610,15 +610,8 @@ fn cloud_methods_answer_coded_failures_and_destructive_ones_are_forbidden(cx: &m
         .update(cx, |shell, _, cx| {
             let web = device(DeviceKind::Web, None);
             for method in [
-                "cloud.instances",
-                "cloud.startOptions",
-                "cloud.stop",
-                "cloud.resume",
-                "cloud.retryStart",
-                "cloud.keepRunning",
-                "cloud.moveToCloud",
+                // Answered through the host (it needs the window).
                 "cloud.moveToLocal",
-                "cloud.cancelMove",
                 "cloud.something",
             ] {
                 assert_eq!(
