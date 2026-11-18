@@ -6,7 +6,7 @@ use gpui::TestAppContext;
 use monocode_core::{
     cloud_sessions::{CloudBackendKind, CloudSessions, CloudState, Host, StepKind, StepStatus},
     codespaces::{GhOutput, GhRunner},
-    mobile::{DeviceKind, Permission},
+    mobile::{DeviceKind, Permission, cloud_policy},
     remote::Machine,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 /// The rail project the window fixture opens.
 const PROJECT: &str = "/work/monocode";
 const REMOTE_CWD: &str = "remote://box/home/me/app";
+
+/// The id a web device sees for the remote project of [`REMOTE_CWD`].
+fn opaque_remote_id() -> String {
+    cloud_policy::remote_project_id(&monocode_core::files::path_key(REMOTE_CWD))
+}
 
 fn device(kind: DeviceKind, projects: Option<Vec<String>>) -> DeviceContext {
     DeviceContext {
@@ -192,54 +197,24 @@ fn entry_of(shell: &Shell, id: i64, cx: &App) -> CatalogEntry {
         .unwrap_or_else(|| panic!("session {id} is not in the catalog"))
 }
 
-/// The catalog JSON the app would publish, built from the same pieces as
-/// `publish_mobile_catalog`: session cards, rail projects and the extra
-/// remote projects. `today` leaves out what this change adds: it lists only
-/// the sessions whose own cwd is a rail project and adds no field.
-fn catalog(shell: &Shell, today: bool, cx: &App) -> Value {
-    let paths = shell.mobile_projects(cx);
-    let entries = shell.mobile_catalog_sessions(&paths, cx);
-    let extra = cloud::web_only_projects(
-        entries
+/// The catalog JSON the app publishes: the real `mobile_catalog_work` (the code
+/// `publish_mobile_catalog` runs), with each session card renamed `c{id}` so
+/// assertions read by session id.
+fn published(shell: &mut Shell, cx: &mut Context<Shell>) -> Value {
+    let work = shell.mobile_catalog_work(cx);
+    let (mut catalog, ids, _) = cx
+        .foreground_executor()
+        .block_test(work)
+        .expect("the catalog builds");
+    for card in catalog["sessions"].as_array_mut().unwrap() {
+        if let Some((id, _)) = ids
             .iter()
-            .filter_map(|entry| Some((entry.cloud.as_ref()?, entry.summary.cwd.as_str()))),
-    );
-    let on_rail = |cwd: &str| {
-        paths
-            .iter()
-            .any(|p| monocode_core::files::path_key(p) == monocode_core::files::path_key(cwd))
-    };
-    let extra = if today { Vec::new() } else { extra };
-    let projects: Vec<Value> = paths
-        .iter()
-        .chain(&extra)
-        .map(|path| {
-            let mut project = json!({"id": project_id(path), "path": path, "name": path});
-            if extra.contains(path) {
-                cloud::mark_web_only(&mut project);
-            }
-            project
-        })
-        .collect();
-    let sessions: Vec<Value> = entries
-        .iter()
-        .filter(|entry| !today || on_rail(&entry.summary.cwd))
-        .map(|entry| {
-            let mut card = mobile_catalog::session(
-                &entry.summary,
-                &format!("c{}", entry.id),
-                &entry.project,
-                &Default::default(),
-                None,
-                "",
-            );
-            if !today {
-                cloud::annotate_card(&mut card, entry.cloud.as_ref());
-            }
-            card
-        })
-        .collect();
-    json!({"projects": projects, "monos": [], "sessions": sessions})
+            .find(|(_, persisted)| card["id"] == persisted.as_str())
+        {
+            card["id"] = json!(format!("c{id}"));
+        }
+    }
+    catalog
 }
 
 fn card(catalog: &Value, id: i64) -> Option<&Value> {
@@ -256,7 +231,7 @@ fn the_catalog_files_each_kind_under_its_project_with_its_fields_for_web(cx: &mu
     window
         .update(cx, |shell, _, cx| {
             let project = project_id(PROJECT);
-            let mut web = catalog(shell, false, cx);
+            let mut web = published(shell, cx);
             policy::filter_reply(&device(DeviceKind::Web, None), "workspace.list", &mut web);
             let target = |id: i64| card(&web, id).unwrap_or_else(|| panic!("{id} missing"));
 
@@ -278,7 +253,8 @@ fn the_catalog_files_each_kind_under_its_project_with_its_fields_for_web(cx: &mu
 
             // A remote-machine session has its own remote project.
             let remote = target(w.remote);
-            assert_eq!(remote["projectId"], project_id(REMOTE_CWD));
+            let opaque = opaque_remote_id();
+            assert_eq!(remote["projectId"], opaque);
             assert_eq!(
                 remote["target"],
                 json!({"kind": "remote", "instance": "box"})
@@ -288,9 +264,15 @@ fn the_catalog_files_each_kind_under_its_project_with_its_fields_for_web(cx: &mu
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|p| p["id"] == project_id(REMOTE_CWD))
+                .find(|p| p["id"] == opaque)
                 .expect("the remote project is listed for web devices");
-            assert_eq!(own["path"], REMOTE_CWD);
+            // M2: only a label of the machine's folder, never its path.
+            assert!(own.get("path").is_none());
+            let text = web.to_string();
+            assert!(
+                !text.contains("remote://") && !text.contains("/home/me"),
+                "{text}"
+            );
 
             // A moved session keeps its local row and gains its cloud target.
             let moved = target(w.moved);
@@ -306,47 +288,184 @@ fn the_catalog_files_each_kind_under_its_project_with_its_fields_for_web(cx: &mu
         .unwrap();
 }
 
+/// The sessions a phone's catalog always listed: the cwd is a rail project.
+fn todays_ids(shell: &Shell, ids: &[i64], cx: &App) -> Vec<String> {
+    let paths = shell.mobile_projects(cx);
+    let mut listed: Vec<String> = ids
+        .iter()
+        .filter(|id| {
+            let cwd = &shell.session_summaries[*id].cwd;
+            paths
+                .iter()
+                .any(|p| monocode_core::files::path_key(p) == monocode_core::files::path_key(cwd))
+        })
+        .map(|id| format!("c{id}"))
+        .collect();
+    listed.sort();
+    listed
+}
+
 #[gpui::test]
 fn a_phone_gets_exactly_todays_lists_and_a_moved_session_stays_local(cx: &mut TestAppContext) {
     let (window, w) = world(cx);
     window
         .update(cx, |shell, _, cx| {
-            // Today's catalog: no hook, no new field.
-            let today = catalog(shell, true, cx);
-            let shared = catalog(shell, false, cx);
+            // The catalog the app really publishes, then each device's view of it.
+            let shared = published(shell, cx);
             assert!(
                 shared.to_string().contains("webOnly"),
                 "the shared catalog is marked"
             );
             let ids = |catalog: &Value| -> Vec<String> {
-                catalog["sessions"]
+                let mut ids: Vec<String> = catalog["sessions"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .map(|card| card["id"].as_str().unwrap().to_owned())
-                    .collect()
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let all = [
+                w.codespace,
+                w.sandbox,
+                w.stopped,
+                w.remote,
+                w.moved,
+                w.local,
+                w.other,
+            ];
+            let expected = todays_ids(shell, &all, cx);
+            assert_eq!(expected.len(), 3, "local, other and the moved session");
+            let rail: Vec<String> = shell
+                .mobile_projects(cx)
+                .iter()
+                .map(|path| project_id(path))
+                .collect();
+            let web = {
+                let mut reply = shared.clone();
+                policy::filter_reply(&device(DeviceKind::Web, None), "workspace.list", &mut reply);
+                reply
             };
             for method in ["workspace.list", "sessions.list"] {
                 let mut reply = shared.clone();
                 policy::filter_reply(&device(DeviceKind::Phone, None), method, &mut reply);
-                // Exactly today's: same sessions, same cards, same projects.
-                assert_eq!(ids(&reply), ids(&today), "{method}");
-                assert_eq!(reply, today, "{method}");
-                // The cloud-born sessions and the remote machine are not there.
-                let listed = ids(&reply);
-                for hidden in [w.codespace, w.sandbox, w.stopped, w.remote] {
-                    assert!(!listed.contains(&format!("c{hidden}")), "{hidden}");
+                // Exactly today's sessions, projects and cards.
+                assert_eq!(ids(&reply), expected, "{method}");
+                let mut projects: Vec<String> = reply["projects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["id"].as_str().unwrap().to_owned())
+                    .collect();
+                let mut want = rail.clone();
+                projects.sort();
+                want.sort();
+                assert_eq!(projects, want, "{method}");
+                let text = reply.to_string();
+                for leak in ["webOnly", "target", "cloudState", "startup", "remote://"] {
+                    assert!(!text.contains(leak), "{method}: {leak}");
                 }
-                // The moved session is listed as local, with no cloud field.
-                let moved = card(&reply, w.moved).expect("a moved session stays listed");
-                assert!(moved.get("target").is_none() && moved.get("cloudState").is_none());
-                assert_eq!(listed.len(), 3, "{method}");
+                // Every card is the web's card without its web-only fields.
+                for card in reply["sessions"].as_array().unwrap() {
+                    let mut twin = web["sessions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|c| c["id"] == card["id"])
+                        .cloned()
+                        .unwrap();
+                    for field in cloud_policy::WEB_CARD_FIELDS {
+                        twin.as_object_mut().unwrap().remove(field);
+                    }
+                    assert_eq!(&twin, card, "{method}");
+                }
             }
             assert!(
                 entry_of(shell, w.moved, cx)
                     .cloud
                     .is_some_and(|c| !c.web_only),
                 "a moved session is not web only"
+            );
+        })
+        .unwrap();
+}
+
+/// H2: a phone reaches no session only web devices see, whatever it asks for.
+#[gpui::test]
+fn a_phone_is_refused_every_web_only_session_but_keeps_a_moved_one(cx: &mut TestAppContext) {
+    let (window, w) = world(cx);
+    window
+        .update(cx, |shell, window, cx| {
+            let phone = device(DeviceKind::Phone, None);
+            let web = device(DeviceKind::Web, None);
+            for id in [w.codespace, w.sandbox, w.stopped, w.remote] {
+                let wire = shell.mobile_session_id(id);
+                assert_eq!(
+                    shell.mobile_target(&wire, &phone, cx).err(),
+                    Some(policy::Code::UnsupportedTarget.failure()),
+                    "{id}"
+                );
+                assert!(shell.mobile_target(&wire, &web, cx).is_ok(), "{id}");
+            }
+            for id in [w.moved, w.local, w.other] {
+                let wire = shell.mobile_session_id(id);
+                assert!(shell.mobile_target(&wire, &phone, cx).is_ok(), "{id}");
+            }
+            // A moved session still has its instance: a phone may neither delete it
+            // (orphaning a billing instance) nor archive it (skipping keep or stop).
+            assert_eq!(
+                cloud::before_delete(shell, &phone, w.moved, cx),
+                Err(policy::Code::UnsupportedTarget.failure())
+            );
+            assert_eq!(
+                cloud::before_archive(shell, &phone, w.moved, &json!({}), window, cx),
+                Err(policy::Code::UnsupportedTarget.failure())
+            );
+            // A plain local session is as before.
+            assert_eq!(cloud::before_delete(shell, &phone, w.local, cx), Ok(()));
+            assert_eq!(
+                cloud::before_archive(shell, &phone, w.local, &json!({}), window, cx),
+                Ok(cloud::Archive::Local)
+            );
+        })
+        .unwrap();
+}
+
+/// L2: a web delete is refused for anything bound to an instance or on a remote machine,
+/// also when the shell's marks do not know it (a binding or start record in the store, or a
+/// `remote://` cwd alone).
+#[gpui::test]
+fn a_web_delete_is_refused_for_anything_remote_even_without_a_mark(cx: &mut TestAppContext) {
+    let (window, w) = world(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let web = device(DeviceKind::Web, None);
+            for id in [w.codespace, w.sandbox, w.stopped, w.remote, w.moved] {
+                assert_eq!(
+                    cloud::before_delete(shell, &web, id, cx),
+                    Err(policy::Code::UnsupportedTarget.failure()),
+                    "{id}"
+                );
+            }
+            assert_eq!(cloud::before_delete(shell, &web, w.local, cx), Ok(()));
+            // The mark is gone (a restart before the marks were rebuilt): the store still binds it.
+            shell.cloud_marks.remove(&w.codespace);
+            assert_eq!(
+                cloud::before_delete(shell, &web, w.codespace, cx),
+                Err(policy::Code::UnsupportedTarget.failure())
+            );
+            // Only a start record remains.
+            let mut record = crate::cloud_start_view::fixtures::record(2);
+            record.session_id = w.local;
+            monocode_core::cloud_sessions::startup::save_start_record(
+                &locked(&shell.store).unwrap(),
+                &record,
+            )
+            .unwrap();
+            assert_eq!(
+                cloud::before_delete(shell, &web, w.local, cx),
+                Err(policy::Code::UnsupportedTarget.failure())
             );
         })
         .unwrap();
@@ -360,7 +479,7 @@ fn a_cloud_session_of_an_unselected_project_is_not_listed_or_reachable(cx: &mut 
             let project = project_id(PROJECT);
             let elsewhere = project_id("/work/another-project");
             let only_elsewhere = device(DeviceKind::Web, Some(vec![elsewhere.clone()]));
-            let mut reply = catalog(shell, false, cx);
+            let mut reply = published(shell, cx);
             policy::filter_reply(&only_elsewhere, "workspace.list", &mut reply);
             for hidden in [
                 w.codespace,
@@ -383,7 +502,7 @@ fn a_cloud_session_of_an_unselected_project_is_not_listed_or_reachable(cx: &mut 
             );
 
             let with_project = device(DeviceKind::Web, Some(vec![project.clone()]));
-            let mut reply = catalog(shell, false, cx);
+            let mut reply = published(shell, cx);
             policy::filter_reply(&with_project, "sessions.list", &mut reply);
             for shown in [w.codespace, w.sandbox, w.stopped, w.moved, w.local] {
                 assert!(card(&reply, shown).is_some(), "{shown}");
@@ -405,13 +524,21 @@ fn a_cloud_session_of_an_unselected_project_is_not_listed_or_reachable(cx: &mut 
                 shell.mobile_target(&remote, &with_project, cx).err(),
                 Some(not_selected())
             );
-            let own = device(DeviceKind::Web, Some(vec![project_id(REMOTE_CWD)]));
+            // A narrowed web device selects the remote project by the opaque id the
+            // catalog shows (M2), not by the app's path id.
+            let opaque = opaque_remote_id();
+            let own = device(DeviceKind::Web, Some(vec![opaque]));
             assert!(shell.mobile_target(&remote, &own, cx).is_ok());
-            // A narrowed phone keeps today's answer: it never reaches a cloud session.
+            let by_path = device(DeviceKind::Web, Some(vec![project_id(REMOTE_CWD)]));
+            assert_eq!(
+                shell.mobile_target(&remote, &by_path, cx).err(),
+                Some(not_selected())
+            );
+            // A phone never reaches a session only the web sees (H2), narrowed or not.
             let narrowed_phone = device(DeviceKind::Phone, Some(vec![project]));
             assert_eq!(
                 shell.mobile_target(&cs, &narrowed_phone, cx).err(),
-                Some(not_selected())
+                Some(policy::Code::UnsupportedTarget.failure())
             );
             let moved = shell.mobile_session_id(w.moved);
             assert!(shell.mobile_target(&moved, &narrowed_phone, cx).is_ok());
@@ -458,7 +585,7 @@ fn reads_and_frames_carry_the_cloud_field_for_web_only_and_never_call_out(cx: &m
                     .is_empty()
             );
             // Reading a stopped session, in every way, called nothing.
-            let _ = catalog(shell, false, cx);
+            let _ = published(shell, cx);
             assert_eq!(
                 w.calls.count(),
                 0,
@@ -491,7 +618,7 @@ fn a_start_in_progress_shows_its_steps_in_milliseconds_and_a_failure_its_clean_e
             assert_eq!(field["startup"]["steps"][0]["startedAt"], 1000);
             assert_eq!(field["startup"]["steps"][0]["finishedAt"], 6000);
             assert!(field["startup"]["steps"][2]["finishedAt"].is_null());
-            let cards = catalog(shell, false, cx);
+            let cards = published(shell, cx);
             let cs = card(&cards, w.codespace).unwrap();
             assert_eq!(cs["cloudState"], "starting");
             assert_eq!(cs["startup"], json!({"step": "buildContainer"}));
@@ -508,7 +635,7 @@ fn a_start_in_progress_shows_its_steps_in_milliseconds_and_a_failure_its_clean_e
                 &record,
             )
             .unwrap();
-            let cards = catalog(shell, false, cx);
+            let cards = published(shell, cx);
             let cs = card(&cards, w.codespace).unwrap();
             // A failed start shows the cached state again, plus the error.
             assert_eq!(cs["cloudState"], "available");
@@ -638,4 +765,24 @@ fn cloud_methods_answer_coded_failures_and_destructive_ones_are_forbidden(cx: &m
             }
         })
         .unwrap();
+}
+
+/// H2: a Mono's launch card follows the same scope as the lists: a phone gets none for a
+/// web-only session, and a narrowed device only those of its projects.
+#[test]
+fn a_launch_card_is_scoped_per_device_kind_and_selection() {
+    let phone = device(DeviceKind::Phone, None);
+    let web = device(DeviceKind::Web, None);
+    assert!(!launch_shown(&phone, true, "p"));
+    assert!(launch_shown(&phone, false, "p"));
+    assert!(launch_shown(&web, true, "remote-0123456789abcdef"));
+    let narrowed = device(
+        DeviceKind::Web,
+        Some(vec!["remote-0123456789abcdef".into()]),
+    );
+    assert!(launch_shown(&narrowed, true, "remote-0123456789abcdef"));
+    assert!(!launch_shown(&narrowed, true, "p"));
+    let narrowed_phone = device(DeviceKind::Phone, Some(vec!["p".into()]));
+    assert!(launch_shown(&narrowed_phone, false, "p"));
+    assert!(!launch_shown(&narrowed_phone, false, "q"));
 }

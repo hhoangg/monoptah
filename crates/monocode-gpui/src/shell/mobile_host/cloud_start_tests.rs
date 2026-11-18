@@ -397,6 +397,34 @@ fn a_held_slot_is_freed_when_its_operation_ends(cx: &mut TestAppContext) {
     assert_eq!(in_flight(&who.id), 0, "freed once it ended");
 }
 
+/// S5: the start's reply is bounded well inside the host's 25 s wait, and the first answer
+/// (the start's own or the `starting` one at the bound) is the only one.
+#[gpui::test]
+fn a_start_answers_once_and_within_the_hosts_reply_wait(cx: &mut TestAppContext) {
+    assert!(super::cloud_start::START_REPLY_BOUND <= Duration::from_secs(20));
+    let (window, _, _) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, _, _| {
+            let got: Rc<RefCell<Vec<Result<Value, Failure>>>> = Rc::default();
+            let sink = got.clone();
+            let done = RefCell::new(Some(move |_: &mut Shell, reply| {
+                sink.borrow_mut().push(reply)
+            }));
+            super::cloud_start::answer_once(
+                &done,
+                shell,
+                Ok(json!({"accepted": true, "starting": true})),
+            );
+            super::cloud_start::answer_once(&done, shell, Ok(json!({"sessionId": "late"})));
+            assert_eq!(
+                *got.borrow(),
+                [Ok(json!({"accepted": true, "starting": true}))],
+                "the late reply is dropped"
+            );
+        })
+        .unwrap();
+}
+
 // MARK: H-14
 
 fn seed_move(shell: &mut Shell, id: i64, step: Option<&str>, branch: &str) {
@@ -493,8 +521,8 @@ fn move_calls_check_the_selection_and_the_params(cx: &mut TestAppContext) {
                 ),
                 Err(policy::Code::NotSelected.failure())
             );
-            // Nothing but the session id (and kind and instance for a move to
-            // the cloud): no branch, machine, size, kit or deleteWorkspace.
+            // Nothing but the session id and a start `target` (S4): no kit, deleteWorkspace,
+            // image, cpus, template or any other key.
             for (method, params) in [
                 (
                     "cloud.cancelMove",
@@ -502,15 +530,15 @@ fn move_calls_check_the_selection_and_the_params(cx: &mut TestAppContext) {
                 ),
                 (
                     "cloud.moveToCloud",
-                    json!({"sessionId": sid, "target": {"kind": "codespace", "branch": "x"}}),
+                    json!({"sessionId": sid, "target": {"kind": "codespace", "image": "x"}}),
                 ),
                 (
                     "cloud.moveToCloud",
-                    json!({"sessionId": sid, "target": {"kind": "codespace", "machine": "m"}}),
+                    json!({"sessionId": sid, "target": {"kind": "sandbox", "cpus": 64}}),
                 ),
                 (
                     "cloud.moveToCloud",
-                    json!({"sessionId": sid, "target": {"kind": "sandbox", "size": "2cpu-4g"}}),
+                    json!({"sessionId": sid, "target": {"kind": "codespace", "kit": "none"}}),
                 ),
                 (
                     "cloud.moveToCloud",
@@ -534,6 +562,111 @@ fn move_calls_check_the_selection_and_the_params(cx: &mut TestAppContext) {
             // Nothing was claimed by any of these.
             assert_eq!(in_flight(&who.id), 0);
             assert_eq!(calls_this_hour(&who.id), 0);
+        })
+        .unwrap();
+}
+
+/// S4: a move takes the keys of a start `target` (what the web sends), or none (the
+/// desktop's default), and every refusal carries a code.
+#[gpui::test]
+fn a_move_target_takes_the_start_keys_and_every_refusal_is_coded(cx: &mut TestAppContext) {
+    let (window, id, _) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let sid = shell.mobile_session_id(id);
+            let who = web("c14-keys");
+            let coded = |result: Result<Value, Failure>| {
+                let failure = result.expect_err("the desktop refuses this session");
+                failure.code.clone().expect("a code")
+            };
+            for target in [
+                json!({"kind": "codespace", "branch": "x"}),
+                json!({"kind": "codespace", "machine": "basicLinux32gb"}),
+                json!({"kind": "sandbox", "size": "2cpu-4g"}),
+                json!({"kind": "codespace", "instance": "new"}),
+            ] {
+                let params = json!({"sessionId": sid, "target": target});
+                let code = coded(crate::mobile::cloud::dispatch(
+                    shell,
+                    &who,
+                    "cloud.moveToCloud",
+                    &params,
+                    cx,
+                ));
+                // Past the shape check: the desktop's own refusal, coded.
+                assert_eq!(code, "unsupported_target", "{target}");
+            }
+            // Wrong types and impossible pairs are `forbidden`.
+            for target in [
+                json!({"kind": "codespace", "branch": 5}),
+                json!({"kind": "codespace", "size": "2cpu-4g"}),
+                json!({"kind": "vm"}),
+                json!("codespace"),
+            ] {
+                let params = json!({"sessionId": sid, "target": target});
+                assert_eq!(
+                    coded(crate::mobile::cloud::dispatch(
+                        shell,
+                        &who,
+                        "cloud.moveToCloud",
+                        &params,
+                        cx
+                    )),
+                    "forbidden",
+                    "{target}"
+                );
+            }
+            // No target: the desktop's default (the first target its dialog offers).
+            // This session offers none, so the refusal is coded too.
+            let params = json!({"sessionId": sid});
+            assert_eq!(
+                coded(crate::mobile::cloud::dispatch(
+                    shell,
+                    &who,
+                    "cloud.moveToCloud",
+                    &params,
+                    cx
+                )),
+                "unsupported_target"
+            );
+            let params = json!({"target": {"kind": "codespace"}});
+            assert_eq!(
+                coded(crate::mobile::cloud::dispatch(
+                    shell,
+                    &who,
+                    "cloud.moveToCloud",
+                    &params,
+                    cx
+                )),
+                "forbidden"
+            );
+            assert_eq!(in_flight(&who.id), 0, "no refusal holds a slot");
+        })
+        .unwrap();
+}
+
+/// A cancel with a move of the agent's own running reaches the engine, and never asks for
+/// the workspace to be deleted (the params take nothing else).
+#[gpui::test]
+fn a_cancel_with_a_move_running_is_accepted_and_deletes_nothing(cx: &mut TestAppContext) {
+    let (window, id, other) = crate::shell::tests::window(cx);
+    window
+        .update(cx, |shell, _, cx| {
+            let sid = shell.mobile_session_id(id);
+            let who = web("c14-cancel");
+            seed_move(shell, id, Some("upload"), "feat/x");
+            shell.cloud_moves.get_mut(&id).unwrap().by_api = true;
+            let before = shell.session_summaries.len();
+            let reply = crate::mobile::cloud::dispatch(
+                shell,
+                &who,
+                "cloud.cancelMove",
+                &json!({"sessionId": sid}),
+                cx,
+            );
+            assert_eq!(reply, Ok(json!({"accepted": true})), "{reply:?}");
+            assert_eq!(shell.session_summaries.len(), before);
+            assert!(shell.session_summaries.contains_key(&other));
         })
         .unwrap();
 }

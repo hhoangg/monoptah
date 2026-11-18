@@ -14,7 +14,7 @@ use gpui::{App, Context, Window};
 use monocode_core::cloud_sessions::CloudRef;
 use monocode_core::cloud_sessions::workspaces::WorkspaceTarget;
 use monocode_core::mobile::cloud_policy::{self, WakeSlot};
-use monocode_core::mobile::policy::{Code, Failure};
+use monocode_core::mobile::policy::{self, Code, Failure};
 use monocode_core::mobile::{DeviceContext, DeviceKind};
 use monocode_core::mono::cloud_api::CloudApi;
 use serde_json::{Value, json};
@@ -117,12 +117,19 @@ pub(super) fn start_wake(
 }
 
 /// `cloud.stop {sessionId}` or `{kind, instance}`: asks the instance to stop
-/// the way the app API does (`CloudApi::stop_instance`) and answers with the
-/// desktop's `warning` naming the sessions it interrupted. `stopped` means
-/// requested; progress is the `stopReport` of `cloud.instances`. Allowed on a
-/// `kept` instance. Refused with `instance_busy` while the desktop archives or
-/// converts on it, `auto_stopping` while it stops it itself, `not_selected`
-/// for an instance no selected project uses. Not rate limited: it saves money.
+/// the way the app API does (`CloudApi::stop_instance`). The instance is
+/// checked against what the app knows (a session's, or one in the cached
+/// listing), the request is answered at once with the sessions that work on it
+/// and a `warning` naming those that are busy, and the stop runs on a worker
+/// (it can take a `gh` call per project, longer than a request may wait).
+/// `stopped` means requested; progress is the `stopReport` of
+/// `cloud.instances`, and a stop that fails afterwards is shown to the desktop
+/// user. Allowed on a `kept` instance. Refused with `instance_busy` while the
+/// desktop archives or converts on it, `auto_stopping` while it stops it
+/// itself, `not_selected` for an instance no selected project uses,
+/// `unsupported_target` for a name the app does not know, `busy` beyond
+/// `STOP_LIMIT_PER_MINUTE` stops per device (a stop saves money, so only a
+/// loop is limited).
 pub(super) fn stop(
     shell: &mut Shell,
     device: &DeviceContext,
@@ -135,6 +142,7 @@ pub(super) fn stop(
         if let Some(failure) = busy_failure(shell, &cloud) {
             return Err(failure);
         }
+        cloud_policy::allow_stop(&device.id)?;
         Ok((cloud, project))
     })();
     let (cloud, project) = match planned {
@@ -167,21 +175,17 @@ pub(super) fn stop(
             });
         api.stop_instance(&target, &busy)
     });
-    let device = device.clone();
+    let preview = shell.mobile_stop_preview(&cloud, cx);
+    let reply = stop_reply(shell, device, &preview, cx);
     cx.spawn(async move |this, cx| {
         let result = work.await;
-        let _ = this.update(cx, move |this, cx| {
-            let reply = match result {
-                Ok(value) => {
-                    this.mobile_cloud_changed(&cloud, cx);
-                    Ok(stop_reply(this, &device, &value, cx))
-                }
-                Err(error) => Err(safe_error(&error)),
-            };
-            finish(this, reply);
+        let _ = this.update(cx, move |this, cx| match result {
+            Ok(_) => this.mobile_cloud_changed(&cloud, cx),
+            Err(error) => this.mobile_stop_failed(safe_error(&error).error, cx),
         });
     })
     .detach();
+    finish(shell, Ok(reply));
 }
 
 /// The reply of a stop for `device`: only the sessions of its selected
@@ -291,7 +295,9 @@ pub(super) fn resume(
 /// `cloud.retryStart {sessionId}`: runs a failed start again the way the
 /// desktop's own Retry does, for a failed start (a `kept` instance is one).
 /// Answers `{accepted: true}` at once; progress is the `startup` of the
-/// `cloud` field. Rate limited like any call that can bill.
+/// `cloud` field. Rate limited like any call that can bill. A retry that would
+/// create the instance (the failed start never did) needs "Remote cloud start"
+/// (`disabled`); one on a kept instance needs only `control`.
 pub(super) fn retry_start(
     shell: &mut Shell,
     device: &DeviceContext,
@@ -307,6 +313,11 @@ pub(super) fn retry_start(
     }
     if let Some(failure) = busy_failure(shell, &cloud) {
         return Err(failure);
+    }
+    // A retry on a kept instance (the failed start created it) only runs again what the
+    // user already has; one that has to create the instance is a cloud start.
+    if shell.mobile_retry_creates(id) && !policy::flags().remote_cloud_start {
+        return Err(Code::Disabled.failure());
     }
     let slot = cloud_policy::acquire_wake(&device.id)?;
     shell.mobile_retry_start(id, cx);
@@ -359,7 +370,13 @@ pub(super) fn before_archive(
     cx: &mut Context<Shell>,
 ) -> Result<Archive, Failure> {
     if device.kind != DeviceKind::Web {
-        return Ok(Archive::Local);
+        // A phone has no keep/stop choice to make: its archive of a session bound to an
+        // instance would skip it (the instance would keep billing), so it is refused (H2).
+        return if shell.mobile_cloud_bound(session) {
+            Err(Code::UnsupportedTarget.failure())
+        } else {
+            Ok(Archive::Local)
+        };
     }
     let Some(view) = super::card_view(shell, session, false).filter(|view| view.is_cloud()) else {
         return Ok(Archive::Local);
@@ -381,24 +398,31 @@ pub(super) fn before_archive(
     Ok(Archive::Handled)
 }
 
-/// Before a session is deleted: a web device never deletes a cloud or a
-/// remote-machine session (`unsupported_target`, D7). A phone's delete only
-/// removes the local row, as it always did, and is left as it is.
+/// Before a session is deleted: nobody remote deletes a session that is bound
+/// to a cloud instance (it would orphan a billable instance) or that lives on
+/// a remote machine (D7, `unsupported_target`). A session counts as bound when
+/// the app has a mark, a binding in the store or a start record for it, not
+/// only what the catalog shows (L2). A phone's delete of any other session
+/// only removes the local row, as it always did, and is left as it is.
 pub(super) fn before_delete(
     shell: &mut Shell,
     device: &DeviceContext,
     session: i64,
     _cx: &mut Context<Shell>,
 ) -> Result<(), Failure> {
+    if shell.mobile_cloud_bound(session) {
+        return Err(Code::UnsupportedTarget.failure());
+    }
     if device.kind != DeviceKind::Web {
         return Ok(());
     }
-    match super::card_view(shell, session, false) {
-        Some(view) if view.placement != super::view::Placement::Local => {
-            Err(Code::UnsupportedTarget.failure())
-        }
-        _ => Ok(()),
+    let remote = shell.mobile_remote_cwd(session)
+        || super::card_view(shell, session, false)
+            .is_some_and(|view| view.placement != super::view::Placement::Local);
+    if remote {
+        return Err(Code::UnsupportedTarget.failure());
     }
+    Ok(())
 }
 
 /// Sets `kept` and `auto_stop` of the `cloud` field for a session.

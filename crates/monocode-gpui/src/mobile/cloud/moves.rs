@@ -44,10 +44,13 @@ pub(crate) fn step_id(step: monocode_core::cloud_sessions::move_session::MoveSte
     }
 }
 
-/// The desktop's refusal as a failure for the web: sanitized (no path, URL or
-/// command line), the text only.
+/// The desktop's refusal as a failure for the web: coded, and the text sanitized (no path,
+/// URL or command line).
 fn refusal(error: &str) -> Failure {
-    sanitize_startup_error(error).into()
+    Failure::coded(
+        Code::UnsupportedTarget.as_str(),
+        sanitize_startup_error(error),
+    )
 }
 
 /// `sessionId` of the params, the only thing a cancel or a return takes.
@@ -56,33 +59,56 @@ fn only_session_id(params: &Value) -> Result<&str, Failure> {
     if map.keys().any(|key| key != "sessionId") {
         return Err(Code::Forbidden.failure());
     }
+    session_id(params)
+}
+
+fn session_id(params: &Value) -> Result<&str, Failure> {
     params["sessionId"]
         .as_str()
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| "Choose a session".into())
+        .ok_or_else(|| Failure::coded(Code::Forbidden.as_str(), "Choose a session"))
 }
 
-/// `{sessionId, target: {kind, instance?}}` as the app API's input. The target
-/// takes only `kind` and `instance`: no branch, machine, size or kit.
-fn move_to_cloud_input(session: i64, params: &Value) -> Result<move_api::MoveToCloud, Failure> {
+/// `{sessionId, target?}` as the app API's input. The `target` takes the keys of a
+/// remote start (`kind`, `instance`, `branch`, `machine`, `size`, see
+/// `cloud_policy::validate_start_target`); anything else is `forbidden`. The move itself is
+/// the app API's, which takes only the kind and the instance and runs against the targets
+/// the desktop's own dialog offers, so `branch`, `machine` and `size` are checked for shape
+/// and the desktop's own choices apply. No `target` is the desktop's default: the first
+/// target its dialog offers for the session.
+fn move_to_cloud_input(
+    shell: &Shell,
+    session: i64,
+    params: &Value,
+) -> Result<move_api::MoveToCloud, Failure> {
     let map = params.as_object().ok_or(Code::Forbidden.failure())?;
     if map.keys().any(|key| key != "sessionId" && key != "target") {
         return Err(Code::Forbidden.failure());
     }
-    let target = map
-        .get("target")
-        .and_then(Value::as_object)
-        .ok_or("Choose where to move the session")?;
-    if target.keys().any(|key| key != "kind" && key != "instance") {
-        return Err(Code::Forbidden.failure());
-    }
-    // The app API's own parser checks the kind and the instance name.
-    let mut target = Value::Object(target.clone());
-    if target.get("instance").is_none() {
-        target["instance"] = json!("new");
-    }
-    move_api::parse_move_to_cloud(&json!({"session": session, "target": target}))
-        .map_err(|error| refusal(&error))
+    let (kind, instance) = match map.get("target") {
+        None | Some(Value::Null) => {
+            let (kind, instance) = shell
+                .mobile_move_default(session)
+                .ok_or_else(|| Code::UnsupportedTarget.failure())?;
+            (kind, instance)
+        }
+        Some(target) => {
+            let target = cloud_policy::validate_start_target(target).map_err(Code::failure)?;
+            let kind = match target.kind {
+                cloud_policy::StartKind::Codespace => "codespace",
+                cloud_policy::StartKind::Sandbox => "sandbox",
+            };
+            let instance = match target.instance {
+                cloud_policy::StartInstance::New => "new".to_owned(),
+                cloud_policy::StartInstance::Named(name) => name,
+            };
+            (kind, instance)
+        }
+    };
+    move_api::parse_move_to_cloud(
+        &json!({"session": session, "target": {"kind": kind, "instance": instance}}),
+    )
+    .map_err(|error| refusal(&error))
 }
 
 pub(super) fn move_to_cloud(
@@ -94,11 +120,11 @@ pub(super) fn move_to_cloud(
     if device.kind != DeviceKind::Web {
         return Err(Code::Unsupported.failure());
     }
-    let session = shell.mobile_move_session(params["sessionId"].as_str(), device, cx)?;
-    let request = move_to_cloud_input(session, params)?;
+    let session = shell.mobile_move_session(Some(session_id(params)?), device, cx)?;
+    let request = move_to_cloud_input(shell, session, params)?;
     let project = shell
         .mobile_move_project(session)
-        .ok_or("Session is no longer available")?;
+        .ok_or_else(|| Code::UnsupportedTarget.failure())?;
     let slot = cloud_policy::acquire_wake(&device.id)?;
     match shell.api_move_to_cloud(&project, request, cx) {
         Ok(_) => {
@@ -127,7 +153,7 @@ pub(crate) fn move_to_local(
     let session = shell.mobile_move_session(Some(only_session_id(params)?), device, cx)?;
     let project = shell
         .mobile_move_project(session)
-        .ok_or("Session is no longer available")?;
+        .ok_or_else(|| Code::UnsupportedTarget.failure())?;
     let slot = cloud_policy::acquire_wake(&device.id)?;
     match shell.api_move_to_local(&project, session, window, cx) {
         Ok(_) => {
@@ -156,7 +182,7 @@ pub(super) fn cancel_move(
     let session = shell.mobile_move_session(Some(only_session_id(params)?), device, cx)?;
     let project = shell
         .mobile_move_project(session)
-        .ok_or("Session is no longer available")?;
+        .ok_or_else(|| Code::UnsupportedTarget.failure())?;
     shell
         .api_cancel_move(&project, session, cx)
         .map(|_| json!({"accepted": true}))

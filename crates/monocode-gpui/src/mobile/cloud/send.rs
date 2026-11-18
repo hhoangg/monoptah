@@ -2,19 +2,25 @@
 //! refusals (H-10, H-12).
 //!
 //! Web devices only (D1): a phone's send is never looked at, so it keeps today's
-//! path and reply, and can never wake billable compute. For a codespace or
-//! sandbox session of a web device, in this order:
+//! path and reply, and it can never wake billable compute (its message goes
+//! through `Conversation::mobile_submit`, which never reconnects a workspace).
+//! For a codespace or sandbox session of a web device, in this order:
 //!
 //! 1. the instance is starting (or its start failed): `starting` carrying the
 //!    desktop's own `starting_refusal` text;
 //! 2. the desktop is stopping the instance on its own: `auto_stopping`;
 //! 3. an archive works on the instance: `instance_busy`;
-//! 4. the instance is `available`: a plain send, as today;
+//! 4. the instance is `available` and the session is connected (or its view
+//!    is not loaded and says nothing else): a plain send, as today;
 //! 5. `unavailable`: `unsupported_target`, nothing can wake it;
-//! 6. `stopped`, `stopping` or `unknown`: without `wake: true` it is
-//!    `wake_required`; with it, one pending wake-send per session (`busy`),
-//!    the per-device rate limit (`busy`), then the wake starts on a worker and
-//!    the message waits in the existing deferral. Nothing waits for the wake.
+//! 6. `stopped`, `stopping` or `unknown`, or `available` by the cache but not
+//!    connected in the session's loaded view (the cache can be stale after an
+//!    idle stop or a sandbox TTL): without `wake: true` it is `wake_required`,
+//!    which costs nothing. With it, one pending wake-send per session (`busy`)
+//!    is checked here; the plan says `wake`, and the host calls
+//!    [`start_wake_send`] only once the message is validated, its files are
+//!    staged and the submit is about to be queued, so a refused message never
+//!    wakes anything or holds a slot. Nothing waits for the wake.
 use super::lifecycle::{self, Wake};
 use crate::shell::Shell;
 use gpui::Context;
@@ -69,6 +75,14 @@ pub(super) fn before_send(
     if shell.mobile_instance_busy(&cloud) {
         return Err(Code::InstanceBusy.failure());
     }
+    // The cache can be stale: a loaded view that is not connected is not available.
+    let live = shell
+        .mobile_session_view(id)
+        .and_then(|view| view.read(cx).mobile_cloud_connected());
+    let state = match (state, live) {
+        (CloudState::Available, Some(false)) => CloudState::Stopped,
+        (state, _) => state,
+    };
     match state {
         CloudState::Available => Ok(SendPlan::default()),
         CloudState::Unavailable => Err(Code::UnsupportedTarget.failure()),
@@ -77,20 +91,36 @@ pub(super) fn before_send(
             if params["wake"] != true {
                 return Err(Code::WakeRequired.failure());
             }
-            if !crate::conversation::Conversation::begin_wake_send(id) {
+            if crate::conversation::Conversation::wake_send_pending(id) {
                 return Err(Code::Busy.failure());
             }
-            let slot = match cloud_policy::acquire_wake(&device.id) {
-                Ok(slot) => slot,
-                Err(failure) => {
-                    crate::conversation::Conversation::end_wake_send(id);
-                    return Err(failure);
-                }
-            };
-            lifecycle::start_wake(shell, id, slot, Wake::Send, cx);
             Ok(SendPlan { wake: true })
         }
     }
+}
+
+/// Starts the wake of a send that was consented to, right before its message
+/// is queued: one pending wake-send per session (`busy`), then a slot of the
+/// per-device rate limit (`busy`), then the wake on a worker. On any failure
+/// nothing stays claimed.
+pub(crate) fn start_wake_send(
+    shell: &mut Shell,
+    device: &DeviceContext,
+    id: i64,
+    cx: &mut Context<Shell>,
+) -> Result<(), Failure> {
+    if !crate::conversation::Conversation::begin_wake_send(id) {
+        return Err(Code::Busy.failure());
+    }
+    let slot = match cloud_policy::acquire_wake(&device.id) {
+        Ok(slot) => slot,
+        Err(failure) => {
+            crate::conversation::Conversation::end_wake_send(id);
+            return Err(failure);
+        }
+    };
+    lifecycle::start_wake(shell, id, slot, Wake::Send, cx);
+    Ok(())
 }
 
 /// The `starting` refusal with the desktop's own text, which can quote the

@@ -297,4 +297,22 @@ fn the_cloud_module_never_names_a_destructive_call() {
             assert!(!source.contains(needle), "{path:?} names {needle}");
         }
     }
+    // The shell halves of the same methods: the start and move helpers, and the part of the
+    // cloud archive file that serves remote devices (the rest is the desktop's own archive).
+    let shell = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell");
+    let start = std::fs::read_to_string(shell.join("mobile_host/cloud_start.rs")).unwrap();
+    let archive = std::fs::read_to_string(shell.join("cloud_app_archive.rs")).unwrap();
+    let marker = "// MARK: remote devices (WS-D4";
+    let remote_part = archive
+        .split(marker)
+        .nth(1)
+        .expect("the remote-device part");
+    for (name, source) in [
+        ("cloud_start.rs", start.as_str()),
+        ("cloud_app_archive.rs", remote_part),
+    ] {
+        for needle in needles {
+            assert!(!source.contains(needle), "{name} names {needle}");
+        }
+    }
 }

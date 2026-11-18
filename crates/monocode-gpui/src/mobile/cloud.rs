@@ -37,6 +37,7 @@ mod start;
 mod tests;
 mod view;
 
+pub(crate) use instances::instance_was_listed;
 pub(crate) use lifecycle::Archive;
 #[cfg(test)]
 pub(crate) use moves::STEP_IDS as MOVE_STEP_IDS;
@@ -165,14 +166,17 @@ fn on_rail<'a>(paths: &'a [String], project: &str) -> Option<&'a String> {
         .find(|path| monocode_core::files::path_key(path) == key)
 }
 
-/// The project path a session is filed under in the catalog when its own
-/// `cwd` is not a rail project. The catalog is built once for every device, so
-/// this has no device: it answers for the web, and `cloud_policy::scope_catalog`
+/// The project id a session is filed under in the catalog when its own `cwd`
+/// is not a rail project. The catalog is built once for every device, so this
+/// has no device: it answers for the web, and `cloud_policy::scope_catalog`
 /// removes what a phone must not see.
 ///
 /// * A codespace or sandbox session is filed under its local twin
-///   (`Shell::project_of`), when that project is on the rail (`paths`).
-/// * A session on a remote machine is filed under its own remote project.
+///   (`Shell::project_of`), when that project is on the rail (`paths`): the
+///   rail project's id.
+/// * A session on a remote machine is filed under an opaque id of its own
+///   remote project ([`cloud_policy::remote_project_id`]): nothing of the
+///   machine's path reaches the wire (M2).
 pub(crate) fn catalog_project_of(
     shell: &Shell,
     id: i64,
@@ -181,10 +185,22 @@ pub(crate) fn catalog_project_of(
 ) -> Option<String> {
     let facts = shell.mobile_cloud_facts(id)?;
     match &facts.binding {
-        Some(binding) => on_rail(paths, &binding.local_project).cloned(),
-        None => facts
-            .remote_machine
-            .then(|| monocode_core::files::path_key(&summary.cwd)),
+        Some(binding) => {
+            on_rail(paths, &binding.local_project).map(|path| Shell::mobile_project_id(path))
+        }
+        None => facts.remote_machine.then(|| {
+            cloud_policy::remote_project_id(&monocode_core::files::path_key(&summary.cwd))
+        }),
+    }
+}
+
+/// The id a project path has on the wire when no project is known for it:
+/// opaque for a remote path, the app's usual id for a local one.
+pub(crate) fn opaque_or_local_id(cwd: &str) -> String {
+    if cwd.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX) {
+        cloud_policy::remote_project_id(&monocode_core::files::path_key(cwd))
+    } else {
+        Shell::mobile_project_id(cwd)
     }
 }
 
@@ -200,6 +216,29 @@ pub(crate) fn target_project_of(
     (device.kind == DeviceKind::Web)
         .then(|| catalog_project_of(shell, id, summary, paths))
         .flatten()
+}
+
+/// Whether only web devices see session `id`: it runs in a codespace, a
+/// sandbox or on a remote machine, and its own folder is not a rail project,
+/// so the phone catalog never listed it (D1). A phone can reach none of them.
+pub(crate) fn web_only_session(shell: &Shell, id: i64, paths: &[String]) -> bool {
+    shell.mobile_cloud_facts(id).is_some_and(|facts| {
+        (facts.binding.is_some() || facts.remote_machine) && on_rail(paths, &facts.cwd).is_none()
+    })
+}
+
+/// H2: a phone is refused a session that only web devices see
+/// (`unsupported_target`), before anything else about it is looked at.
+pub(crate) fn refuse_web_only_for_phone(
+    shell: &Shell,
+    device: &DeviceContext,
+    id: i64,
+    paths: &[String],
+) -> Result<(), Failure> {
+    if device.kind == DeviceKind::Phone && web_only_session(shell, id, paths) {
+        return Err(Code::UnsupportedTarget.failure());
+    }
+    Ok(())
 }
 
 /// How a session is shown on a web device's card; `web_only` is true when a
@@ -233,9 +272,15 @@ pub(crate) fn web_only_projects<'a>(
     paths
 }
 
-/// Marks a catalog project card as one only web devices see.
-pub(crate) fn mark_web_only(project: &mut Value) {
+/// Makes a catalog project card the one only web devices see, for the remote
+/// project at `path`: it gets the opaque id sessions are filed under and loses
+/// its path, so only a label of the machine's folder is left (M2).
+pub(crate) fn mark_web_only(project: &mut Value, path: &str) {
     project[WEB_ONLY] = Value::Bool(true);
+    project["id"] = Value::String(cloud_policy::remote_project_id(path));
+    if let Some(card) = project.as_object_mut() {
+        card.remove("path");
+    }
 }
 
 /// Runs before a session is archived. A cloud session of a web device is
@@ -273,6 +318,16 @@ pub(crate) fn before_send(
     cx: &mut Context<Shell>,
 ) -> Result<SendPlan, Failure> {
     send::before_send(shell, device, session, params, cx)
+}
+
+/// Starts the wake of a consented send (see `send::start_wake_send`).
+pub(crate) fn start_wake_send(
+    shell: &mut Shell,
+    device: &DeviceContext,
+    session: i64,
+    cx: &mut Context<Shell>,
+) -> Result<(), Failure> {
+    send::start_wake_send(shell, device, session, cx)
 }
 
 /// Checks the `target` of a session start once its project (`cwd`) is

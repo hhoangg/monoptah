@@ -395,6 +395,12 @@ impl Shell {
             .values()
             .filter(|mark| mark.cloud() == cloud)
             .collect();
+        // Only an instance this app knows: one a session uses, or one the last
+        // listing (the cached overviews) shows. Any other name could be a
+        // codespace or sandbox the app does not own.
+        if users.is_empty() && !self.mobile_cached_instance(&cloud, cx) {
+            return Err(Code::UnsupportedTarget.failure());
+        }
         let allowed = device.projects.is_none()
             || users.iter().any(|mark| {
                 super::mobile_host::in_selection(
@@ -543,6 +549,82 @@ impl Shell {
         })
     }
 
+    /// Tells the desktop user that a stop a remote device asked for did not go through (the
+    /// device was already answered: the stop runs after the answer).
+    pub(crate) fn mobile_stop_failed(&mut self, error: String, cx: &mut Context<Self>) {
+        self.error = Some(error);
+        cx.notify();
+    }
+
+    /// The instance appeared in a `cloud.instances` reply (the cached overviews). No call out.
+    fn mobile_cached_instance(&self, cloud: &CloudRef, _cx: &App) -> bool {
+        crate::mobile::cloud::instance_was_listed(cloud)
+    }
+
+    /// What a `cloud.stop` of `cloud` reports at once, from the store and the live views (the
+    /// same reading the stop itself makes, `CloudApi::busy_sessions_on`): the sessions of
+    /// this app on it with their titles and whether they work now. The stop runs on a
+    /// worker afterwards.
+    pub(crate) fn mobile_stop_preview(&self, cloud: &CloudRef, cx: &App) -> Value {
+        use monocode_core::mono::cloud_api::AppBusy;
+        let busy = self.cloud_busy_snapshot(cx);
+        let idle = matches!(
+            self.cloud_states.get(&cloud.key()),
+            Some(CloudState::Stopped | CloudState::Unavailable)
+        );
+        let sessions: Vec<Value> = self
+            .cloud
+            .sessions_on(cloud)
+            .into_iter()
+            .map(|mut session| {
+                if idle {
+                    session.running = false;
+                    session.needs_input = false;
+                } else if busy.session_busy(session.id) {
+                    session.running = true;
+                }
+                json!({"sessionId": session.id, "title": session.title, "busy": session.busy()})
+            })
+            .collect();
+        json!({"kind": cloud.kind.api_name(), "instance": cloud.name, "sessions": sessions})
+    }
+
+    /// The session is bound to a cloud instance as far as the app knows: a mark, a binding
+    /// in the store or a start record (also a failed one, which holds a billable instance).
+    pub(crate) fn mobile_cloud_bound(&self, id: i64) -> bool {
+        if self.cloud_marks.contains_key(&id) {
+            return true;
+        }
+        let Ok(store) = locked(&self.store) else {
+            return false;
+        };
+        store
+            .remote_session(id)
+            .ok()
+            .flatten()
+            .is_some_and(|remote| remote.project.cloud().is_some())
+            || monocode_core::cloud_sessions::start_record(&store, id).is_some()
+    }
+
+    /// The session's own folder is on a remote machine (`remote://`).
+    pub(crate) fn mobile_remote_cwd(&self, id: i64) -> bool {
+        self.session_summaries.get(&id).is_some_and(|summary| {
+            summary
+                .cwd
+                .starts_with(monocode_core::remote::REMOTE_PATH_PREFIX)
+        })
+    }
+
+    /// Retrying the failed start of session `id` would create a new instance: the failed
+    /// start never created one (a kept one is retried in place).
+    pub(crate) fn mobile_retry_creates(&self, id: i64) -> bool {
+        let Ok(store) = locked(&self.store) else {
+            return true;
+        };
+        !monocode_core::cloud_sessions::start_record(&store, id)
+            .is_some_and(|record| record.created)
+    }
+
     /// Archives cloud session `id` with `choice` ("keep" or "stop") like the app API, and
     /// tells the desktop user how it ended: a failure on the error line, a warning as a
     /// notice. The remote device is answered at once; the archive takes minutes.
@@ -577,13 +659,19 @@ impl Shell {
     /// stop is running now, or the idle stop is at most [`AUTO_STOP_NOTICE_SECS`] away and
     /// nothing is keeping the instance busy. Memory only. Typing in a session counts as
     /// activity (it moves the idle stop away); watching never does.
+    ///
+    /// `at` is a fixed deadline: the idle window's end for an idle stop, the moment the stop
+    /// was first seen running for a stop in progress. It never moves between two frames, so
+    /// the watch (which sends the field when it changed) stays quiet.
     pub(crate) fn mobile_auto_stop(&self, id: i64, cx: &App) -> Option<(u64, &'static str)> {
         let mark = self.cloud_marks.get(&id)?;
         let cloud = mark.cloud();
-        let now_ms = monocode_core::time::now_ms();
+        let base = epoch_wall_ms(self.auto_stop_epoch);
         if self.auto_stop_running.contains(&cloud.key()) {
-            return Some((now_ms, "idle"));
+            let started = stop_first_seen(&cloud.key(), Some(base + self.auto_stop_now() * 1000));
+            return Some((started.unwrap_or(0), "idle"));
         }
+        stop_first_seen(&cloud.key(), None);
         if self.cloud_states.get(&cloud.key()) != Some(&CloudState::Available) {
             return None;
         }
@@ -611,13 +699,11 @@ impl Shell {
             .filter_map(|s| s.last_input)
             .max()
             .unwrap_or(0);
-        let since = self
-            .auto_stop
-            .idle_since(&cloud)
-            .unwrap_or(now)
-            .max(last_input);
-        let remaining = (since + u64::from(minutes) * 60).saturating_sub(now);
-        (remaining <= AUTO_STOP_NOTICE_SECS).then_some((now_ms + remaining * 1000, "idle"))
+        // Not checked yet: nothing is announced until the idle window has a start.
+        let since = self.auto_stop.idle_since(&cloud)?.max(last_input);
+        let deadline = since + u64::from(minutes) * 60;
+        (deadline.saturating_sub(now) <= AUTO_STOP_NOTICE_SECS)
+            .then_some((base + deadline * 1000, "idle"))
     }
 
     /// `cloud.keepRunning`: starts a fresh idle window for the instance and exempts it from
@@ -628,4 +714,37 @@ impl Shell {
         self.auto_stop.resumed(cloud, now);
         self.auto_stop.keep_running(cloud);
     }
+}
+
+/// The wall clock (ms since the Unix epoch) at the auto-stop clock's start, fixed the first
+/// time it is asked for: deadlines derived from it do not move with the clock's jitter.
+fn epoch_wall_ms(epoch: std::time::Instant) -> u64 {
+    thread_local! {
+        static BASES: std::cell::RefCell<std::collections::HashMap<std::time::Instant, u64>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    BASES.with(|bases| {
+        *bases.borrow_mut().entry(epoch).or_insert_with(|| {
+            monocode_core::time::now_ms().saturating_sub(epoch.elapsed().as_millis() as u64)
+        })
+    })
+}
+
+/// When an auto-stop of the instance `key` was first seen running (ms): remembered while it
+/// runs (`seen` is the value to record the first time), forgotten when asked with `None`.
+fn stop_first_seen(key: &str, seen: Option<u64>) -> Option<u64> {
+    thread_local! {
+        static SEEN: std::cell::RefCell<std::collections::HashMap<String, u64>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    SEEN.with(|map| {
+        let mut map = map.borrow_mut();
+        match seen {
+            Some(at) => Some(*map.entry(key.to_owned()).or_insert(at)),
+            None => {
+                map.remove(key);
+                None
+            }
+        }
+    })
 }

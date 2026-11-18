@@ -183,6 +183,57 @@ fn before_send(
         .unwrap()
 }
 
+/// `conversation.send` for `device` through the host's own path (`mobile_send_for`): the
+/// checks, the staging, the wake and the submit, answered like the wire reply.
+fn send(
+    fx: &Fx,
+    cx: &mut TestAppContext,
+    device: &DeviceContext,
+    session: i64,
+    params: Value,
+) -> Result<Value, Failure> {
+    let wire = persisted(fx, cx, session);
+    let mut params = params;
+    params["conversationId"] = json!(wire);
+    if params.get("text").is_none() {
+        params["text"] = json!("hello");
+    }
+    let answer: Rc<RefCell<Option<Result<Value, Failure>>>> = Rc::default();
+    let slot = answer.clone();
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.mobile_send_for(
+                device.clone(),
+                params,
+                move |_, result| *slot.borrow_mut() = Some(result),
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+    answer.take().expect("the send was answered")
+}
+
+/// Marks the codespace session's view as loaded, with its link down.
+fn load_view(fx: &Fx, cx: &mut TestAppContext) {
+    let cs = fx.cs;
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, _| chat.loaded_for_test());
+        })
+        .unwrap();
+}
+
+/// The prompts the session's view sent to its workspace.
+fn launched(fx: &Fx, cx: &mut TestAppContext) -> Vec<String> {
+    let cs = fx.cs;
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].read(cx).launched_for_test()
+        })
+        .unwrap()
+}
+
 fn set_state(fx: &Fx, cx: &mut TestAppContext, state: CloudState) {
     fx.window
         .update(cx, |shell, _, _| {
@@ -221,27 +272,51 @@ fn save_start(fx: &Fx, cx: &mut TestAppContext, failed: bool) {
 }
 
 #[gpui::test]
-fn instances_are_listed_from_the_cache_and_a_request_never_calls_out_again(
-    cx: &mut TestAppContext,
-) {
+fn instances_are_served_from_the_cache_and_a_miss_loads_in_the_background(cx: &mut TestAppContext) {
     let fx = fixture(cx, "Shutdown", CloudState::Stopped);
-    let first = call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
-    let after_first = fx.gh.calls.lock().unwrap().len();
-    assert!(after_first > 0, "the first read loads the overview once");
+    // S5: the first read finds nothing cached. It answers at once, without the
+    // instances yet, and says it is loading; the load runs after the answer.
+    let answer: Rc<RefCell<Option<Result<Value, Failure>>>> = Rc::default();
+    let slot = answer.clone();
+    let device = fx.web();
+    fx.window
+        .update(cx, |shell, _, cx| {
+            cloud::dispatch_deferred(
+                shell,
+                &device,
+                "cloud.instances",
+                &json!({}),
+                move |_, result| *slot.borrow_mut() = Some(result),
+                cx,
+            )
+        })
+        .unwrap();
+    cx.executor().run_until_parked();
+    let first = answer.take().expect("answered").unwrap();
+    assert_eq!(first["loading"], true);
+    assert_eq!(first["instances"], json!([]));
+    let after_load = fx.gh.calls.lock().unwrap().len();
+    assert!(
+        after_load > 0,
+        "the overview was loaded once, in the background"
+    );
+    // The next read is answered from the cache: no outside call at all.
+    let second = call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
+    assert!(second.get("loading").is_none(), "{second}");
     for _ in 0..5 {
         let again = call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
-        assert_eq!(again, first);
+        assert_eq!(again, second);
     }
     assert_eq!(
         fx.gh.calls.lock().unwrap().len(),
-        after_first,
+        after_load,
         "{:?}",
         fx.gh.calls.lock().unwrap()
     );
     assert_eq!(changes(&fx.gh), 0, "listing never wakes anything");
     assert!(fx.host.0.lock().unwrap().is_empty());
 
-    let instance = &first["instances"][0];
+    let instance = &second["instances"][0];
     assert_eq!(instance["kind"], "codespace");
     assert_eq!(instance["instance"], CS);
     assert_eq!(instance["state"], "stopped");
@@ -254,8 +329,8 @@ fn instances_are_listed_from_the_cache_and_a_request_never_calls_out_again(
             "busy": false,
         }])
     );
-    assert!(first["backends"].as_array().unwrap().len() == 2);
-    assert!(first.get("otherCount").is_none());
+    assert!(second["backends"].as_array().unwrap().len() == 2);
+    assert!(second.get("otherCount").is_none());
 }
 
 #[gpui::test]
@@ -289,6 +364,8 @@ fn reads_are_rate_limited_and_a_phone_has_no_cloud_methods(cx: &mut TestAppConte
 #[gpui::test]
 fn a_device_with_a_selection_lists_only_its_projects_instances(cx: &mut TestAppContext) {
     let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    // A first read loads the overview in the background; the checks read the cache.
+    call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
     let elsewhere = device_of(
         &format!("{}-3", fx.id),
         DeviceKind::Web,
@@ -341,10 +418,110 @@ fn stop_asks_the_instance_to_stop_and_names_the_sessions_it_interrupted(cx: &mut
         "{:?}",
         fx.gh.calls.lock().unwrap()
     );
-    // Stop is not rate limited.
+    // Stop is only lightly limited: a loop of them is not.
     for _ in 0..8 {
         call(&fx, cx, &fx.web(), "cloud.stop", json!({"sessionId": id})).unwrap();
     }
+}
+
+/// L3: a stop by name needs a name the app knows, and a device may stop only so often.
+#[gpui::test]
+fn a_stop_by_name_needs_a_known_instance_and_is_limited_per_device(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Available", CloudState::Available);
+    // A codespace the app never listed and no session uses: not ours to stop.
+    let refused = call(
+        &fx,
+        cx,
+        &fx.web(),
+        "cloud.stop",
+        json!({"kind": "codespace", "instance": "somebody-elses"}),
+    )
+    .unwrap_err();
+    assert_eq!(code_of(&refused), Some("unsupported_target"));
+    assert_eq!(changes(&fx.gh), 0, "nothing was called for a stranger");
+    // A listed one is known (an orphan billing instance is listed, not marked).
+    fx.window
+        .update(cx, |shell, _, _| {
+            shell.cloud_marks.clear();
+        })
+        .unwrap();
+    call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
+    let listed = call(&fx, cx, &fx.web(), "cloud.instances", json!({})).unwrap();
+    assert_eq!(listed["instances"][0]["instance"], CS, "{listed}");
+    let reply = call(
+        &fx,
+        cx,
+        &fx.web(),
+        "cloud.stop",
+        json!({"kind": "codespace", "instance": CS}),
+    )
+    .unwrap();
+    assert_eq!(reply["stopped"], true);
+    // The eleventh stop in a minute is busy; another device has its own budget.
+    for _ in 1..cloud_policy::STOP_LIMIT_PER_MINUTE {
+        call(
+            &fx,
+            cx,
+            &fx.web(),
+            "cloud.stop",
+            json!({"kind": "codespace", "instance": CS}),
+        )
+        .unwrap();
+    }
+    let refused = call(
+        &fx,
+        cx,
+        &fx.web(),
+        "cloud.stop",
+        json!({"kind": "codespace", "instance": CS}),
+    )
+    .unwrap_err();
+    assert_eq!(code_of(&refused), Some("busy"));
+    let other = device_of(&format!("{}-6", fx.id), DeviceKind::Web, None);
+    call(
+        &fx,
+        cx,
+        &other,
+        "cloud.stop",
+        json!({"kind": "codespace", "instance": CS}),
+    )
+    .unwrap();
+}
+
+/// S5: the stop answers at once, whatever the backend takes; the stop runs after the answer.
+#[gpui::test]
+fn a_stop_is_answered_before_the_worker_stops_anything(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Available", CloudState::Available);
+    let id = persisted(&fx, cx, fx.cs);
+    let answer: Rc<RefCell<Option<Result<Value, Failure>>>> = Rc::default();
+    let slot = answer.clone();
+    let device = fx.web();
+    fx.window
+        .update(cx, |shell, _, cx| {
+            cloud::dispatch_deferred(
+                shell,
+                &device,
+                "cloud.stop",
+                &json!({"sessionId": id}),
+                move |_, result| *slot.borrow_mut() = Some(result),
+                cx,
+            );
+            assert_eq!(
+                shell.cloud_states.get(&Fx::key()),
+                Some(&CloudState::Available)
+            );
+        })
+        .unwrap();
+    // Answered in the same turn, before any worker ran: nothing was called yet.
+    let reply = answer.take().expect("answered at once").unwrap();
+    assert_eq!(reply["stopped"], true);
+    assert_eq!(count(&fx.gh, "codespace stop"), 0);
+    cx.run_until_parked();
+    assert_eq!(
+        count(&fx.gh, "codespace stop"),
+        1,
+        "the worker stops it after"
+    );
 }
 
 #[gpui::test]
@@ -616,6 +793,82 @@ fn retry_start_runs_a_failed_start_again_and_only_a_failed_one(cx: &mut TestAppC
     );
 }
 
+/// L4: a retry that has to create the instance is a cloud start (needs the toggle);
+/// a retry on a kept instance is not.
+#[gpui::test]
+fn a_retry_that_creates_an_instance_needs_remote_cloud_start(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let id = persisted(&fx, cx, fx.cs);
+    let before = policy::flags();
+    policy::set_flags(policy::PolicyFlags::default());
+    // The failed start never created the instance (`created` is false).
+    save_start(&fx, cx, true);
+    let cs = fx.cs;
+    fx.window
+        .update(cx, |shell, _, _| {
+            let store = locked(&shell.store).unwrap();
+            let mut record = monocode_core::cloud_sessions::start_record(&store, cs).unwrap();
+            record.created = false;
+            monocode_core::cloud_sessions::startup::save_start_record(&store, &record).unwrap();
+        })
+        .unwrap();
+    let refused = call(
+        &fx,
+        cx,
+        &fx.web(),
+        "cloud.retryStart",
+        json!({"sessionId": id}),
+    )
+    .unwrap_err();
+    assert_eq!(code_of(&refused), Some("disabled"));
+    assert_eq!(
+        cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
+        0,
+        "a refused retry costs no slot"
+    );
+    // With the toggle on, it runs.
+    policy::set_flags(policy::PolicyFlags {
+        remote_cloud_start: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        call(
+            &fx,
+            cx,
+            &fx.web(),
+            "cloud.retryStart",
+            json!({"sessionId": id})
+        )
+        .unwrap(),
+        json!({"accepted": true})
+    );
+    // A kept instance (the failed start created it) is retried in place, toggle off.
+    policy::set_flags(policy::PolicyFlags::default());
+    fx.window
+        .update(cx, |shell, _, _| {
+            shell.drop_cloud_start(cs);
+            let store = locked(&shell.store).unwrap();
+            let mut record = monocode_core::cloud_sessions::start_record(&store, cs).unwrap();
+            record.created = true;
+            monocode_core::cloud_sessions::startup::save_start_record(&store, &record).unwrap();
+        })
+        .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(3));
+    cx.run_until_parked();
+    assert_eq!(
+        call(
+            &fx,
+            cx,
+            &fx.web(),
+            "cloud.retryStart",
+            json!({"sessionId": id})
+        )
+        .unwrap(),
+        json!({"accepted": true})
+    );
+    policy::set_flags(before);
+}
+
 #[gpui::test]
 fn a_send_while_the_instance_starts_is_refused_with_the_desktops_own_text(cx: &mut TestAppContext) {
     let fx = fixture(cx, "Shutdown", CloudState::Stopped);
@@ -715,30 +968,46 @@ fn a_send_during_an_auto_stop_or_an_archive_is_refused(cx: &mut TestAppContext) 
 fn a_wake_send_wakes_once_queues_the_message_and_a_second_send_is_busy(cx: &mut TestAppContext) {
     let fx = fixture(cx, "Shutdown", CloudState::Stopped);
     let cs = fx.cs;
+    // The check alone claims nothing: no slot, no flag, no wake.
     let plan = before_send(&fx, cx, &fx.web(), json!({"wake": true})).unwrap();
     assert!(plan.wake);
-    // The reply does not wait: the slot is held and the flag is set.
+    assert_eq!(
+        cloud_policy::limiter().in_flight(&fx.id, std::time::Instant::now()),
+        0
+    );
+    assert!(!crate::conversation::Conversation::wake_send_pending(cs));
+    // S10: the wire reply of the host's own send path.
+    let reply = send(
+        &fx,
+        cx,
+        &fx.web(),
+        cs,
+        json!({"wake": true, "text": "hello"}),
+    )
+    .unwrap();
+    assert_eq!(
+        reply,
+        json!({"sessionId": persisted(&fx, cx, cs), "wake": true, "queued": true})
+    );
     assert_eq!(
         cloud_policy::limiter().in_flight(&fx.id, std::time::Instant::now()),
         1
     );
     assert!(crate::conversation::Conversation::wake_send_pending(cs));
-    // The message goes through the existing deferral.
     fx.window
         .update(cx, |shell, _, cx| {
-            let view = shell.sessions[&cs].clone();
-            view.update(cx, |chat, cx| {
-                chat.mobile_submit("hello".into(), vec![], cx)
-            });
             assert!(
-                view.read(cx).remote_debug().contains("actions=1"),
-                "{}",
-                view.read(cx).remote_debug()
+                shell.sessions[&cs]
+                    .read(cx)
+                    .remote_debug()
+                    .contains("actions=1"),
+                "the message waits in the deferral: {}",
+                shell.sessions[&cs].read(cx).remote_debug()
             );
         })
         .unwrap();
     // A second send while one is pending is busy and takes no slot.
-    let refused = before_send(&fx, cx, &fx.web(), json!({"wake": true})).unwrap_err();
+    let refused = send(&fx, cx, &fx.web(), cs, json!({"wake": true})).unwrap_err();
     assert_eq!(code_of(&refused), Some("busy"));
     assert_eq!(
         cloud_policy::limiter().in_flight(&fx.id, std::time::Instant::now()),
@@ -748,7 +1017,7 @@ fn a_wake_send_wakes_once_queues_the_message_and_a_second_send_is_busy(cx: &mut 
     let other = device_of(&format!("{}-9", fx.id), DeviceKind::Web, None);
     let refused = before_send(&fx, cx, &other, json!({"wake": true})).unwrap_err();
     assert_eq!(code_of(&refused), Some("busy"));
-    // The wake runs; the instance comes back; the reload flushes the queued send.
+    // The wake runs and the instance comes back.
     cx.run_until_parked();
     cx.executor().advance_clock(Duration::from_secs(5));
     cx.run_until_parked();
@@ -768,24 +1037,77 @@ fn a_wake_send_wakes_once_queues_the_message_and_a_second_send_is_busy(cx: &mut 
     );
 }
 
+/// S6: with the history already loaded, submitting the wake-send does not clear the busy
+/// flag; only its flush does, so a second send is still busy while the first waits.
 #[gpui::test]
-fn a_failed_wake_releases_the_slot_and_drops_the_queued_send(cx: &mut TestAppContext) {
+fn the_busy_flag_survives_the_submit_of_a_loaded_session_and_ends_at_the_flush(
+    cx: &mut TestAppContext,
+) {
     let fx = fixture(cx, "Shutdown", CloudState::Stopped);
     let cs = fx.cs;
-    fx.host.2.store(true, std::sync::atomic::Ordering::Relaxed);
+    load_view(&fx, cx);
+    let reply = send(
+        &fx,
+        cx,
+        &fx.web(),
+        cs,
+        json!({"wake": true, "text": "queued one"}),
+    )
+    .unwrap();
+    assert_eq!(reply["wake"], true);
     assert!(
-        before_send(&fx, cx, &fx.web(), json!({"wake": true}))
-            .unwrap()
-            .wake
+        crate::conversation::Conversation::wake_send_pending(cs),
+        "the submit that created the flag must not clear it"
     );
+    let refused = before_send(&fx, cx, &fx.web(), json!({"wake": true})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("busy"));
+    assert!(
+        launched(&fx, cx).is_empty(),
+        "nothing is sent while the instance is down"
+    );
+    // The link comes up and the reload flushes the deferral: the message goes out and the flag ends.
     fx.window
         .update(cx, |shell, _, cx| {
-            let view = shell.sessions[&cs].clone();
-            view.update(cx, |chat, cx| {
-                chat.mobile_submit("hello".into(), vec![], cx)
+            shell.sessions[&cs].update(cx, |chat, cx| {
+                chat.set_online_for_test(true);
+                chat.flush_history_for_test(cx);
             });
         })
         .unwrap();
+    assert_eq!(launched(&fx, cx), ["queued one"]);
+    assert!(
+        !crate::conversation::Conversation::wake_send_pending(cs),
+        "the flush clears the flag"
+    );
+}
+
+#[gpui::test]
+fn a_failed_wake_releases_the_slot_and_drops_only_the_queued_send(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let cs = fx.cs;
+    load_view(&fx, cx);
+    fx.host.2.store(true, std::sync::atomic::Ordering::Relaxed);
+    // S7: an action the desktop itself waits to run on the same history must survive.
+    let desktop_ran = Rc::new(std::cell::Cell::new(false));
+    let ran = desktop_ran.clone();
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| {
+                chat.defer_history_action(move |_, _| ran.set(true), cx)
+            });
+        })
+        .unwrap();
+    assert_eq!(
+        send(
+            &fx,
+            cx,
+            &fx.web(),
+            cs,
+            json!({"wake": true, "text": "doomed"})
+        )
+        .unwrap()["wake"],
+        true
+    );
     cx.run_until_parked();
     cx.executor().advance_clock(Duration::from_secs(5));
     cx.run_until_parked();
@@ -797,18 +1119,24 @@ fn a_failed_wake_releases_the_slot_and_drops_the_queued_send(cx: &mut TestAppCon
         !crate::conversation::Conversation::wake_send_pending(cs),
         "a failed wake clears the busy flag"
     );
+    // The link is brought up by hand later: the doomed message must not go out, the
+    // desktop's own action still runs.
     fx.window
         .update(cx, |shell, _, cx| {
-            assert!(
-                shell.sessions[&cs]
-                    .read(cx)
-                    .remote_debug()
-                    .contains("actions=0"),
-                "{}",
-                shell.sessions[&cs].read(cx).remote_debug()
-            );
+            shell.sessions[&cs].update(cx, |chat, cx| {
+                chat.set_online_for_test(true);
+                chat.flush_history_for_test(cx);
+            });
         })
         .unwrap();
+    assert!(
+        launched(&fx, cx).is_empty(),
+        "the dropped send never goes out"
+    );
+    assert!(
+        desktop_ran.get(),
+        "the desktop's own deferred action was not dropped"
+    );
     // The device may try again.
     fx.host.2.store(false, std::sync::atomic::Ordering::Relaxed);
     assert!(
@@ -818,28 +1146,154 @@ fn a_failed_wake_releases_the_slot_and_drops_the_queued_send(cx: &mut TestAppCon
     );
 }
 
+/// L1 and S3: a message that is refused (no text, too long) wakes nothing, takes no slot and
+/// leaves no flag, so the device is not locked out for 15 minutes.
 #[gpui::test]
-fn a_phone_send_to_a_stopped_cloud_session_never_wakes_and_keeps_its_reply(
-    cx: &mut TestAppContext,
-) {
+fn a_refused_message_never_wakes_or_leaves_a_busy_flag(cx: &mut TestAppContext) {
     let fx = fixture(cx, "Shutdown", CloudState::Stopped);
     let cs = fx.cs;
-    for params in [json!({}), json!({"wake": true})] {
-        assert_eq!(
-            before_send(&fx, cx, &fx.phone(), params),
-            Ok(cloud::SendPlan::default())
+    for params in [
+        json!({"wake": true, "text": ""}),
+        json!({"wake": true, "text": "   "}),
+        json!({"wake": true, "text": "x".repeat(100_001)}),
+    ] {
+        let refused = send(&fx, cx, &fx.web(), cs, params).unwrap_err();
+        assert!(
+            refused.error.contains("Enter a message"),
+            "{}",
+            refused.error
         );
     }
+    // Without consent the refusal is the free one.
+    let refused = send(&fx, cx, &fx.web(), cs, json!({"text": "hi"})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("wake_required"));
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
     assert_eq!(
-        cloud_policy::limiter()
-            .calls_this_hour(&format!("{}-phone", fx.id), std::time::Instant::now()),
+        cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
         0
     );
-    assert!(!crate::conversation::Conversation::wake_send_pending(cs));
     assert_eq!(changes(&fx.gh), 0);
+    assert!(
+        fx.host.0.lock().unwrap().is_empty(),
+        "{:?}",
+        fx.host.0.lock().unwrap()
+    );
+    assert!(!crate::conversation::Conversation::wake_send_pending(cs));
+    // So the next good send is not busy.
+    assert_eq!(
+        send(&fx, cx, &fx.web(), cs, json!({"wake": true, "text": "hi"})).unwrap()["wake"],
+        true
+    );
+}
+
+/// H1 and L5: the cache can say `available` after the instance went down. A loaded view that
+/// is not connected is not available: without consent the send is `wake_required`, with it
+/// the wake is claimed and counted. A send never reconnects an instance on its own.
+#[gpui::test]
+fn a_stale_available_cache_does_not_let_a_send_wake_the_instance(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Available);
+    let cs = fx.cs;
+    load_view(&fx, cx);
+    let refused = send(&fx, cx, &fx.web(), cs, json!({"text": "hi"})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("wake_required"));
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    assert_eq!(changes(&fx.gh), 0);
+    assert!(
+        fx.host.0.lock().unwrap().is_empty(),
+        "{:?}",
+        fx.host.0.lock().unwrap()
+    );
+    assert_eq!(
+        cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
+        0
+    );
+    // A connected view is available: a plain send, as today.
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, _| chat.set_online_for_test(true));
+        })
+        .unwrap();
+    assert_eq!(
+        before_send(&fx, cx, &fx.web(), json!({})),
+        Ok(cloud::SendPlan { wake: false })
+    );
+}
+
+/// H1: a remote send without the wake plan (a phone, or any send the host did not check
+/// for a wake) never reconnects a stopped cloud workspace, whatever state the view is in.
+#[gpui::test]
+fn a_send_without_the_wake_plan_never_reconnects_the_workspace(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let cs = fx.cs;
+    load_view(&fx, cx);
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| {
+                chat.mobile_submit("sneaky".into(), vec![], cx);
+                assert!(!chat.is_waking(), "no reconnect was started");
+            });
+        })
+        .unwrap();
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    assert!(
+        fx.host.0.lock().unwrap().is_empty(),
+        "{:?}",
+        fx.host.0.lock().unwrap()
+    );
+    assert_eq!(changes(&fx.gh), 0);
+    assert!(launched(&fx, cx).is_empty());
+    fx.window
+        .update(cx, |shell, _, cx| {
+            let chat = shell.sessions[&cs].read(cx);
+            assert!(!chat.is_waking());
+            assert!(
+                !chat.input_has_text_for_test(cx),
+                "the desktop composer is untouched"
+            );
+        })
+        .unwrap();
+}
+
+/// S10: a phone's send goes through the host's own path and gets today's reply, with no
+/// wake call. A moved session (a local row bound to an instance) is the cloud session a
+/// phone may still reach; a cloud-born one is refused (H2).
+#[gpui::test]
+fn a_phone_send_never_wakes_and_keeps_its_reply(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let (cs, local) = (fx.cs, fx.local);
+    // The local session is moved: it is bound to the stopped instance and keeps its folder.
+    fx.window
+        .update(cx, |shell, _, _| {
+            let mark = shell.cloud_marks[&cs].clone();
+            shell.cloud_marks.insert(local, mark);
+        })
+        .unwrap();
+    let phone = fx.phone();
+    for params in [json!({"text": "hi"}), json!({"text": "hi", "wake": true})] {
+        // Today's reply: the session id and nothing else.
+        let reply = send(&fx, cx, &phone, local, params).unwrap();
+        assert_eq!(reply, json!({"sessionId": persisted(&fx, cx, local)}));
+    }
+    cx.executor().advance_clock(Duration::from_secs(5));
+    cx.run_until_parked();
+    assert_eq!(
+        cloud_policy::limiter().calls_this_hour(&phone.id, std::time::Instant::now()),
+        0
+    );
+    assert!(!crate::conversation::Conversation::wake_send_pending(local));
+    assert_eq!(changes(&fx.gh), 0);
+    assert!(
+        fx.host.0.lock().unwrap().is_empty(),
+        "{:?}",
+        fx.host.0.lock().unwrap()
+    );
+    // The cloud-born session is not a phone's business.
+    let refused = send(&fx, cx, &phone, cs, json!({"text": "hi"})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("unsupported_target"));
     assert!(fx.host.0.lock().unwrap().is_empty());
-    // Today's reply has no wake or queued field.
-    assert!(!cloud::SendPlan::default().wake);
 }
 
 #[gpui::test]
@@ -988,6 +1442,48 @@ fn an_auto_stop_is_announced_near_its_time_cancelled_by_keep_running_and_refuses
     assert_eq!(code_of(&refused), Some("unsupported_target"));
 }
 
+/// S8: `autoStop.at` is a fixed deadline. Two frames a second apart carry the same value, so
+/// the watch (which sends the field when it changed) is not woken every second.
+#[gpui::test]
+fn the_announced_auto_stop_time_does_not_move_between_frames(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Available", CloudState::Available);
+    let cs = fx.cs;
+    let at = |fx: &Fx, cx: &mut TestAppContext| {
+        fx.window
+            .update(cx, |shell, _, cx| {
+                cloud::frame_fields(shell, cs, &fx.web(), cx)["cloud"]["autoStop"]["at"].as_u64()
+            })
+            .unwrap()
+    };
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell
+                .workspace
+                .preferences
+                .cloud_auto_stop
+                .policy_mut(CloudBackendKind::Codespaces)
+                .idle_minutes = Some(10);
+            shell.sessions[&cs].update(cx, |chat, _| chat.loaded_for_test());
+            let prefs = shell.workspace.preferences.cloud_auto_stop;
+            let facts = shell.auto_stop_facts(cx);
+            shell.auto_stop.check(0, &prefs, &facts);
+            shell.auto_stop_epoch = std::time::Instant::now() - Duration::from_secs(6 * 60);
+        })
+        .unwrap();
+    let first = at(&fx, cx).expect("announced");
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(at(&fx, cx), Some(first), "the idle deadline is fixed");
+    // While the stop runs the value is the moment it was first seen, also fixed.
+    fx.window
+        .update(cx, |shell, _, _| {
+            shell.auto_stop_running.insert(Fx::key());
+        })
+        .unwrap();
+    let running = at(&fx, cx).expect("announced");
+    std::thread::sleep(Duration::from_millis(1100));
+    assert_eq!(at(&fx, cx), Some(running));
+}
+
 #[gpui::test]
 fn archiving_a_cloud_session_needs_the_cloud_choice_and_goes_through_the_cloud_archive(
     cx: &mut TestAppContext,
@@ -1009,8 +1505,13 @@ fn archiving_a_cloud_session_needs_the_cloud_choice_and_goes_through_the_cloud_a
                 cloud::before_archive(shell, &fx.web(), local, &json!({}), window, cx),
                 Ok(cloud::Archive::Local)
             );
+            // A phone cannot choose keep or stop, so it may not archive a session bound to
+            // an instance at all (H2); a plain session is archived as always.
+            let refused =
+                cloud::before_archive(shell, &fx.phone(), cs, &json!({}), window, cx).unwrap_err();
+            assert_eq!(code_of(&refused), Some("unsupported_target"));
             assert_eq!(
-                cloud::before_archive(shell, &fx.phone(), cs, &json!({}), window, cx),
+                cloud::before_archive(shell, &fx.phone(), local, &json!({}), window, cx),
                 Ok(cloud::Archive::Local)
             );
             // With the choice the cloud archive takes it, and the instance is held.
@@ -1057,8 +1558,11 @@ fn a_cloud_or_remote_session_is_never_deleted_by_a_web_device(cx: &mut TestAppCo
             let refused = cloud::before_delete(shell, &fx.web(), cs, cx).unwrap_err();
             assert_eq!(code_of(&refused), Some("unsupported_target"));
             assert_eq!(cloud::before_delete(shell, &fx.web(), local, cx), Ok(()));
-            // A phone's delete only removes the local row, as it always did.
-            assert_eq!(cloud::before_delete(shell, &fx.phone(), cs, cx), Ok(()));
+            // A phone's delete of a plain session only removes the local row, as it always
+            // did; of one bound to an instance it would orphan a billing instance (H2).
+            assert_eq!(cloud::before_delete(shell, &fx.phone(), local, cx), Ok(()));
+            let refused = cloud::before_delete(shell, &fx.phone(), cs, cx).unwrap_err();
+            assert_eq!(code_of(&refused), Some("unsupported_target"));
         })
         .unwrap();
 }

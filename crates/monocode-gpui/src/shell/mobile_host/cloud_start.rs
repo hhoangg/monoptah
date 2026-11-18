@@ -19,6 +19,21 @@ use monocode_core::mono::cloud_api::CloudApi;
 /// How often a held wake slot checks whether its operation ended.
 const SLOT_POLL: Duration = Duration::from_secs(2);
 
+/// How long a cloud start may take to record its session before the request is answered
+/// with `{accepted, starting}` (the host stops waiting for a reply after 25 s).
+pub(super) const START_REPLY_BOUND: Duration = Duration::from_secs(20);
+
+/// Answers once: the first of the start's own reply and the time bound. A later one is dropped.
+pub(super) fn answer_once<F: FnOnce(&mut Shell, Result<Value, Failure>)>(
+    done: &std::cell::RefCell<Option<F>>,
+    shell: &mut Shell,
+    reply: Result<Value, Failure>,
+) {
+    if let Some(done) = done.borrow_mut().take() {
+        done(shell, reply);
+    }
+}
+
 /// What the start needs from the request, owned.
 pub(super) struct CloudStartRequest {
     pub device: DeviceContext,
@@ -146,19 +161,36 @@ impl Shell {
             async move { probe.run().check(&target, &used) }
         });
         cx.spawn(async move |this, cx| {
+            // The first answer wins: the reply of the start, or `starting` when the start
+            // has not recorded the session within `START_REPLY_BOUND`, which is well inside
+            // the host's reply wait. The start itself always runs to its end.
+            let done = std::rc::Rc::new(std::cell::RefCell::new(Some(done)));
             if let Err(code) = checking.await {
-                let _ = this.update(cx, |this, _| done(this, Err(code.failure())));
+                let _ = this.update(cx, |this, _| answer_once(&done, this, Err(code.failure())));
                 return;
             }
             let claimed = this.update(cx, |_, _| cloud_policy::acquire_wake(&device.id));
             let slot = match claimed {
                 Ok(Ok(slot)) => slot,
                 Ok(Err(error)) => {
-                    let _ = this.update(cx, |this, _| done(this, Err(error)));
+                    let _ = this.update(cx, |this, _| answer_once(&done, this, Err(error)));
                     return;
                 }
                 Err(_) => return,
             };
+            let bound = done.clone();
+            let waiting = this.clone();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(START_REPLY_BOUND).await;
+                let _ = waiting.update(cx, |this, _| {
+                    answer_once(
+                        &bound,
+                        this,
+                        Ok(json!({"accepted": true, "starting": true})),
+                    )
+                });
+            })
+            .detach();
             let work = cx.background_executor().spawn(async move {
                 begin_cloud_session(
                     &store,
@@ -179,12 +211,12 @@ impl Shell {
                     let id = this.install_cloud_start(summary, settings, cx);
                     this.hold_wake_slot(slot, move |shell| shell.cloud_start_over(id), cx);
                     let reply = json!({"sessionId": this.mobile_session_id(id)});
-                    done(this, Ok(reply));
+                    answer_once(&done, this, Ok(reply));
                 }
                 Err(error) => {
                     cloud_policy::release_wake(&slot);
                     // The desktop's own text can hold a path or a command.
-                    done(this, Err(sanitize_startup_error(&error).into()));
+                    answer_once(&done, this, Err(sanitize_startup_error(&error).into()));
                 }
             });
         })
@@ -246,6 +278,18 @@ impl Shell {
             Some(mark) => Some(mark.local_project.clone()),
             None => self.session_summaries.get(&id).map(|s| s.cwd.clone()),
         }
+    }
+
+    /// The target the move dialog offers first for session `id`, as `(kind, instance)` words
+    /// (`"new"` or the instance name): what a move without a `target` uses.
+    pub(crate) fn mobile_move_default(&self, id: i64) -> Option<(&'static str, String)> {
+        use monocode_core::cloud_sessions::move_session::MoveTarget;
+        let choice = self.move_targets(id).into_iter().next()?;
+        Some(match choice.target {
+            MoveTarget::NewCodespace { .. } => ("codespace", "new".to_owned()),
+            MoveTarget::NewSandbox { .. } => ("sandbox", "new".to_owned()),
+            MoveTarget::Existing { backend, name } => (backend.api_name(), name),
+        })
     }
 
     /// Whether a move of the session is on (a worker runs or it waits).

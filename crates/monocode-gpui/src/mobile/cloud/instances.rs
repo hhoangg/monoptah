@@ -13,6 +13,7 @@
 //! name only as `otherCount`.
 use crate::shell::Shell;
 use gpui::Context;
+use monocode_core::cloud_sessions::CloudRef;
 use monocode_core::cloud_sessions::footer_status::{Concern, concern_of};
 use monocode_core::cloud_sessions::stopping::StopReport;
 use monocode_core::cloud_sessions::workspaces::{WorkspaceOverview, WorkspaceRow, WorkspaceState};
@@ -21,10 +22,42 @@ use monocode_core::mobile::cloud_policy;
 use monocode_core::mobile::policy::Failure;
 use monocode_core::mono::cloud_api::CloudApi;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+
+/// Projects whose overview is being loaded in the background now, so a device
+/// that asks again while a load runs does not start a second one.
+static REFRESHING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// The instances the cached overviews showed in a reply, for `cloud.stop`: a
+/// name the app never listed is not stopped by name. Bounded.
+static LISTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+const LISTED_MAX: usize = 500;
+
+/// Whether `cloud` was shown by a `cloud.instances` reply.
+pub(crate) fn instance_was_listed(cloud: &CloudRef) -> bool {
+    LISTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&cloud.key())
+}
+
+fn remember(loads: &[WorkspaceOverview]) {
+    let mut listed = LISTED.lock().unwrap_or_else(|e| e.into_inner());
+    if listed.len() > LISTED_MAX {
+        listed.clear();
+    }
+    for load in loads {
+        listed.extend(load.rows.iter().map(|row| row.cloud.key()));
+    }
+}
 
 /// The instances of the device's selected projects, answered through
-/// `finish` when the worker that reads the cached overviews is done.
+/// `finish` from the overviews that are cached now (30 s TTL). A request never
+/// calls `gh` or `sbx` and never waits for them: a project with no fresh
+/// overview is loaded in the background (one load at a time per project) and
+/// the reply says `loading: true`, with what is cached (possibly no instance
+/// at all), so the device asks again shortly.
 pub(super) fn list(
     shell: &mut Shell,
     device: &DeviceContext,
@@ -38,24 +71,35 @@ pub(super) fn list(
     let store = shell.mobile_database();
     let work = cx.background_executor().spawn(async move {
         let api = CloudApi::shared(&store).ok()?;
-        Some(
-            projects
-                .iter()
-                .map(|project| api.cloud().workspaces_overview(project, false))
-                .collect::<Vec<_>>(),
-        )
+        let mut loads = Vec::new();
+        let mut missing = Vec::new();
+        for project in projects {
+            match api.cloud().cached_workspaces(&project) {
+                Some(load) => loads.push(load),
+                None => missing.push(project),
+            }
+        }
+        Some((api, loads, missing))
     });
     let device = device.clone();
     cx.spawn(async move |this, cx| {
-        let loads = work.await;
+        let cached = work.await;
+        let background = cx.background_executor().clone();
         let _ = this.update(cx, move |this, cx| {
-            let result = match loads {
-                Some(loads) => {
+            let result = match cached {
+                Some((api, loads, missing)) => {
+                    let loading = !missing.is_empty();
+                    refresh_in_background(&background, api, missing);
+                    remember(&loads);
                     let all = device.projects.is_none();
                     let now = monocode_core::time::now_ms();
-                    Ok(assemble(all, &loads, now, &mut |id| {
+                    let mut reply = assemble(all, &loads, now, &mut |id| {
                         this.mobile_session_use(id, &device, cx)
-                    }))
+                    });
+                    if loading {
+                        reply["loading"] = json!(true);
+                    }
+                    Ok(reply)
                 }
                 None => Err(Failure::from("Cloud is not available")),
             };
@@ -63,6 +107,36 @@ pub(super) fn list(
         });
     })
     .detach();
+}
+
+/// Loads the overviews of `projects` on a worker nobody waits for, so the next
+/// `cloud.instances` finds them cached.
+fn refresh_in_background(
+    executor: &gpui::BackgroundExecutor,
+    api: Arc<CloudApi>,
+    projects: Vec<String>,
+) {
+    let projects: Vec<String> = {
+        let mut running = REFRESHING.lock().unwrap_or_else(|e| e.into_inner());
+        projects
+            .into_iter()
+            .filter(|project| running.insert(project.clone()))
+            .collect()
+    };
+    if projects.is_empty() {
+        return;
+    }
+    executor
+        .spawn(async move {
+            for project in &projects {
+                let _ = api.cloud().workspaces_overview(project, false);
+                REFRESHING
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(project);
+            }
+        })
+        .detach();
 }
 
 /// `state` on the wire for a workspace state (`cloud_api::state_id` words).

@@ -270,6 +270,9 @@ pub(crate) struct Conversation {
     /// workflow or app API send reaches the same code with this false, and may not resume a
     /// Docker sandbox.
     pub(super) user_send: bool,
+    /// True while a remote device's send runs without the consent to wake the instance
+    /// (`mobile_submit`): the send never reconnects a cloud workspace by itself.
+    pub(super) mobile_no_wake: bool,
     /// True while the Resume pill's own click runs: only that may resume with an empty prompt.
     pub(super) resume_click: bool,
     /// Every prompt `launch_prompt` was asked to send, for tests that count sends.
@@ -771,6 +774,7 @@ impl Conversation {
             stopping: false,
             cloud_locked: false,
             user_send: false,
+            mobile_no_wake: false,
             resume_click: false,
             #[cfg(test)]
             launched: Vec::new(),

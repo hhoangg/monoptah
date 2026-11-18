@@ -817,7 +817,11 @@ impl Conversation {
                     cx.notify();
                     return true;
                 }
-            } else if unreachable && !self.user_send && self.reconnect_cloud(cx) {
+            } else if unreachable
+                && !self.user_send
+                && !self.mobile_no_wake
+                && self.reconnect_cloud(cx)
+            {
                 let noun = self.cloud_noun().unwrap_or("codespace");
                 self.status = format!("Reconnecting the {noun}...");
                 cx.notify();
