@@ -240,6 +240,8 @@ Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'
 
 For static assets the same policy is written to `app/dist/client/_headers` at build time (`web/app/vite-plugins/headers.ts`, using the Worker's `buildCsp`), with `HOST` set to the host of `RP_ORIGIN` from `wrangler.jsonc` `vars` (`zptah.app` by default; self-hosters can override it with `MONOPTAH_RP_ORIGIN`).
 
+Sonner and vaul append a runtime `<style>` at import time and Radix scroll lock (through vaul) appends one each time a modal drawer opens; `style-src 'self'` blocks both. The S-08 patches remove them in the build: `web/app/vite-plugins/staticLibraryCss.ts` strips the `__insertCSS` call of the two libraries (their stylesheets are bundled as normal CSS by `ui/sonner.tsx` and `ui/drawer.tsx`) and fails the build when it no longer finds the call or a chunk still creates a `<style>` at runtime; `web/app/vite.config.ts` aliases `react-style-singleton` to `web/app/src/patches/style-singleton.ts`, which adopts a constructed stylesheet instead. Re-run the S-08 spike when sonner (2.0.8) or vaul (1.1.2) is upgraded.
+
 ```
 Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
 X-Content-Type-Options: nosniff
