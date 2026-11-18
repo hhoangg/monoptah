@@ -363,13 +363,24 @@ export const METHODS = {
   "session.resumeUsage": method({
     class: "control",
     transport: "app",
-    params: z.object({ conversationId: ConversationId, token: z.string() }),
+    params: z.object({
+      conversationId: ConversationId,
+      token: z.string(),
+      /** Consent to wake a stopped cloud instance, as for `conversation.send` (needed only for a cloud session). */
+      wake: z.literal(true).optional(),
+    }),
     result: SessionAck,
   }),
   "session.resumeUsageAtReset": method({
     class: "control",
     transport: "app",
-    params: z.object({ conversationId: ConversationId, token: z.string(), enabled: z.boolean() }),
+    params: z.object({
+      conversationId: ConversationId,
+      token: z.string(),
+      enabled: z.boolean(),
+      /** Consent to wake a stopped cloud instance, as for `conversation.send` (needed only for a cloud session). */
+      wake: z.literal(true).optional(),
+    }),
     result: SessionAck,
   }),
   "session.answerQuestion": method({

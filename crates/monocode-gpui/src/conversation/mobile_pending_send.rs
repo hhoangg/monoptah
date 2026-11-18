@@ -135,6 +135,30 @@ impl Conversation {
         self.launched.clone()
     }
 
+    /// Test support: whether each run that started was marked no-wake.
+    #[cfg(test)]
+    pub(crate) fn launched_no_wake_for_test(&self) -> Vec<bool> {
+        self.launched_no_wake.clone()
+    }
+
+    /// Test support: a turn is running (or not).
+    #[cfg(test)]
+    pub(crate) fn set_busy_for_test(&mut self, busy: bool) {
+        self.busy = busy;
+    }
+
+    /// Test support: the queue is pumped as a finished turn would.
+    #[cfg(test)]
+    pub(crate) fn pump_for_test(&mut self, cx: &mut Context<Self>) {
+        self.pump_follow_ups(cx);
+    }
+
+    /// Test support: a send typed on the desktop (not a remote device's).
+    #[cfg(test)]
+    pub(crate) fn desktop_send_for_test(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        self.launch_prompt(prompt.to_owned(), cx);
+    }
+
     /// Test support: runs what waited for the history, as the reload after a wake does.
     #[cfg(test)]
     pub(crate) fn flush_history_for_test(&mut self, cx: &mut Context<Self>) {
@@ -186,7 +210,6 @@ impl Conversation {
             return;
         }
         self.mobile_no_wake = false;
-        crate::runtime::remote::allow_wake_for_next_run(self.summary.id);
         self.submit_from_remote_now(send.prompt, send.attachments, cx);
     }
 }

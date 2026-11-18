@@ -63,6 +63,21 @@ impl Conversation {
         &mut self,
         token: &serde_json::Value,
         automatic: Option<bool>,
+        wake: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        // The run this starts wakes a stopped cloud workspace only when the device
+        // consented (the host checked and counted it).
+        self.mobile_no_wake = !wake;
+        let result = self.resume_usage_checked(token, automatic, cx);
+        self.mobile_no_wake = false;
+        result
+    }
+
+    fn resume_usage_checked(
+        &mut self,
+        token: &serde_json::Value,
+        automatic: Option<bool>,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         if self.settings.worktree_removed {
@@ -153,7 +168,6 @@ impl Conversation {
             return;
         }
         self.mobile_no_wake = true;
-        crate::runtime::remote::forbid_wake_for_next_run(self.summary.id);
         self.submit_from_remote_now(prompt, attachments, cx);
         self.mobile_no_wake = false;
     }
@@ -201,6 +215,13 @@ impl Conversation {
         {
             let composer = std::mem::replace(&mut self.attachments, attachments);
             self.enqueue_follow_up(prompt, None, cx);
+            // The queued message carries the no-wake flag to the run that sends it, whenever
+            // that is (`pump_follow_ups`).
+            if self.mobile_no_wake
+                && let Some(message) = self.follow_ups.state.messages.last()
+            {
+                self.mobile_no_wake_ids.insert(message.id.clone());
+            }
             self.attachments = composer;
             if !self.busy {
                 self.pump_follow_ups(cx);
@@ -694,19 +715,19 @@ mod usage_tests {
             let token = v.mobile_usage_limit(cx)["token"].clone();
             v.model = Some("different-model".into());
             assert!(
-                v.mobile_resume_usage(&token, None, cx)
+                v.mobile_resume_usage(&token, None, true, cx)
                     .unwrap_err()
                     .contains("changed")
             );
             v.model = None;
             v.settings.account.id = "different-account".into();
-            assert!(v.mobile_resume_usage(&token, None, cx).is_err());
+            assert!(v.mobile_resume_usage(&token, None, true, cx).is_err());
             v.settings.account = Default::default();
             v.settings.worktree_removed = true;
             assert_eq!(v.mobile_usage_limit(cx)["canResume"], false);
             assert_eq!(v.mobile_usage_limit(cx)["canAutoResume"], false);
             assert!(
-                v.mobile_resume_usage(&token, None, cx)
+                v.mobile_resume_usage(&token, None, true, cx)
                     .unwrap_err()
                     .contains("working copy was removed")
             );
@@ -715,7 +736,7 @@ mod usage_tests {
             // A desktop dismissal/resume invalidates every phone's old action.
             v.settings.usage_limit = None;
             assert!(
-                v.mobile_resume_usage(&token, None, cx)
+                v.mobile_resume_usage(&token, None, true, cx)
                     .unwrap_err()
                     .contains("no longer paused")
             );
@@ -753,9 +774,12 @@ mod usage_tests {
                 resume_at_reset: false,
             });
             let token = v.mobile_usage_limit(cx)["token"].clone();
-            assert!(v.mobile_resume_usage(&token, None, cx).is_err());
-            assert!(v.mobile_resume_usage(&token, Some(true), cx).is_ok());
-            assert!(v.mobile_resume_usage(&token, Some(false), cx).is_err()); // stale preference
+            assert!(v.mobile_resume_usage(&token, None, true, cx).is_err());
+            assert!(v.mobile_resume_usage(&token, Some(true), true, cx).is_ok());
+            assert!(
+                v.mobile_resume_usage(&token, Some(false), true, cx)
+                    .is_err()
+            ); // stale preference
             assert!(v.settings.usage_limit.as_ref().unwrap().resume_at_reset);
         });
         cx.run_until_parked();
@@ -787,13 +811,14 @@ mod usage_tests {
 
         view.update(cx, |v, cx| {
             let token = v.mobile_usage_limit(cx)["token"].clone();
-            v.mobile_resume_usage(&token, Some(false), cx).unwrap();
+            v.mobile_resume_usage(&token, Some(false), true, cx)
+                .unwrap();
             v.settings.usage_limit.as_mut().unwrap().resets_at = Some(usage::now_ms() - 31_000);
             v.tick_usage(cx);
             assert!(v.settings.usage_limit.is_some()); // disabling cancels the real scheduler
             let token = v.mobile_usage_limit(cx)["token"].clone();
-            v.mobile_resume_usage(&token, None, cx).unwrap();
-            assert!(v.mobile_resume_usage(&token, None, cx).is_err()); // duplicate/another device
+            v.mobile_resume_usage(&token, None, true, cx).unwrap();
+            assert!(v.mobile_resume_usage(&token, None, true, cx).is_err()); // duplicate/another device
             assert!(v.settings.usage_limit.is_none());
         });
         cx.run_until_parked();
@@ -804,7 +829,7 @@ mod usage_tests {
                 resume_at_reset: false,
             });
             let token = v.mobile_usage_limit(cx)["token"].clone();
-            v.mobile_resume_usage(&token, Some(true), cx).unwrap();
+            v.mobile_resume_usage(&token, Some(true), true, cx).unwrap();
             v.settings.usage_limit.as_mut().unwrap().resets_at = Some(usage::now_ms() - 31_000);
             v.tick_usage(cx); // the existing desktop clock, without a phone
             assert!(v.settings.usage_limit.is_none());

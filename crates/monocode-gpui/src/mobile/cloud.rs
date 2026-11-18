@@ -320,6 +320,26 @@ pub(crate) fn before_send(
     send::before_send(shell, device, session, params, cx)
 }
 
+/// `session.resumeUsage` and `session.resumeUsageAtReset` start a turn, which wakes a stopped
+/// cloud instance like a send: the same check (`wake_required` without `wake: true` for web,
+/// a coded "not connected" for a phone unless live). With consent the call counts in the
+/// per-device wake limit and the run may wake (`true`); otherwise the run never wakes.
+pub(crate) fn before_resume_usage(
+    shell: &mut Shell,
+    device: &DeviceContext,
+    session: i64,
+    params: &Value,
+    cx: &mut Context<Shell>,
+) -> Result<bool, Failure> {
+    let plan = send::before_send(shell, device, Some(session), params, cx)?;
+    if plan.wake {
+        let slot = cloud_policy::acquire_wake(&device.id)?;
+        // The run is the wake; the call stays counted for the hour, nothing is held.
+        cloud_policy::release_wake(&slot);
+    }
+    Ok(plan.wake)
+}
+
 /// Just before a plain message is submitted: a cloud conversation must still be connected
 /// (a coded failure otherwise), so an ok reply always means the message is delivered.
 pub(crate) fn before_send_again(shell: &Shell, session: i64, cx: &App) -> Result<(), Failure> {

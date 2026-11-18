@@ -1434,6 +1434,138 @@ fn a_moved_session_never_wakes_without_consent_for_web_or_phone(cx: &mut TestApp
     assert_eq!(reply, json!({"sessionId": persisted(&fx, cx, local)}));
 }
 
+fn no_wake_runs(fx: &Fx, cx: &mut TestAppContext) -> Vec<bool> {
+    let cs = fx.cs;
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].read(cx).launched_no_wake_for_test()
+        })
+        .unwrap()
+}
+
+/// The no-wake flag travels with the message: a remote message queued behind a busy turn
+/// runs later with the flag, and nothing is left behind for the desktop's own sends.
+#[gpui::test]
+fn a_remote_send_queued_behind_a_busy_turn_still_runs_without_waking(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Available", CloudState::Available);
+    let cs = fx.cs;
+    load_view(&fx, cx);
+    connect(&fx, cx, true);
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, _| chat.set_busy_for_test(true))
+        })
+        .unwrap();
+    let reply = send(&fx, cx, &fx.web(), cs, json!({"text": "queued"})).unwrap();
+    assert_eq!(reply, json!({"sessionId": persisted(&fx, cx, cs)}));
+    assert!(
+        no_wake_runs(&fx, cx).is_empty(),
+        "nothing ran yet: the turn is busy"
+    );
+    // The turn ends much later; the queue is pumped.
+    cx.executor().advance_clock(Duration::from_secs(120));
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| {
+                chat.set_busy_for_test(false);
+                chat.pump_for_test(cx);
+            })
+        })
+        .unwrap();
+    assert_eq!(launched(&fx, cx), ["queued"]);
+    assert_eq!(
+        no_wake_runs(&fx, cx),
+        [true],
+        "the queued message ran without waking"
+    );
+    // A send typed on the desktop is not marked: it wakes as today.
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| chat.desktop_send_for_test("mine", cx))
+        })
+        .unwrap();
+    assert_eq!(no_wake_runs(&fx, cx), [true, false]);
+}
+
+/// A remote send that is refused before any run leaves nothing behind: the desktop's next
+/// send is not marked.
+#[gpui::test]
+fn a_refused_remote_send_leaves_no_mark_for_the_desktop(cx: &mut TestAppContext) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let cs = fx.cs;
+    load_view(&fx, cx);
+    let refused = send(&fx, cx, &fx.web(), cs, json!({"text": "hi"})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("wake_required"));
+    fx.window
+        .update(cx, |shell, _, cx| {
+            shell.sessions[&cs].update(cx, |chat, cx| chat.desktop_send_for_test("mine", cx))
+        })
+        .unwrap();
+    assert_eq!(no_wake_runs(&fx, cx), [false]);
+}
+
+/// `session.resumeUsage` and `...AtReset` start a turn, so on a cloud conversation they follow
+/// the send rules: consent for web, a coded failure for a phone while down, the wake limit,
+/// and a run that never wakes unless consented.
+#[gpui::test]
+fn resuming_usage_on_a_cloud_conversation_needs_the_same_consent_as_a_send(
+    cx: &mut TestAppContext,
+) {
+    let fx = fixture(cx, "Shutdown", CloudState::Stopped);
+    let (cs, local) = (fx.cs, fx.local);
+    move_local_to_cloud(&fx, cx);
+    let check =
+        |fx: &Fx, cx: &mut TestAppContext, device: DeviceContext, id: i64, params: Value| {
+            fx.window
+                .update(cx, |shell, _, cx| {
+                    cloud::before_resume_usage(shell, &device, id, &params, cx)
+                })
+                .unwrap()
+        };
+    for id in [cs, local] {
+        // Web without consent: refused for free.
+        let refused = check(&fx, cx, fx.web(), id, json!({})).unwrap_err();
+        assert_eq!(code_of(&refused), Some("wake_required"), "{id}");
+        assert_eq!(
+            cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
+            0
+        );
+    }
+    assert!(fx.host.0.lock().unwrap().is_empty());
+    assert_eq!(changes(&fx.gh), 0);
+    // A phone while the instance is down: coded failure (the moved session is its to reach).
+    let refused = check(&fx, cx, fx.phone(), local, json!({})).unwrap_err();
+    assert_eq!(code_of(&refused), Some("unsupported_target"));
+    assert!(refused.error.contains("not connected"), "{}", refused.error);
+    // Web with consent: the run may wake, and the call is counted.
+    assert_eq!(
+        check(&fx, cx, fx.web(), local, json!({"wake": true})),
+        Ok(true)
+    );
+    assert_eq!(
+        cloud_policy::limiter().calls_this_hour(&fx.id, std::time::Instant::now()),
+        1
+    );
+    // Connected: no wake is needed, so the run is marked no-wake.
+    set_state(&fx, cx, CloudState::Available);
+    assert_eq!(check(&fx, cx, fx.web(), local, json!({})), Ok(false));
+    assert_eq!(check(&fx, cx, fx.phone(), local, json!({})), Ok(false));
+    // A session that is not a cloud conversation is not looked at.
+    let plain = fx
+        .window
+        .update(cx, |shell, _, _| {
+            let store = locked(&shell.store).unwrap();
+            let mut summary = store.create("claude", "/work/plain").unwrap();
+            summary.has_messages = true;
+            let id = summary.id;
+            drop(store);
+            shell.session_summaries.insert(id, summary);
+            id
+        })
+        .unwrap();
+    assert_eq!(check(&fx, cx, fx.web(), plain, json!({})), Ok(false));
+}
+
 /// N7: a wake that cannot open its conversation is a coded failure and holds nothing.
 #[gpui::test]
 fn a_wake_that_cannot_open_the_session_fails_coded_and_holds_nothing(cx: &mut TestAppContext) {

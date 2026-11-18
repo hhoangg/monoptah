@@ -275,11 +275,16 @@ pub(crate) struct Conversation {
     pub(super) mobile_no_wake: bool,
     /// The message of a confirmed wake-send, waiting for the link (`mobile_wake_submit`).
     wake_send: Option<mobile_pending_send::WakeSend>,
+    /// Queued messages of remote devices that may not wake a cloud workspace when they run.
+    mobile_no_wake_ids: std::collections::HashSet<String>,
     /// True while the Resume pill's own click runs: only that may resume with an empty prompt.
     pub(super) resume_click: bool,
     /// Every prompt `launch_prompt` was asked to send, for tests that count sends.
     #[cfg(test)]
     pub(super) launched: Vec<String>,
+    /// For each run that started, whether it was marked no-wake.
+    #[cfg(test)]
+    pub(super) launched_no_wake: Vec<bool>,
     notification_cancelled: bool,
     /// The store's saved-draft flag, until the conversation loads its own.
     pub(crate) draft_hint: bool,
@@ -778,9 +783,12 @@ impl Conversation {
             user_send: false,
             mobile_no_wake: false,
             wake_send: None,
+            mobile_no_wake_ids: Default::default(),
             resume_click: false,
             #[cfg(test)]
             launched: Vec::new(),
+            #[cfg(test)]
+            launched_no_wake: Vec::new(),
             notification_cancelled: false,
             draft_hint: false,
             model: std::env::var(format!(
@@ -1498,15 +1506,22 @@ impl Conversation {
             .is_remote()
             .then(|| self.remote_state.client.clone())
             .flatten();
+        // A run of a remote device's message that did not consent to waking the workspace
+        // never starts it (the flag travels with the message, see `pump_follow_ups`).
+        let no_wake = self.mobile_no_wake;
+        #[cfg(test)]
+        self.launched_no_wake.push(no_wake);
         cx.background_executor()
             .spawn(async move {
-                if let Some(client) = remote_client {
-                    crate::runtime::remote::run_with_client(
-                        client, summary, prompt, settings, control_rx, store, cancel, tx,
-                    );
-                } else {
-                    run_turn(summary, prompt, settings, control_rx, store, cancel, tx);
-                }
+                crate::runtime::remote::run_without_waking(no_wake, || {
+                    if let Some(client) = remote_client {
+                        crate::runtime::remote::run_with_client(
+                            client, summary, prompt, settings, control_rx, store, cancel, tx,
+                        );
+                    } else {
+                        run_turn(summary, prompt, settings, control_rx, store, cancel, tx);
+                    }
+                })
             })
             .detach();
         cx.spawn(async move |this, cx| {

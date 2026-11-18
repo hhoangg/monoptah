@@ -1404,6 +1404,15 @@ fn stopped_codespace(
     use monocode_core::mono::cloud_api::{CloudTarget, InstanceChoice};
     cx.update(|cx| cx.set_reduce_motion(true));
     let dir = github_project();
+    let project = dir.0.to_string_lossy().into_owned();
+    // The directory holds the guard of the process-wide cloud service: keep it until the test
+    // thread ends, not until this helper returns, so no concurrent test replaces the service
+    // the test is still using.
+    thread_local! {
+        static HELD: std::cell::RefCell<Vec<crate::cloud_wake::fakes::Dir>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    HELD.with(|held| held.borrow_mut().push(dir));
     let store: Database = Arc::new(Mutex::new(
         monocode_core::store::Store::open(Path::new(":memory:")).unwrap(),
     ));
@@ -1411,7 +1420,7 @@ fn stopped_codespace(
     let api = monocode_core::mono::cloud_api::CloudApi::shared(&store).unwrap();
     let binding = api
         .prepare(
-            dir.0.to_str().unwrap(),
+            &project,
             CloudTarget::new(
                 CloudBackendKind::Codespaces,
                 InstanceChoice::Named("octo-run".into()),

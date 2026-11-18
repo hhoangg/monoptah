@@ -793,16 +793,20 @@ fn a_launch_card_is_scoped_per_device_kind_and_selection() {
 #[test]
 fn a_no_wake_run_only_probes_the_host_and_fails_visibly() {
     use crate::runtime::remote::{
-        NOT_CONNECTED, allow_wake_for_next_run, forbid_wake_for_next_run, require_connected,
-        take_no_wake,
+        NOT_CONNECTED, no_wake_run, require_connected, run_without_waking,
     };
-    forbid_wake_for_next_run(41);
-    assert!(take_no_wake(41));
-    assert!(!take_no_wake(41), "one run uses the mark up");
-    forbid_wake_for_next_run(42);
-    allow_wake_for_next_run(42);
-    assert!(!take_no_wake(42), "a confirmed wake-send clears it");
-    assert!(!take_no_wake(43), "no mark, no restriction");
+    // The flag is carried by the run itself: set inside it, gone after it, never global.
+    assert!(!no_wake_run());
+    assert!(run_without_waking(true, no_wake_run));
+    assert!(!no_wake_run(), "the flag ends with the run");
+    assert!(
+        !run_without_waking(false, no_wake_run),
+        "a consented or desktop run is free"
+    );
+    assert!(
+        !std::thread::spawn(no_wake_run).join().unwrap(),
+        "another thread never sees it"
+    );
 
     // A Host that does not answer: the send fails, nothing is woken.
     let calls = Calls::default();

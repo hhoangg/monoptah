@@ -506,38 +506,26 @@ pub(crate) fn run(
 // MARK: no-wake sends from remote devices
 //
 // A remote device's message (without the consent to wake) must never start a stopped
-// codespace: `ensure_before_send` below would. The conversation marks the next run of a
-// session as "no wake" when it submits such a message; the run then only checks that the
-// Host answers and fails the send visibly when it does not.
+// codespace: `ensure_before_send` below would. The turn worker runs the whole run on one
+// thread, so the flag the message carried is set for the duration of that run on that thread
+// (no global state, no timer): the run then only checks that the Host answers and fails the
+// send visibly when it does not.
 
-/// How long a mark lives: the run starts right after the submit.
-const NO_WAKE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-
-static NO_WAKE: std::sync::Mutex<Option<std::collections::HashMap<i64, std::time::Instant>>> =
-    std::sync::Mutex::new(None);
-
-/// The next run of session `id` may not wake its instance.
-pub(crate) fn forbid_wake_for_next_run(id: i64) {
-    let mut marks = NO_WAKE.lock().unwrap_or_else(|e| e.into_inner());
-    marks
-        .get_or_insert_with(Default::default)
-        .insert(id, std::time::Instant::now());
+thread_local! {
+    static NO_WAKE_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The run of session `id` may wake: a confirmed wake-send, or the user's own.
-pub(crate) fn allow_wake_for_next_run(id: i64) {
-    if let Some(marks) = NO_WAKE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        marks.remove(&id);
-    }
+/// Runs `run` (a whole turn) as a no-wake one when `no_wake` is set.
+pub(crate) fn run_without_waking<T>(no_wake: bool, run: impl FnOnce() -> T) -> T {
+    NO_WAKE_RUN.with(|flag| flag.set(no_wake));
+    let result = run();
+    NO_WAKE_RUN.with(|flag| flag.set(false));
+    result
 }
 
-/// Whether this run is a no-wake one (and uses the mark up).
-pub(crate) fn take_no_wake(id: i64) -> bool {
-    let mut marks = NO_WAKE.lock().unwrap_or_else(|e| e.into_inner());
-    marks
-        .as_mut()
-        .and_then(|marks| marks.remove(&id))
-        .is_some_and(|at| at.elapsed() < NO_WAKE_TTL)
+/// Whether the run on this thread may not wake its instance.
+pub(crate) fn no_wake_run() -> bool {
+    NO_WAKE_RUN.with(std::cell::Cell::get)
 }
 
 /// The text of a send that found its instance down and was not allowed to wake it.
@@ -707,7 +695,7 @@ pub(crate) fn run_with_client_mirrored(
             // blocking for the boot is fine. Attaching never wakes.
             if binding.project.cloud().is_some() {
                 monocode_core::cloud_sessions::require_claude(&binding.summary.provider)?;
-                if take_no_wake(mirror.unwrap_or(summary.id)) {
+                if no_wake_run() {
                     require_connected(&client, &binding.project.environment_id)?;
                 }
                 // Stop cancels the wake; the status line shows it only when a

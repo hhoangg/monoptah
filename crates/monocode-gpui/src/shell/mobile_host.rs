@@ -1702,8 +1702,16 @@ impl Shell {
                         .and_then(|m| m.update(cx, |m, cx| m.mobile_chat(mono, cx))),
                 }
                 .ok_or("This conversation is still opening on desktop; try again")?;
+                // Resuming runs a turn: on a cloud conversation it wakes a stopped instance, so it
+                // follows the same consent, rate limit and live-link rules as a send.
+                let wake = match target {
+                    Target::Session(id) => {
+                        cloud::before_resume_usage(self, device, *id, params, cx)?
+                    }
+                    Target::Mono(_) => false,
+                };
                 view.update(cx, |v, cx| {
-                    v.mobile_resume_usage(&params["token"], automatic, cx)
+                    v.mobile_resume_usage(&params["token"], automatic, wake, cx)
                 })?;
                 Ok(reply)
             }
@@ -3458,7 +3466,7 @@ mod tests {
                         resume_at_reset: false,
                     });
                     let token = v.mobile_usage_limit(cx)["token"].clone();
-                    v.mobile_resume_usage(&token, Some(true), cx).unwrap();
+                    v.mobile_resume_usage(&token, Some(true), true, cx).unwrap();
                 });
                 conversation
             })
