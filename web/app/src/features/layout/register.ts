@@ -7,5 +7,7 @@ import { registerSlot } from "@/ui/slots";
 import { AppShell } from "./AppShell";
 // The WS-P settings groups (themes and accents, U-03) fill `settings-sections` from their own register.
 import "@/features/themes/register";
+// The Files panel and the Mod+P quick-open shortcut (U-05).
+import "@/features/files/register";
 
 registerSlot("app-shell", AppShell);

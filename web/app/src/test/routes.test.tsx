@@ -153,6 +153,9 @@ const SCREENS: Record<string, string> = {
   // U-17 (WS-C): the cloud instance list, framed by the workspace with its "Cloud" h1.
   "/d/dk1/cloud": "Cloud",
   "/d/:desktopId/cloud": "Cloud",
+  // U-05 (WS-P): the file browser, with its "Files" h1 (the splat stays in the route params).
+  "/d/dk1/p/p1/files/src/main.rs": "Files",
+  "/d/:desktopId/p/:projectId/files/*": "Files",
   // The default test account is a member, so the admin routes show their guard screen (U-04).
   "/admin": "Not available",
   "/admin/users": "Not available",
