@@ -337,10 +337,6 @@ impl SessionTable {
             .keys()
             .filter(|k| k.device_id == key.device_id && **k != key)
             .count();
-        let total = self.sessions.len() - usize::from(self.sessions.contains_key(&key));
-        if total >= MAX_SESSIONS {
-            return vec![Action::Send(bye(key))];
-        }
         // A device at its channel limit does not lock itself out. A browser
         // reload drops its socket without a BYE, so the old channel can only
         // be told apart from a live one by its silence. The device's least
@@ -355,8 +351,17 @@ impl SessionTable {
                     .map(|(k, _)| *k)
             })
             .flatten();
+        // The victim leaves when the handshake succeeds, so it does not count
+        // against the total (the table never exceeds MAX_SESSIONS) nor, in
+        // `handshake`, against the pending limits.
+        let total = self.sessions.len()
+            - usize::from(self.sessions.contains_key(&key))
+            - usize::from(victim.is_some());
+        if total >= MAX_SESSIONS {
+            return vec![Action::Send(bye(key))];
+        }
         let live = self.sessions.contains_key(&key);
-        match self.handshake(key, body, now) {
+        match self.handshake(key, victim, body, now) {
             Some(mut out) => {
                 if let Some(victim) = victim {
                     if self.remove_session(&victim) {
@@ -377,7 +382,13 @@ impl SessionTable {
 
     /// Runs the responder and the directory check. `None` means BYE with no
     /// state.
-    fn handshake(&mut self, key: SessionKey, body: &[u8], now: u64) -> Option<Vec<Action>> {
+    fn handshake(
+        &mut self,
+        key: SessionKey,
+        victim: Option<SessionKey>,
+        body: &[u8],
+        now: u64,
+    ) -> Option<Vec<Action>> {
         let mut responder = Responder::new(
             &self.static_private,
             &self.desktop_id,
@@ -407,9 +418,10 @@ impl SessionTable {
             }
             Lookup::Pending => {
                 // Other keys' sessions only: this key's own old session is
-                // replaced if the handshake succeeds.
+                // replaced, and the eviction victim removed, if the handshake
+                // succeeds.
                 let pending = |(k, s): &(&SessionKey, &Session)| {
-                    **k != key && matches!(s.mode, Mode::Pending { .. })
+                    **k != key && Some(**k) != victim && matches!(s.mode, Mode::Pending { .. })
                 };
                 let total = self.sessions.iter().filter(pending).count();
                 let own = self
@@ -804,8 +816,9 @@ mod tests {
             // Only this channel's frames: an eviction adds a BYE for another.
             let msgs = frames[1..]
                 .iter()
-                .filter(|f| f.kind == FrameType::Transport && f.channel == channel)
+                .filter(|f| f.channel == channel)
                 .map(|f| {
+                    assert_eq!(f.kind, FrameType::Transport, "{actions:?}");
                     let plain = it.decrypt(&f.body).unwrap();
                     let Plaintext::Msg(m) = Plaintext::decode(&plain).unwrap() else {
                         panic!("expected MSG");
@@ -1457,6 +1470,55 @@ mod tests {
         for ch in 0..MAX_CHANNELS_PER_DEVICE as u16 {
             assert!(h.table.sessions.contains_key(&dev.key(ch)));
         }
+    }
+
+    #[test]
+    fn a_pending_device_at_the_channel_cap_evicts_its_least_recently_active_session() {
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.allow(&dev, Lookup::Pending);
+        for ch in 0..MAX_CHANNELS_PER_DEVICE as u16 {
+            let a = h
+                .table
+                .on_frame(hs1_for(&dev, &h, ch, br#"{"name":"x"}"#), u64::from(ch) + 1);
+            assert_eq!(sent(&a)[0].kind, FrameType::Hs2, "{a:?}");
+        }
+        assert_eq!(h.table.len(), MAX_CHANNELS_PER_DEVICE);
+        let a = h
+            .table
+            .on_frame(hs1_for(&dev, &h, 9, br#"{"name":"x"}"#), 10);
+        assert_eq!(sent(&a)[0].kind, FrameType::Hs2, "{a:?}");
+        assert_eq!(h.table.len(), MAX_CHANNELS_PER_DEVICE);
+        assert!(!h.table.sessions.contains_key(&dev.key(0)));
+        assert!(h.table.sessions.contains_key(&dev.key(9)));
+        assert!(a.contains(&Action::Closed { key: dev.key(0) }), "{a:?}");
+    }
+
+    #[test]
+    fn a_device_at_the_channel_cap_evicts_even_when_the_table_is_full() {
+        let mut h = h();
+        let mut devs = Vec::new();
+        for n in 0..(MAX_SESSIONS / MAX_CHANNELS_PER_DEVICE) {
+            let dev = Dev::new(n as u8 + 1);
+            h.confirmed(&dev);
+            devs.push(dev);
+        }
+        for dev in &devs {
+            for ch in 0..MAX_CHANNELS_PER_DEVICE as u16 {
+                let _ = h.connect(dev, ch, u64::from(ch));
+            }
+        }
+        assert_eq!(h.table.len(), MAX_SESSIONS);
+        let (_it, _msgs, actions) = h.connect(&devs[0], 9, 10);
+        assert_eq!(h.table.len(), MAX_SESSIONS);
+        assert!(h.table.sessions.contains_key(&devs[0].key(9)));
+        assert!(!h.table.sessions.contains_key(&devs[0].key(0)));
+        assert!(
+            actions.contains(&Action::Closed {
+                key: devs[0].key(0)
+            }),
+            "{actions:?}"
+        );
     }
 
     #[test]
