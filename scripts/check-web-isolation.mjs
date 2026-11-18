@@ -175,6 +175,13 @@ export function check(root) {
   const srcIndex = existsSync(srcDir) && statSync(srcDir).isDirectory() ? buildSrcIndex(srcDir) : null;
   if (!srcIndex) notes.push("src/ not present, similarity check skipped");
 
+  // Symlink targets are real paths, so compare them with the real root (macOS /var -> /private/var).
+  let realRoot = root;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    // root does not exist on disk: keep the given path
+  }
   const symlinks = [];
   const webFiles = walk(webDir, new Set(["docs"]), [], symlinks);
   for (const link of symlinks) {
@@ -185,7 +192,7 @@ export function check(root) {
       add(link, 1, "legacy-reference", "dangling symlink, cannot prove it stays inside web/");
       continue;
     }
-    const hit = intoLegacy(target, root);
+    const hit = intoLegacy(target, realRoot);
     if (hit) add(link, 1, "legacy-reference", `symlink points into repo-root ${hit}/`);
   }
 
