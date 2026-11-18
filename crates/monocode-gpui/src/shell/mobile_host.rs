@@ -12,8 +12,8 @@ use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
     mobile::{
-        DeviceContext, Event, Invite, MobileHost, Push, Request, Status, WatchStart, notify,
-        policy, watch, web_link,
+        DeviceContext, Event, Invite, MobileHost, Push, Request, Status, WatchStart,
+        denylist::DenyList, notify, policy, watch, web_link,
     },
     transcript::Row,
 };
@@ -848,16 +848,23 @@ impl Shell {
             let cwd = PathBuf::from(cwd);
             let worktree = params["worktreePath"].as_str();
             let path = string(&params, "path").unwrap_or_default();
+            // Every remote device: defaults plus this project's extra patterns.
+            let deny = DenyList::for_project(&cwd.to_string_lossy());
             match method.as_str() {
                 "project.worktrees" => project::worktrees(&cwd),
                 "project.changes" => {
-                    project::changes(&project::resolve_root(&cwd, worktree)?, worktree)
+                    project::changes(&project::resolve_root(&cwd, worktree)?, worktree, &deny)
                 }
-                "project.files" => project::files(&project::resolve_root(&cwd, worktree)?, &path),
-                "project.file" => project::file(&project::resolve_root(&cwd, worktree)?, &path),
+                "project.files" => {
+                    project::files(&project::resolve_root(&cwd, worktree)?, &path, &deny)
+                }
+                "project.file" => {
+                    project::file(&project::resolve_root(&cwd, worktree)?, &path, &deny)
+                }
                 "project.search" => project::search(
                     &project::resolve_root(&cwd, worktree)?,
                     params["query"].as_str().unwrap_or_default(),
+                    &deny,
                 ),
                 "project.git" => project::git(&project::resolve_root(&cwd, worktree)?),
                 _ => Err("Unsupported mobile operation".into()),
