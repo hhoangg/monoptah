@@ -4,6 +4,8 @@
 // registration contract of workstreams.md 3.2). The `/d/:desktopId` layout renders both slots next to
 // the page: the switcher is a slim bar, the link-state screens are a blocking layer.
 import { registerSlot } from "@/ui/slots";
+import { DesktopSwitcher } from "./DesktopSwitcher";
 import { LinkStateScreens } from "./LinkStateScreens";
 
+registerSlot("desktop-switcher", DesktopSwitcher);
 registerSlot("link-state-screens", LinkStateScreens);
