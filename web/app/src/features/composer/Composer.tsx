@@ -10,6 +10,11 @@
 // - A read-only device cannot write: the field and buttons are disabled and a line says why.
 // - Offline (the link is not ready) keeps the field open for writing; only Send and Stop wait.
 // - Attachments: a file picker, paste and drop, limited as in `attachments.ts`.
+// - F-47 morph: the glass is a pill (round, one line) at rest and morphs to a card (26 px corners, a taller field)
+//   while it has focus, a draft, an attachment, a notice or an error. The radius and the field height animate with
+//   `motion` (it writes through the CSSOM, so the CSP needs no inline style attribute); with
+//   `prefers-reduced-motion` the change is instant. `data-shape` says which one it is.
+import { useReducedMotion } from "motion/react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
 import { DictationButton } from "@/features/dictation";
 import { cn } from "@/lib/utils";
@@ -37,6 +42,11 @@ export const READ_ONLY_REASON = "Read-only: this device can read sessions but no
 export const DESKTOP_LAYOUT_QUERY = "(min-width: 640px) and (pointer: fine)";
 const INPUT_MIN_PX = 64;
 const INPUT_MAX_PX = 160;
+/** The resting pill: a one-line field with fully round ends. */
+export const PILL_FIELD_MIN_PX = 40;
+export const PILL_RADIUS_PX = 32;
+export const CARD_RADIUS_PX = 26;
+const MORPH_TRANSITION = { type: "spring", stiffness: 260, damping: 26, mass: 0.8 } as const;
 
 export interface ComposerProps {
   /** Guards and sends. Resolve to clear the draft, reject to keep it. */
@@ -76,8 +86,12 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
   const desktopLayout = useMediaQuery(DESKTOP_LAYOUT_QUERY);
   const inset = useKeyboardInset();
   const blocked = !!notice;
+  const reducedMotion = useReducedMotion();
+  const [focusWithin, setFocusWithin] = useState(false);
 
   const hasDraft = text.trim().length > 0 || attachments.length > 0;
+  const card = focusWithin || hasDraft || blocked || !!error;
+  const fieldMin = card ? INPUT_MIN_PX : PILL_FIELD_MIN_PX;
   const canSend = hasDraft && !submitting && !readOnly && !offline && !blocked;
   const showStop = !hasDraft && busy && !!onStop;
 
@@ -86,8 +100,8 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
     const element = area.current;
     if (!element) return;
     element.style.height = "auto";
-    element.style.height = `${Math.min(INPUT_MAX_PX, Math.max(INPUT_MIN_PX, element.scrollHeight))}px`;
-  }, [text]);
+    element.style.height = `${Math.min(INPUT_MAX_PX, Math.max(fieldMin, element.scrollHeight))}px`;
+  }, [text, fieldMin]);
 
   useEffect(() => {
     if (autoFocus && !readOnly) area.current?.focus();
@@ -195,7 +209,14 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
     <div data-testid="composer" className={cn("pb-3 pt-1", className)} style={inset ? { marginBottom: inset } : undefined}>
       <Glass
         className="flex flex-col gap-1 px-3 pb-2 pt-3"
-        style={{ borderRadius: 26 }}
+        data-shape={card ? "card" : "pill"}
+        initial={false}
+        animate={{ borderRadius: card ? CARD_RADIUS_PX : PILL_RADIUS_PX }}
+        transition={reducedMotion ? { duration: 0 } : MORPH_TRANSITION}
+        onFocus={() => setFocusWithin(true)}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusWithin(false);
+        }}
         onDragOver={(event) => {
           if (event.dataTransfer.types.includes("Files")) event.preventDefault();
         }}
@@ -237,8 +258,8 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
             onKeyDown={onKeyDown}
             onPaste={onPaste}
             onFocus={onFocus}
-            className="block w-full resize-none bg-transparent px-1 text-row text-content outline-none placeholder:text-muted-text disabled:opacity-60"
-            style={{ minHeight: INPUT_MIN_PX, maxHeight: INPUT_MAX_PX }}
+            className="block w-full resize-none bg-transparent px-1 motion-safe:transition-[height] motion-safe:duration-200 text-row text-content outline-none placeholder:text-muted-text disabled:opacity-60"
+            style={{ minHeight: fieldMin, maxHeight: INPUT_MAX_PX }}
           />
         )}
 
