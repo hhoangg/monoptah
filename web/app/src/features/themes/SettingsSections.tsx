@@ -1,4 +1,5 @@
 import { BackgroundsSection } from "@/features/backgrounds";
+import { MonosOnlySection } from "@/features/monos/MonosOnlySection";
 import { ThemeSection } from "./ThemeSection";
 
 /** The WS-P part of the `settings-sections` slot. Later tasks add their groups here. */
@@ -7,6 +8,7 @@ export function WsPSettingsSections() {
     <>
       <ThemeSection />
       <BackgroundsSection />
+      <MonosOnlySection />
     </>
   );
 }

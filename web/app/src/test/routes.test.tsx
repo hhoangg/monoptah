@@ -61,6 +61,12 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
     fullPath: "/d/$desktopId/s/$sessionId",
   },
   {
+    url: "/d/dk1/monos",
+    route: "/d/:desktopId/monos",
+    params: { desktopId: "dk1" },
+    fullPath: "/d/$desktopId/monos/",
+  },
+  {
     url: "/d/dk1/monos/m1",
     route: "/d/:desktopId/monos/:monoId",
     params: { desktopId: "dk1", monoId: "m1" },
@@ -161,6 +167,11 @@ const SCREENS: Record<string, string> = {
   "/d/:desktopId/p/:projectId/changes/*": "Changes",
   "/d/dk1/p/p1/git": "Git",
   "/d/:desktopId/p/:projectId/git": "Git",
+  // U-09 (WS-P): the Mono home list and the Mono chat (its title is "Mono" until the catalog names it).
+  "/d/dk1/monos": "Monos",
+  "/d/:desktopId/monos": "Monos",
+  "/d/dk1/monos/m1": "Mono",
+  "/d/:desktopId/monos/:monoId": "Mono",
   // The default test account is a member, so the admin routes show their guard screen (U-04).
   "/admin": "Not available",
   "/admin/users": "Not available",
