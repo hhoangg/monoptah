@@ -4,7 +4,7 @@
 // Every statement after the first insert keys on that first row, so a parallel regenerate that lost the race
 // writes nothing and answers 409 instead of leaving two live batches.
 import type { Handler } from "hono";
-import { RegenerateRecoveryResponse } from "@monoptah/protocol";
+import { AckRecoveryBody, RegenerateRecoveryResponse } from "@monoptah/protocol";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
@@ -21,7 +21,12 @@ export const INSERT_NEXT_CODE_SQL =
 export const DELETE_OLD_CODES_SQL =
   "DELETE FROM recovery_codes WHERE user_id = ? AND batch <= ? AND EXISTS (SELECT 1 FROM recovery_codes WHERE id = ?)";
 export const CLEAR_ACK_SQL = "UPDATE users SET recovery_ack_at = NULL WHERE id = ? AND EXISTS (SELECT 1 FROM recovery_codes WHERE id = ?)";
-export const SET_ACK_SQL = "UPDATE users SET recovery_ack_at = ? WHERE id = ?";
+/** Acks only the batch the user saw, and only once: params are now, user id, user id, batch. */
+export const SET_ACK_SQL =
+  "UPDATE users SET recovery_ack_at = ? WHERE id = ? AND recovery_ack_at IS NULL AND (SELECT coalesce(max(batch), 0) FROM recovery_codes WHERE user_id = ?) = ?";
+/** For a repeated ack of the same batch: acked already and the batch is still the current one. */
+export const ACKED_BATCH_SQL =
+  "SELECT 1 AS ok FROM users WHERE id = ? AND recovery_ack_at IS NOT NULL AND (SELECT coalesce(max(batch), 0) FROM recovery_codes WHERE user_id = ?) = ?";
 
 export const regenerateRecoveryCodes: Handler<AppEnv> = async (c) => {
   const { user } = requireAuth(c);
@@ -45,15 +50,24 @@ export const regenerateRecoveryCodes: Handler<AppEnv> = async (c) => {
     ),
   ]);
   if ((results[0]?.meta.changes ?? 0) === 0) return apiError(c, 409, "conflict", "Recovery codes were regenerated at the same time");
-  return respond(c, RegenerateRecoveryResponse, { recoveryCodes: fresh.codes });
+  return respond(c, RegenerateRecoveryResponse, { recoveryCodes: fresh.codes, batch });
 };
 
 /**
- * `POST /api/recovery-codes/ack` ("I saved these"): sets `users.recovery_ack_at`. A null value at the next sign-in
- * makes the client force a regenerate; regenerating clears it again. Idempotent: it only moves the timestamp.
+ * `POST /api/recovery-codes/ack` ("I saved these"), body `{batch}`: sets `users.recovery_ack_at` only when `batch` is
+ * the user's current batch and it is not acknowledged yet. A repeat for the same batch answers 200 without a write;
+ * an older batch (another tab regenerated since) or a batch the user never had answers 409. A null value at the
+ * next sign-in makes the client force a regenerate; regenerating clears it again.
  */
 export const ackRecoveryCodes: Handler<AppEnv> = async (c) => {
   const { user } = requireAuth(c);
-  await c.env.DB.prepare(SET_ACK_SQL).bind(nowSeconds(), user.id).run();
+  const body = AckRecoveryBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return apiError(c, 400, "invalid", "Invalid acknowledgement");
+  const { batch } = body.data;
+  const result = await c.env.DB.prepare(SET_ACK_SQL).bind(nowSeconds(), user.id, user.id, batch).run();
+  if (result.meta.changes === 0) {
+    const again = await c.env.DB.prepare(ACKED_BATCH_SQL).bind(user.id, user.id, batch).first();
+    if (!again) return apiError(c, 409, "conflict", "These recovery codes are not the current ones");
+  }
   return c.json({ ok: true as const });
 };

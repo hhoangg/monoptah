@@ -27,13 +27,13 @@ import { detectPlatform } from "./standalone";
 const CREDENTIAL = { id: "cred", rawId: "cred", type: "public-key", response: {}, clientExtensionResults: {} };
 
 let restore: (() => void) | undefined;
-let calls: Array<{ method: string; url: string }> = [];
+let calls: Array<{ method: string; url: string; body?: unknown }> = [];
 
 function install(options: SeedOptions = {}) {
   const state = createMockState({ signedIn: true, ...options });
   const server = createMockServer({ state });
   const transport: ApiTransport = (url, init) => {
-    calls.push({ method: init.method ?? "GET", url });
+    calls.push({ method: init.method ?? "GET", url, body: init.body ? JSON.parse(String(init.body)) : undefined });
     return server.transport(url, init);
   };
   restore = setApiTransport(transport);
@@ -184,7 +184,30 @@ describe("recovery codes", () => {
     await user.click(screen.getByLabelText("I saved these codes"));
     await user.click(screen.getByRole("button", { name: "Done" }));
     expect(await screen.findByRole("button", { name: "Generate new codes" })).toBeInTheDocument();
+    expect(calls.filter((c) => c.url === "/api/recovery-codes/ack").map((c) => c.body)).toEqual([{ batch: 2 }]);
     expect(screen.queryByRole("list", { name: "Recovery codes" })).toBeNull();
+  });
+});
+
+describe("recovery codes and a me refetch", () => {
+  it("keeps the new codes on screen when me is refetched with a cleared ack, until the user confirms", async () => {
+    install();
+    const user = userEvent.setup();
+    const { queryClient } = mount("/settings");
+    await user.click(await screen.findByRole("button", { name: "Generate new codes" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Generate new codes" }));
+    await screen.findByRole("list", { name: "Recovery codes" });
+
+    // The Worker cleared the ack: a reconnect or a stale refetch of `me` now says recoveryAckAt null.
+    await queryClient.refetchQueries({ queryKey: ["me"] });
+    expect(queryClient.getQueryData<{ recoveryAckAt: number | null }>(["me"])?.recoveryAckAt).toBeNull();
+    expect(screen.getByRole("list", { name: "Recovery codes" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { level: 1, name: "Get new recovery codes" })).toBeNull();
+
+    await user.click(screen.getByLabelText("I saved these codes"));
+    await user.click(screen.getByRole("button", { name: "Done" }));
+    expect(await screen.findByRole("button", { name: "Generate new codes" })).toBeInTheDocument();
+    expect(queryClient.getQueryData<{ recoveryAckAt: number | null }>(["me"])?.recoveryAckAt).not.toBeNull();
   });
 });
 

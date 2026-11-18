@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { acknowledgeRecoveryCodes, regenerateRecoveryCodes } from "@/features/accounts/queries";
+import { setRecoveryCodesShown } from "@/features/accounts/pendingRecoveryCodes";
 import { RecoveryCodes } from "@/features/accounts/RecoveryCodes";
 import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
@@ -20,6 +21,13 @@ export function RecoveryCodesSection({ handle }: { handle: string }) {
   const [codes, setCodes] = useState<string[] | null>(null);
 
   useEffect(() => () => setCodes(null), []);
+  // Keep /settings on this page while the new codes are on screen: a `me` refetch would otherwise see the cleared ack
+  // and swap in the forced regenerate screen, dropping the codes before they are saved.
+  const showing = codes !== null;
+  useEffect(() => {
+    setRecoveryCodesShown(showing);
+    return () => setRecoveryCodesShown(false);
+  }, [showing]);
 
   async function generate() {
     const ok = await action.run(async () => setCodes(await regenerateRecoveryCodes(queryClient)));

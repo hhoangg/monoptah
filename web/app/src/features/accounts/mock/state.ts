@@ -90,6 +90,8 @@ export interface MockState {
   pushSubscriptions: Map<string, { endpoint: string; deviceId: string }>;
   /** Normalised valid recovery codes. */
   recoveryCodes: Set<string>;
+  /** Batch number of the live recovery codes, like `recovery_codes.batch`. */
+  recoveryBatch: number;
   challenges: Map<string, MockChallenge>;
   counter: number;
   /** Failed recovery attempts, for the 429 simulation. */
@@ -153,6 +155,7 @@ export function normalizeRecoveryCode(code: string): string {
 export function newRecoveryBatch(state: MockState): string[] {
   const codes = Array.from({ length: 10 }, generateRecoveryCode);
   state.recoveryCodes = new Set(codes.map(normalizeRecoveryCode));
+  state.recoveryBatch += 1;
   return codes;
 }
 
@@ -290,6 +293,7 @@ export function createMockState(options: SeedOptions = {}): MockState {
     prefs: new Map(),
     pushSubscriptions: new Map(),
     recoveryCodes: new Set(),
+    recoveryBatch: 0,
     challenges: new Map(),
     counter: 0,
     recoverFailures: 0,

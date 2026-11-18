@@ -11,7 +11,7 @@ import { authedCall, createTestDesktop, createTestInvite, createTestUser, loginA
 const errorCode = async (res: Response) => ((await res.json()) as { code: string }).code;
 const recover = (handle: string, code: string, init: Parameters<typeof postJson>[2] = {}) => postJson("/api/auth/recover", { handle, code }, init);
 const regenerate = (cookie: string) => authedCall({ cookie }, "/api/recovery-codes/regenerate", { method: "POST" });
-const ackCodes = (cookie: string) => authedCall({ cookie }, "/api/recovery-codes/ack", { method: "POST" });
+const ackCodes = (cookie: string, batch = 1) => authedCall({ cookie }, "/api/recovery-codes/ack", { method: "POST", body: JSON.stringify({ batch }) });
 const newUser = async (): Promise<RegisteredUser> => registerUser((await createTestInvite(env)).code);
 const cookieOf = (res: Response) => setCookies(res)[0]?.split(";")[0] ?? "";
 
@@ -262,10 +262,31 @@ describe("recovery_ack_at", () => {
     expect(await first.json()).toEqual({ ok: true });
     const stamp = await ackOf(user.cookie);
     expect(stamp).toBeGreaterThan(0);
-    expect((await regenerate(user.cookie)).status).toBe(200);
+    const regenerated = await regenerate(user.cookie);
+    expect(regenerated.status).toBe(200);
+    expect(((await regenerated.json()) as { batch: number }).batch).toBe(2);
     expect(await ackOf(user.cookie)).toBeNull();
-    expect((await ackCodes(user.cookie)).status).toBe(200);
+    expect((await ackCodes(user.cookie, 2)).status).toBe(200);
     expect(await ackOf(user.cookie)).toBeGreaterThanOrEqual(stamp ?? 0);
+  });
+
+  it("acknowledges only the batch the user saw, and only once", async () => {
+    const user = await newUser();
+    // A batch the user never had, or one that is not the current one, is refused and writes nothing.
+    expect((await ackCodes(user.cookie, 7)).status).toBe(409);
+    expect(await ackOf(user.cookie)).toBeNull();
+    expect((await regenerate(user.cookie)).status).toBe(200);
+    const stale = await ackCodes(user.cookie, 1);
+    expect(stale.status).toBe(409);
+    expect(await errorCode(stale)).toBe("conflict");
+    expect(await ackOf(user.cookie)).toBeNull();
+    expect((await ackCodes(user.cookie, 2)).status).toBe(200);
+    const stamp = await ackOf(user.cookie);
+    // A repeat of the current batch is a no-op that keeps the first timestamp; a missing or bad body is 400.
+    expect((await ackCodes(user.cookie, 2)).status).toBe(200);
+    expect(await ackOf(user.cookie)).toBe(stamp);
+    expect((await authedCall({ cookie: user.cookie }, "/api/recovery-codes/ack", { method: "POST" })).status).toBe(400);
+    expect((await ackCodes(user.cookie, 0)).status).toBe(400);
   });
 
   it("the ack is idempotent, needs a session and is not open to a recovery-only session", async () => {

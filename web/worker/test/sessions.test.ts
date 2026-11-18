@@ -488,6 +488,31 @@ describe("revoke helpers (sign out everywhere, recovery, block)", () => {
     expect(await sessionRow(foreign.idHash)).not.toBeNull();
   });
 
+  it("reaches every live desktop even when there are more than MAX_DESKTOPS_PER_USER, and still resolves when a room rejects", async () => {
+    const user = await createTestUser(env);
+    const desktops: string[] = [];
+    for (let i = 0; i < 4; i += 1) desktops.push(await createTestDesktop(env, user.id));
+    const room = fakeRoomNamespace();
+    const failing = {
+      idFromName: (name: string) => ({ name }),
+      get: (id: { name: string }) => ({
+        revoke: (target: unknown, code: number) => {
+          if (id.name === desktops[1]) return Promise.reject(new Error("room down"));
+          return (room.namespace.get as unknown as (id: unknown) => { revoke: (t: unknown, c: number) => Promise<void> })(id).revoke(target, code);
+        },
+      }),
+    } as unknown as typeof env.ROOM;
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const capped = Object.create(withRoom(env, { namespace: failing }), { MAX_DESKTOPS_PER_USER: { value: "1" } }) as typeof env;
+      await expect(closeSessionSockets(capped, user.id, ["h1"])).resolves.toBeUndefined();
+      expect(new Set(room.calls.map((call) => call.desktopId))).toEqual(new Set([desktops[0], desktops[2], desktops[3]]));
+      expect(errors.mock.calls.map((args) => String(args[0]))).toEqual(["room.revoke failed: calls=4 failed=1"]);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
   it("calls room.revoke once per desktop with every hash, however many sessions are revoked", async () => {
     const user = await createTestUser(env);
     const desktops = [];

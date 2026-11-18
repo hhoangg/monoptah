@@ -8,6 +8,7 @@ import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
 import { releaseDevice } from "./deviceBinding";
 import { clearLowCodes } from "./lowCodes";
+import { getRecoveryBatch, setRecoveryBatch } from "./pendingRecoveryCodes";
 import { unsubscribeFromPush } from "@/features/push/subscribe";
 import { getDeviceKeyInfo } from "@/link/keys";
 import { createPasskey, getPasskey } from "./webauthn";
@@ -122,6 +123,7 @@ export async function registerAccount(
   if (result.status === "cancelled") return result;
   const verified = await apiFetch(endpoints.registerVerify, { body: { challengeId, response: wireResponse(result.response) } });
   clearAccountCache(queryClient);
+  setRecoveryBatch(verified.batch);
   return { status: "ok", user: verified.user, recoveryCodes: verified.recoveryCodes };
 }
 
@@ -209,14 +211,17 @@ export async function deletePasskey(queryClient: QueryClient, id: string): Promi
  * `acknowledgeRecoveryCodes` when the user confirms.
  */
 export async function regenerateRecoveryCodes(_queryClient: QueryClient): Promise<string[]> {
-  const { recoveryCodes } = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
+  const { recoveryCodes, batch } = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
+  setRecoveryBatch(batch);
   clearLowCodes();
   return recoveryCodes;
 }
 
 /** "I saved these": records the acknowledgement on the server (`recoveryAckAt`) and refreshes `me`. */
 export async function acknowledgeRecoveryCodes(queryClient: QueryClient): Promise<void> {
-  await apiFetch(endpoints.ackRecoveryCodes);
+  const batch = getRecoveryBatch();
+  if (batch === null) throw new Error("No recovery codes to acknowledge");
+  await apiFetch(endpoints.ackRecoveryCodes, { body: { batch } });
   await queryClient.invalidateQueries({ queryKey: ME_KEY });
 }
 

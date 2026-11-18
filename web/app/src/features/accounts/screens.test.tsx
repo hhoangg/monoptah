@@ -114,6 +114,8 @@ describe("register", () => {
     }
 
     await user.click(next);
+    // Continue records "I saved these" for the batch the Worker issued (batch 1 for a new account).
+    await waitFor(() => expect(sent.filter((s) => s.url.endsWith("/api/recovery-codes/ack"))).toEqual([{ url: "/api/recovery-codes/ack", body: { batch: 1 } }]));
     await screen.findByRole("heading", { level: 1, name: "Add a second passkey" });
     expect(screen.getByRole("button", { name: "Skip for now" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Skip for now" }));

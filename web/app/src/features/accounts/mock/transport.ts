@@ -205,6 +205,7 @@ const handlers: Record<string, Handler> = {
     }
     state.user = { id: randomId("user"), handle: challenge.handle ?? "new-user", displayName: challenge.displayName ?? "New User", role: "user" };
     state.passkeys = [];
+    state.recoveryBatch = 0;
     addPasskey(state, undefined);
     state.invites = [];
     state.inviteCodes = new Map();
@@ -212,7 +213,7 @@ const handlers: Record<string, Handler> = {
     const recoveryCodes = newRecoveryBatch(state);
     // Like the Worker: `recovery_ack_at` stays NULL until `POST /api/recovery-codes/ack`.
     state.recoveryAckAt = null;
-    return { user: state.user, recoveryCodes };
+    return { user: state.user, recoveryCodes, batch: state.recoveryBatch };
   },
 
   "POST /api/auth/login/options": ({ state }) => {
@@ -301,10 +302,12 @@ const handlers: Record<string, Handler> = {
     const recoveryCodes = newRecoveryBatch(state);
     // Like the Worker: regenerating clears `recovery_ack_at` until `POST /api/recovery-codes/ack`.
     state.recoveryAckAt = null;
-    return { recoveryCodes };
+    return { recoveryCodes, batch: state.recoveryBatch };
   },
-  "POST /api/recovery-codes/ack": ({ state }) => {
-    state.recoveryAckAt = nowSeconds();
+  "POST /api/recovery-codes/ack": ({ state, body }) => {
+    // Like the Worker: only the current batch is acknowledged; a repeat for it is a no-op.
+    if (body.batch !== state.recoveryBatch) throw new MockHttpError(409, "conflict", "These recovery codes are not the current ones");
+    if (state.recoveryAckAt === null) state.recoveryAckAt = nowSeconds();
     return { ok: true };
   },
 

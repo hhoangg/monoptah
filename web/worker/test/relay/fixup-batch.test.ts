@@ -1,8 +1,8 @@
 // Web fix-up batch (point 8): forgetting a device needs a fresh passkey, logout deletes the push subscriptions of
 // the browser's device, the pairing request keeps the desktop's app version, and the outer input bounds.
 import { describe, expect, it } from "vitest";
-import { postJson } from "../support/accounts.ts";
-import { approve, authedCall, env, json, newAccount, pairDesktop, rawStart, randomKey, registerDevice, sha256Base64Url } from "./support/api-support.ts";
+import { loginAs, postJson, freshIp } from "../support/accounts.ts";
+import { approve, authedCall, BROWSER_HEADERS, call, env, json, newAccount, pairDesktop, rawStart, randomKey, registerDevice, sha256Base64Url } from "./support/api-support.ts";
 
 const errorCode = async (res: Response) => ((await res.json()) as { code: string }).code;
 
@@ -83,6 +83,58 @@ describe("POST /api/auth/logout and push subscriptions", () => {
     expect((await authedCall(third.session, "/api/auth/logout", json({ deviceId: 42 }))).status).toBe(200);
     expect(await sessionExists(third.session.idHash)).toBe(false);
     expect(await subscriptionIds(keep1)).toEqual([keep1]);
+  });
+});
+
+describe("logout of a recovery-only session and of an oversized device id", () => {
+  it("a recovery-only session signs out but never deletes push subscriptions", async () => {
+    const mine = await newAccount();
+    const device = await registerDevice(mine);
+    const kept = await addSubscription("kept", mine.user.id, device.deviceId);
+    const recovery = await loginAs(mine.user.id, { recoveryOnly: true });
+    const res = await authedCall(recovery, "/api/auth/logout", json({ deviceId: device.deviceId }));
+    expect(res.status).toBe(200);
+    expect(await sessionExists(recovery.idHash)).toBe(false);
+    expect(await subscriptionIds(kept)).toEqual([kept]);
+  });
+
+  it("a device id over 64 characters is ignored and the session still ends", async () => {
+    const mine = await newAccount();
+    const res = await authedCall(mine.session, "/api/auth/logout", json({ deviceId: "d".repeat(65) }));
+    expect(res.status).toBe(200);
+    expect(await sessionExists(mine.session.idHash)).toBe(false);
+  });
+});
+
+describe("request body size limit", () => {
+  it("refuses a body over 32 KiB with 413 before any handler reads it, on public and session routes", async () => {
+    const huge = JSON.stringify({ handle: "bob-1", code: "A".repeat(40 * 1024) });
+    const pub = await postJson("/api/auth/recover", JSON.parse(huge));
+    expect(pub.status).toBe(413);
+    expect(await errorCode(pub)).toBe("invalid");
+    const mine = await newAccount();
+    const session = await authedCall(mine.session, "/api/auth/logout", { method: "POST", body: huge });
+    expect(session.status).toBe(413);
+    expect(await sessionExists(mine.session.idHash)).toBe(true);
+  });
+
+  it("refuses an over-limit body that declares no length (chunked)", async () => {
+    const chunk = new TextEncoder().encode("A".repeat(1024));
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"handle":"bob-1","code":"'));
+        for (let i = 0; i < 40; i += 1) controller.enqueue(chunk);
+        controller.enqueue(new TextEncoder().encode('"}'));
+        controller.close();
+      },
+    });
+    const res = await call("/api/auth/recover", { method: "POST", headers: { ...BROWSER_HEADERS, "CF-Connecting-IP": freshIp() }, body: stream, duplex: "half" } as RequestInit);
+    expect(res.status).toBe(413);
+  });
+
+  it("still takes a normal body (a recovery code of 256 characters reaches the schema bound)", async () => {
+    const res = await postJson("/api/auth/recover", { handle: "bob-1", code: "A".repeat(256) });
+    expect(res.status).toBe(401);
   });
 });
 

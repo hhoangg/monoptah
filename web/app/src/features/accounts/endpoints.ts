@@ -1,5 +1,6 @@
 // Every `/api/*` route the account screens (W-02, W-03, W-10, W-11) call, typed once.
 import {
+  AckRecoveryBody,
   AddPasskeyOptionsResponse,
   AddPasskeyVerifyBody,
   CreateInviteResponse,
@@ -61,7 +62,7 @@ export const endpoints = {
   deletePasskey: endpoint("DELETE", "/api/passkeys/:id", Ok),
 
   regenerateRecoveryCodes: endpoint("POST", "/api/recovery-codes/regenerate", RegenerateRecoveryResponse),
-  ackRecoveryCodes: endpoint("POST", "/api/recovery-codes/ack", Ok),
+  ackRecoveryCodes: endpoint("POST", "/api/recovery-codes/ack", Ok, AckRecoveryBody),
 
   invites: endpoint("GET", "/api/invites", InvitesResponse),
   createInvite: endpoint("POST", "/api/invites", CreateInviteResponse),

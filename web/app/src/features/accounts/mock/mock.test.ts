@@ -309,11 +309,12 @@ describe("mock server: recovery code acknowledgement", () => {
     setup({ signedIn: false });
     await register(SEED_INVITE_CODE);
     expect((await apiFetch(endpoints.me)).recoveryAckAt).toBeNull();
-    await apiFetch(endpoints.ackRecoveryCodes);
+    await apiFetch(endpoints.ackRecoveryCodes, { body: { batch: 1 } });
     expect((await apiFetch(endpoints.me)).recoveryAckAt).toBeGreaterThan(0);
 
     await reauth();
-    await apiFetch(endpoints.regenerateRecoveryCodes);
+    expect((await apiFetch(endpoints.regenerateRecoveryCodes)).batch).toBe(2);
+    await expect(apiFetch(endpoints.ackRecoveryCodes, { body: { batch: 1 } })).rejects.toMatchObject({ status: 409 });
     const afterRegenerate = await apiFetch(endpoints.me);
     expect(afterRegenerate.recoveryAckAt).toBeNull();
     expect(afterRegenerate.recoveryCodesLeft).toBe(10);

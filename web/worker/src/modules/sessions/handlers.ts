@@ -71,7 +71,8 @@ export const logout: Handler<AppEnv> = async (c) => {
   // The optional body names this browser's device. A missing or malformed body only skips the push cleanup:
   // signing out must never fail because of it.
   const body = LogoutBody.safeParse(await c.req.json().catch(() => undefined));
-  const deviceId = body.success ? body.data?.deviceId : undefined;
+  // A recovery-only session never touches devices (recover.ts), so it gets no push cleanup either.
+  const deviceId = body.success && !session.recoveryOnly ? body.data?.deviceId : undefined;
   // The push cleanup goes after the audit INSERT, which reads the changes() of the session DELETE before it.
   const pushCleanup = deviceId === undefined ? [] : [c.env.DB.prepare(LOGOUT_PUSH_SQL).bind(deviceId, user.id)];
   // Idempotent: a logout that finds its session already deleted (a parallel one) still clears the cookie, without an event.

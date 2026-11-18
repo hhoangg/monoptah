@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  AckRecoveryBody,
   API_AUTH,
   API_MODULES,
   API_ROUTES,
@@ -11,6 +12,7 @@ import {
   MAX_RECOVERY_CODE_INPUT,
   MAX_TRANSPORT_INPUT,
   MAX_TRANSPORTS_INPUT,
+  LogoutBody,
   MeResponse,
   PairPollResponse,
   PairStartBody,
@@ -156,8 +158,8 @@ describe("schemas", () => {
 
   it("registration returns exactly 10 recovery codes", () => {
     const user = { id: "u1", handle: "alice", displayName: "Alice", role: "user" };
-    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: Array(10).fill("abcd-abcd-abcd-abcd") }).success).toBe(true);
-    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: ["abcd"] }).success).toBe(false);
+    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: Array(10).fill("abcd-abcd-abcd-abcd"), batch: 1 }).success).toBe(true);
+    expect(RegisterVerifyResponse.safeParse({ user, recoveryCodes: ["abcd"], batch: 1 }).success).toBe(false);
     expect(CreateInviteResponse.shape.code).toBeDefined();
   });
 
@@ -204,6 +206,15 @@ describe("outer input bounds and the Me contract (fix-up point 8)", () => {
     expect(MeResponse.safeParse(me).success).toBe(false);
     expect(MeResponse.safeParse({ ...me, recoveryCodesLeft: 10 }).success).toBe(true);
     expect(MeResponse.safeParse({ ...me, recoveryCodesLeft: -1 }).success).toBe(false);
+  });
+
+  it("the ack and logout bodies are bounded", () => {
+    expect(AckRecoveryBody.safeParse({ batch: 2 }).success).toBe(true);
+    expect(AckRecoveryBody.safeParse({}).success).toBe(false);
+    expect(AckRecoveryBody.safeParse({ batch: 0 }).success).toBe(false);
+    expect(LogoutBody.safeParse(undefined).success).toBe(true);
+    expect(LogoutBody.safeParse({ deviceId: "d".repeat(64) }).success).toBe(true);
+    expect(LogoutBody.safeParse({ deviceId: "d".repeat(65) }).success).toBe(false);
   });
 
   it("registers the ack route as a session route and the device forget as a fresh one", () => {

@@ -34,6 +34,7 @@ import {
   INSERT_FIRST_CODE_SQL,
   INSERT_NEXT_CODE_SQL,
   MAX_BATCH_SQL,
+  ACKED_BATCH_SQL,
   SET_ACK_SQL,
 } from "../src/modules/recovery/regenerate.ts";
 import {
@@ -112,7 +113,7 @@ const CASES: PlanCase[] = [
   { name: "session row of the request cookie", sql: SESSION_BY_HASH_SQL, bind: ["h"] },
   { name: "list session hashes", sql: LIST_SESSION_HASHES_SQL, bind: ["u"] },
   { name: "list session hashes except one", sql: LIST_SESSION_HASHES_EXCEPT_SQL, bind: ["u", "h"] },
-  { name: "list desktops of a user", sql: LIST_DESKTOP_IDS_SQL, bind: ["u", 5] },
+  { name: "list desktops of a user", sql: LIST_DESKTOP_IDS_SQL, bind: ["u"] },
   { name: "me row", sql: ME_ROW_SQL, bind: ["u"] },
   { name: "invites used by a user", sql: INVITES_USED_SQL, bind: ["u"] },
   { name: "unused recovery codes of a user", sql: RECOVERY_LEFT_SQL, bind: ["u"] },
@@ -172,7 +173,8 @@ const CASES: PlanCase[] = [
   { name: "regenerate: next code", sql: INSERT_NEXT_CODE_SQL, bind: ["i", "u", "h", 2, 1, "i"] },
   { name: "regenerate: delete old codes", sql: DELETE_OLD_CODES_SQL, bind: ["u", 1, "i"] },
   { name: "regenerate: clear ack", sql: CLEAR_ACK_SQL, bind: ["u", "i"] },
-  { name: "recovery ack", sql: SET_ACK_SQL, bind: [1, "u"] },
+  { name: "recovery ack", sql: SET_ACK_SQL, bind: [1, "u", "u", 1] },
+  { name: "recovery ack, repeated", sql: ACKED_BATCH_SQL, bind: ["u", "u", 1] },
   { name: "passkeys: list own", sql: LIST_PASSKEYS_SQL, bind: ["u"] },
   { name: "passkeys: get own by id", sql: GET_PASSKEY_SQL, bind: ["c", "u"] },
   { name: "passkeys: exclude list", sql: ADD_PASSKEY_EXCLUDE_SQL, bind: ["u"] },

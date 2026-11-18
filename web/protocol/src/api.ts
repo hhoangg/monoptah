@@ -28,8 +28,8 @@ const Base64Url = z.string().min(1);
 /** WebAuthn JSON from `@simplewebauthn`: kept open, the Worker library validates it. */
 const WebAuthnOptions = z.looseObject({ challenge: z.string() });
 /**
- * Outer bounds of the free-form strings the Worker hashes or stores, checked before any handler runs (a larger body
- * is `400 invalid`). The handlers keep tighter, uniform-answer bounds inside them: a recovery code is 16 characters
+ * Outer bounds of the free-form strings the Worker hashes or stores, checked by the handler that parses the body (a larger value
+ * is `400 invalid`); the body itself is capped at 32 KiB by the Worker before any handler reads it. The handlers keep tighter, uniform-answer bounds inside them: a recovery code is 16 characters
  * (19 with hyphens) and the Worker refuses over 64, an invite code is 22 characters (16 bytes, base64url) and the
  * Worker refuses over 128, and at most 8 transports of 32 characters are stored per passkey.
  */
@@ -75,13 +75,13 @@ export const RegisterOptionsBody = z.object({
 export const RegisterOptionsResponse = WebAuthnChallenge;
 export const RegisterVerifyBody = WebAuthnVerifyBody;
 /** `recoveryCodes` (10) are returned once. The session cookie is set by the response. */
-export const RegisterVerifyResponse = z.object({ user: UserSchema, recoveryCodes: z.array(z.string()).length(10) });
+export const RegisterVerifyResponse = z.object({ user: UserSchema, recoveryCodes: z.array(z.string()).length(10), batch: z.number().int().positive() });
 
 /**
  * `POST /api/auth/logout`. `deviceId` (optional) is this browser's registered device: its push subscriptions are
  * deleted with the session, so a signed-out browser stops getting pushes even when it could not unsubscribe first.
  */
-export const LogoutBody = z.object({ deviceId: Id.optional() }).optional();
+export const LogoutBody = z.object({ deviceId: Id.max(64).optional() }).optional();
 
 export const LoginOptionsBody = z.object({}).optional();
 export const LoginOptionsResponse = WebAuthnChallenge;
@@ -157,7 +157,9 @@ export const RenamePasskeyBody = z.object({ name: z.string().trim().min(1).max(6
 // --- Recovery codes ---
 
 /** The 10 new codes are returned once; all older codes stop working. */
-export const RegenerateRecoveryResponse = z.object({ recoveryCodes: z.array(z.string()).length(10) });
+export const RegenerateRecoveryResponse = z.object({ recoveryCodes: z.array(z.string()).length(10), batch: z.number().int().positive() });
+/** "I saved these" for the batch the user saw (the `batch` of the register or regenerate response). */
+export const AckRecoveryBody = z.object({ batch: z.number().int().positive() });
 
 // --- Invites ---
 
@@ -472,7 +474,7 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "DELETE", path: "/api/passkeys/:id", auth: "fresh", module: "passkeys", request: { params: idParam }, response: Ok }),
 
   r({ method: "POST", path: "/api/recovery-codes/regenerate", auth: "fresh", module: "recovery", request: {}, response: RegenerateRecoveryResponse }),
-  r({ method: "POST", path: "/api/recovery-codes/ack", auth: "session", module: "recovery", request: {}, response: Ok }),
+  r({ method: "POST", path: "/api/recovery-codes/ack", auth: "session", module: "recovery", request: { body: AckRecoveryBody }, response: Ok }),
 
   r({ method: "GET", path: "/api/invites", auth: "session", module: "invites", request: {}, response: InvitesResponse }),
   r({ method: "POST", path: "/api/invites", auth: "session", module: "invites", request: {}, response: CreateInviteResponse }),

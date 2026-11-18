@@ -9,6 +9,7 @@ import { apiFetch } from "./api";
 import { passkeyErrorMessage } from "./authCopy";
 import { endpoints } from "./endpoints";
 import { clearLowCodes } from "./lowCodes";
+import { setRecoveryBatch } from "./pendingRecoveryCodes";
 import { acknowledgeRecoveryCodes, ReauthCancelledError, withFreshAuth } from "./queries";
 import { RecoveryCodes } from "./RecoveryCodes";
 
@@ -33,6 +34,7 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
     setCancelled(false);
     try {
       const result = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
+      setRecoveryBatch(result.batch);
       setCodes(result.recoveryCodes);
     } catch (caught) {
       if (caught instanceof ReauthCancelledError) setCancelled(true);
