@@ -37,7 +37,7 @@ export type GrantPhase =
 const inFlight = new Map<string, Promise<"posted" | "revoked" | "failed">>();
 
 /** One POST per desktop and device at a time (a remount or a strict-mode double effect shares it). */
-function requestOnce(queryClient: QueryClient, desktopId: string, deviceId: string): Promise<"posted" | "revoked" | "failed"> {
+export function requestOnce(queryClient: QueryClient, desktopId: string, deviceId: string): Promise<"posted" | "revoked" | "failed"> {
   const key = `${desktopId}:${deviceId}`;
   const existing = inFlight.get(key);
   if (existing) return existing;
