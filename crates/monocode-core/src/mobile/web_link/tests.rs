@@ -2087,6 +2087,190 @@ mod seam {
         };
         world.hub.rt.block_on(conn.send(frame));
         world.wait_for("the permission report", |w| w.hub.count("POST", &path) == 3);
+        let last = world.hub.requests("POST", &path).pop().unwrap();
+        assert_eq!(
+            last.body,
+            json!({"state": "confirmed", "permission": "control"})
+        );
+    }
+    fn ctrl_grants() -> Frame {
+        Frame {
+            kind: FrameType::Ctrl,
+            channel: 0,
+            device_id: [0; 16],
+            body: serde_json::to_vec(&json!({"t": "grants"})).unwrap(),
+        }
+    }
+
+    fn failing_reports(grants: Grants) -> Handler {
+        Arc::new(move |req| {
+            if req.method == "POST" && req.path.starts_with("/api/desktop/grants/") {
+                return (500, "{}".into());
+            }
+            grant_handler(grants.clone())(req)
+        })
+    }
+
+    #[test]
+    fn a_revoke_made_while_the_server_is_down_heals_to_revoked_never_pending() {
+        let grants = Grants::default();
+        let world = world(failing_reports(grants.clone()), true);
+        let (gone, denied) = (world.peer(101), world.peer(102));
+        world
+            .host
+            .add_device_for_test(confirmed_row(&gone, "row-g", Permission::Control));
+        *grants.lock().unwrap() = vec![
+            grant(&gone, "confirmed", None, Some("control")),
+            grant(&denied, "pending", None, None),
+        ];
+        let path = format!("/api/desktop/grants/{}/state", gone.relay_id());
+        let deny_path = format!("/api/desktop/grants/{}/state", denied.relay_id());
+        world.host.web_revoke("row-g").unwrap();
+        world.wait_for("the failed revoke report", |w| {
+            w.hub.count("POST", &path) == 1
+        });
+        let saved =
+            || std::fs::read_to_string(world._dir.path().join("mobile-access.json")).unwrap();
+        assert!(saved().contains(&gone.relay_id()));
+        // The desktop's own deny is durable too.
+        let mut conn = world.connect();
+        world.wait_for("the pending device", |w| w.status().pending.len() == 1);
+        world.host.web_deny(&denied.fingerprint()).unwrap();
+        world.wait_for("the failed deny report", |w| {
+            w.hub.count("POST", &deny_path) == 1
+        });
+        world.hub.rt.block_on(conn.send(ctrl_grants()));
+        world.wait_for("the repeated reports", |w| {
+            w.hub.count("POST", &path) >= 2 && w.hub.count("POST", &deny_path) >= 2
+        });
+        for report in world.hub.requests("POST", &path) {
+            assert_eq!(report.body, json!({"state": "revoked"}));
+        }
+        assert!(world.status().pending.is_empty());
+        assert!(world.status().devices.is_empty());
+        // Once the server lists both `revoked`, they are forgotten.
+        *grants.lock().unwrap() = vec![
+            grant(&gone, "revoked", None, None),
+            grant(&denied, "revoked", None, None),
+        ];
+        world.hub.rt.block_on(conn.send(ctrl_grants()));
+        world.wait_for("the ids to settle", |_| {
+            !saved().contains(&gone.relay_id()) && !saved().contains(&denied.relay_id())
+        });
+    }
+
+    #[test]
+    fn a_revoked_grant_does_not_hide_a_new_pending_grant_of_the_same_key() {
+        let grants = Grants::default();
+        let world = world(grant_handler(grants.clone()), true);
+        let (old, new) = (world.peer(111), world.peer(112));
+        let mut twin = grant(&old, "pending", None, None);
+        twin["deviceId"] = json!(new.relay_id());
+        *grants.lock().unwrap() = vec![grant(&old, "revoked", None, None), twin];
+        let _conn = world.connect();
+        world.wait_for("the pending twin", |w| w.status().pending.len() == 1);
+        assert_eq!(world.status().pending[0].server_device_id, new.relay_id());
+    }
+
+    #[test]
+    fn a_pairing_cancelled_in_flight_is_given_back_to_the_typed_host() {
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen_in, wait_for) = (entered.clone(), release.clone());
+        let handler: Handler = Arc::new(move |req| {
+            match req.path.as_str() {
+            "/api/pair/start" => (
+                200,
+                r#"{"userCode":"ABCD-2345","deviceCode":"fake-device-code","confirmationCode":"123456","expiresIn":600,"interval":3}"#.into(),
+            ),
+            "/api/pair/poll" => {
+                seen_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                for _ in 0..800 {
+                    if wait_for.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                (
+                    200,
+                    json!({"status":"approved","desktopId":DESKTOP_UUID,"desktopToken":TOKEN,
+                        "account":{"handle":"alice"},
+                        "relayUrl":format!("ws://127.0.0.1:1/relay/desktop/{DESKTOP_UUID}")})
+                    .to_string(),
+                )
+            }
+            "/api/desktop/me" => (200, r#"{"ok":true}"#.into()),
+            _ => (404, "{}".into()),
+        }
+        });
+        let world = world(handler, false);
+        let host_url = format!("http://127.0.0.1:{}", world.hub.port);
+        world.host.web_pair_start(&host_url, "Mac").unwrap();
+        let host = world.host.clone();
+        let poller = std::thread::spawn(move || host.web_pair_poll());
+        world.wait_for("the poll", |_| {
+            entered.load(std::sync::atomic::Ordering::SeqCst)
+        });
+        world.host.web_pair_cancel();
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = poller.join().unwrap().unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        let deleted = world.hub.requests("DELETE", "/api/desktop/me");
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].auth, bearer());
+        assert!(!world.status().paired);
+    }
+
+    #[test]
+    fn a_device_confirmed_while_offline_gets_confirmed_when_it_connects() {
+        let grants = Grants::default();
+        let world = world(grant_handler(grants.clone()), true);
+        let mut peer = world.peer(121);
+        *grants.lock().unwrap() = vec![grant(&peer, "pending", None, None)];
+        let mut conn = world.connect();
+        world.wait_for("the pending device", |w| w.status().pending.len() == 1);
+        assert!(!world.status().pending[0].online);
+        world
+            .host
+            .web_confirm(&peer.fingerprint(), Permission::Control, None, None)
+            .unwrap();
+        world.hub.rt.block_on(async {
+            let state = peer.handshake(&mut conn, 1).await;
+            assert_eq!(state["state"], "confirmed");
+            assert_eq!(state["permission"], "control");
+        });
+    }
+
+    #[test]
+    fn confirm_ends_a_session_that_came_in_under_another_relay_id() {
+        let grants = Grants::default();
+        let world = world(grant_handler(grants.clone()), true);
+        let mut peer = world.peer(131);
+        *grants.lock().unwrap() = vec![grant(&peer, "pending", None, None)];
+        let mut conn = world.connect();
+        world.wait_for("the pending device", |w| w.status().pending.len() == 1);
+        world.hub.rt.block_on(async {
+            assert_eq!(peer.handshake(&mut conn, 1).await["state"], "pending");
+        });
+        // The grant list changes: the same key is now pending under another id.
+        let mut moved = grant(&peer, "pending", None, None);
+        moved["deviceId"] = json!(world.peer(132).relay_id());
+        *grants.lock().unwrap() = vec![moved];
+        world.hub.rt.block_on(conn.send(ctrl_grants()));
+        world.wait_for("the new id", |w| {
+            w.status()
+                .pending
+                .first()
+                .is_some_and(|p| p.server_device_id == world.peer(132).relay_id())
+        });
+        world
+            .host
+            .web_confirm(&peer.fingerprint(), Permission::Read, None, None)
+            .unwrap();
+        world.hub.rt.block_on(async {
+            let frame = conn.frame().await;
+            assert_eq!((frame.kind, frame.device_id), (FrameType::Bye, peer.id));
+        });
     }
 }
 

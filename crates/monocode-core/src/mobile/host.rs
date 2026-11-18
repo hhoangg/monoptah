@@ -149,6 +149,23 @@ struct Config {
     /// while off, so a phone-only file is unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     web_enabled: bool,
+    /// Server device ids the user revoked or denied on this desktop. The grant
+    /// sync reports each as `revoked` until the server lists it so, even when
+    /// the first report was lost offline. Capped at `MAX_REVOKED_IDS` (the
+    /// oldest are dropped) and cleared on Unpair and on a new pairing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    web_revoked: Vec<String>,
+}
+/// How many revoked server ids are remembered.
+const MAX_REVOKED_IDS: usize = 256;
+/// Remembers `id` as revoked by the user (no duplicates, oldest dropped).
+fn note_revoked(config: &mut Config, id: &str) {
+    config
+        .web_revoked
+        .retain(|old| !old.eq_ignore_ascii_case(id));
+    config.web_revoked.push(id.to_owned());
+    let extra = config.web_revoked.len().saturating_sub(MAX_REVOKED_IDS);
+    config.web_revoked.drain(..extra);
 }
 fn is_false(value: &bool) -> bool {
     !*value
@@ -161,6 +178,7 @@ impl Default for Config {
             remote_address: String::new(),
             devices: Vec::new(),
             web_enabled: false,
+            web_revoked: Vec::new(),
         }
     }
 }
@@ -450,6 +468,7 @@ impl MobileHost {
                 remote_address: remote_address.into(),
                 devices: inner.config.devices.clone(),
                 web_enabled: inner.config.web_enabled,
+                web_revoked: inner.config.web_revoked.clone(),
             };
             self.save(&config)?;
             inner.config = config;
@@ -1347,13 +1366,14 @@ impl MobileHost {
                     PairPoll::Expired
                 })
             }
-            PollOutcome::Approved(approval) => self.finish_pairing(id, approval),
+            PollOutcome::Approved(approval) => self.finish_pairing(id, &base, approval),
         }
     }
 
     fn finish_pairing(
         &self,
         id: u64,
+        typed_base: &str,
         approval: super::web_link::desktop_api::Approval,
     ) -> Result<PairPoll, String> {
         let dev = cfg!(debug_assertions);
@@ -1372,11 +1392,9 @@ impl MobileHost {
             let _ = desktop_api::delete_me(base, &approval.desktop_token, Duration::from_secs(8));
         };
         let Some(pairing) = pairing else {
-            // Cancelled while the answer was on its way: the typed host is
-            // gone with the pairing, so use the one the answer names.
-            if let Ok(base) = desktop_api::base_url(&approval.relay_url, dev) {
-                undo(&base);
-            }
+            // Cancelled while the answer was on its way: give the desktop back
+            // to the host the user typed, never to the one the answer names.
+            undo(typed_base);
             return Err("The pairing was cancelled".into());
         };
         // The relay must be on the host the user typed, and its path id must be
@@ -1430,7 +1448,10 @@ impl MobileHost {
         config
             .devices
             .retain(|device| device.kind != DeviceKind::Web);
-        if config.devices.len() != inner.config.devices.len() {
+        config.web_revoked.clear();
+        if config.devices.len() != inner.config.devices.len()
+            || !inner.config.web_revoked.is_empty()
+        {
             self.save(&config)?;
             inner.config = config;
         }
@@ -1555,8 +1576,17 @@ impl MobileHost {
         let grant = self
             .web
             .pending()
-            .remove(fingerprint)
+            .get(fingerprint)
             .ok_or("Unknown device: it is not waiting for confirmation")?;
+        {
+            // Durable first: a lost report is repeated by the grant sync.
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            let mut config = inner.config.clone();
+            note_revoked(&mut config, &grant.server_device_id);
+            self.save(&config)?;
+            inner.config = config;
+            self.web.pending().remove(fingerprint);
+        }
         self.web.command(LinkCommand::Deny {
             fingerprint: fingerprint.to_owned(),
         });
@@ -1576,6 +1606,9 @@ impl MobileHost {
                 .position(|device| device.id == device_id && device.kind == DeviceKind::Web)
                 .ok_or("Unknown web device")?;
             let removed = config.devices.remove(position);
+            if let Some(id) = &removed.server_device_id {
+                note_revoked(&mut config, id);
+            }
             self.save(&config)?;
             inner.config = config;
             close_device_watches(&mut inner, &removed.fingerprint);
@@ -1704,8 +1737,18 @@ impl MobileHost {
             if self.web.generation() != generation {
                 return reports;
             }
-            let plan = super::web_link::grants::plan(grants, &inner.config.devices);
+            let plan = super::web_link::grants::plan(
+                grants,
+                &inner.config.devices,
+                &inner.config.web_revoked,
+            );
             let mut config = inner.config.clone();
+            config.web_revoked.retain(|id| {
+                !plan
+                    .settled
+                    .iter()
+                    .any(|settled| settled.eq_ignore_ascii_case(id))
+            });
             let mut closing: Vec<String> = Vec::new();
             for row_id in &plan.revoked_rows {
                 if let Some(position) = config.devices.iter().position(|d| &d.id == row_id) {
@@ -1728,7 +1771,9 @@ impl MobileHost {
                     }
                 }
             }
-            if config.devices != inner.config.devices {
+            if config.devices != inner.config.devices
+                || config.web_revoked != inner.config.web_revoked
+            {
                 if self.save(&config).is_err() {
                     return Vec::new();
                 }
@@ -1755,6 +1800,9 @@ impl MobileHost {
             // The pending set is replaced under the same lock that `web_confirm`
             // takes, so a device confirmed meanwhile is not listed again.
             self.web.pending().replace(plan.pending);
+            for server_id in plan.rerevoke {
+                reports.push((server_id, "revoked", None));
+            }
             for server_id in plan.orphaned {
                 reports.push((server_id, "pending", None));
             }

@@ -76,6 +76,11 @@ pub(crate) struct Plan {
     /// `(server device id, permission)`: the server's view of a confirmed
     /// local row is stale (a report failed), so report `confirmed` again.
     pub reconfirm: Vec<(String, Permission)>,
+    /// Ids the user revoked or denied that the server still lists as pending
+    /// or confirmed: report `revoked` again, and never list them as pending.
+    pub rerevoke: Vec<String>,
+    /// Ids the user revoked that the server now lists `revoked`: forget them.
+    pub settled: Vec<String>,
 }
 
 /// The fingerprint of a grant's public key, `None` for a key that is not
@@ -87,7 +92,7 @@ pub(crate) fn grant_fingerprint(public_key: &str) -> Option<String> {
 
 /// Sorts the server's grants into what to do. `rows` are the desktop's
 /// devices; only web rows count.
-pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device]) -> Plan {
+pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device], user_revoked: &[String]) -> Plan {
     let web = |row: &&Device| row.kind == DeviceKind::Web;
     let by_server_id = |id: &str| {
         rows.iter().filter(web).find(|row| {
@@ -96,9 +101,10 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device]) -> Plan {
                 .is_some_and(|row_id| row_id.eq_ignore_ascii_case(id))
         })
     };
-    // A key listed under several device ids is ambiguous: list none of them.
+    // A pending key listed under several device ids is ambiguous: list none
+    // of them. Revoked and confirmed grants are keyed by server id instead.
     let mut ids_by_key: std::collections::HashMap<String, Vec<&str>> = Default::default();
-    for grant in grants {
+    for grant in grants.iter().filter(|g| g.state == "pending") {
         if let Some(own) = grant_fingerprint(&grant.public_key) {
             let ids = ids_by_key.entry(own).or_default();
             if !ids.contains(&grant.device_id.as_str()) {
@@ -108,6 +114,18 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device]) -> Plan {
     }
     let mut plan = Plan::default();
     for grant in grants {
+        let listed = user_revoked
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(&grant.device_id))
+            && by_server_id(&grant.device_id).is_none();
+        if listed {
+            match grant.state.as_str() {
+                "revoked" => plan.settled.push(grant.device_id.clone()),
+                "pending" | "confirmed" => plan.rerevoke.push(grant.device_id.clone()),
+                _ => {}
+            }
+            continue;
+        }
         let Some(own) = grant_fingerprint(&grant.public_key) else {
             continue;
         };
@@ -116,11 +134,11 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device]) -> Plan {
         if !grant.fingerprint.eq_ignore_ascii_case(&own) {
             continue;
         }
-        if ids_by_key.get(&own).is_some_and(|ids| ids.len() > 1) {
-            continue;
-        }
         match grant.state.as_str() {
             "pending" => {
+                if ids_by_key.get(&own).is_some_and(|ids| ids.len() > 1) {
+                    continue;
+                }
                 let row = rows.iter().filter(web).find(|row| row.fingerprint == own);
                 if let Some(row) = row {
                     let same_id = row
@@ -313,6 +331,7 @@ mod tests {
                 forged, short_key, known, fresh, orphan, revoked, raise, lower, same,
             ],
             &rows,
+            &[],
         );
         assert_eq!(
             plan.pending,
@@ -354,6 +373,7 @@ mod tests {
                 twin_b,
             ],
             &rows,
+            &[],
         );
         assert_eq!(
             plan.reconfirm,
@@ -363,6 +383,29 @@ mod tests {
             ]
         );
         assert!(plan.pending.is_empty());
+    }
+
+    #[test]
+    fn the_plan_rerevokes_what_the_user_revoked_and_settles_listed_ids() {
+        let pending = server_grant([1; 32], "s1", "pending");
+        let confirmed = server_grant([2; 32], "s2", "confirmed");
+        let revoked = server_grant([3; 32], "s3", "revoked");
+        let other = server_grant([4; 32], "s4", "confirmed");
+        let ids = ["s1".to_string(), "s2".to_string(), "S3".to_string()];
+        let plan = plan(&[pending, confirmed, revoked, other], &[], &ids);
+        assert_eq!(plan.rerevoke, ["s1", "s2"]);
+        assert_eq!(plan.settled, ["s3"]);
+        assert!(plan.pending.is_empty());
+        // Another confirmed grant without a row is still an orphan.
+        assert_eq!(plan.orphaned, ["s4"]);
+    }
+
+    #[test]
+    fn only_pending_twins_are_ambiguous() {
+        let old = server_grant([5; 32], "s1", "revoked");
+        let new = server_grant([5; 32], "s2", "pending");
+        let plan = plan(&[old, new], &[], &[]);
+        assert_eq!(plan.pending.len(), 1);
     }
 
     #[test]
