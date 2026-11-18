@@ -101,7 +101,8 @@ export const ApprovalsFieldSchema = z.array(ApprovalSchema);
 
 /** Fields added to `conversation.read` results and watch frames for cloud sessions and approvals. */
 export const CloudApprovalFields = {
-  cloud: CloudFieldSchema.optional(),
+  /** `null`: the session is local again (it no longer runs on an instance); absent: unchanged in a frame. */
+  cloud: CloudFieldSchema.nullable().optional(),
   approvals: ApprovalsFieldSchema.optional(),
 };
 

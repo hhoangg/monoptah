@@ -98,11 +98,11 @@ describe("cloudSendGuard", () => {
     ["stopping", COST_NOTICES.wakeStopping],
     ["unknown", COST_NOTICES.wakeUnknown],
   ] as const)("confirms the wake cost for a %s instance", async (state, notice) => {
-    expect(await send("sandbox", state)).toEqual({ kind: "confirm", notice });
+    expect(await send("sandbox", state)).toEqual({ kind: "confirm", notice, wake: true });
   });
 
   it("confirms a billable session whose state is not known at all", async () => {
-    expect(await send("codespace", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wakeUnknown });
+    expect(await send("codespace", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wakeUnknown, wake: true });
   });
 
   it("confirms the start cost for a cloud start from the New session page (empty session id)", async () => {
@@ -116,7 +116,7 @@ describe("cloudSendGuard", () => {
       const sources = placementSources(card, undefined, false);
       expect(sources.states).toContain("unknown");
       publishPlacement("d", "s1", "w1", sources);
-      expect(await send("codespace", "available")).toEqual({ kind: "confirm", notice: COST_NOTICES.wakeUnknown });
+      expect(await send("codespace", "available")).toEqual({ kind: "confirm", notice: COST_NOTICES.wakeUnknown, wake: true });
     });
 
     it("trusts it once the catalog is fresh, or when a live field arrived", () => {
@@ -132,24 +132,24 @@ describe("cloudSendGuard", () => {
   describe("live sources", () => {
     it("uses the live state when the catalog card is missing", async () => {
       publishPlacement("d", "s1", "w1", { kinds: ["sandbox"], states: ["stopped"] });
-      expect(await send(null, undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+      expect(await send(null, undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake, wake: true });
     });
 
     it("uses the card cloudState published next to the target (a card with only cloudState)", async () => {
       publishPlacement("d", "s1", "w1", { kinds: ["codespace"], states: ["stopped"] });
-      expect(await send("codespace", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+      expect(await send("codespace", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake, wake: true });
     });
 
     it("takes the most cautious answer when the sources disagree", async () => {
       publishPlacement("d", "s1", "w1", { kinds: ["sandbox"], states: ["available"] });
-      expect(await send("sandbox", "stopped")).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+      expect(await send("sandbox", "stopped")).toEqual({ kind: "confirm", notice: COST_NOTICES.wake, wake: true });
       publishPlacement("d", "s1", "w2", { kinds: ["sandbox"], states: ["starting"] });
       expect(await send("sandbox", "stopped")).toEqual({ kind: "refuse", reason: STARTING_REFUSAL });
     });
 
     it("treats a session that moved to the cloud as billable although the card still says local", async () => {
       publishPlacement("d", "s1", "w1", { kinds: ["sandbox"], states: ["stopped"] });
-      expect(await send("local", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+      expect(await send("local", undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake, wake: true });
     });
 
     it("keys the live state by desktop and session", async () => {
@@ -162,7 +162,7 @@ describe("cloudSendGuard", () => {
       publishPlacement("d", "s1", "chip", { kinds: ["sandbox"], states: ["stopped"] });
       publishPlacement("d", "s1", "top", { kinds: ["sandbox"], states: ["stopped"] });
       publishPlacement("d", "s1", "chip", undefined);
-      expect(await send(null, undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake });
+      expect(await send(null, undefined)).toEqual({ kind: "confirm", notice: COST_NOTICES.wake, wake: true });
       publishPlacement("d", "s1", "top", undefined);
       expect(await send(null, undefined)).toEqual({ kind: "allow" });
     });

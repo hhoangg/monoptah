@@ -11,7 +11,7 @@ import { getLinkConnection, useLinkConnection, useLinkDesktopId, type LinkReques
 import type { LinkClient } from "./client.ts";
 import { getMutator } from "./mutations.ts";
 import { loadPersistedTurns, persistTurns } from "./persist.ts";
-import { LINK_QUERY_DEFAULTS, conversationKey } from "./queries.ts";
+import { LINK_QUERY_DEFAULTS, catalogKey, conversationKey } from "./queries.ts";
 import {
   NO_APPROVALS,
   attachmentCount,
@@ -27,8 +27,21 @@ import {
 import { useLinkDataSync } from "./sync.ts";
 import { applyFrames, type WatchFrameInput } from "./watchUpdates.ts";
 
+/** When the watch ends with an error: read once, wait this long (doubling), then open the watch again (F-32, WorkspaceProvider.tsx:363-396). */
+export const READ_POLL_MS = 1_000;
+export const READ_POLL_MAX_MS = 8_000;
+/** Recovery stops after this many failed reopens in a row; the next reconnect still reopens the watch. */
+export const WATCH_RECOVERY_MAX = 6;
+/** Errors that retrying cannot fix: the session is gone or this device may not see it. */
+const PERMANENT_WATCH_ERRORS = new Set(["not_found", "revoked", "forbidden", "not_selected", "unsupported", "unsupported_target"]);
+
 /** How many of the latest turns a watch opens on (and how many the persisted cache keeps). */
 export const WATCH_TAIL = 30;
+
+/** Per-call options of a send: `wake` is the user's consent to wake a stopped cloud instance (architecture.md 6.6). */
+export interface SendOptions {
+  wake?: boolean;
+}
 
 export interface SendResult {
   /** True when the desktop accepted the message. False means it shows "Not sent, retry". */
@@ -41,6 +54,27 @@ function errorCode(error: unknown): string {
     return (error as { code: string }).code;
   }
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The desktop said `cloud: null` for this session (read or frame): it is local again. The catalog card keeps no
+ * cloud target, state or startup, so badges, the startup list and the wake notice go away now instead of at the
+ * next catalog refresh. A read that merely omits `cloud` (marks not loaded yet) never gets here.
+ */
+export function clearCardCloud(queryClient: QueryClient, desktopId: string, conversationId: string): void {
+  queryClient.setQueryData<ResultOf<"workspace.list">>(catalogKey(desktopId), (catalog) => {
+    if (!catalog?.sessions.some((card) => card.id === conversationId && (card.target || card.cloudState || card.startup))) return catalog;
+    return {
+      ...catalog,
+      sessions: catalog.sessions.map((card) => {
+        if (card.id !== conversationId) return card;
+        const { cloudState, startup, ...rest } = card;
+        void cloudState;
+        void startup;
+        return { ...rest, target: { kind: "local" as const } };
+      }),
+    };
+  });
 }
 
 export interface ConversationWatcherDeps {
@@ -58,7 +92,7 @@ export class ConversationWatcher {
   readonly #client: LinkClient;
   readonly #queryClient: QueryClient;
   readonly #key: ReturnType<typeof conversationKey>;
-  readonly #params = new Map<string, { text: string; attachments: Attachment[] | undefined }>();
+  readonly #params = new Map<string, { text: string; attachments: Attachment[] | undefined; wake: boolean; fresh: boolean }>();
   #registration: WatchRegistrationHandle | null = null;
   /** Invalidates the callbacks of an earlier registration. */
   #gen = 0;
@@ -66,6 +100,8 @@ export class ConversationWatcher {
   #reopening = false;
   #nextPending = 1;
   #started = false;
+  #recoveryTimer: ReturnType<typeof setTimeout> | null = null;
+  #recoveries = 0;
 
   constructor(deps: ConversationWatcherDeps) {
     this.#client = deps.client;
@@ -102,6 +138,7 @@ export class ConversationWatcher {
     this.#started = false;
     globalThis.document?.removeEventListener("visibilitychange", this.#onVisibility);
     this.#gen += 1;
+    this.#stopRecovery();
     this.#registration?.unregister();
     this.#registration = null;
     this.#save();
@@ -134,12 +171,45 @@ export class ConversationWatcher {
         if (gen === this.#gen) this.#onFrame(frame);
       },
       onError: (error) => {
-        if (gen === this.#gen) this.#update((state) => ({ ...state, error: error.message }));
+        if (gen !== this.#gen) return;
+        this.#update((state) => ({ ...state, error: error.message }));
+        this.#recover(error.code);
+      },
+      onDead: () => {
+        // The connection reopens the watch itself; one read fills the gap meanwhile.
+        if (gen === this.#gen) void this.read().catch(() => undefined);
       },
     });
   }
 
+  /**
+   * The watch ended with an error and is not reopened until the next reconnect. Like mobile: read once, wait
+   * (1 s, doubling to 8 s), open the watch again. Bounded by `WATCH_RECOVERY_MAX`; never for a permanent error.
+   */
+  #recover(code: string | undefined): void {
+    if (!this.#started || this.#recoveryTimer || (code !== undefined && PERMANENT_WATCH_ERRORS.has(code))) return;
+    if (this.#recoveries >= WATCH_RECOVERY_MAX) return;
+    const wait = Math.min(READ_POLL_MAX_MS, READ_POLL_MS * 2 ** this.#recoveries);
+    this.#recoveries += 1;
+    if (this.#client.store.getState().status === "ready") void this.read().catch(() => undefined);
+    this.#recoveryTimer = setTimeout(() => {
+      this.#recoveryTimer = null;
+      // Not ready: the reconnect reopens every watch by itself.
+      if (!this.#started || this.#client.store.getState().status !== "ready") return;
+      this.#registration?.unregister();
+      this.#register();
+    }, wait);
+  }
+
+  #stopRecovery(): void {
+    if (this.#recoveryTimer) clearTimeout(this.#recoveryTimer);
+    this.#recoveryTimer = null;
+  }
+
   #onFrame(frame: WatchFrameInput): void {
+    // A frame means the watch is alive again.
+    this.#stopRecovery();
+    this.#recoveries = 0;
     const current = this.state ?? emptyConversation();
     const applied = applyFrames(current.turns, [frame]);
     if (!applied) {
@@ -148,6 +218,7 @@ export class ConversationWatcher {
     }
     this.#nulls = 0;
     this.#update((state) => withFrames(state, applied));
+    if (applied.cloud === null) clearCardCloud(this.#queryClient, this.#client.desktopId, this.conversationId);
   }
 
   /** A frame named a turn the client never got: close the watch and open it again with `from`. */
@@ -170,12 +241,17 @@ export class ConversationWatcher {
   async read(): Promise<void> {
     const result = await this.#client.request("conversation.read", { conversationId: this.conversationId });
     this.#update((state) => withRead(state, result));
+    if (result.cloud === null) clearCardCloud(this.#queryClient, this.#client.desktopId, this.conversationId);
   }
 
-  /** Sends a message: an optimistic turn first, then the desktop answer decides what it shows. */
-  async send(text: string, attachments?: Attachment[]): Promise<SendResult> {
+  /**
+   * Sends a message: an optimistic turn first, then the desktop answer decides what it shows. `wake: true` is only
+   * ever passed by a caller that showed the cost notice and got the user's confirmation. A `wake_required` answer
+   * removes the optimistic turn again: the caller still holds the text (the draft), asks, and sends once more.
+   */
+  async send(text: string, attachments?: Attachment[], options: SendOptions = {}): Promise<SendResult> {
     const id = `pending:${this.#nextPending++}`;
-    this.#params.set(id, { text, attachments });
+    this.#params.set(id, { text, attachments, wake: options.wake === true, fresh: true });
     this.#update((state) =>
       withOptimistic(state, { id, text, at: Date.now(), attachments: attachmentCount(attachments), status: "sending", baseline: this.#baseline(state, id) }),
     );
@@ -183,9 +259,12 @@ export class ConversationWatcher {
   }
 
   /** User action only: sends a "Not sent" message again with the same command id. */
-  async retry(id: string): Promise<SendResult> {
+  async retry(id: string, options: SendOptions = {}): Promise<SendResult> {
     const turn = this.state?.optimistic.find((other) => other.id === id);
-    if (!turn || turn.status !== "not_sent" || !this.#params.has(id)) return { sent: false, error: "nothing_to_retry" };
+    const held = this.#params.get(id);
+    if (!turn || turn.status !== "not_sent" || !held) return { sent: false, error: "nothing_to_retry" };
+    // The text lives only in this turn, so a refused retry keeps it as "Not sent".
+    this.#params.set(id, { ...held, wake: options.wake === true, fresh: false });
     this.#update((state) => withOptimisticStatus({ ...state, optimistic: state.optimistic.map((o) => (o.id === id ? { ...o, baseline: this.#baseline(state, id) } : o)) }, id, { status: "sending" }));
     return this.#deliver(id);
   }
@@ -202,10 +281,17 @@ export class ConversationWatcher {
         conversationId: this.conversationId,
         text: params.text,
         ...(params.attachments?.length ? { attachments: params.attachments } : {}),
+        ...(params.wake ? { wake: true as const } : {}),
       });
     } catch (error) {
       // Never re-sent here: after a reconnect the state is re-read, and the turn reconciles or stays "Not sent".
       const code = errorCode(error);
+      if (code === "wake_required" && params.fresh && !params.wake) {
+        // Nothing was sent. The caller still holds the text, so no "Not sent" turn is left behind.
+        this.#params.delete(id);
+        this.#update((state) => ({ ...state, optimistic: state.optimistic.filter((turn) => turn.id !== id) }));
+        return { sent: false, error: code };
+      }
       this.#update((state) => reconcile(withOptimisticStatus(state, id, { status: "not_sent", error: code })));
       return { sent: false, error: code };
     }
@@ -281,6 +367,7 @@ export function conversationQueryOptions(desktopId: string, conversationId: stri
         { conversationId },
         { signal },
       );
+      if (result.cloud === null) clearCardCloud(queryClient, desktopId, conversationId);
       return withRead(queryClient.getQueryData<ConversationState>(conversationKey(desktopId, conversationId)) ?? emptyConversation(), result);
     },
   });
@@ -289,9 +376,9 @@ export function conversationQueryOptions(desktopId: string, conversationId: stri
 export interface UseConversationResult {
   /** Undefined until the first frame, read or persisted entry arrives. */
   state: ConversationState | undefined;
-  send(text: string, attachments?: Attachment[]): Promise<SendResult>;
+  send(text: string, attachments?: Attachment[], options?: SendOptions): Promise<SendResult>;
   /** Re-sends a "Not sent" message with its command id. Call it from a user action only. */
-  retry(optimisticId: string): Promise<SendResult>;
+  retry(optimisticId: string, options?: SendOptions): Promise<SendResult>;
 }
 
 /** Opens the conversation watch for the lifetime of the component and returns its state and send API. */
@@ -308,18 +395,18 @@ export function useConversation(conversationId: string): UseConversationResult {
   return useMemo(
     () => ({
       state: data,
-      send: async (text, attachments) => {
+      send: async (text, attachments, options) => {
         const handle = openConversation(queryClient, client, conversationId);
         try {
-          return await handle.watcher.send(text, attachments);
+          return await handle.watcher.send(text, attachments, options);
         } finally {
           handle.close();
         }
       },
-      retry: async (id) => {
+      retry: async (id, options) => {
         const handle = openConversation(queryClient, client, conversationId);
         try {
-          return await handle.watcher.retry(id);
+          return await handle.watcher.retry(id, options);
         } finally {
           handle.close();
         }

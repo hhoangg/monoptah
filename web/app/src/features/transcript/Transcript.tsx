@@ -3,9 +3,11 @@
 // end, shows the jump-to-bottom button 160 px away from it, pages older turns in when the reader reaches
 // the top and keeps the reader's place while they land (prependAnchor.ts, useReplyReflowAnchor).
 //
-// Mobile anchors the latest user message under the header with blank room below for the reply. The web
-// follows the end instead: a reply grows downward while the reader is at the end, and a message the user
-// sends scrolls to the end. See the Task 4 report.
+// Like mobile, a message the user sends is anchored: it rests near the top of the scroller with blank room
+// below it for the reply (`blank`), and the reply grows into that room before the list scrolls. Opening an
+// idle session still lands at the end of the true height; a session that is working at open anchors at once.
+// The room is sized so the anchor position is the end of the scroll height, so the reader "follows the end"
+// the whole time and only a reader who scrolled away keeps their place.
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Turn } from "@monoptah/protocol";
@@ -29,6 +31,8 @@ const FOLLOW_PX = 48;
 const OLDER_TRIGGER_PX = 320;
 const ESTIMATE_ROW_PX = 140;
 const PADDING_PX = 16;
+/** The anchored message rests this far under the top of the scroller. */
+const ANCHOR_REST_PX = 8;
 
 interface Row {
   key: string;
@@ -56,6 +60,13 @@ export interface TranscriptProps {
 }
 
 const rememberNothing = () => {};
+
+const hasUser = (row: Row) => row.turn.items.some((item) => item.type === "user");
+
+function lastUserRow(rows: Row[]): number {
+  for (let index = rows.length - 1; index >= 0; index -= 1) if (hasUser(rows[index]!)) return index;
+  return -1;
+}
 
 function sameRows(a: Row[], b: Row[]): boolean {
   return a.length === b.length && a.every((row, index) => row.key === b[index]!.key && row.turn === b[index]!.turn && row.optimistic === b[index]!.optimistic);
@@ -105,6 +116,23 @@ export function Transcript({
   );
   const rows = useStableValue(built, sameRows);
 
+  // Anchoring (F-32): switched on by a message sent here, by a newer user message from elsewhere, or by a
+  // session that is working when its turns first show. The confirmation of a pending message (same place,
+  // desktop id instead of `pending:`) does not anchor again. Decided during render, so the room under the
+  // message exists in the same pass that adds it.
+  const anchorIndex = lastUserRow(rows);
+  const latestUserKey = anchorIndex >= 0 ? rows[anchorIndex]!.key : undefined;
+  const [anchoring, setAnchoring] = useState(false);
+  const [seen, setSeen] = useState<{ latest: string | undefined; optimistic: number; settled: boolean }>({ latest: undefined, optimistic: 0, settled: false });
+  if (seen.latest !== latestUserKey || seen.optimistic !== optimistic.length || (!seen.settled && rows.length > 0)) {
+    const sentHere = optimistic.length > seen.optimistic;
+    const confirmation = seen.latest?.startsWith("pending:") === true && latestUserKey !== undefined && !latestUserKey.startsWith("pending:");
+    const newer = seen.latest !== undefined && latestUserKey !== undefined && latestUserKey !== seen.latest && !confirmation;
+    const openedBusy = !seen.settled && rows.length > 0 && busy && latestUserKey !== undefined;
+    setSeen({ latest: latestUserKey, optimistic: optimistic.length, settled: seen.settled || rows.length > 0 });
+    if (sentHere || newer || openedBusy) setAnchoring(true);
+  }
+
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scroller,
@@ -116,7 +144,11 @@ export function Transcript({
     // jsdom has no layout: without a size the window would be empty.
     initialRect: { width: 800, height: 800 },
   });
-  const total = virtualizer.getTotalSize();
+  const measuredTotal = virtualizer.getTotalSize();
+  const anchorStart = anchoring && anchorIndex >= 0 ? virtualizer.measurementsCache[anchorIndex]?.start : undefined;
+  // The blank room under the anchored message: the anchor position is exactly the end of the scroll height.
+  const blank = anchorStart !== undefined && scroller ? Math.max(0, Math.max(0, anchorStart - ANCHOR_REST_PX) + scroller.clientHeight - measuredTotal) : 0;
+  const total = measuredTotal + blank;
 
   // Re-evaluates the end-follow state and the jump button from the scroller's geometry.
   const syncScroll = useCallback(() => {

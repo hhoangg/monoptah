@@ -10,10 +10,16 @@ export interface SendGuardContext {
   target?: { kind: string } | null;
 }
 
-/** `confirm` shows a notice (for example a cost notice) and sends only if the user agrees. */
+/** The notice shown when the desktop refuses a send with `wake_required` although the guard allowed it (a stale cached state). */
+export const WAKE_REQUIRED_NOTICE = "This instance is stopped. Sending wakes it, and a running instance is billable until it stops.";
+
+/**
+ * `confirm` shows a notice (for example a cost notice) and sends only if the user agrees. `wake: true` marks a
+ * notice that asks to wake a stopped cloud instance: the send after the confirmation then carries `wake: true`.
+ */
 export type SendGuardResult =
   | { kind: "allow" }
-  | { kind: "confirm"; notice: string }
+  | { kind: "confirm"; notice: string; wake?: true }
   | { kind: "refuse"; reason: string };
 
 export type SendGuard = (context: SendGuardContext) => Promise<SendGuardResult>;

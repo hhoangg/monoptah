@@ -230,6 +230,8 @@ export const CloudInstancesResultSchema = z.looseObject({
   backends: z.array(z.looseObject({ kind: z.string(), ready: z.boolean().optional() })).optional(),
   /** Billing instances the device's selection hides: shown as "N other instances". */
   otherCount: z.number().int().nonnegative().optional(),
+  /** True while the desktop is still reading some instances: the list is partial, ask again shortly. */
+  loading: z.boolean().optional(),
 });
 
 export const CloudStopParamsSchema = z.union([
@@ -280,7 +282,7 @@ export const METHODS = {
       usageLimit: UsageLimitSchema.nullable().optional(),
       older: z.boolean(),
       question: QuestionPromptSchema.nullable().optional(),
-      cloud: CloudFieldSchema.optional(),
+      cloud: CloudFieldSchema.nullable().optional(),
       approvals: ApprovalsFieldSchema.optional(),
     }),
   }),

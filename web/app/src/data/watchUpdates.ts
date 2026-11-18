@@ -64,7 +64,7 @@ export interface AppliedFrames {
   questions: (QuestionPrompt | null)[];
   error?: string;
   /** The last `cloud` a frame carried; undefined when no frame carried one (unchanged). */
-  cloud?: CloudField;
+  cloud?: CloudField | null;
   /** The last `approvals` a frame carried (an empty array clears); undefined when unchanged. */
   approvals?: Approval[];
 }
@@ -82,7 +82,7 @@ export function applyFrames(previous: Turn[], frames: WatchFrameInput[]): Applie
   const questions: (QuestionPrompt | null)[] = [];
   let older: boolean | undefined;
   let error: string | undefined;
-  let cloud: CloudField | undefined;
+  let cloud: CloudField | null | undefined;
   let approvals: Approval[] | undefined;
   for (const frame of frames) {
     if (frame.error) {

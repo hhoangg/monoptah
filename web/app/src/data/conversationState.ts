@@ -113,15 +113,15 @@ export function withFrames(state: ConversationState, applied: AppliedFrames): Co
     question: lastQuestion !== undefined ? lastQuestion : state.question,
     usageLimit: applied.usageLimit !== undefined ? applied.usageLimit : state.usageLimit,
     error: applied.error ?? null,
-    // A field a frame does not carry is unchanged; `approvals: []` clears.
-    cloud: applied.cloud !== undefined ? applied.cloud : state.cloud,
+    // A field a frame does not carry is unchanged; `approvals: []` and `cloud: null` clear.
+    cloud: applied.cloud !== undefined ? (applied.cloud ?? undefined) : state.cloud,
     approvals: applied.approvals !== undefined ? applied.approvals : state.approvals,
     approvalsSeq: applied.approvals !== undefined ? state.approvalsSeq + 1 : state.approvalsSeq,
     cachedOnly: false,
   });
 }
 
-/** A `conversation.read` result is the whole conversation: it replaces the fields, even to clear them. */
+/** A `conversation.read` result is the whole conversation: it replaces the fields, even to clear them (`cloud` only by an explicit null). */
 export function withRead(
   state: ConversationState,
   result: {
@@ -130,7 +130,7 @@ export function withRead(
     older: boolean;
     usageLimit?: UsageLimit | null | undefined;
     question?: QuestionPrompt | null | undefined;
-    cloud?: CloudField | undefined;
+    cloud?: CloudField | null | undefined;
     approvals?: Approval[] | undefined;
   },
 ): ConversationState {
@@ -142,7 +142,8 @@ export function withRead(
     question: result.question ?? null,
     usageLimit: result.usageLimit ?? null,
     error: null,
-    cloud: result.cloud,
+    // Only an explicit `cloud: null` clears it; a read that omits the field (marks not loaded yet) leaves it.
+    cloud: result.cloud === undefined ? state.cloud : (result.cloud ?? undefined),
     approvals: result.approvals ?? NO_APPROVALS,
     approvalsSeq: state.approvalsSeq + 1,
     cachedOnly: false,

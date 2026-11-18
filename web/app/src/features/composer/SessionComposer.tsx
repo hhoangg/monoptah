@@ -4,9 +4,9 @@
 import { useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { QuestionPrompt, QuestionReply, SessionCard, UsageLimit } from "@monoptah/protocol";
-import type { SendResult } from "@/data";
+import type { SendOptions, SendResult } from "@/data";
 import { useLinkMutation } from "@/data";
-import { useLinkState } from "@/link";
+import { useLinkDesktopId, useLinkState } from "@/link";
 import { ModelControls } from "@/features/models/ModelControls";
 import { useDefaultModels } from "@/features/models/defaultModel";
 import { UsageLimitCard } from "@/features/models/UsageLimitCard";
@@ -14,7 +14,9 @@ import { useUsageLimitActions } from "@/features/models/hooks";
 import { assertFitsRequest, toWire } from "./attachments";
 import { Composer } from "./Composer";
 import { QuestionForm } from "./QuestionForm";
-import { useSendGuard } from "./useSendGuard";
+import { sendErrorMessage } from "./sendErrors";
+import { WAKE_REQUIRED_NOTICE } from "@/ui/hooks";
+import { SendCancelled, SendRefused, useSendGuard } from "./useSendGuard";
 
 export const QUESTION_READ_ONLY_REASON = "Answer on desktop or use a control device.";
 
@@ -31,7 +33,7 @@ export interface SessionComposerProps {
   busy: boolean;
   readOnly: boolean;
   /** Sends the text and the attachments as a turn (the data layer's `useConversation().send`). */
-  send: (text: string, attachments?: ReturnType<typeof toWire>) => Promise<SendResult>;
+  send: (text: string, attachments?: ReturnType<typeof toWire>, options?: SendOptions) => Promise<SendResult>;
   /** The latest session error, shown in place of the field until dismissed. */
   notice?: { text: string; dismiss: () => void } | null;
 }
@@ -47,10 +49,14 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
 
   const submit = async (text: string, attachments: Parameters<typeof toWire>[0]) => {
     assertFitsRequest(text, attachments);
-    await guard.check({ desktopId, sessionId, target: session?.target ?? null });
-    // The optimistic turn shows the message at once; a failure appears there as "Not sent, retry".
     const wire = toWire(attachments);
-    void send(text, wire.length > 0 ? wire : undefined);
+    // The optimistic turn shows the message at once; a failure appears there as "Not sent, retry". Only a
+    // `wake_required` refusal rejects here, so the composer keeps the draft until the user confirms the wake
+    // cost and the desktop accepts the send.
+    const result = await guard.guardedSend({ desktopId, sessionId, target: session?.target ?? null }, (options) =>
+      send(text, wire.length > 0 ? wire : undefined, options),
+    );
+    if (!result.sent && result.error === "wake_required") throw new Error(sendErrorMessage(result.error));
   };
 
   const toolbar = (
@@ -110,19 +116,62 @@ export function SessionQuestionCard({ sessionId, prompt, readOnly }: { sessionId
   );
 }
 
-/** The usage limit card above the composer while the conversation waits for its limit to reset. */
-export function SessionUsageCard({ sessionId, state, readOnly }: { sessionId: string; state: UsageLimit; readOnly: boolean }) {
+/** True when the desktop refused the request because the cloud instance is stopped and no wake was confirmed. */
+function isWakeRequired(reason: unknown): boolean {
+  return typeof reason === "object" && reason !== null && (reason as { code?: unknown }).code === "wake_required";
+}
+
+/**
+ * The usage limit card above the composer while the conversation waits for its limit to reset. Resume and
+ * Resume at reset run through the send-guard like a message: a stopped cloud instance asks for the wake cost
+ * first, and the request carries `wake: true` only after that confirmation (once per confirmation).
+ */
+export function SessionUsageCard({
+  sessionId,
+  state,
+  readOnly,
+  desktopId,
+  target,
+}: {
+  sessionId: string;
+  state: UsageLimit;
+  readOnly: boolean;
+  desktopId?: string;
+  target?: SessionCard["target"] | null;
+}) {
   const ready = useLinkReady();
   const actions = useUsageLimitActions(sessionId, state);
+  const guard = useSendGuard();
+  const linkDesktopId = useLinkDesktopId();
+
+  const guarded = async (call: (options: { wake?: boolean }) => Promise<void>): Promise<void> => {
+    try {
+      const { wake } = await guard.check({ desktopId: desktopId ?? linkDesktopId, sessionId, target: target ?? null });
+      try {
+        await call(wake ? { wake: true } : {});
+      } catch (reason) {
+        if (wake || !isWakeRequired(reason)) throw reason;
+        await guard.confirm(WAKE_REQUIRED_NOTICE);
+        await call({ wake: true });
+      }
+    } catch (reason) {
+      if (reason instanceof SendCancelled) return;
+      if (reason instanceof SendRefused) throw new Error(reason.message, { cause: reason });
+      if (isWakeRequired(reason)) throw new Error(sendErrorMessage("wake_required"), { cause: reason });
+      throw reason;
+    }
+  };
+
   return (
     <div className="pb-2" data-testid="usage-limit-card">
       <UsageLimitCard
         state={state}
         connected={ready}
         readOnly={readOnly}
-        onResume={() => actions.resume(state.token)}
-        onResumeAtReset={(enabled) => actions.resumeAtReset(state.token, enabled)}
+        onResume={() => guarded((options) => actions.resume(state.token, options))}
+        onResumeAtReset={(enabled) => guarded((options) => actions.resumeAtReset(state.token, enabled, options))}
       />
+      {guard.dialog}
     </div>
   );
 }

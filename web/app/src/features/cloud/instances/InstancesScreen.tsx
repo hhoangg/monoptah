@@ -98,7 +98,11 @@ export function InstancesScreen({ desktopId }: { desktopId: string }) {
           </Button>
         </Notice>
       ) : null}
-      {instances.length === 0 ? (
+      {instances.length === 0 && query.data.loading === true && !paused ? (
+        <div className="flex min-h-13 items-center justify-center py-2">
+          <DelayedSpinner label="Loading cloud instances" />
+        </div>
+      ) : instances.length === 0 ? (
         <p data-testid="cloud-empty" className="py-6 text-center text-body text-muted-text">
           No cloud instances yet. Instances appear here when a session runs in the cloud.
         </p>

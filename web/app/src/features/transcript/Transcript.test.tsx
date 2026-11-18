@@ -65,6 +65,78 @@ describe("windowing and the end (F-32)", () => {
   });
 });
 
+describe("anchoring the latest user message (F-32)", () => {
+  const userTurn = (id: string): Turn => ({ id, items: [{ type: "user", id: `${id}:u`, text: `Question ${id}` }] });
+  const pendingTurn = (id = "pending:1"): OptimisticTurn => ({ id, text: "Question sent here", at: 1, attachments: 0, status: "sending", baseline: 0 });
+  const REST = 8;
+  const end = () => scroller().scrollHeight - VIEW;
+
+  it("a message sent here rests near the top with blank room below it, and the reply grows into that room first", async () => {
+    const { rerender } = render(<Transcript turns={turns(0, 20)} />);
+    await screen.findByText("Reply number 19");
+    rerender(<Transcript turns={turns(0, 20)} optimistic={[pendingTurn()]} />);
+    await screen.findByText("Question sent here");
+    const anchored = rowStart("pending:1") - REST;
+    await waitFor(() => expect(scroller().scrollTop).toBe(anchored));
+    // The room below is blank: the scroll height reaches past the content, and the anchor is exactly its end.
+    expect(end()).toBe(anchored);
+    expect(scroller().scrollHeight).toBeGreaterThan(rowStart("pending:1") + ROW + 16);
+
+    // The desktop confirms the message and a reply of one row fills part of the room: the message does not move.
+    const confirmed = [...turns(0, 20), userTurn("u1")];
+    rerender(<Transcript turns={confirmed} />);
+    await screen.findByText("Question u1");
+    expect(scroller().scrollTop).toBe(anchored);
+    rerender(<Transcript turns={[...confirmed, turn(21)]} />);
+    await screen.findByText("Reply number 21");
+    expect(scroller().scrollTop).toBe(anchored);
+
+    // Once the reply is taller than the room the list follows the end as usual.
+    rerender(<Transcript turns={[...confirmed, turn(21), turn(22), turn(23), turn(24), turn(25)]} />);
+    await screen.findByText("Reply number 25");
+    await waitFor(() => expect(scroller().scrollTop).toBe(end()));
+    expect(scroller().scrollTop).toBeGreaterThan(anchored);
+  });
+
+  it("the desktop confirming the pending message does not move the anchor", async () => {
+    const { rerender } = render(<Transcript turns={turns(0, 20)} />);
+    await screen.findByText("Reply number 19");
+    rerender(<Transcript turns={turns(0, 20)} optimistic={[pendingTurn()]} />);
+    await screen.findByText("Question sent here");
+    await waitFor(() => expect(scroller().scrollTop).toBe(rowStart("pending:1") - REST));
+    const anchored = scroller().scrollTop;
+    rerender(<Transcript turns={[...turns(0, 20), userTurn("u1")]} />);
+    await screen.findByText("Question u1");
+    expect(scroller().scrollTop).toBe(anchored);
+    expect(rowStart("u1") - REST).toBe(anchored);
+  });
+
+  it("a message the reader sends goes to the anchor even from far up the history", async () => {
+    const { rerender } = render(<Transcript turns={turns(0, 20)} />);
+    await screen.findByText("Reply number 19");
+    scrollTo(500);
+    rerender(<Transcript turns={turns(0, 20)} optimistic={[pendingTurn()]} />);
+    await screen.findByText("Question sent here");
+    // Sending is the user's own action: it goes to the anchor (the sent message is what they want to see).
+    await waitFor(() => expect(scroller().scrollTop).toBe(rowStart("pending:1") - REST));
+  });
+
+  it("opening an idle session lands at the end; opening one that is working anchors its latest user message", async () => {
+    const history = [...turns(0, 18), userTurn("u1"), turn(19)];
+    const idle = render(<Transcript turns={history} />);
+    await screen.findByText("Question u1");
+    await waitFor(() => expect(scroller().scrollTop).toBe(end()));
+    expect(end()).toBe(scroller().scrollHeight - VIEW);
+    expect(rowStart("u1") - REST).not.toBe(scroller().scrollTop);
+    idle.unmount();
+
+    render(<Transcript turns={history} busy />);
+    await screen.findByText("Question u1");
+    await waitFor(() => expect(scroller().scrollTop).toBe(rowStart("u1") - REST));
+    expect(end()).toBe(scroller().scrollTop);
+  });
+});
+
 describe("jump to bottom (F-33)", () => {
   it("appears when the reader is more than 160 px from the end and takes them back", async () => {
     const user = userEvent.setup();
