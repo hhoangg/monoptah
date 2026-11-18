@@ -69,11 +69,17 @@ export interface ComposerProps {
   /** Above the field, inside the card (the workspace menu). */
   topRow?: ReactNode;
   autoFocus?: boolean;
+  /** The draft to start from (a page that was unmounted and comes back), and a report of every change to it. */
+  initialText?: string;
+  onTextChange?: (text: string) => void;
   className?: string;
 }
 
-export function Composer({ onSubmit, busy = false, onStop, readOnly = false, offline = false, notice, toolbar, topRow, autoFocus = false, className }: ComposerProps) {
-  const [text, setText] = useState("");
+export function Composer({ onSubmit, busy = false, onStop, readOnly = false, offline = false, notice, toolbar, topRow, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
+  const [text, setText] = useState(initialText);
+  useEffect(() => {
+    onTextChange?.(text);
+  }, [text, onTextChange]);
   const [attachments, setAttachmentsState] = useState<ComposerAttachment[]>([]);
   // Read by the async picks, which must not merge into a stale list.
   const held = useRef<ComposerAttachment[]>([]);

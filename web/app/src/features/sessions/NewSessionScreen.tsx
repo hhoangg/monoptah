@@ -5,7 +5,7 @@
 // start the page opens the session, or goes back to the project when "Open after starting" is off (F-20).
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { SessionStartTargetSchema, type ParamsOf } from "@monoptah/protocol";
 import { catalogKey, useCatalog, useLinkMutation } from "@/data";
 import { BACKGROUND_CONTAINER_CLASS, EmptySessionBackground } from "@/features/backgrounds";
@@ -29,6 +29,7 @@ import { WorkspaceMenu } from "./WorkspaceMenu";
 import type { Worktree } from "./sessionListFilter";
 import { useReadOnly } from "./WorkspaceFrame";
 import { useRememberPlace } from "./lastPlace";
+import { clearNewSessionDraft, readNewSessionDraft, writeNewSessionDraft } from "./newSessionDraft";
 
 export const EMPTY_HEADLINE = "What should we work on?";
 
@@ -58,7 +59,14 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
   const models = useModelCatalog({ projectId });
   const { defaults, loaded } = useDefaultModels(desktopId);
 
-  const [picked, setPicked] = useState<ModelSelection | null>(null);
+  // The text and the model pick live in a per-project store too, so they outlive this page being unmounted (F-18).
+  const [initialDraft] = useState(() => readNewSessionDraft(desktopId, projectId));
+  const [picked, setPickedState] = useState<ModelSelection | null>(initialDraft.picked);
+  const setPicked = (next: ModelSelection | null) => {
+    setPickedState(next);
+    writeNewSessionDraft(desktopId, projectId, { picked: next });
+  };
+  const rememberText = useCallback((text: string) => writeNewSessionDraft(desktopId, projectId, { text }), [desktopId, projectId]);
   const [worktree, setWorktree] = useState<Worktree | null>(null);
   const [newWorktree, setNewWorktree] = useState(false);
   const [target, setTarget] = useState<unknown>(null);
@@ -90,6 +98,7 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
       ...(newWorktree ? { workspaceMode: "worktree" as const } : {}),
       ...(validTarget ? { target: validTarget } : {}),
     });
+    clearNewSessionDraft(desktopId, projectId);
     void queryClient.invalidateQueries({ queryKey: catalogKey(desktopId) });
     void queryClient.invalidateQueries({ queryKey: ["link", desktopId, "sessions.list"] });
     const sessionId = result.sessionId;
@@ -177,6 +186,8 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
       <div className="mx-auto w-full max-w-[768px] shrink-0 px-2 pb-[env(safe-area-inset-bottom)] min-[24rem]:px-5">
         <Composer
           autoFocus={!embedded}
+          initialText={initialDraft.text}
+          onTextChange={rememberText}
           onSubmit={submit}
           readOnly={readOnly}
           offline={!ready}

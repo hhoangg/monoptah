@@ -103,7 +103,7 @@ export const SPLIT_QUERY = "(min-width: 64rem)";
  * The two project routes, `/p/:projectId` (sessions) and `/p/:projectId/new` (New session). Below 1024 px each is
  * its own page; from 1024 px both show side by side (list left, New session right) on either URL.
  *
- * The New session page is rendered once, always, through a portal into a host element that is moved between the
+ * The New session page is rendered once, while visible, through a portal into a host element that is moved between the
  * full-page slot and the split pane. React sees the same element in the same place on both sides of 1024 px, so
  * a rotation or a window resize keeps the typed draft, the attachments and the chosen model.
  */
@@ -139,8 +139,8 @@ export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string
     <>
       {page === "new" && !split ? null : <ProjectScreen desktopId={desktopId} projectId={projectId} split={split} detailRef={place} />}
       {split ? null : page === "new" ? <div ref={place} /> : null}
-      {/* Always mounted: on the sessions page below 1024 px it stays in the detached host, so a draft typed in the wide side pane survives going narrow and wide again. */}
-      {createPortal(<NewSessionScreen desktopId={desktopId} projectId={projectId} embedded={split || page === "sessions"} />, host)}
+      {/* Mounted only while it can be seen: a phone on the sessions page must not fetch models for it. The draft survives in the per-project store (newSessionDraft.ts). */}
+      {split || page === "new" ? createPortal(<NewSessionScreen desktopId={desktopId} projectId={projectId} embedded={split} />, host) : null}
     </>
   );
 }

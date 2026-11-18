@@ -15,6 +15,7 @@ import { resetSessionActivity } from "./activityStore";
 import { DESKTOP_ID, connectMockDesktop, emptyWorkspace, seedWorkspace, type MockLink, type MockLinkOptions } from "./dev/mockLink";
 import { DRAWER_FILTER_KEY } from "./drawerFilter";
 import { lastPlaceKey } from "./lastPlace";
+import { resetNewSessionDrafts } from "./newSessionDraft";
 
 /** A matchMedia stub: `wide` makes the 640 px query match. */
 function stubMatchMedia(wide: boolean) {
@@ -51,6 +52,7 @@ afterEach(() => {
   clearLinkStores();
   registerPersistAdapter(previous);
   resetSessionActivity();
+  resetNewSessionDrafts();
   clearSlots();
   clearHooks();
   localStorage.clear();
@@ -475,7 +477,7 @@ describe("New session draft on the sessions URL across 1024 px (F-18)", () => {
     setWide(true);
     const again = await screen.findByTestId("project-split");
     const back = within(again).getByRole("textbox", { name: "Message" });
-    expect(back).toBe(field);
+    expect(back).not.toBe(field); // the page was unmounted while narrow; the store gave the draft back
     expect(back).toHaveValue("side pane draft");
   });
 
@@ -493,5 +495,38 @@ describe("New session draft on the sessions URL across 1024 px (F-18)", () => {
     setWide(false);
     await waitFor(() => expect(screen.queryByTestId("project-split")).toBeNull());
     expect(document.activeElement).toBe(field);
+  });
+});
+
+describe("narrow sessions page does not load the New session page (F-18)", () => {
+  function spyRequests() {
+    const methods: string[] = [];
+    const connection = getLinkConnection(DESKTOP_ID);
+    const original = connection.request.bind(connection);
+    connection.request = ((method: string, ...rest: unknown[]) => {
+      methods.push(method);
+      return (original as (...args: unknown[]) => unknown)(method, ...rest);
+    }) as typeof connection.request;
+    return methods;
+  }
+
+  it("sends no models.list or cloud.startOptions on the sessions URL below 1024 px, and does once wide", async () => {
+    stubQueries(["(min-width: 640px)"]);
+    mount("/p/proj-alpha");
+    const methods = spyRequests();
+    await screen.findByRole("heading", { level: 1, name: "Example Alpha" });
+    await within(await screen.findByTestId("sessions-list")).findAllByTestId("session-card");
+    expect(methods).toContain("sessions.list");
+    expect(methods).not.toContain("models.list");
+    expect(methods).not.toContain("cloud.startOptions");
+    expect(screen.queryByTestId("new-session-screen")).toBeNull();
+  });
+
+  it("does ask for models when the New session page is on screen (the spy sees them)", async () => {
+    stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
+    mount("/p/proj-alpha");
+    const methods = spyRequests();
+    await screen.findByTestId("project-split");
+    await waitFor(() => expect(methods).toContain("models.list"));
   });
 });
