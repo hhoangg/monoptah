@@ -250,6 +250,8 @@ describe("forgetDevice", () => {
     expect(result.wasThisDevice).toBe(true);
     expect(keys.forgetDeviceKey).toHaveBeenCalledTimes(1);
     expect(pins.forgetPins).toHaveBeenCalledTimes(1);
+    // Scoped to the forgotten device, never "every pin".
+    expect(pins.forgetPins).toHaveBeenCalledWith("dev1");
   });
 
   it("also clears the persisted cache of every desktop, stops the live links and drops the link queries", async () => {

@@ -231,7 +231,7 @@ async function runAll(steps: Array<() => Promise<unknown> | unknown>): Promise<v
 
 /**
  * Forgets a device: the server revokes every grant of it and deletes its push subscriptions. When it
- * is this browser's own device, the local state goes too: the device key, every pin, the persisted
+ * is this browser's own device, the local state goes too: the device key, the pins of this device, the persisted
  * (encrypted) cache of every desktop, the live link connections and the link queries. A 404 for this
  * browser's own device means an earlier attempt already deleted it on the server (and failed locally),
  * so the local cleanup still runs.
@@ -247,7 +247,7 @@ export async function forgetDevice(queryClient: QueryClient, deviceId: string): 
   const cleanup = wasThisDevice
     ? runAll([
         () => forgetDeviceKey(),
-        () => forgetPins(),
+        () => forgetPins(deviceId),
         () => clearPersistedCache(),
         () => resetLinkConnections(),
         () => queryClient.removeQueries({ queryKey: ["link"] }),

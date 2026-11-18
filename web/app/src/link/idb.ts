@@ -67,6 +67,27 @@ export async function idbClear(store: LinkStore): Promise<void> {
   await run([store], "readwrite", (tx) => request(tx.objectStore(store).clear()));
 }
 
+/** Deletes every record of `store` for which `matches(value)` is true, in one transaction. Resolves with the count. */
+export function idbDeleteWhere<T>(store: LinkStore, matches: (value: T) => boolean): Promise<number> {
+  return run([store], "readwrite", (tx) => {
+    const os = tx.objectStore(store);
+    return new Promise<number>((resolve, reject) => {
+      let removed = 0;
+      const cursor = os.openCursor();
+      cursor.onerror = () => reject(cursor.error ?? new Error("IndexedDB cursor failed"));
+      cursor.onsuccess = () => {
+        const at = cursor.result;
+        if (!at) return resolve(removed);
+        if (matches(at.value as T)) {
+          at.delete();
+          removed += 1;
+        }
+        at.continue();
+      };
+    });
+  });
+}
+
 /** Read-modify-write of one key in a single transaction (no interleaving between read and write). */
 export function idbUpdate<T, R>(store: LinkStore, key: string, fn: (current: T | undefined) => { next?: T; result: R }): Promise<R> {
   return run([store], "readwrite", async (tx) => {
