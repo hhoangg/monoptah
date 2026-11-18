@@ -1,0 +1,39 @@
+/* Copied from src/styles/index.css at ca73ac2b */
+/* The `shimmer-text` rule and its keyframes, retargeted to the design tokens (--content). */
+.shimmer-text {
+  background-image:
+    linear-gradient(
+      90deg,
+      transparent calc(50% - var(--spread)),
+      var(--content) calc(50%),
+      transparent calc(50% + var(--spread))
+    ),
+    linear-gradient(var(--content-a72), var(--content-a72));
+  background-size:
+    250% 100%,
+    auto;
+  background-repeat: no-repeat, padding-box;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: shimmer-text var(--shimmer-duration, 2s) linear infinite;
+}
+
+@keyframes shimmer-text {
+  from {
+    background-position: 100% center;
+  }
+  to {
+    background-position: 0% center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-text {
+    animation: none;
+    background-image: none;
+    background-clip: border-box;
+    -webkit-background-clip: border-box;
+    color: var(--content-a72);
+  }
+}

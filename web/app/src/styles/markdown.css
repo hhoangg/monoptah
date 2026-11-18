@@ -1,0 +1,164 @@
+/* Markdown typography for the AST renderer (features/markdown). Sizes follow the mobile app's
+   Markdown.tsx; colours come from the design tokens. No shadows. Imported by the markdown
+   components, not by styles/index.css. */
+
+.agent-markdown {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  color: var(--content);
+  font-size: 16px;
+  line-height: 24px;
+  overflow-wrap: anywhere;
+}
+.agent-markdown > * { margin: 0; }
+
+.agent-markdown .md-p { margin: 0; }
+.agent-markdown-muted .md-p { color: color-mix(in srgb, var(--content) 65%, transparent); }
+
+.agent-markdown .md-heading { margin: 4px 0 0; font-weight: 600; font-size: 16px; line-height: 24px; }
+.agent-markdown .md-hlarge { font-size: 18px; line-height: 26px; }
+.agent-markdown-muted .md-heading,
+.agent-markdown-muted .md-hlarge {
+  font-size: 14px;
+  line-height: 22px;
+  color: color-mix(in srgb, var(--content) 80%, transparent);
+}
+
+.agent-markdown strong { font-weight: 600; }
+.agent-markdown del { color: var(--muted); }
+
+.agent-markdown .md-link { color: var(--accent-color); text-decoration: none; }
+.agent-markdown .md-link:hover { text-decoration: underline; }
+.agent-markdown .md-link[data-insecure] { text-decoration: underline dotted; }
+.agent-markdown .md-link-blocked { color: inherit; }
+
+.agent-markdown .md-inline-code {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--content) 7%, transparent);
+}
+.agent-markdown .md-file-ref {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: inherit;
+}
+.agent-markdown .md-file-ref .md-file-name { color: var(--accent-color); background: none; padding: 0; }
+.agent-markdown .md-file-icon { display: inline-block; vertical-align: -2px; margin-right: 4px; color: var(--muted); }
+
+.agent-markdown .md-list { margin: 0; padding-inline-start: 1.5rem; display: flex; flex-direction: column; gap: 6px; }
+.agent-markdown .md-list > li { min-width: 0; padding-inline-start: 2px; }
+.agent-markdown .md-list > li::marker { color: var(--muted); }
+.agent-markdown li > .md-list { margin-top: 6px; }
+.agent-markdown li > :not(:first-child) { margin-top: 6px; }
+
+.agent-markdown .md-quote {
+  margin: 0;
+  padding-inline-start: 12px;
+  border-inline-start: 2px solid color-mix(in srgb, var(--content) 20%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.agent-markdown .md-rule { width: 100%; height: 1px; border: 0; margin: 0; background: var(--stroke); }
+
+.agent-markdown .md-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  max-width: 100%;
+}
+.agent-markdown .md-table { border-collapse: collapse; width: 100%; font-size: 14px; line-height: 20px; }
+.agent-markdown .md-table th,
+.agent-markdown .md-table td { min-width: 140px; padding: 6px 10px; text-align: start; vertical-align: top; }
+.agent-markdown .md-table th { font-weight: 600; }
+.agent-markdown .md-table tr + tr > * { border-top: 1px solid var(--stroke); }
+
+/* Code block */
+.agent-markdown .md-code,
+.md-code {
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--content) 5%, transparent);
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.md-code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 6px 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 20px;
+}
+.md-code-lang { font-family: var(--font-mono); text-transform: lowercase; }
+.md-code-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+.md-code-copy:hover { color: var(--content); background: color-mix(in srgb, var(--content) 8%, transparent); }
+.md-code-copy:focus-visible { outline: 2px solid var(--accent-color); outline-offset: -2px; }
+.md-code-body { overflow-x: auto; padding: 4px 12px 12px; }
+.md-code-body pre { margin: 0; }
+.md-code-body code {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 19px;
+  color: color-mix(in srgb, var(--content) 85%, transparent);
+  white-space: pre;
+  tab-size: 2;
+}
+.md-code-line { display: block; }
+.md-code-numbered .md-code-line { counter-increment: md-line; padding-inline-start: 3.2ch; position: relative; }
+.md-code-numbered .md-code-line::before {
+  content: counter(md-line);
+  position: absolute;
+  inset-inline-start: 0;
+  width: 2.2ch;
+  text-align: end;
+  color: var(--faint);
+  user-select: none;
+}
+
+/* Tokens carry two colours (github-light, github-dark); the scheme picks one. */
+.md-token { color: var(--md-tok-light, inherit); }
+:root[data-scheme="dark"] .md-token { color: var(--md-tok-dark, inherit); }
+.md-token-italic { font-style: italic; }
+.md-token-bold { font-weight: 600; }
+.md-token-underline { text-decoration: underline; }
+
+/* Word reveal (U-14): new words fade in over a time that follows the stream's cadence. */
+/* Copied from src/styles/index.css at ca73ac2b */
+/* (@keyframes word-fade-in and the word-fading rule, re-targeted to .md-word) */
+@keyframes word-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+.agent-markdown .md-word {
+  animation: word-fade-in var(--md-fade-ms, 320ms) cubic-bezier(0.33, 0.53, 0.67, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-markdown .md-word { animation: none; }
+}
