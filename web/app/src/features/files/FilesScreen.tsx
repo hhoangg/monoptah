@@ -17,8 +17,8 @@ export function FilesScreen({ desktopId, projectId, path }: { desktopId: string;
   const capabilities = useLinkState((state) => state.capabilities);
   const catalog = useCatalog();
   const project = catalog.data?.projects.find((candidate) => candidate.id === projectId);
-  const kind = useEntryKind(projectId, path);
   const allowed = sessionCan("files", { target: null, desktopCapabilities: capabilities });
+  const kind = useEntryKind(projectId, path, allowed);
 
   return (
     <div className="flex min-h-0 w-full flex-col" data-testid="files-screen">

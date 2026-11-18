@@ -1,7 +1,7 @@
 // F-61: the quick open dialog. Type to find a file (`project.search`, 150 ms debounce, fuzzy ranked),
 // Up/Down move, Enter opens it in the files screen, Esc closes. A dialog from 640px, a sheet below.
 import { useNavigate } from "@tanstack/react-router";
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Input } from "@/ui/input";
@@ -28,6 +28,17 @@ function QuickOpenBody({ desktopId, projectId }: { desktopId: string; projectId:
     void navigate({ to: "/d/$desktopId/p/$projectId/files/$", params: { desktopId, projectId, _splat: path } });
   };
 
+  // Enter inside the debounce window must open the top hit of what is typed now, not of the previous query: it
+  // waits until the search of the typed text has answered (a ref, so no state is set in the effect).
+  const enterWaiting = useRef(false);
+  const settled = query === text.trim() && !isPending;
+  useEffect(() => {
+    if (!enterWaiting.current || !settled) return;
+    enterWaiting.current = false;
+    const hit = hits[0];
+    if (hit) open(hit.path);
+  });
+
   return (
     <div className="flex flex-col gap-2">
       <Input
@@ -51,11 +62,14 @@ function QuickOpenBody({ desktopId, projectId }: { desktopId: string; projectId:
             event.preventDefault();
             setActive((index) => (index - 1 + hits.length) % hits.length);
           } else if (event.key === "Enter") {
-            const hit = hits[active];
-            if (hit) {
-              event.preventDefault();
-              open(hit.path);
+            if (text.trim() === "") return;
+            event.preventDefault();
+            if (!settled) {
+              enterWaiting.current = true;
+              return;
             }
+            const hit = hits[active];
+            if (hit) open(hit.path);
           }
         }}
       />

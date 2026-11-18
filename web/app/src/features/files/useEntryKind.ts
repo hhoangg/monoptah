@@ -5,9 +5,9 @@ import { folderParams, nameOf, parentPath } from "./filePaths";
 
 export type EntryKind = "root" | "folder" | "file" | "loading";
 
-export function useEntryKind(projectId: string, path: string): EntryKind {
-  const parent = useLinkQuery("project.files", folderParams(projectId, parentPath(path)), { enabled: path !== "" });
-  if (path === "") return "root";
+export function useEntryKind(projectId: string, path: string, enabled = true): EntryKind {
+  const parent = useLinkQuery("project.files", folderParams(projectId, parentPath(path)), { enabled: enabled && path !== "" });
+  if (path === "" || !enabled) return "root";
   if (parent.isError) return "file";
   if (!parent.data) return "loading";
   const entry = parent.data.entries.find((candidate) => candidate.name === nameOf(path));

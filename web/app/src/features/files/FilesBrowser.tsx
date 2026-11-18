@@ -34,7 +34,7 @@ export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, l
       <FileTree projectId={projectId} selected={path} onOpenFile={open} className="h-full" />
     </FileSearchPane>
   );
-  const viewer = isFile ? <FileViewer projectId={projectId} path={path} onOpenPath={open} /> : null;
+  const viewer = isFile ? <FileViewer key={path} projectId={projectId} path={path} onOpenPath={open} /> : null;
 
   return (
     <div className="flex h-full min-h-0 flex-col" data-testid="files-browser" data-layout={layout}>

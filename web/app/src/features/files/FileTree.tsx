@@ -1,5 +1,7 @@
 // F-59: the file tree. Folders load lazily when opened (`project.files`), ignored entries are dimmed,
 // the first four root folders are prefetched, and a refresh button re-reads what is loaded (the web has no pull).
+// Keyboard (WAI-ARIA tree): one tab stop (roving tabindex); Up/Down/Home/End move, Right opens a folder or
+// enters it, Left closes it or goes to the parent, Enter and Space open.
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { linkQueryOptions, useLinkQuery } from "@/data";
@@ -31,8 +33,50 @@ interface TreeContext {
   projectId: string;
   expanded: ReadonlySet<string>;
   selected: string;
+  /** The one treeitem in the tab order: the last focused one, else the first of the root. */
+  tabStop: string | null;
+  onFocusItem: (path: string) => void;
   onToggle: (path: string) => void;
   onOpenFile: (path: string) => void;
+}
+
+/** Arrow-key navigation over the visible treeitems of `tree` (a DOM walk: the tree is lazily loaded). */
+function onTreeKeyDown(event: React.KeyboardEvent<HTMLElement>, isDir: boolean, open: boolean, full: string, onToggle: (path: string) => void): void {
+  const tree = event.currentTarget.closest('[role="tree"]');
+  if (!tree || event.altKey || event.ctrlKey || event.metaKey) return;
+  const items = Array.from(tree.querySelectorAll<HTMLElement>('[role="treeitem"]'));
+  const index = items.indexOf(event.currentTarget);
+  const level = Number(event.currentTarget.getAttribute("aria-level"));
+  const go = (item: HTMLElement | undefined) => {
+    event.preventDefault();
+    item?.focus();
+  };
+  switch (event.key) {
+    case "ArrowDown":
+      return go(items[index + 1]);
+    case "ArrowUp":
+      return go(items[index - 1]);
+    case "Home":
+      return go(items[0]);
+    case "End":
+      return go(items[items.length - 1]);
+    case "ArrowRight":
+      if (!isDir) return;
+      if (!open) {
+        event.preventDefault();
+        return onToggle(full);
+      }
+      return go(Number(items[index + 1]?.getAttribute("aria-level")) > level ? items[index + 1] : undefined);
+    case "ArrowLeft":
+      if (isDir && open) {
+        event.preventDefault();
+        return onToggle(full);
+      }
+      for (let i = index - 1; i >= 0; i -= 1) {
+        if (Number(items[i]?.getAttribute("aria-level")) < level) return go(items[i]);
+      }
+      return;
+  }
 }
 
 function Folder({ path, depth, context }: { path: string; depth: number; context: TreeContext }) {
@@ -61,8 +105,9 @@ function Folder({ path, depth, context }: { path: string; depth: number; context
   }
   return (
     <>
-      {entries.map((entry) => {
+      {entries.map((entry, position) => {
         const full = path ? `${path}/${entry.name}` : entry.name;
+        const stop = context.tabStop === null ? path === "" && position === 0 : context.tabStop === full;
         const open = entry.isDir && context.expanded.has(full);
         return (
           <li key={entry.name} role="none">
@@ -74,6 +119,9 @@ function Folder({ path, depth, context }: { path: string; depth: number; context
               aria-selected={!entry.isDir && context.selected === full}
               data-ignored={entry.ignored || undefined}
               data-kind={entry.isDir ? "folder" : "file"}
+              tabIndex={stop ? 0 : -1}
+              onFocus={() => context.onFocusItem(full)}
+              onKeyDown={(event) => onTreeKeyDown(event, entry.isDir, open, full, context.onToggle)}
               onClick={() => (entry.isDir ? context.onToggle(full) : context.onOpenFile(full))}
               className={cn(rowClass, entry.ignored && "opacity-50", !entry.isDir && context.selected === full && "bg-selection")}
               style={{ paddingLeft: depth * 16 + 8 }}
@@ -108,6 +156,7 @@ export function FileTree({ projectId, selected, onOpenFile, className }: FileTre
   const queryClient = useQueryClient();
   const root = useLinkQuery("project.files", folderParams(projectId, ""));
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set(ancestorsOf(selected)));
+  const [tabStop, setTabStop] = useState<string | null>(null);
 
   // Reveal the selected path when it changes (a link, quick open or a search hit): state adjusted while rendering.
   const [revealed, setRevealed] = useState(selected);
@@ -138,12 +187,17 @@ export function FileTree({ projectId, selected, onOpenFile, className }: FileTre
     projectId,
     expanded,
     selected,
-    onToggle: (path) =>
+    tabStop,
+    onFocusItem: setTabStop,
+    onToggle: (path) => {
+      // Closing a folder that holds the tab stop hands the stop to the folder, so the tree stays reachable.
+      if (expanded.has(path)) setTabStop((current) => (current?.startsWith(`${path}/`) ? path : current));
       setExpanded((current) => {
         const next = new Set(current);
         if (!next.delete(path)) next.add(path);
         return next;
-      }),
+      });
+    },
     onOpenFile,
   };
 

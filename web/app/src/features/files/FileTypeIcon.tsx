@@ -1,5 +1,5 @@
 // Copied from src/features/files/ui/FileTypeIcon.tsx at c579af2e
-// (the Material icon pack and its dangerouslySetInnerHTML SVG sink are replaced
+// (the Material icon pack and its raw SVG markup injection are replaced
 // by hugeicons through @/ui/Icon; the name -> kind logic lives in @/lib/fileKind).
 /**
  * `<FileTypeIcon name isDir isOpen? size? />` renders a decorative (aria-hidden)
