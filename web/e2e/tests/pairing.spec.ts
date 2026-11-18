@@ -1,8 +1,8 @@
 // E-01 acceptance smoke: register, pair the headless desktop, confirm a device, read a catalog.
 //
 // Test 1 runs now: the headless desktop plays the desktop side of the pairing (`pair`, architecture.md 6.4) and an
-// account registered with the virtual authenticator approves its user code through the API (the WS-S /pair/:code
-// page is still a RouteStub, so the API is used and the approval is checked against the same data the page shows).
+// account registered with the virtual authenticator approves its user code through the API (the /pair/:code page is
+// driven in tests/w14-flows.spec.ts; here the API keeps this smoke independent of the UI).
 // Test 2 serves the paired desktop (`serve --confirm-pending`), confirms a browser device and reads the catalog.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";

@@ -4,52 +4,12 @@
 // zoom (emulated, see VIEWPORTS in lib/w14-ui.ts), no horizontal overflow, the key control visible, and axe
 // (wcag2a, wcag2aa) with zero violations of impact serious or critical. Screenshots go to <output>/w14-visual and are
 // reviewed by eye; there are no committed pixel baselines. Keyboard checks follow in the last tests.
-import type { Locator, Page } from "@playwright/test";
-import { join } from "node:path";
+import type { Page } from "@playwright/test";
 import { namedInvite } from "../lib/env.ts";
 import { test, expect } from "../lib/fixtures.ts";
 import { probePair } from "../lib/probes.ts";
 import { startPairing, type PendingPairing } from "../lib/w14-headless.ts";
-import {
-  applyViewport,
-  axeSeriousViolations,
-  expectNoHorizontalOverflow,
-  focusIsVisible,
-  openIn,
-  registerThroughUi,
-  resetViewport,
-  VIEWPORTS,
-  visualDir,
-  type Scheme,
-} from "../lib/w14-ui.ts";
-
-const SCHEMES: Scheme[] = ["light", "dark"];
-
-interface Screen {
-  name: string;
-  path: string;
-  /** What must be visible on the screen: its primary control or heading. */
-  key: (page: Page) => Locator;
-}
-
-async function checkScreen(page: Page, screen: Screen): Promise<void> {
-  for (const scheme of SCHEMES) {
-    await resetViewport(page);
-    await openIn(page, screen.path, scheme);
-    // axe runs once per theme at the desktop width, before the viewport emulation changes anything.
-    await expect(screen.key(page).first(), `${screen.name} ${scheme}: key control`).toBeVisible();
-    const violations = await axeSeriousViolations(page);
-    expect(violations, `${screen.name} ${scheme}: axe serious or critical violations`).toEqual([]);
-    for (const viewport of VIEWPORTS) {
-      await applyViewport(page, viewport);
-      const label = `${screen.name} ${scheme} ${viewport.name}`;
-      await expect(screen.key(page).first(), `${label}: key control`).toBeVisible();
-      await expectNoHorizontalOverflow(page, label);
-      await page.screenshot({ path: join(visualDir(), `${screen.name}-${scheme}-${viewport.name}.png`), fullPage: true });
-    }
-  }
-  await resetViewport(page);
-}
+import { checkScreen, focusIsVisible, registerThroughUi, type Screen } from "../lib/w14-ui.ts";
 
 // Visits `path`, tabs through the page and returns the accessible names of what got focus, in order.
 async function tabThrough(page: Page, path: string, primary: RegExp): Promise<void> {

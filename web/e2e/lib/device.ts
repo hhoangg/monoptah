@@ -1,7 +1,7 @@
 // The device (browser) half of the pairing spec, played from the Playwright test process with the TypeScript device
-// client of web/mock-desktop (`@monoptah/mock-desktop/test-client`). The app has no route that renders a catalog yet
-// (WS-M desktop pages are stubs), so the app's own link client cannot be driven from a page. The e2e package has no
-// workspace link to mock-desktop (and `pnpm add` is not allowed for this task), so the sources are imported by path.
+// client of web/mock-desktop (`@monoptah/mock-desktop/test-client`). The UI flows (tests/w14-flows.spec.ts) use the
+// app's own link client in the page; this client serves the protocol-level specs that need raw frames and tokens. The
+// e2e package has no workspace link to mock-desktop, so the sources are imported by path.
 import type { FrameSocket } from "../../mock-desktop/src/transport.ts";
 import { TestClient } from "../../mock-desktop/src/client.ts";
 import { generateKeyPair, type KeyPair } from "../../mock-desktop/src/noise.ts";

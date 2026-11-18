@@ -1,6 +1,6 @@
 // W-14 helpers: UI registration, theme, viewports, overflow check, axe scan. Shared by tests/w14-*.spec.ts.
 import AxeBuilder from "@axe-core/playwright";
-import type { Page } from "@playwright/test";
+import type { Locator, Page } from "@playwright/test";
 import { expect } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -117,4 +117,35 @@ export async function focusIsVisible(page: Page): Promise<boolean> {
     const ring = style.boxShadow !== "none" && style.boxShadow !== "";
     return outline || ring;
   });
+}
+
+export const SCHEMES: Scheme[] = ["light", "dark"];
+
+export interface Screen {
+  name: string;
+  path: string;
+  /** What must be visible on the screen: its primary control or heading. */
+  key: (page: Page) => Locator;
+  /** Optional: content that must be visible before axe and the screenshots run (a transcript or list that loads over the link). */
+  ready?: (page: Page) => Locator;
+}
+
+export async function checkScreen(page: Page, screen: Screen): Promise<void> {
+  for (const scheme of SCHEMES) {
+    await resetViewport(page);
+    await openIn(page, screen.path, scheme);
+    // axe runs once per theme at the desktop width, before the viewport emulation changes anything.
+    await expect(screen.key(page).first(), `${screen.name} ${scheme}: key control`).toBeVisible();
+    if (screen.ready) await expect(screen.ready(page).first(), `${screen.name} ${scheme}: content loaded`).toBeVisible({ timeout: 30_000 });
+    const violations = await axeSeriousViolations(page);
+    expect(violations, `${screen.name} ${scheme}: axe serious or critical violations`).toEqual([]);
+    for (const viewport of VIEWPORTS) {
+      await applyViewport(page, viewport);
+      const label = `${screen.name} ${scheme} ${viewport.name}`;
+      await expect(screen.key(page).first(), `${label}: key control`).toBeVisible();
+      await expectNoHorizontalOverflow(page, label);
+      await page.screenshot({ path: join(visualDir(), `${screen.name}-${scheme}-${viewport.name}.png`), fullPage: true });
+    }
+  }
+  await resetViewport(page);
 }
