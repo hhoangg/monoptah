@@ -1807,6 +1807,18 @@ impl MobileHost {
         Ok(())
     }
 
+    /// The project id of a session in the last published catalog, for the
+    /// web push notice. One lock, no I/O.
+    pub(crate) fn catalog_session_project(&self, session_id: &str) -> Option<String> {
+        let inner = self.inner.lock().ok()?;
+        inner.catalog["sessions"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(session_id))
+            .and_then(|entry| entry["projectId"].as_str())
+            .map(str::to_owned)
+    }
+
     /// The projects and Monos of the last published catalog as `(id, name)`
     /// pairs in catalog order (the `id` and `name` fields the app writes in
     /// `shell/mobile_host.rs`; the ids are what `Device.projects` and
