@@ -62,19 +62,19 @@ pub(in crate::settings) struct MobileState {
     away: bool,
     remote: Option<Entity<Input>>,
     qr: Option<(String, Arc<Qr>)>,
-    poll: Option<Task<()>>,
+    pub(in crate::settings) poll: Option<Task<()>>,
     _remote_events: Vec<Subscription>,
 }
 
 /// A QR code's modules, row by row, without the quiet zone.
 #[derive(Debug, PartialEq)]
-pub(super) struct Qr {
+pub(in crate::settings) struct Qr {
     width: usize,
     dark: Vec<bool>,
 }
 
 /// The QR code phones scan; low error correction keeps the modules large.
-pub(super) fn qr(text: &str) -> Option<Qr> {
+pub(in crate::settings) fn qr(text: &str) -> Option<Qr> {
     let code =
         qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::L).ok()?;
     Some(Qr {
@@ -134,7 +134,7 @@ impl SettingsView {
                         this.mobile.known = None;
                         cx.notify();
                     }
-                    if this.ctx.mobile_invite.is_some() {
+                    if this.ctx.mobile_invite.is_some() || this.ctx.web_pairing.is_some() {
                         cx.notify();
                     }
                     cx.emit(SettingsEvent::MobileRefresh);
@@ -154,6 +154,7 @@ impl SettingsView {
         if self.ctx.mobile_invite.is_some() {
             cx.emit(SettingsEvent::MobileCancelInvite);
         }
+        self.leave_web_app(cx);
         self.mobile.known = None;
         self.mobile.pairing = None;
         self.mobile.removing = None;
@@ -164,6 +165,9 @@ impl SettingsView {
     pub(in crate::settings) fn dismiss_mobile(&mut self, cx: &mut Context<Self>) -> bool {
         if self.section != Section::Connections {
             return false;
+        }
+        if self.dismiss_web_app(cx) {
+            return true;
         }
         if self.ctx.mobile_invite.is_some() {
             self.close_invite(cx);
@@ -808,7 +812,8 @@ impl SettingsView {
     /// PairPhoneDialog.tsx, presented by Shell alongside the other window
     /// overlays so its scrim and centering cover the entire viewport.
     pub(crate) fn mobile_overlay_open(&self) -> bool {
-        self.section == Section::Connections && self.ctx.mobile_invite.is_some()
+        self.section == Section::Connections
+            && (self.ctx.mobile_invite.is_some() || self.web_overlay_open())
     }
 
     pub(crate) fn mobile_overlay(
@@ -818,6 +823,9 @@ impl SettingsView {
     ) -> Option<AnyElement> {
         if !self.mobile_overlay_open() {
             return None;
+        }
+        if self.ctx.mobile_invite.is_none() {
+            return self.web_overlay(window, cx);
         }
         let invite = self.ctx.mobile_invite.clone()?;
         let left = invite.expires.saturating_sub(now());
@@ -1164,7 +1172,7 @@ fn expired_qr_blur() -> impl IntoElement {
 
 /// Dark modules on white with the same two-module quiet zone as React's
 /// QRCode.toDataURL. All edges land on device pixels so cameras see crisp ink.
-fn qr_canvas(qr: Arc<Qr>) -> impl IntoElement {
+pub(super) fn qr_canvas(qr: Arc<Qr>) -> impl IntoElement {
     canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {

@@ -80,6 +80,9 @@ impl Shell {
             remote: Some(self.remote.clone()),
             mobile: self.mobile_status(),
             mobile_invite: self.mobile.invite.clone(),
+            web: self.web_status(),
+            web_pairing: self.web_pairing(cx),
+            web_notice: self.web_notice(cx),
             quick_error: self.quick.error.clone(),
             inbox_connections: self
                 .inbox
@@ -296,6 +299,13 @@ impl Shell {
                 SettingsEvent::MobilePair => this.pair_mobile(cx),
                 SettingsEvent::MobileCancelInvite => this.mobile_cancel_invite(cx),
                 SettingsEvent::MobileRevoke(id) => this.mobile_revoke(id, cx),
+                SettingsEvent::WebPair { .. }
+                | SettingsEvent::WebCancelPair
+                | SettingsEvent::WebUnpair
+                | SettingsEvent::WebDenyDevice(_)
+                | SettingsEvent::WebSetPermission { .. }
+                | SettingsEvent::WebRevokeDevice(_)
+                | SettingsEvent::WebAnswerRequest { .. } => this.web_settings_event(event, cx),
             },
         ));
         // This dialog is painted at the window root, like React's portal.
@@ -446,6 +456,8 @@ impl Shell {
         self.settings = None;
         self.settings_events = None;
         self.settings_overlay_watch = None;
+        // A web pairing code nobody can see should not stay usable either.
+        self.web_cancel_pair(cx);
         // A code nobody can see should not stay usable.
         if self.mobile.invite.is_some() {
             self.mobile_cancel_invite(cx);
