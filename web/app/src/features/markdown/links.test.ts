@@ -12,6 +12,7 @@ describe("classifyLink", () => {
     expect(classifyLink("http://a.dev")).toMatchObject({ kind: "external", insecure: true });
     expect(classifyLink("mailto:me@a.dev")).toMatchObject({ kind: "mailto" });
     expect(classifyLink("/d/abc/s/1")).toEqual({ kind: "internal", href: "/d/abc/s/1" });
+    expect(classifyLink("/d/abc/s/1?x=1#top")).toEqual({ kind: "internal", href: "/d/abc/s/1?x=1#top" });
   });
 
   it.each([
@@ -41,6 +42,11 @@ describe("classifyLink", () => {
     "#fragment",
     "/etc/passwd",
     "/d/../../x",
+    "/d/%2e%2e/pair/CODE#fp=abc",
+    "/d/.%2E/settings",
+    "/d/%2e./x",
+    "/d/%2E%2E/%2e%2e/login",
+    "/d/a/%2fb",
     "",
   ])("rejects %j", (href) => {
     expect(classifyLink(href)).toBeNull();

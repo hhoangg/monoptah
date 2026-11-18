@@ -1,5 +1,5 @@
-// Adapted from src/features/files/model/markdownFileLinks.ts at ca73ac2b (file reference rules)
-// and mobile/src/features/sessions/Markdown.tsx `inlineFileName`. Works on AST text, not on
+// Copied from src/features/files/model/markdownFileLinks.ts at ca73ac2b
+// Adapted: the file reference rules, plus mobile/src/features/sessions/Markdown.tsx `inlineFileName`. Works on AST text, not on
 // a remark tree. A minimal local path helper: swap for `@/lib/paths` when that lands.
 
 export interface FileReference {

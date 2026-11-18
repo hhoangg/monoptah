@@ -284,7 +284,8 @@ function sticky(pattern: RegExp, text: string, index: number): RegExpExecArray |
   return pattern.exec(text);
 }
 
-export function parseInline(text: string, depth = 0): Inline[] {
+/** `inLink`: the text is a link's label, where a bare URL is not turned into a second (nested) link. */
+export function parseInline(text: string, depth = 0, inLink = false): Inline[] {
   if (depth === 0) scanBudget = MAX_SCAN_STEPS;
   if (depth > MAX_DEPTH) return text ? [{ type: "text", text }] : [];
   const out: Inline[] = [];
@@ -312,12 +313,16 @@ export function parseInline(text: string, depth = 0): Inline[] {
         index = close + ticks.length;
         continue;
       }
+      // No matching close: the whole run is literal text (as in CommonMark), so a long run is read once.
+      plain += ticks;
+      index = run;
+      continue;
     }
     if (char === "[") {
       const link = sticky(LINK, text, index);
       if (link) {
         flush();
-        out.push({ type: "link", href: link[2] ?? "", children: parseInline(link[1] ?? "", depth + 1) });
+        out.push({ type: "link", href: link[2] ?? "", children: parseInline(link[1] ?? "", depth + 1, true) });
         index += link[0].length;
         continue;
       }
@@ -332,6 +337,7 @@ export function parseInline(text: string, depth = 0): Inline[] {
       }
     }
     if (
+      !inLink &&
       char === "h" &&
       /^https?:\/\//.test(text.slice(index, index + 8)) &&
       !/\w/.test(text[index - 1] ?? "")
@@ -360,7 +366,7 @@ export function parseInline(text: string, depth = 0): Inline[] {
       const close = opens ? findClose(text, mark, index + mark.length) : -1;
       if (close > 0) {
         flush();
-        out.push({ type, children: parseInline(text.slice(index + mark.length, close), depth + 1) });
+        out.push({ type, children: parseInline(text.slice(index + mark.length, close), depth + 1, inLink) });
         index = close + mark.length;
         continue;
       }

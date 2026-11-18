@@ -72,7 +72,8 @@ function QuestionFormBody({ prompt, onReply, onKeepOpen, disabledReason, classNa
   );
 
   const interact = () => {
-    if (prompt.autoResolveAt == null || !onKeepOpen || keptOpen.current) return;
+    // A read-only device cannot answer, so it does not hold the question open either.
+    if (readOnly || prompt.autoResolveAt == null || !onKeepOpen || keptOpen.current) return;
     keptOpen.current = true;
     // A later touch can retry after a failure; never duplicate a request still in flight.
     const retry = () => {

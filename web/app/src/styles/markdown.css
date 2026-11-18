@@ -2,6 +2,8 @@
    Markdown.tsx; colours come from the design tokens. No shadows. Imported by the markdown
    components, not by styles/index.css. */
 
+/* Copied from src/styles/index.css at ca73ac2b */
+/* (the .agent-markdown spacing rules, restyled to the design tokens) */
 .agent-markdown {
   display: flex;
   flex-direction: column;

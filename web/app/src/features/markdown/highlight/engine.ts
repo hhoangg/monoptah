@@ -13,7 +13,8 @@ import {
 
 const MAX_ENTRIES = 100;
 const MAX_CACHED_CHARS = 500_000;
-const MAX_LINE_LENGTH = 2_000;
+// Grammars can backtrack badly, and the cost grows faster than the line: long lines stay plain text.
+const MAX_LINE_LENGTH = 400;
 
 const THEMES = { light: "github-light", dark: "github-dark" } as const;
 

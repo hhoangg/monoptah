@@ -6,6 +6,7 @@ import { Icon } from "@/ui/Icon";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import "@/styles/markdown.css";
 import { CodeBlock } from "./CodeBlock";
+import { ExternalLink, inlineText } from "./ExternalLink";
 import { inlineFileReference } from "./fileLinks";
 import { classifyLink } from "./links";
 import {
@@ -330,16 +331,9 @@ function renderInline(node: Inline, fade: Fade | undefined, handlers: Handlers):
           );
         case "external":
           return (
-            <a
-              className="md-link"
-              href={target.href}
-              target="_blank"
-              rel="noopener noreferrer nofollow"
-              data-insecure={target.insecure || undefined}
-              title={target.insecure ? "Not encrypted (http)" : undefined}
-            >
+            <ExternalLink href={target.href} insecure={target.insecure} label={inlineText(node.children)}>
               {children}
-            </a>
+            </ExternalLink>
           );
       }
     }

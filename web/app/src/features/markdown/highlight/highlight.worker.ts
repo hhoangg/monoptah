@@ -14,3 +14,6 @@ self.onmessage = async ({ data }: MessageEvent<{ id: number; request: HighlightR
     self.postMessage({ id: data.id, error: String(error) });
   }
 };
+
+// Tells the page the engine is loaded, so the page's time limit counts the job and not the download.
+self.postMessage({ ready: true });

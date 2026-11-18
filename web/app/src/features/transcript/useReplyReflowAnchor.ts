@@ -21,7 +21,8 @@ export function useReplyReflowAnchor(
   // change before it returns. Keep the character as well as the scroll offset.
   const retained = useRef<Anchor | undefined>(undefined);
   useLayoutEffect(() => {
-    if (!visible || !scroller) return;
+    // Without ResizeObserver (old engines, jsdom) there is nothing to observe the reflow with.
+    if (!visible || !scroller || typeof ResizeObserver === "undefined") return;
     let width = scroller.clientWidth;
     let anchor = following.current ? undefined : retained.current;
     let frame = 0;

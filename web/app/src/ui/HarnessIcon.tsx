@@ -6,6 +6,7 @@ import type { Harness } from "@monoptah/protocol";
 import { cn } from "@/lib/utils";
 import antigravity from "@/assets/providers/antigravity.svg";
 import claude from "@/assets/providers/claude.svg";
+import providerNotice from "@/assets/providers/NOTICE?raw";
 import codex from "@/assets/providers/codex.svg";
 import cursor from "@/assets/providers/cursor.svg";
 import devin from "@/assets/providers/devin.svg";
@@ -15,6 +16,18 @@ import hermes from "@/assets/providers/hermes.svg";
 import omp from "@/assets/providers/omp.svg";
 import opencode from "@/assets/providers/opencode.svg";
 import pi from "@/assets/providers/pi.svg";
+
+/** The trademark note for the provider marks. It is rendered (see `ProviderNotice`), so it ships with the built app. */
+export const PROVIDER_NOTICE: string = providerNotice.trim();
+
+/** The provider trademark note as small print, shown where the marks are listed (the model picker). */
+export function ProviderNotice({ className }: { className?: string }) {
+  return (
+    <p data-testid="provider-notice" className={cn("text-meta text-faint", className)}>
+      {PROVIDER_NOTICE}
+    </p>
+  );
+}
 
 export const HARNESS_ICONS: Record<Harness, string> = {
   claude,

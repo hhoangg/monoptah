@@ -1,12 +1,13 @@
-// Route stub of /d/:desktopId. Owner: WS-T (workstreams.md 3.1).
+// `/d/:desktopId`: the catalog home of one desktop (W-06, F-14). Owner: WS-T (workstreams.md 3.1).
 import { createFileRoute } from "@tanstack/react-router";
-import { RouteStub } from "@/ui/RouteStub";
+import "@/features/sessions/register";
+import { HomeScreen } from "@/features/sessions/screens";
 
 export const Route = createFileRoute("/d/$desktopId/")({
   component: Page,
 });
 
 function Page() {
-  const params = Route.useParams();
-  return <RouteStub route="/d/:desktopId" purpose="Home for one desktop: projects and recent sessions (catalog)." params={params} />;
+  const { desktopId } = Route.useParams();
+  return <HomeScreen desktopId={desktopId} />;
 }
