@@ -1,6 +1,7 @@
 // The two WS-T screens of W-06: the catalog home of a desktop and the project's sessions list.
 import { Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { useCallback, useState } from "react";
+import { createPortal } from "react-dom";
 import { useCatalog } from "@/data";
 import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
@@ -101,15 +102,43 @@ export const SPLIT_QUERY = "(min-width: 64rem)";
 /**
  * The two project routes, `/p/:projectId` (sessions) and `/p/:projectId/new` (New session). Below 1024 px each is
  * its own page; from 1024 px both show side by side (list left, New session right) on either URL.
+ *
+ * The New session page is rendered once, through a portal into a host element that is moved between the
+ * full-page slot and the split pane. React sees the same element in the same place on both sides of 1024 px, so
+ * a rotation or a window resize keeps the typed draft, the attachments and the chosen model.
  */
 export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string; projectId: string; page: "sessions" | "new" }) {
   const split = useMediaQuery(SPLIT_QUERY);
-  if (page === "new" && !split) return <NewSessionScreen desktopId={desktopId} projectId={projectId} />;
-  return <ProjectScreen desktopId={desktopId} projectId={projectId} split={split} />;
+  const [host] = useState(() => document.createElement("div"));
+  const place = useCallback(
+    (element: HTMLElement | null) => {
+      if (element && host.parentElement !== element) element.appendChild(host);
+    },
+    [host],
+  );
+  const showNew = split || page === "new";
+  return (
+    <>
+      {page === "new" && !split ? null : <ProjectScreen desktopId={desktopId} projectId={projectId} split={split} detailRef={place} />}
+      {split ? null : page === "new" ? <div ref={place} /> : null}
+      {showNew ? createPortal(<NewSessionScreen desktopId={desktopId} projectId={projectId} embedded={split} />, host) : null}
+    </>
+  );
 }
 
 /** `/d/:desktopId/p/:projectId`: the project's sessions list with search and the now-working pill. */
-export function ProjectScreen({ desktopId, projectId, split = false }: { desktopId: string; projectId: string; split?: boolean }) {
+export function ProjectScreen({
+  desktopId,
+  projectId,
+  split = false,
+  detailRef,
+}: {
+  desktopId: string;
+  projectId: string;
+  split?: boolean;
+  /** Where the New session page is placed in the split layout. */
+  detailRef?: (element: HTMLElement | null) => void;
+}) {
   const catalog = useCatalog();
   const readOnly = useReadOnly();
   const [text, setText] = useState("");
@@ -171,9 +200,7 @@ export function ProjectScreen({ desktopId, projectId, split = false }: { desktop
           <NowWorking desktopId={desktopId} projectId={projectId} readOnly={readOnly} />
           </div>
           {split ? (
-            <section aria-label="New session" data-testid="project-split-detail" className="min-w-0">
-              <NewSessionScreen desktopId={desktopId} projectId={projectId} embedded />
-            </section>
+            <section ref={detailRef} aria-label="New session" data-testid="project-split-detail" className="min-w-0" />
           ) : null}
         </div>
       )}

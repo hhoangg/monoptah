@@ -383,3 +383,56 @@ describe("project screen wide layout (F-18, design-system.md section 11)", () =>
     expect(within(split).getByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
   });
 });
+
+describe("New session survives crossing 1024 px (F-18)", () => {
+  /** A matchMedia stub whose 64rem query can be flipped, notifying subscribers like a real window resize. */
+  function flippable(initial: boolean) {
+    let wide = initial;
+    const listeners = new Set<() => void>();
+    window.matchMedia = ((query: string) => ({
+      get matches() {
+        return query === "(min-width: 64rem)" ? wide : query === "(min-width: 640px)";
+      },
+      media: query,
+      onchange: null,
+      addEventListener: (_: string, listener: () => void) => listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) => listeners.delete(listener),
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+    return (next: boolean) => {
+      wide = next;
+      act(() => listeners.forEach((listener) => listener()));
+    };
+  }
+
+  it("keeps the typed draft when a narrow /new page becomes the split layout and back", async () => {
+    const setWide = flippable(false);
+    const user = userEvent.setup();
+    mount("/p/proj-alpha/new");
+    const field = await screen.findByRole("textbox", { name: "Message" });
+    await screen.findByText("Example Alpha");
+    await user.type(field, "keep this draft");
+
+    setWide(true);
+    const split = await screen.findByTestId("project-split");
+    expect(within(split).getByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
+    expect(within(split).getByRole("textbox", { name: "Message" })).toBe(field);
+    expect(field).toHaveValue("keep this draft");
+
+    setWide(false);
+    await waitFor(() => expect(screen.queryByTestId("project-split")).toBeNull());
+    expect(screen.getByRole("textbox", { name: "Message" })).toBe(field);
+    expect(field).toHaveValue("keep this draft");
+    expect(screen.getByTestId("new-session-screen")).not.toHaveAttribute("data-embedded");
+  });
+
+  it("does not move focus into the side pane when the project list opens wide (embedded: no autofocus)", async () => {
+    stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
+    mount("/p/proj-alpha");
+    const split = await screen.findByTestId("project-split");
+    await within(split).findByTestId("new-session-screen");
+    expect(within(split).getByRole("textbox", { name: "Message" })).not.toHaveFocus();
+  });
+});

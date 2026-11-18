@@ -176,7 +176,7 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
 
       <div className="mx-auto w-full max-w-[768px] shrink-0 px-2 pb-[env(safe-area-inset-bottom)] min-[24rem]:px-5">
         <Composer
-          autoFocus
+          autoFocus={!embedded}
           onSubmit={submit}
           readOnly={readOnly}
           offline={!ready}
