@@ -136,6 +136,9 @@ const SCREENS: Record<string, string> = {
   // W-07 (WS-T): the session screen. Without a connected desktop its title is "Session".
   "/d/dk1/s/s9": "Session",
   "/d/:desktopId/s/:sessionId": "Session",
+  // W-08 (WS-T): the new-session page.
+  "/d/dk1/p/p1/new": "New session",
+  "/d/:desktopId/p/:projectId/new": "New session",
 };
 
 async function renderAt(url: string) {

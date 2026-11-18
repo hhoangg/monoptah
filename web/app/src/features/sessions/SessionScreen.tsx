@@ -3,9 +3,11 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
+import { SessionComposer, SessionQuestionCard, SessionUsageCard } from "@/features/composer/SessionComposer";
 import { DocumentDialog } from "@/features/transcript/DocumentDialog";
 import { Transcript } from "@/features/transcript/Transcript";
 import type { TranscriptActions } from "@/features/transcript/context";
+import { latestSessionError } from "@/features/transcript/sessionError";
 import { useOlderTurns } from "@/features/transcript/useOlderTurns";
 import type { DocumentItem } from "@/features/transcript/turnItems";
 import { Badge } from "@/ui/badge";
@@ -14,6 +16,7 @@ import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { ComposerRegion } from "./ComposerRegion";
 import { useRememberPlace } from "./lastPlace";
+import { SessionHeaderMenu } from "./SessionHeaderMenu";
 import { SessionHeaderChipSlot } from "./slots";
 import { useReadOnly } from "./WorkspaceFrame";
 
@@ -27,6 +30,10 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
   const state = conversation.state;
   const older = useOlderTurns(sessionId, state?.turns ?? [], state?.older ?? false);
   const [document, setDocument] = useState<DocumentItem | null>(null);
+  // F-41: the latest error takes the composer's place until it is tapped away (for this run of the screen).
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
+  const error = state ? latestSessionError(state.turns) : undefined;
+  const errorKey = error ? `${state?.turns.at(-1)?.id ?? ""}:${error.text}` : null;
 
   const { send } = conversation;
   const projectId = session?.projectId;
@@ -85,6 +92,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
             </Glass>
           ) : null}
           {session ? <SessionHeaderChipSlot desktopId={desktopId} session={session} /> : null}
+          {session ? <SessionHeaderMenu desktopId={desktopId} session={session} readOnly={readOnly} /> : null}
         </div>
       </header>
 
@@ -107,7 +115,27 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
         actions={actions}
       />
       <DocumentDialog document={document} onClose={() => setDocument(null)} />
-      <ComposerRegion desktopId={desktopId} sessionId={sessionId} />
+      <ComposerRegion
+        desktopId={desktopId}
+        sessionId={sessionId}
+        above={
+          <>
+            {state?.usageLimit ? <SessionUsageCard sessionId={sessionId} state={state.usageLimit} readOnly={readOnly} /> : null}
+            {state?.question ? <SessionQuestionCard sessionId={sessionId} prompt={state.question} readOnly={readOnly} /> : null}
+          </>
+        }
+      >
+        <SessionComposer
+          desktopId={desktopId}
+          sessionId={sessionId}
+          projectId={projectId}
+          session={session}
+          busy={state?.busy ?? false}
+          readOnly={readOnly}
+          send={send}
+          notice={error && errorKey !== dismissedError ? { text: error.text, dismiss: () => setDismissedError(errorKey) } : null}
+        />
+      </ComposerRegion>
     </div>
   );
 }

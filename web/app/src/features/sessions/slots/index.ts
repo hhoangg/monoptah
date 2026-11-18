@@ -1,1 +1,1 @@
-export { ArchiveDialogSlot, ComposerTopSlot, SessionCardBadgeSlot, SessionHeaderChipSlot, SessionMenuItemsSlot } from "./hosts";
+export { ArchiveDialogSlot, ComposerTopSlot, NewSessionTargetSlot, SessionCardBadgeSlot, SessionHeaderChipSlot, SessionMenuItemsSlot } from "./hosts";

@@ -48,3 +48,15 @@ export function ArchiveDialogSlot({
   if (!getSlot("archive-dialog")) return <>{fallback}</>;
   return <Slot name="archive-dialog" desktopId={desktopId} session={session} open={open} onOpenChange={onOpenChange} />;
 }
+
+/** On the new-session page: the target picker (U-18, filled by WS-C). Controlled: `value` and `onChange(target | null)`; null means local. */
+export function NewSessionTargetSlot({
+  desktopId,
+  projectId,
+  value,
+  onChange,
+  fallback = null,
+}: HostProps & { projectId: string; value: unknown; onChange: (target: unknown) => void }) {
+  if (!getSlot("new-session-target")) return <>{fallback}</>;
+  return <Slot name="new-session-target" desktopId={desktopId} projectId={projectId} value={value} onChange={onChange} />;
+}

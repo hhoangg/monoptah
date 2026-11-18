@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ATTACHMENT_LIMIT_COPY,
   AttachmentError,
+  assertFitsRequest,
   MAX_ATTACHMENTS,
   MAX_FILE_BYTES,
   MAX_IMAGE_SIDE,
@@ -161,5 +162,18 @@ describe("attachmentFromFile", () => {
   it("refuses a file over the per-file cap", async () => {
     const huge = new File([new Uint8Array(MAX_FILE_BYTES + 1)], "huge.bin", { type: "application/octet-stream" });
     await expect(attachmentFromFile(huge)).rejects.toThrow(/8 MiB per message/);
+  });
+});
+
+describe("assertFitsRequest", () => {
+  const item = (length: number) => ({ name: "a.bin", mimeType: "application/octet-stream", data: "A".repeat(length) });
+  it("accepts a message well inside the 8 MiB request", () => {
+    expect(() => assertFitsRequest("hello", [item(1024)])).not.toThrow();
+  });
+  it("refuses attachments that fill the whole 8 MiB, which leaves no room for the envelope", () => {
+    expect(() => assertFitsRequest("hi", [item(MAX_TOTAL_BASE64_BYTES)])).toThrow(/too large to send/);
+  });
+  it("counts the text too", () => {
+    expect(() => assertFitsRequest("x".repeat(20_000), [item(MAX_TOTAL_BASE64_BYTES - 10_000)])).toThrow(AttachmentError);
   });
 });

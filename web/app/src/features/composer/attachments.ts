@@ -216,6 +216,22 @@ export function mergeAttachments(
   return next;
 }
 
+/** Room kept for the JSON envelope of the request (method, ids, attachment names and types). */
+export const REQUEST_ENVELOPE_BYTES = 4096;
+
+/**
+ * The link refuses a request over 8 MiB after it is encoded (`too_large`), and the base64 of the files is most of
+ * it. Throws an `AttachmentError` with user-facing text when the text plus the attachments would not fit, so the
+ * user hears it before the send and keeps the draft.
+ */
+export function assertFitsRequest(text: string, attachments: readonly Pick<ComposerAttachment, "data" | "name" | "mimeType">[]): void {
+  const textBytes = new TextEncoder().encode(JSON.stringify(text)).length;
+  const files = attachments.reduce((sum, item) => sum + item.data.length + item.name.length * 6 + item.mimeType.length + 64, 0);
+  if (textBytes + files + REQUEST_ENVELOPE_BYTES > MAX_TOTAL_BASE64_BYTES) {
+    throw new AttachmentError(`This message is too large to send. ${ATTACHMENT_LIMIT_COPY} Remove an attachment or shorten the text and try again.`);
+  }
+}
+
 /** How many more files fit. */
 export function attachmentRoom(existing: readonly unknown[]): number {
   return Math.max(0, MAX_ATTACHMENTS - existing.length);
