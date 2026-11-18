@@ -11,6 +11,8 @@
 //   permission=read       the device is read-only (default control)
 //   empty=1               an empty workspace (the F-14 empty state)
 //   sessions=N&working=N  how many extra sessions the seed adds (default 45) and how many of them work (default 2)
+//   turns=N&tail=N        the long conversation `sess-long` (open it with ?to=/d/<id>/s/sess-long): N turns (default 200),
+//                         the last `tail` (default 24) sent on open and the rest paged in by conversation.older
 // Screenshots: `node /tmp/ws-t/shoot.mjs --url "/d/<id>/p/proj-alpha" --name W-06/project-list` writes the
 // six PNGs (390x844, 768x1024, 1280x800, light and dark) to /tmp/evidence/ws-t/W-06/.
 //
@@ -24,6 +26,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { installMockApi } from "@/features/accounts/mock";
 import "@/styles/index.css";
+import { seedLongSession } from "./longSession";
 import { DESKTOP_ID, connectMockDesktop, emptyWorkspace, seedWorkspace } from "./mockLink";
 
 const params = new URLSearchParams(window.location.search);
@@ -41,7 +44,10 @@ connectMockDesktop({
   permission: params.get("permission") === "read" ? "read" : "control",
   seed: (desktop) => {
     if (params.get("empty") === "1") emptyWorkspace(desktop);
-    else seedWorkspace(desktop, { sessions: count("sessions", 45), working: count("working", 2) });
+    else {
+      seedWorkspace(desktop, { sessions: count("sessions", 45), working: count("working", 2) });
+      seedLongSession(desktop, { total: count("turns", 200), tail: count("tail", 24) });
+    }
   },
 });
 
