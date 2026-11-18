@@ -221,6 +221,8 @@ pub(crate) enum WebPolicyFlag {
     GitPush,
     /// "Remote cloud start" (capability `cloudStart`).
     CloudStart,
+    /// "Remote approvals" (capability `approvals`).
+    Approvals,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

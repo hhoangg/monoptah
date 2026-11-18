@@ -601,6 +601,20 @@ impl SessionTable {
         keys
     }
 
+    /// Every ready session with its device's permission, in key order.
+    pub fn ready_sessions(&self) -> Vec<(SessionKey, policy::Permission)> {
+        let mut ready: Vec<(SessionKey, policy::Permission)> = self
+            .sessions
+            .iter()
+            .filter_map(|(k, s)| match &s.mode {
+                Mode::Ready(device) => Some((*k, device.permission)),
+                Mode::Pending { .. } => None,
+            })
+            .collect();
+        ready.sort_by_key(|(key, _)| *key);
+        ready
+    }
+
     /// Moves a pending session to ready and sends the confirmed state. Does
     /// nothing for a session that is not pending.
     pub fn confirm(&mut self, key: SessionKey, device: Device, now_ms: u64) -> Vec<Action> {
@@ -833,6 +847,37 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(capabilities(&mut h()), json!(["cloud", "cloudStart"]));
+        policy::set_flags(before);
+    }
+
+    /// A toggle change re-sends the state to the ready sessions only, and the
+    /// state they get then lists `approvals` while the toggle is on.
+    #[test]
+    fn ready_sessions_get_a_state_that_follows_the_approvals_toggle() {
+        let _serial = FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = policy::flags();
+        let mut h = h();
+        let dev = Dev::new(3);
+        h.confirmed(&dev);
+        let _ = h.connect(&dev, 7, 1_000);
+        assert_eq!(
+            h.table.ready_sessions(),
+            vec![(dev.key(7), Permission::Read)]
+        );
+        let mode = Mode::Pending { since: 0 };
+        policy::set_flags(PolicyFlags::default());
+        assert_eq!(
+            h.table.state_message(&mode)["capabilities"],
+            json!(["cloud"])
+        );
+        policy::set_flags(PolicyFlags {
+            remote_approvals: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            h.table.state_message(&mode)["capabilities"],
+            json!(["cloud", "approvals"])
+        );
         policy::set_flags(before);
     }
 

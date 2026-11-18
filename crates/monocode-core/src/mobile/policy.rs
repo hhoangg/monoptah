@@ -62,18 +62,19 @@ pub struct PolicyFlags {
     pub remote_git_push: bool,
     /// "Remote cloud start".
     pub remote_cloud_start: bool,
-    /// "Answer approvals from remote devices" (H-08). Only effective while
-    /// [`REMOTE_APPROVALS_ENABLED`] is on as well.
+    /// "Answer approvals from remote devices" (H-08). Effective together with
+    /// [`REMOTE_APPROVALS_ENABLED`].
     pub remote_approvals: bool,
 }
 
 /// The file name of the saved policy settings, next to the mobile config.
 pub const SETTINGS_FILE: &str = "mobile-policy.json";
 
-/// Whether remote devices may answer tool approvals. Stays false until the
-/// U-13 review gate passes (H-08). Even then the desktop's own toggle
-/// (`PolicyFlags::remote_approvals`) must be on: see [`approvals_effective`].
-pub const REMOTE_APPROVALS_ENABLED: bool = false;
+/// Whether remote devices may answer tool approvals. The U-13 review gate
+/// passed on 2026-11-18 (H-08), so this is on. The desktop's own toggle
+/// (`PolicyFlags::remote_approvals`, default off) must be on as well: see
+/// [`approvals_effective`].
+pub const REMOTE_APPROVALS_ENABLED: bool = true;
 
 /// Whether remote approvals are on: the U-13 `gate` AND the desktop toggle.
 pub fn approvals_effective(flags: &PolicyFlags, gate: bool) -> bool {
@@ -1393,6 +1394,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// U-13 passed: the real gate is on, so the desktop toggle decides. Toggle
+    /// off is refused with the existing code, toggle on lets a control device
+    /// answer, and a read device is refused either way.
+    #[test]
+    fn with_the_real_gate_on_the_toggle_decides() {
+        assert!(
+            !PolicyFlags::default().remote_approvals,
+            "the toggle defaults off"
+        );
+        assert!(!approvals_effective(
+            &PolicyFlags::default(),
+            REMOTE_APPROVALS_ENABLED
+        ));
+        let off = PolicyFlags::default();
+        let on = PolicyFlags {
+            remote_approvals: true,
+            ..PolicyFlags::default()
+        };
+        let answer = |device: &DeviceContext, flags: &PolicyFlags| {
+            code(authorize_with(
+                device,
+                "session.answerApproval",
+                &json!({}),
+                flags,
+                REMOTE_APPROVALS_ENABLED,
+            ))
+        };
+        for kind in [DeviceKind::Phone, DeviceKind::Web] {
+            let control = ctx(kind, Permission::Control);
+            let reader = ctx(kind, Permission::Read);
+            assert_eq!(answer(&control, &off), Some(Code::Disabled), "{kind:?}");
+            assert_eq!(answer(&control, &on), None, "{kind:?}");
+            assert_eq!(answer(&reader, &on), Some(Code::ReadOnly), "{kind:?}");
+            assert_eq!(answer(&reader, &off), Some(Code::ReadOnly), "{kind:?}");
+        }
+        assert_eq!(capabilities_with(&off, REMOTE_APPROVALS_ENABLED), ["cloud"]);
+        assert_eq!(
+            capabilities_with(&on, REMOTE_APPROVALS_ENABLED),
+            ["cloud", "approvals"]
+        );
     }
 
     /// M1: saves from several threads never share a temporary file, so each

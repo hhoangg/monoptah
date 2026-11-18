@@ -1,6 +1,6 @@
 //! Permission requests a paired device may answer (H-08). The whole path is
-//! behind `policy::REMOTE_APPROVALS_ENABLED`, which stays false until the U-13
-//! review gate passes, and the desktop's own toggle
+//! behind `policy::REMOTE_APPROVALS_ENABLED` (on since the U-13 review gate
+//! passed) and the desktop's own toggle, which defaults to off
 //! (`PolicyFlags::remote_approvals`): while either is off a device cannot
 //! answer one and sees no approval fields. A request is answered once: the
 //! `(session, requestId)` pair is recorded before the decision is applied.
@@ -185,18 +185,34 @@ pub(crate) fn fields_with(
 pub(crate) fn read_fields(
     shell: &Shell,
     session: i64,
-    _device: &DeviceContext,
+    device: &DeviceContext,
     cx: &App,
 ) -> Map<String, Value> {
-    fields_with(shell, session, policy::approvals_enabled(), cx)
+    device_fields(shell, session, device, cx)
+}
+
+/// The fields for `device`: the list while approvals are on; a web device also gets an
+/// explicit `approvals: []` while they are off, so a card it still shows is cleared.
+fn device_fields(
+    shell: &Shell,
+    session: i64,
+    device: &DeviceContext,
+    cx: &App,
+) -> Map<String, Value> {
+    let enabled = policy::approvals_enabled();
+    let mut fields = fields_with(shell, session, enabled, cx);
+    if !enabled && device.kind == policy::DeviceKind::Web {
+        fields.insert("approvals".into(), Value::Array(Vec::new()));
+    }
+    fields
 }
 
 /// Fields added to a watch frame for a session; see [`read_fields`].
 pub(crate) fn frame_fields(
     shell: &Shell,
     session: i64,
-    _device: &DeviceContext,
+    device: &DeviceContext,
     cx: &App,
 ) -> Map<String, Value> {
-    fields_with(shell, session, policy::approvals_enabled(), cx)
+    device_fields(shell, session, device, cx)
 }

@@ -310,6 +310,8 @@ impl Shell {
                     )
                 });
                 monocode_core::mobile::web_link::resend_state();
+                // Open watches drop an `approvals` or `cloud` field that is now off.
+                this.push_mobile_watches(cx);
                 this.web_set_notice(notice, cx);
             });
         })
@@ -464,6 +466,7 @@ fn with_flag(mut flags: PolicyFlags, flag: WebPolicyFlag, on: bool) -> PolicyFla
     match flag {
         WebPolicyFlag::GitPush => flags.remote_git_push = on,
         WebPolicyFlag::CloudStart => flags.remote_cloud_start = on,
+        WebPolicyFlag::Approvals => flags.remote_approvals = on,
     }
     flags
 }
@@ -533,6 +536,38 @@ mod tests {
         let saved = policy::load_settings(&dir.join(policy::SETTINGS_FILE));
         assert!(saved.flags.remote_git_push && !saved.flags.remote_cloud_start);
         assert_eq!(saved, policy::settings());
+        policy::install_settings(Default::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The approvals toggle defaults off, is saved like the others, and a
+    /// change re-sends the state (`resend_state` runs after the save).
+    #[gpui::test]
+    fn the_approvals_toggle_defaults_off_and_is_saved(cx: &mut gpui::TestAppContext) {
+        let _serial = POLICY.lock().unwrap_or_else(|e| e.into_inner());
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let dir = scratch_dir("approvals");
+        policy::install_settings(Default::default());
+        assert!(!policy::flags().remote_approvals, "off by default");
+        assert!(!policy::approvals_enabled());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.data_dir = Some(dir.clone());
+                shell.web_settings_event(
+                    &SettingsEvent::WebSetPolicyFlag {
+                        flag: WebPolicyFlag::Approvals,
+                        on: true,
+                    },
+                    cx,
+                );
+                assert!(policy::flags().remote_approvals);
+                assert!(policy::approvals_enabled());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let saved = policy::load_settings(&dir.join(policy::SETTINGS_FILE));
+        assert!(saved.flags.remote_approvals);
+        assert!(!saved.flags.remote_git_push && !saved.flags.remote_cloud_start);
         policy::install_settings(Default::default());
         let _ = std::fs::remove_dir_all(&dir);
     }

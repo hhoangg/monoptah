@@ -701,6 +701,18 @@ fn run_command(
         LinkCommand::Deny { fingerprint } | LinkCommand::Revoke { fingerprint } => {
             close_fingerprint(&fingerprint, table, requests, link, now, frames);
         }
+        LinkCommand::ResendAll => {
+            for (key, permission) in table.ready_sessions() {
+                match table.send(key, &confirmed_state(permission), now) {
+                    Ok(sent) => frames.extend(sent),
+                    Err(SendError::Encrypt) => {
+                        frames.push(SessionTable::bye_frame(key));
+                        requests.closed(key);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
         LinkCommand::Resend { fingerprint } => {
             let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
                 return;

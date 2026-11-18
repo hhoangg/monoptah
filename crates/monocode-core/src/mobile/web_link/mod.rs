@@ -122,6 +122,8 @@ pub(crate) enum LinkCommand {
     Revoke { fingerprint: String },
     /// Send a fresh `state` on every live session of `fingerprint`.
     Resend { fingerprint: String },
+    /// Send a fresh `state` on every ready session (a policy toggle changed).
+    ResendAll,
 }
 
 /// The identity facts Settings shows, cached so a refresh reads no database.
@@ -449,7 +451,11 @@ pub(crate) fn sync_with(host: &MobileHost, timing: relay::Timing) {
     };
 }
 
-/// Re-sends the current state (capabilities, selection) on every live web
-/// channel, after a policy toggle changes. Nothing is connected yet.
-#[allow(dead_code)]
-pub fn resend_state() {}
+/// Re-sends the current state (capabilities) on every ready web session,
+/// after a policy toggle changes, so a card appears or goes away without a
+/// reconnect. Does nothing when the web link is not running.
+pub fn resend_state() {
+    if let Some(host) = attached_host() {
+        host.web_link().command(LinkCommand::ResendAll);
+    }
+}

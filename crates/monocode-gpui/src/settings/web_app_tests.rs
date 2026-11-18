@@ -775,18 +775,36 @@ fn the_remote_action_toggles_render_off_and_emit_the_new_state(cx: &mut TestAppC
             let ctx = &preview.settings.read(cx).ctx;
             assert!(!ctx.web_policy.remote_git_push);
             assert!(!ctx.web_policy.remote_cloud_start);
+            assert!(!ctx.web_policy.remote_approvals, "approvals default off");
         })
         .unwrap();
     for selector in [
         "settings-toggle-web-policy-git-push",
         "settings-toggle-web-policy-cloud-start",
+        "settings-toggle-web-policy-approvals",
     ] {
         click(visual, selector);
     }
     assert_eq!(
         events(&window, visual),
-        ["policy:GitPush:true", "policy:CloudStart:true"]
+        [
+            "policy:GitPush:true",
+            "policy:CloudStart:true",
+            "policy:Approvals:true"
+        ]
     );
+}
+
+#[gpui::test]
+fn the_approvals_toggle_that_is_on_emits_off(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(paired());
+        ctx.web_policy.remote_approvals = true;
+    });
+    click(visual, "settings-toggle-web-policy-approvals");
+    assert_eq!(events(&window, visual), ["policy:Approvals:false"]);
 }
 
 #[gpui::test]
