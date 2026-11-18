@@ -12,8 +12,8 @@ use gpui::{EntityId, Task};
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
     mobile::{
-        DeviceContext, Event, Invite, MobileHost, Push, Request, Status, WatchStart, notify, watch,
-        web_link,
+        DeviceContext, Event, Invite, MobileHost, Push, Request, Status, WatchStart, notify,
+        policy, watch, web_link,
     },
     transcript::Row,
 };
@@ -211,6 +211,48 @@ fn string(params: &Value, key: &str) -> Option<String> {
     params[key].as_str().map(str::to_owned)
 }
 
+/// Whether a selection (None means everything) includes `id`.
+fn in_selection(selection: &Option<Vec<String>>, id: &str) -> bool {
+    selection
+        .as_ref()
+        .is_none_or(|list| list.iter().any(|entry| entry == id))
+}
+
+fn not_selected() -> String {
+    policy::Code::NotSelected.message().to_owned()
+}
+
+/// The access mode a remote device asked for, if any. Full access is never
+/// enabled remotely, for any device (H-03).
+fn remote_access(params: &Value) -> Result<Option<AccessMode>, String> {
+    let Some(mode) = params["runtimeMode"].as_str() else {
+        return Ok(None);
+    };
+    if !crate::conversation::mobile_access_modes().any(|(id, ..)| id == mode) {
+        return Ok(None);
+    }
+    match AccessMode::from_id(mode) {
+        AccessMode::FullAccess => Err(policy::Code::Forbidden.message().to_owned()),
+        access => Ok(Some(access)),
+    }
+}
+
+/// The permission modes any remote device may pick: never full access.
+fn remote_runtime_modes() -> Vec<Value> {
+    crate::conversation::mobile_access_modes()
+        .filter(|(id, ..)| *id != AccessMode::FullAccess.id())
+        .map(|(id, label, hint)| json!({"id": id, "label": label, "hint": hint}))
+        .collect()
+}
+
+/// Desktop default access, never full access for a session a remote device starts.
+fn remote_default_access(access: AccessMode) -> AccessMode {
+    match access {
+        AccessMode::FullAccess => AccessMode::Supervised,
+        other => other,
+    }
+}
+
 impl Shell {
     pub(super) fn init_mobile_host(&mut self, cx: &mut Context<Self>) {
         // GPUI's deterministic executor cannot be woken by the link's threads.
@@ -223,6 +265,9 @@ impl Shell {
         else {
             return;
         };
+        if let Some(dir) = path.parent() {
+            policy::install_settings(policy::load_settings(&dir.join(policy::SETTINGS_FILE)));
+        }
         let (host, events) = match MobileHost::open(path) {
             Ok(opened) => opened,
             Err(error) => {
@@ -383,7 +428,15 @@ impl Shell {
         paths
     }
 
-    fn mobile_project_path(&self, id: &str, cx: &App) -> Result<String, String> {
+    fn mobile_project_path(
+        &self,
+        id: &str,
+        device: &DeviceContext,
+        cx: &App,
+    ) -> Result<String, String> {
+        if !in_selection(&device.projects, id) {
+            return Err(not_selected());
+        }
         self.mobile_projects(cx)
             .into_iter()
             .find(|path| project_id(path) == id)
@@ -396,7 +449,11 @@ impl Shell {
         let model = choice
             .model
             .and_then(|model| monocode_core::store::native_model(&model, choice.kind.id()));
-        (choice.kind, model, crate::conversation::default_access(cx))
+        (
+            choice.kind,
+            model,
+            remote_default_access(crate::conversation::default_access(cx)),
+        )
     }
 
     fn mobile_catalog_sessions(&self, paths: &[String], cx: &App) -> Vec<CatalogEntry> {
@@ -637,8 +694,11 @@ impl Shell {
 
     // MARK: requests
 
-    fn mobile_target(&self, id: &str, cx: &App) -> Result<Target, String> {
+    fn mobile_target(&self, id: &str, device: &DeviceContext, cx: &App) -> Result<Target, String> {
         if let Some(mono) = id.strip_prefix("mono:") {
+            if !in_selection(&device.monos, mono) {
+                return Err(not_selected());
+            }
             return self
                 .monos
                 .as_ref()
@@ -655,6 +715,20 @@ impl Shell {
             .or_else(|| locked(&self.store).ok()?.resolve_existing_session_id(id))
             .filter(|id| self.session_summaries.contains_key(id))
             .ok_or("Session is no longer available")?;
+        if device.projects.is_some() {
+            // A session that maps to no project is refused for a narrowed device.
+            let project = self.session_summaries.get(&session).and_then(|summary| {
+                let key = monocode_core::files::path_key(&summary.cwd);
+                self.mobile_projects(cx)
+                    .iter()
+                    .find(|path| monocode_core::files::path_key(path) == key)
+                    .map(|path| project_id(path))
+                    .or_else(|| cloud::catalog_project_of(summary))
+            });
+            if !project.is_some_and(|project| in_selection(&device.projects, &project)) {
+                return Err(not_selected());
+            }
+        }
         Ok(Target::Session(session))
     }
 
@@ -761,11 +835,14 @@ impl Shell {
     /// Project reads run on the background executor against a checked root.
     fn mobile_project(&mut self, request: Request, cx: &mut Context<Self>) {
         let params = request.params.clone();
-        let cwd =
-            match self.mobile_project_path(&string(&params, "projectId").unwrap_or_default(), cx) {
-                Ok(cwd) => cwd,
-                Err(error) => return request.reply(Err(error)),
-            };
+        let cwd = match self.mobile_project_path(
+            &string(&params, "projectId").unwrap_or_default(),
+            &request.device,
+            cx,
+        ) {
+            Ok(cwd) => cwd,
+            Err(error) => return request.reply(Err(error)),
+        };
         let method = request.method.clone();
         let work = cx.background_executor().spawn(async move {
             let cwd = PathBuf::from(cwd);
@@ -805,6 +882,7 @@ impl Shell {
             None => {
                 let cwd = match self.mobile_project_path(
                     &string(&request.params, "projectId").unwrap_or_default(),
+                    &request.device,
                     cx,
                 ) {
                     Ok(cwd) => cwd,
@@ -866,7 +944,7 @@ impl Shell {
     /// older ones before a turn it already has.
     fn mobile_read(&mut self, request: Request, cx: &mut Context<Self>) {
         let conversation = string(&request.params, "conversationId").unwrap_or_default();
-        let target = match self.mobile_target(&conversation, cx) {
+        let target = match self.mobile_target(&conversation, &request.device, cx) {
             Ok(target) => target,
             Err(error) => return request.reply(Err(error)),
         };
@@ -1119,7 +1197,7 @@ impl Shell {
     // MARK: watches
 
     fn start_mobile_watch(&mut self, start: WatchStart, cx: &mut Context<Self>) {
-        let target = match self.mobile_target(&start.conversation_id, cx) {
+        let target = match self.mobile_target(&start.conversation_id, &start.device, cx) {
             Ok(target) => target,
             Err(error) => return start.accept(Err(error)),
         };
@@ -1409,7 +1487,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Value, String> {
         let conversation = string(params, "conversationId").unwrap_or_default();
-        let target = self.mobile_target(&conversation, cx)?;
+        let target = self.mobile_target(&conversation, device, cx)?;
         let reply = json!({"sessionId": conversation});
         match (method, &target) {
             ("session.cancel", Target::Session(id)) => {
@@ -1448,6 +1526,7 @@ impl Shell {
                 Ok(reply)
             }
             ("session.configure", target) => {
+                let access = remote_access(params)?;
                 let view = match target {
                     Target::Session(id) => self.ensure_session(*id, cx),
                     Target::Mono(mono) => self
@@ -1466,12 +1545,6 @@ impl Shell {
                     _ => None,
                 };
                 let settings = model_settings(params);
-                let access = params["runtimeMode"]
-                    .as_str()
-                    .filter(|mode| {
-                        crate::conversation::mobile_access_modes().any(|(id, ..)| id == *mode)
-                    })
-                    .map(AccessMode::from_id);
                 view.update(cx, |v, cx| {
                     v.load(cx);
                     v.mobile_configure(model, &settings, access, cx);
@@ -1548,7 +1621,7 @@ impl Shell {
     ) {
         let conversation = string(&request.params, "conversationId").unwrap_or_default();
         let staged = (|| {
-            let target = self.mobile_target(&conversation, cx)?;
+            let target = self.mobile_target(&conversation, &request.device, cx)?;
             // After the conversation is resolved, so a device cannot wake or
             // start anything for one it may not reach.
             let session = match &target {
@@ -1611,8 +1684,12 @@ impl Shell {
         let params = request.params.clone();
         let prepared = (|| {
             let text = message_text(&params)?;
-            let cwd =
-                self.mobile_project_path(&string(&params, "projectId").unwrap_or_default(), cx)?;
+            let cwd = self.mobile_project_path(
+                &string(&params, "projectId").unwrap_or_default(),
+                &request.device,
+                cx,
+            )?;
+            let requested = remote_access(&params)?;
             // After the project is resolved, so a device cannot start
             // anything in one it may not reach.
             cloud::start_target(self, &request.device, &cwd, &params, cx)?;
@@ -1626,12 +1703,7 @@ impl Shell {
                 string(&params, "model"),
                 default_model,
             );
-            let access = params["runtimeMode"]
-                .as_str()
-                .filter(|mode| {
-                    crate::conversation::mobile_access_modes().any(|(id, ..)| id == *mode)
-                })
-                .map_or(default_access, AccessMode::from_id);
+            let access = requested.unwrap_or(default_access);
             let account = self.mobile_account(kind, &cwd, &params, cx)?;
             Ok::<_, String>((text, cwd, kind, model, access, account))
         })();
@@ -1960,76 +2032,84 @@ impl Shell {
     fn mobile_models(&mut self, request: Request, cx: &mut Context<Self>) {
         let params = request.params.clone();
         let current = match string(&params, "conversationId") {
-            Some(conversation) => self.mobile_target(&conversation, cx).and_then(|target| {
-                let view = match &target {
-                    Target::Session(id) => self.sessions.get(id).cloned(),
-                    Target::Mono(mono) => {
-                        self.monos.as_ref().and_then(|m| m.read(cx).open_chat(mono))
-                    }
-                };
-                match view {
-                    Some(view) => {
-                        let v = view.read(cx);
-                        Ok((
-                            v.summary.cwd.clone(),
-                            Kind::from_id(&v.summary.provider),
-                            v.mobile_model().map(str::to_owned),
-                            v.mobile_model_settings(),
-                            v.settings.access,
-                            Some(v.settings.account.id.clone()),
-                        ))
-                    }
-                    None => match target {
-                        Target::Session(id) => {
-                            let summary = self
-                                .session_summaries
-                                .get(&id)
-                                .ok_or("Session is no longer available")?;
-                            let settings =
-                                locked(&self.store)?.agent_settings(id)?.unwrap_or_default();
-                            Ok((
-                                summary.cwd.clone(),
-                                Kind::from_id(&summary.provider),
-                                settings.model.clone(),
-                                mobile_settings_of(&settings),
-                                settings.access,
-                                Some(settings.account.id.clone()),
-                            ))
-                        }
-                        // Not open here: what its saved conversation runs with.
+            Some(conversation) => self
+                .mobile_target(&conversation, &request.device, cx)
+                .and_then(|target| {
+                    let view = match &target {
+                        Target::Session(id) => self.sessions.get(id).cloned(),
                         Target::Mono(mono) => {
-                            let id = self
-                                .monos
-                                .as_ref()
-                                .and_then(|m| m.read(cx).roster.get(&mono)?.session_id)
-                                .ok_or(
-                                    "This conversation is still opening on desktop; try again",
-                                )?;
-                            let store = locked(&self.store)?;
-                            let (cwd, provider) = match self.session_summaries.get(&id) {
-                                Some(summary) => (summary.cwd.clone(), summary.provider.clone()),
-                                None => store
-                                    .sessions()?
-                                    .into_iter()
-                                    .find(|s| s.id == id)
-                                    .map(|s| (s.cwd, s.provider))
-                                    .ok_or("Session is no longer available")?,
-                            };
-                            let settings = store.agent_settings(id)?.unwrap_or_default();
+                            self.monos.as_ref().and_then(|m| m.read(cx).open_chat(mono))
+                        }
+                    };
+                    match view {
+                        Some(view) => {
+                            let v = view.read(cx);
                             Ok((
-                                cwd,
-                                Kind::from_id(&provider),
-                                settings.model.clone(),
-                                mobile_settings_of(&settings),
-                                settings.access,
-                                Some(settings.account.id.clone()),
+                                v.summary.cwd.clone(),
+                                Kind::from_id(&v.summary.provider),
+                                v.mobile_model().map(str::to_owned),
+                                v.mobile_model_settings(),
+                                v.settings.access,
+                                Some(v.settings.account.id.clone()),
                             ))
                         }
-                    },
-                }
-            }),
+                        None => match target {
+                            Target::Session(id) => {
+                                let summary = self
+                                    .session_summaries
+                                    .get(&id)
+                                    .ok_or("Session is no longer available")?;
+                                let settings =
+                                    locked(&self.store)?.agent_settings(id)?.unwrap_or_default();
+                                Ok((
+                                    summary.cwd.clone(),
+                                    Kind::from_id(&summary.provider),
+                                    settings.model.clone(),
+                                    mobile_settings_of(&settings),
+                                    settings.access,
+                                    Some(settings.account.id.clone()),
+                                ))
+                            }
+                            // Not open here: what its saved conversation runs with.
+                            Target::Mono(mono) => {
+                                let id = self
+                                    .monos
+                                    .as_ref()
+                                    .and_then(|m| m.read(cx).roster.get(&mono)?.session_id)
+                                    .ok_or(
+                                        "This conversation is still opening on desktop; try again",
+                                    )?;
+                                let store = locked(&self.store)?;
+                                let (cwd, provider) = match self.session_summaries.get(&id) {
+                                    Some(summary) => {
+                                        (summary.cwd.clone(), summary.provider.clone())
+                                    }
+                                    None => store
+                                        .sessions()?
+                                        .into_iter()
+                                        .find(|s| s.id == id)
+                                        .map(|s| (s.cwd, s.provider))
+                                        .ok_or("Session is no longer available")?,
+                                };
+                                let settings = store.agent_settings(id)?.unwrap_or_default();
+                                Ok((
+                                    cwd,
+                                    Kind::from_id(&provider),
+                                    settings.model.clone(),
+                                    mobile_settings_of(&settings),
+                                    settings.access,
+                                    Some(settings.account.id.clone()),
+                                ))
+                            }
+                        },
+                    }
+                }),
             None => self
-                .mobile_project_path(&string(&params, "projectId").unwrap_or_default(), cx)
+                .mobile_project_path(
+                    &string(&params, "projectId").unwrap_or_default(),
+                    &request.device,
+                    cx,
+                )
                 .map(|cwd| {
                     let (kind, model, access) = self.mobile_defaults(&cwd, cx);
                     let mut settings = HashMap::new();
@@ -2116,9 +2196,7 @@ impl Shell {
             json!({
                 "harnesses": harnesses.iter().map(|k| json!({"id": k.id(), "label": k.label()})).collect::<Vec<_>>(),
                 "models": models,
-                "runtimeModes": crate::conversation::mobile_access_modes()
-                    .map(|(id, label, hint)| json!({"id": id, "label": label, "hint": hint}))
-                    .collect::<Vec<_>>(),
+                "runtimeModes": remote_runtime_modes(),
                 "accounts": accounts,
                 "selectedAccounts": selected,
                 "current": current,
@@ -2136,6 +2214,9 @@ impl Shell {
         let id = string(&request.params, "documentId").unwrap_or_default();
         let listed = self.monos.as_ref().and_then(|monos| {
             monos.read(cx).roster.monos.iter().find_map(|mono| {
+                if !in_selection(&request.device.monos, &mono.id) {
+                    return None;
+                }
                 let document = mono.documents.iter().find(|d| d.id == id);
                 (document.is_some() || mono.desktop_document_ids.contains(&id))
                     .then(|| document.cloned())
@@ -2177,6 +2258,9 @@ impl Shell {
     /// A Mono's details for the phone's profile, or a change to its look.
     fn mobile_mono(&mut self, request: Request, cx: &mut Context<Self>) {
         let id = string(&request.params, "monoId").unwrap_or_default();
+        if request.method != "mono.create" && !in_selection(&request.device.monos, &id) {
+            return request.reply(Err(not_selected()));
+        }
         let Some(monos) = self.monos.clone() else {
             return request.reply(Err("Mono is no longer available".into()));
         };
@@ -2197,7 +2281,7 @@ impl Shell {
             // Projects come as the phone's IDs; the roster keeps paths.
             let mut params = request.params.clone();
             if let Some(add) = string(&request.params, "addProject") {
-                match self.mobile_project_path(&add, cx) {
+                match self.mobile_project_path(&add, &request.device, cx) {
                     Ok(path) => params["addPath"] = json!(path),
                     Err(error) => return request.reply(Err(error)),
                 }
@@ -2239,6 +2323,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let id = string(&request.params, "monoId").unwrap_or_default();
+        if !in_selection(&request.device.monos, &id) {
+            return finish(self, request, Err(not_selected()));
+        }
         let Some(monos) = self.monos.clone() else {
             return finish(self, request, Err("Mono is no longer available".into()));
         };
@@ -2276,6 +2363,9 @@ impl Shell {
     /// A Mono's soul or memory for the phone to read, or its edit to save.
     fn mobile_mono_file(&mut self, request: Request, cx: &mut Context<Self>) {
         let id = string(&request.params, "monoId").unwrap_or_default();
+        if !in_selection(&request.device.monos, &id) {
+            return request.reply(Err(not_selected()));
+        }
         let Some(monos) = self.monos.clone() else {
             return request.reply(Err("Mono is no longer available".into()));
         };
@@ -2650,6 +2740,145 @@ mod tests {
             projects: None,
             monos: None,
         }
+    }
+
+    fn web(projects: Option<Vec<String>>, monos: Option<Vec<String>>) -> DeviceContext {
+        DeviceContext {
+            id: "web".into(),
+            kind: DeviceKind::Web,
+            permission: Permission::Control,
+            projects,
+            monos,
+        }
+    }
+
+    #[gpui::test]
+    fn selection_is_enforced_for_sessions_projects_and_monos(cx: &mut gpui::TestAppContext) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let session = shell.session_summaries.get(&id).unwrap().clone();
+                let key = monocode_core::files::path_key(&session.cwd);
+                let own = shell
+                    .mobile_projects(cx)
+                    .iter()
+                    .find(|p| monocode_core::files::path_key(p) == key)
+                    .map(|p| project_id(p))
+                    .expect("the session lives in a rail project");
+                let conversation = shell.mobile_session_id(id);
+                let denied = Some(policy::Code::NotSelected.message());
+                let other = web(Some(vec!["other".into()]), None);
+                let own_only = web(Some(vec![own.clone()]), None);
+                let none = web(Some(vec![]), None);
+
+                // Default phone: exactly as before.
+                assert!(matches!(
+                    shell.mobile_target(&conversation, &phone(), cx),
+                    Ok(Target::Session(found)) if found == id
+                ));
+                assert!(shell.mobile_project_path(&own, &phone(), cx).is_ok());
+                // Read, older, watch start and send all resolve through the target.
+                for device in [&other, &none] {
+                    assert_eq!(
+                        shell
+                            .mobile_target(&conversation, device, cx)
+                            .err()
+                            .as_deref(),
+                        denied
+                    );
+                    assert_eq!(
+                        shell.mobile_project_path(&own, device, cx).err().as_deref(),
+                        denied
+                    );
+                    // Every session.* command goes through the same check.
+                    for method in ["session.cancel", "session.rename", "session.configure"] {
+                        let params = json!({"conversationId": conversation, "title": "t"});
+                        assert_eq!(
+                            shell
+                                .mobile_session_command(device, method, &params, window, cx)
+                                .err()
+                                .as_deref(),
+                            denied,
+                            "{method}"
+                        );
+                    }
+                }
+                assert!(matches!(
+                    shell.mobile_target(&conversation, &own_only, cx),
+                    Ok(Target::Session(found)) if found == id
+                ));
+                assert_eq!(
+                    shell.mobile_project_path(&own, &own_only, cx),
+                    shell.mobile_project_path(&own, &phone(), cx)
+                );
+                // A mono outside the selection is refused before it is looked up.
+                let narrowed = web(None, Some(vec!["m1".into()]));
+                assert_eq!(
+                    shell
+                        .mobile_target("mono:m2", &narrowed, cx)
+                        .err()
+                        .as_deref(),
+                    denied
+                );
+                assert_eq!(
+                    shell
+                        .mobile_target("mono:m1", &narrowed, cx)
+                        .err()
+                        .as_deref(),
+                    Some("Mono is no longer available")
+                );
+                assert_eq!(
+                    shell
+                        .mobile_target("mono:m2", &phone(), cx)
+                        .err()
+                        .as_deref(),
+                    Some("Mono is no longer available")
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn full_access_is_refused_remotely_and_never_a_default(cx: &mut gpui::TestAppContext) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let forbidden = Err(policy::Code::Forbidden.message().to_owned());
+                let conversation = shell.mobile_session_id(id);
+                let params = json!({"conversationId": conversation, "runtimeMode": "full-access"});
+                for device in [phone(), web(None, None)] {
+                    assert_eq!(
+                        shell.mobile_session_command(
+                            &device,
+                            "session.configure",
+                            &params,
+                            window,
+                            cx
+                        ),
+                        forbidden
+                    );
+                }
+                assert_eq!(
+                    remote_access(&params),
+                    Err(policy::Code::Forbidden.message().to_owned())
+                );
+                assert_eq!(
+                    remote_access(&json!({"runtimeMode": "auto"})),
+                    Ok(Some(AccessMode::Auto))
+                );
+                assert_eq!(remote_access(&json!({})), Ok(None));
+                assert_eq!(remote_access(&json!({"runtimeMode": "bogus"})), Ok(None));
+                assert_eq!(
+                    remote_default_access(AccessMode::FullAccess),
+                    AccessMode::Supervised
+                );
+                assert_eq!(remote_default_access(AccessMode::Auto), AccessMode::Auto);
+                let modes = remote_runtime_modes();
+                assert!(!modes.is_empty());
+                assert!(modes.iter().all(|m| m["id"] != "full-access"));
+                assert!(modes.iter().any(|m| m["id"] == "supervised"));
+            })
+            .unwrap();
     }
 
     #[gpui::test]
