@@ -23,23 +23,25 @@ describe("useWindowedList", () => {
     expect(findScrollParent(plain)).toBeNull();
   });
 
-  it("subscribes to the scroll container, not the window, and re-measures on its scroll", () => {
+  it("listens in the capture phase and re-measures on a pane scroll, also after the scroll parent changes", () => {
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
       callback(0);
       return 1;
     });
     vi.stubGlobal("cancelAnimationFrame", () => {});
     try {
-      const windowSpy = vi.spyOn(window, "addEventListener");
+      const documentSpy = vi.spyOn(document, "addEventListener");
       const ranges: { start: number; end: number }[] = [];
       const { container } = render(
-        <div style={{ overflowY: "auto" }} data-testid="pane">
-          <List count={100} onRange={(range) => ranges.push(range)} />
+        <div data-testid="outer">
+          <div style={{ overflowY: "auto" }} data-testid="pane">
+            <List count={100} onRange={(range) => ranges.push(range)} />
+          </div>
         </div>,
       );
       const pane = container.querySelector("[data-testid=pane]") as HTMLElement;
       const list = container.querySelector("ul") as HTMLElement;
-      expect(windowSpy.mock.calls.some((call) => (call[0] as string) === "scroll")).toBe(false);
+      expect(documentSpy.mock.calls.some((call) => call[0] === "scroll" && (call[2] as AddEventListenerOptions).capture === true)).toBe(true);
       Object.defineProperty(pane, "clientHeight", { value: 300, configurable: true });
       pane.getBoundingClientRect = () => ({ top: 0, bottom: 300 }) as DOMRect;
       list.getBoundingClientRect = () => ({ top: -1000 }) as DOMRect;
@@ -49,7 +51,20 @@ describe("useWindowedList", () => {
       const last = ranges[ranges.length - 1]!;
       expect(last.start).toBe(10);
       expect(last.end).toBe(13);
-      windowSpy.mockRestore();
+      // The scroll parent changes without a remount (split <-> stacked): the same listener follows it.
+      const outer = container.querySelector("[data-testid=outer]") as HTMLElement;
+      outer.style.overflowY = "auto";
+      Object.defineProperty(outer, "clientHeight", { value: 200, configurable: true });
+      outer.getBoundingClientRect = () => ({ top: 0, bottom: 200 }) as DOMRect;
+      pane.style.overflowY = "visible";
+      list.getBoundingClientRect = () => ({ top: -2000 }) as DOMRect;
+      act(() => {
+        outer.dispatchEvent(new Event("scroll"));
+      });
+      const moved = ranges[ranges.length - 1]!;
+      expect(moved.start).toBe(20);
+      expect(moved.end).toBe(22);
+      documentSpy.mockRestore();
     } finally {
       vi.unstubAllGlobals();
     }

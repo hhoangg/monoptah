@@ -58,7 +58,7 @@ export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, 
   const hasUnread = useCatalogUnreadMonos(desktopId).size > 0;
 
   return (
-    <div className={cn("mx-auto flex w-full", narrow ? "max-w-[760px]" : "max-w-[1280px]", fill && "h-full min-h-0 flex-1")} data-testid={testId}>
+    <div className={cn("mx-auto flex w-full", narrow ? "max-w-[760px]" : "max-w-[1280px]", fill ? "h-full min-h-0 flex-1" : "flex-1")} data-testid={testId}>
       <div className={cn("min-w-0 flex-1 px-4 pt-2 min-[24rem]:px-5", fill ? "flex min-h-0 flex-col pb-2" : "pb-[calc(10rem+env(safe-area-inset-bottom))]")}>
         <header className="flex shrink-0 items-start gap-3 pb-3">
           {wide ? null : (

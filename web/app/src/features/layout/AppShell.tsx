@@ -16,6 +16,7 @@ import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { useCatalog } from "@/data";
 import { WorkspaceNav } from "@/features/sessions/WorkspaceNav";
 import { Icon } from "@/ui/Icon";
+import { IconTip } from "@/ui/tooltip";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import { BackgroundDialog } from "./BackgroundDialog";
 import { CommandPalette } from "./CommandPalette";
@@ -38,9 +39,11 @@ const barButton =
 
 function SearchButton({ compact }: { compact?: boolean }) {
   return compact ? (
-    <button type="button" aria-label="Search" aria-keyshortcuts="Control+K Meta+K" onClick={openCommandPalette} className={barButton}>
-      <Icon name="search" size={20} />
-    </button>
+    <IconTip label="Search">
+      <button type="button" aria-label="Search" aria-keyshortcuts="Control+K Meta+K" onClick={openCommandPalette} className={barButton}>
+        <Icon name="search" size={20} />
+      </button>
+    </IconTip>
   ) : (
     <button
       type="button"
@@ -66,9 +69,11 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
   if (tablet && collapsed) {
     return (
       <aside data-testid="app-sidebar" data-state="collapsed" className={`${FULL} flex w-16 shrink-0 flex-col items-center gap-2 border-r border-stroke bg-drawer py-3`}>
-        <button type="button" aria-label="Expand sidebar" aria-expanded="false" onClick={() => setCollapsed(false)} className={barButton}>
-          <Icon name="sidebar" size={20} />
-        </button>
+        <IconTip label="Expand sidebar">
+          <button type="button" aria-label="Expand sidebar" aria-expanded="false" onClick={() => setCollapsed(false)} className={barButton}>
+            <Icon name="sidebar" size={20} />
+          </button>
+        </IconTip>
         <SearchButton compact />
         <div className="mt-auto">
           <ProjectBar variant="rail" />
@@ -87,9 +92,11 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
         <div className="flex items-center gap-2 px-4 pt-3">
           <SearchButton />
           {tablet ? (
-            <button type="button" aria-label="Collapse sidebar" aria-expanded="true" onClick={() => setCollapsed(true)} className={barButton}>
-              <Icon name="sidebar" size={20} />
-            </button>
+            <IconTip label="Collapse sidebar">
+              <button type="button" aria-label="Collapse sidebar" aria-expanded="true" onClick={() => setCollapsed(true)} className={barButton}>
+                <Icon name="sidebar" size={20} />
+              </button>
+            </IconTip>
           ) : null}
         </div>
         <div className="min-h-0 flex-1">
@@ -144,7 +151,7 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
     <>
       <div data-testid="app-shell" data-layout={!wide ? "mobile" : desktop ? "desktop" : "tablet"} className="flex min-h-0 w-full flex-1 pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
         {wide ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
-        <div className="@container flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
+        <div className="@container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
           {children}
         </div>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}

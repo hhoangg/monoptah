@@ -46,14 +46,18 @@ export function useWindowedList(count: number, rowHeight: number, overscan = 6):
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(measure);
     };
-    const container = findScrollParent(ref.current);
-    const target: HTMLElement | Window = container ?? window;
-    target.addEventListener("scroll", onChange, { passive: true });
+    // Capture on the document: scroll does not bubble, and the scrolling element changes when the layout
+    // toggles between split and stacked, so one listener sees whichever pane scrolls.
+    document.addEventListener("scroll", onChange, { capture: true, passive: true });
     window.addEventListener("resize", onChange);
+    const container = findScrollParent(ref.current);
+    const observer = container && typeof ResizeObserver !== "undefined" ? new ResizeObserver(onChange) : null;
+    if (container) observer?.observe(container);
     return () => {
       cancelAnimationFrame(frame);
-      target.removeEventListener("scroll", onChange);
+      document.removeEventListener("scroll", onChange, { capture: true });
       window.removeEventListener("resize", onChange);
+      observer?.disconnect();
     };
   }, [measure]);
 

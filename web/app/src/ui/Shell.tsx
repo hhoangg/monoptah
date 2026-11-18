@@ -38,7 +38,7 @@ export function Shell() {
   const phone = !useMediaQuery(TABLET_QUERY);
   const standalone = useStandalone();
   // /install is public: a visitor without a session sees the brand only (the nav entries would bounce to /login).
-  const me = useQuery({ ...meQuery, enabled: pathname === "/install", retry: false });
+  const me = useQuery({ ...meQuery, enabled: pathname === "/install", retry: false, networkMode: "always" });
   // Brand only until /api/me succeeds. A signed-in visitor who is merely offline (a network error, not a 401) keeps the nav.
   const signedOut = me.isError && me.error instanceof ApiError && (me.error.status === 401 || me.error.status === 403);
   const publicPage = signInFamily || (pathname === "/install" && (me.isPending || signedOut));
@@ -46,7 +46,7 @@ export function Shell() {
   return (
     <TooltipProvider delayDuration={300}>
     {/* /d routes: a fixed-height flex column (header, switcher and banner shrink-0, main fills the rest) so no screen needs 100dvh math and the body never scrolls. */}
-    <div className={cn("flex flex-col bg-background text-content", inDesktop ? "h-dvh overflow-hidden" : "min-h-dvh")}>
+    <div className={cn("flex flex-col bg-background text-content", inDesktop ? "relative h-dvh overflow-hidden" : "min-h-dvh")}>
       {/* First focusable element (design-system.md 9): visible on focus only; moves focus to the main content. */}
       <a
         href={`#${MAIN_ID}`}
@@ -107,7 +107,7 @@ export function Shell() {
       <main
         id={MAIN_ID}
         tabIndex={-1}
-        className={cn("outline-none", inDesktop ? "flex min-h-0 flex-1 flex-col overflow-y-auto" : "flex-1 pb-[calc(env(safe-area-inset-bottom)+2.5rem)]")}
+        className={cn("outline-none", inDesktop ? "relative flex min-h-0 flex-1 flex-col overflow-y-auto" : "flex-1 pb-[calc(env(safe-area-inset-bottom)+2.5rem)]")}
       >
         <Outlet />
       </main>

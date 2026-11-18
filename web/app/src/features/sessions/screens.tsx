@@ -226,7 +226,7 @@ export function ProjectScreen({
         </section>
       ) : (
         <div className={split ? "grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] grid-rows-[minmax(0,1fr)] gap-6" : undefined} data-testid={split ? "project-split" : undefined}>
-          <div className={split ? "min-h-0 min-w-0 overflow-y-auto pb-6" : "min-w-0"}>
+          <div className={split ? "min-h-0 min-w-0 overflow-y-auto pb-6" : "flex min-h-full min-w-0 flex-col"}>
           {project ? (
             <div className="pb-2">
               <WorkspaceMenu
