@@ -117,8 +117,14 @@ pub fn load_settings(path: &Path) -> PolicySettings {
 /// Saves `settings` to `path`: written to a temporary file, then renamed.
 pub fn save_settings(path: &Path, settings: &PolicySettings) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    // A name of its own per call, so two saves never share a temporary file.
+    static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
+    temp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let temp = std::path::PathBuf::from(temp);
     std::fs::write(&temp, bytes).map_err(|e| e.to_string())?;
     std::fs::rename(&temp, path).map_err(|e| {
@@ -141,6 +147,10 @@ pub fn settings() -> PolicySettings {
 pub fn flags() -> PolicyFlags {
     settings().flags
 }
+
+/// Tests that move the process-wide settings or toggles hold this, so they run one at a time.
+#[cfg(test)]
+pub(crate) static TEST_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Replaces the process-wide toggles, keeping the deny patterns.
 pub fn set_flags(flags: PolicyFlags) {
@@ -187,6 +197,7 @@ codes! {
     InstanceBusy => "instance_busy",
     NotPending => "not_pending",
     NeedsDesktop => "needs_desktop",
+    WakeRequired => "wake_required",
 }
 
 impl Code {
@@ -214,6 +225,7 @@ impl Code {
             Code::InstanceBusy => "The cloud instance is busy with another operation",
             Code::NotPending => "Approval is no longer pending",
             Code::NeedsDesktop => "Answer this request on the desktop",
+            Code::WakeRequired => "Sending wakes the stopped cloud instance; confirm to continue",
         }
     }
 }
@@ -709,9 +721,16 @@ pub fn capabilities(flags: &PolicyFlags) -> Vec<String> {
 }
 
 fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
-    let mut list = Vec::new();
+    // The desktop supports cloud sessions: the web shows its cloud UI on this.
+    let mut list = vec!["cloud".to_owned()];
     if flags.remote_git_push {
         list.push("gitPush".to_owned());
+    }
+    if flags.remote_cloud_start {
+        list.push("cloudStart".to_owned());
+    }
+    if flags.remote_cloud_start && flags.remote_git_push {
+        list.push("cloudMove".to_owned());
     }
     if approvals_effective(flags, approvals_gate) {
         list.push("approvals".to_owned());
@@ -1299,17 +1318,47 @@ mod tests {
 
     #[test]
     fn capabilities_follow_flags_and_the_approvals_gate() {
-        assert!(capabilities_with(&PolicyFlags::default(), false).is_empty());
-        assert_eq!(capabilities_with(&ON, false), ["gitPush"]);
+        assert_eq!(capabilities_with(&PolicyFlags::default(), false), ["cloud"]);
+        assert_eq!(
+            capabilities_with(&ON, false),
+            ["cloud", "gitPush", "cloudStart", "cloudMove"]
+        );
         // The gate alone does not list approvals: the desktop toggle is needed too.
-        assert!(capabilities_with(&PolicyFlags::default(), true).is_empty());
+        assert_eq!(capabilities_with(&PolicyFlags::default(), true), ["cloud"]);
         let toggle = PolicyFlags {
             remote_approvals: true,
             ..PolicyFlags::default()
         };
-        assert!(capabilities_with(&toggle, false).is_empty());
-        assert_eq!(capabilities_with(&toggle, true), ["approvals"]);
-        assert_eq!(capabilities_with(&ON, true), ["gitPush", "approvals"]);
+        assert_eq!(capabilities_with(&toggle, false), ["cloud"]);
+        assert_eq!(capabilities_with(&toggle, true), ["cloud", "approvals"]);
+        assert_eq!(
+            capabilities_with(&ON, true),
+            ["cloud", "gitPush", "cloudStart", "cloudMove", "approvals"]
+        );
+    }
+
+    /// H-11, H-14: `cloudStart` follows the cloud toggle, `cloudMove` needs it
+    /// and the push toggle too (a move pushes a branch).
+    #[test]
+    fn cloud_capabilities_follow_their_toggles() {
+        let flags = |push, cloud| PolicyFlags {
+            remote_git_push: push,
+            remote_cloud_start: cloud,
+            remote_approvals: false,
+        };
+        assert_eq!(
+            capabilities_with(&flags(false, true), false),
+            ["cloud", "cloudStart"]
+        );
+        assert_eq!(
+            capabilities_with(&flags(true, false), false),
+            ["cloud", "gitPush"]
+        );
+        assert_eq!(
+            capabilities_with(&flags(true, true), false),
+            ["cloud", "gitPush", "cloudStart", "cloudMove"]
+        );
+        assert_eq!(capabilities_with(&flags(false, false), false), ["cloud"]);
     }
 
     /// H-08: approvals are effective only with the U-13 gate AND the toggle.
@@ -1346,6 +1395,32 @@ mod tests {
         }
     }
 
+    /// M1: saves from several threads never share a temporary file, so each
+    /// one lands whole and none leaves a temp file behind.
+    #[test]
+    fn concurrent_saves_use_their_own_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SETTINGS_FILE);
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut settings = PolicySettings::default();
+                    settings.flags.remote_git_push = i % 2 == 0;
+                    for _ in 0..20 {
+                        save_settings(&path, &settings).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let saved = std::fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<PolicySettings>(&saved).is_ok());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     #[test]
     fn settings_round_trip_and_default_when_missing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1360,7 +1435,12 @@ mod tests {
             .insert("/p".into(), vec!["*.pem".into()]);
         save_settings(&path, &settings).unwrap();
         assert_eq!(load_settings(&path), settings);
-        assert!(!dir.path().join("mobile-policy.json.tmp").exists());
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"remoteGitPush\": true") && text.contains("\"denyPatterns\""));
         let empty = serde_json::to_string(&PolicySettings::default()).unwrap();

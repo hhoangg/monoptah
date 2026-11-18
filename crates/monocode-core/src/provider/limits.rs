@@ -153,7 +153,8 @@ printf '%s\n' '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"
             limited,
             vec![Limit {
                 resets_at: Some(1_792_600_200_000),
-                resume_at_reset: false
+                resume_at_reset: false,
+                no_wake: false
             }]
         );
     }

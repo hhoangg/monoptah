@@ -1350,6 +1350,16 @@ pub struct MachineCache {
 }
 
 impl MachineCache {
+    /// The allowed machines of `repo` at `git_ref` when the cache already holds them. Makes no
+    /// call, so a read-only caller never reaches `gh`.
+    pub fn cached(&self, repo: &str, git_ref: Option<&str>) -> Option<Vec<MachineType>> {
+        let key = (
+            repo.to_owned(),
+            git_ref.map(str::trim).unwrap_or_default().to_owned(),
+        );
+        self.entries.lock().ok().and_then(|e| e.get(&key).cloned())
+    }
+
     /// The allowed machines of `repo` at `git_ref`, from the cache or one `gh api` call.
     pub fn allowed(
         &self,

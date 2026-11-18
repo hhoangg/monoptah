@@ -69,6 +69,10 @@ impl Conversation {
     pub(crate) fn cloud_start(&self) -> Option<&Arc<crate::cloud_start_view::CloudStartSnapshot>> {
         self.cloud_start.as_ref()
     }
+    /// The last connection to the workspace failed and the view shows the error.
+    pub(crate) fn remote_connection_failed(&self) -> bool {
+        self.remote_state.error.is_some()
+    }
     /// The message typed while the codespace started, not sent yet.
     #[cfg(test)]
     pub(crate) fn cloud_queued(&self) -> Option<&str> {
@@ -710,6 +714,8 @@ impl Conversation {
                         } else {
                             this.run_history_actions(cx);
                         }
+                        // After the attach to a running host turn, so the message queues behind it.
+                        this.flush_wake_send(cx);
                         this.finish_app_prompt(cx);
                         this.pump_follow_ups(cx);
                         if initial {
@@ -813,7 +819,11 @@ impl Conversation {
                     cx.notify();
                     return true;
                 }
-            } else if unreachable && !self.user_send && self.reconnect_cloud(cx) {
+            } else if unreachable
+                && !self.user_send
+                && !self.mobile_no_wake
+                && self.reconnect_cloud(cx)
+            {
                 let noun = self.cloud_noun().unwrap_or("codespace");
                 self.status = format!("Reconnecting the {noun}...");
                 cx.notify();

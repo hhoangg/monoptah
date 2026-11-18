@@ -763,20 +763,13 @@ fn ticking_every_project_again_goes_back_to_none(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_remote_action_toggles_render_off_and_disabled(cx: &mut TestAppContext) {
+fn the_remote_action_toggles_render_off_and_emit_the_new_state(cx: &mut TestAppContext) {
     let window = preview(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);
     assert!(visual.debug_bounds("web-policy-rows").is_none());
     set_web(&window, visual, |ctx| ctx.web = Some(paired()));
     assert!(visual.debug_bounds("web-policy-rows").is_some());
-    for selector in [
-        "settings-toggle-web-policy-git-push",
-        "settings-toggle-web-policy-cloud-start",
-    ] {
-        click(visual, selector);
-    }
-    // Disabled: clicking changes nothing and sends no event.
-    assert!(events(&window, visual).is_empty());
+    // Off by default.
     window
         .update(visual, |preview, _, cx| {
             let ctx = &preview.settings.read(cx).ctx;
@@ -784,4 +777,26 @@ fn the_remote_action_toggles_render_off_and_disabled(cx: &mut TestAppContext) {
             assert!(!ctx.web_policy.remote_cloud_start);
         })
         .unwrap();
+    for selector in [
+        "settings-toggle-web-policy-git-push",
+        "settings-toggle-web-policy-cloud-start",
+    ] {
+        click(visual, selector);
+    }
+    assert_eq!(
+        events(&window, visual),
+        ["policy:GitPush:true", "policy:CloudStart:true"]
+    );
+}
+
+#[gpui::test]
+fn a_toggle_that_is_on_emits_off(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(paired());
+        ctx.web_policy.remote_cloud_start = true;
+    });
+    click(visual, "settings-toggle-web-policy-cloud-start");
+    assert_eq!(events(&window, visual), ["policy:CloudStart:false"]);
 }

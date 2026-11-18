@@ -466,6 +466,9 @@ mod tests {
 
     #[test]
     fn for_project_reads_the_policy_settings() {
+        let _serial = super::super::policy::TEST_SETTINGS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut settings = super::super::policy::settings();
         settings
             .deny_patterns

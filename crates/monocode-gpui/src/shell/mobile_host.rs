@@ -13,8 +13,8 @@ use monocode_core::mobile::policy::Failure;
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
     mobile::{
-        DeviceContext, Event, Invite, MobileHost, Push, Request, Status, WatchStart, audit,
-        denylist::DenyList, notify, policy, watch, web_link,
+        DeviceContext, DeviceKind, Event, Invite, MobileHost, Push, Request, Status, WatchStart,
+        audit, denylist::DenyList, notify, policy, watch, web_link,
     },
     transcript::Row,
 };
@@ -86,6 +86,8 @@ struct CatalogEntry {
     project: String,
     summary: Session,
     live: Option<mobile_catalog::LiveSession>,
+    /// Where the session runs, for web devices (None when it is not known).
+    cloud: Option<cloud::CardView>,
 }
 
 enum Receipt {
@@ -201,7 +203,7 @@ fn visual_tree(body: &str) -> Result<Value, String> {
     serde_json::to_value(tree).map_err(|e| e.to_string())
 }
 
-fn project_id(path: &str) -> String {
+pub(super) fn project_id(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for byte in path.bytes() {
         if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
@@ -219,8 +221,14 @@ fn string(params: &Value, key: &str) -> Option<String> {
     params[key].as_str().map(str::to_owned)
 }
 
+/// Whether a Mono's launch card is shown to `device`: a phone never sees one for a session that
+/// only web devices see (H2), and every device only the launches of its selected projects.
+fn launch_shown(device: &DeviceContext, web_only: bool, project: &str) -> bool {
+    !(device.kind == DeviceKind::Phone && web_only) && in_selection(&device.projects, project)
+}
+
 /// Whether a selection (None means everything) includes `id`.
-fn in_selection(selection: &Option<Vec<String>>, id: &str) -> bool {
+pub(super) fn in_selection(selection: &Option<Vec<String>>, id: &str) -> bool {
     selection
         .as_ref()
         .is_none_or(|list| list.iter().any(|entry| entry == id))
@@ -259,14 +267,6 @@ impl FileRead {
 
 fn not_selected() -> Failure {
     policy::Code::NotSelected.failure()
-}
-
-/// The WS-D4 hook: a cloud or remote project has no local project methods.
-fn refuse_non_local(project_id: &str) -> Result<(), Failure> {
-    if monocode_core::mobile::cloud_policy::is_non_local_project(project_id) {
-        return Err(policy::Code::UnsupportedTarget.failure());
-    }
-    Ok(())
 }
 
 /// `mono.update` fields a remote device may send. Paths, habits, workflows
@@ -504,8 +504,13 @@ impl Shell {
 
     // MARK: catalog
 
+    /// The id of a rail project's path on the wire.
+    pub(crate) fn mobile_project_id(path: &str) -> String {
+        project_id(path)
+    }
+
     /// Projects on the rail and those Monos work in.
-    fn mobile_projects(&self, cx: &App) -> Vec<String> {
+    pub(super) fn mobile_projects(&self, cx: &App) -> Vec<String> {
         let mut paths: Vec<String> = Vec::new();
         let monos = self
             .monos
@@ -541,6 +546,7 @@ impl Shell {
         if !in_selection(&device.projects, id) {
             return Err(not_selected());
         }
+        cloud::reject_non_local_project(device, id)?;
         self.mobile_projects(cx)
             .into_iter()
             .find(|path| project_id(path) == id)
@@ -578,11 +584,15 @@ impl Shell {
                     return None;
                 }
                 let key = monocode_core::files::path_key(&summary.cwd);
-                let project = paths
+                let rail = paths
                     .iter()
                     .find(|path| monocode_core::files::path_key(path) == key)
-                    .map(|path| project_id(path))
-                    .or_else(|| cloud::catalog_project_of(summary))?;
+                    .map(|path| project_id(path));
+                // Only web devices are told of a session a phone never saw.
+                let web_only = rail.is_none();
+                let project =
+                    rail.or_else(|| cloud::catalog_project_of(self, id, summary, paths))?;
+                let cloud = cloud::card_view(self, id, web_only);
                 let live = self.sessions.get(&id).map(|view| {
                     let view = view.read(cx);
                     mobile_catalog::LiveSession {
@@ -607,6 +617,7 @@ impl Shell {
                     project,
                     summary: summary.clone(),
                     live,
+                    cloud,
                 })
             })
             .collect()
@@ -619,9 +630,40 @@ impl Shell {
         if self.mobile.publishing || !host.enabled() {
             return;
         }
+        self.mobile.publishing = true;
+        let work = self.mobile_catalog_work(cx);
+        cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, _| {
+                this.mobile.publishing = false;
+                if let Ok((catalog, ids, previews)) = result {
+                    this.mobile.ids = ids;
+                    this.mobile.mono_previews = previews;
+                    let _ = host.publish(catalog);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Builds the catalog every device is told of (`workspace.list`, `sessions.list`): the
+    /// reads of the shell's state happen now, the saved-history reads on a worker. Web-only
+    /// sessions and projects are marked; the host scopes the catalog per device.
+    #[allow(clippy::type_complexity)]
+    fn mobile_catalog_work(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(Value, HashMap<i64, String>, HashMap<i64, MonoPreview>), String>> {
         let paths = self.mobile_projects(cx);
+        let entries = self.mobile_catalog_sessions(&paths, cx);
+        let extra = cloud::web_only_projects(
+            entries
+                .iter()
+                .filter_map(|entry| Some((entry.cloud.as_ref()?, entry.summary.cwd.as_str()))),
+        );
         let projects: Vec<Value> = paths
             .iter()
+            .chain(&extra)
             .map(|path| {
                 let appearance = self.appearance(path);
                 let (kind, model, access) = self.mobile_defaults(path, cx);
@@ -644,10 +686,12 @@ impl Shell {
                 if let Some(mascot) = appearance.mascot {
                     project["mascot"] = json!(mascot);
                 }
+                if extra.contains(path) {
+                    cloud::mark_web_only(&mut project, path);
+                }
                 project
             })
             .collect();
-        let entries = self.mobile_catalog_sessions(&paths, cx);
         let monos: Vec<(monocode_core::mono::Mono, Option<Value>)> = self
             .monos
             .as_ref()
@@ -687,8 +731,7 @@ impl Shell {
         let mut previews = self.mobile.mono_previews.clone();
         let store = self.store.clone();
         let mut ids = self.mobile.ids.clone();
-        self.mobile.publishing = true;
-        let work = cx.background_executor().spawn(async move {
+        cx.background_executor().spawn(async move {
             let saved = {
                 let store = locked(&store)?;
                 for id in entries.iter().map(|entry| entry.id).chain(monos.iter().filter_map(|(mono, _)| mono.session_id)) {
@@ -719,8 +762,10 @@ impl Shell {
             };
             let mut branches = HashMap::new();
             let projects: Vec<_> = projects.into_iter().map(|mut project| {
-                let cwd = project["path"].as_str().unwrap_or_default().to_owned();
-                project["branch"] = json!(mobile_catalog::checkout_branch(&cwd, &mut branches));
+                // A remote project has no path to read a branch from.
+                if let Some(cwd) = project["path"].as_str().map(str::to_owned) {
+                    project["branch"] = json!(mobile_catalog::checkout_branch(&cwd, &mut branches));
+                }
                 project
             }).collect();
             let mut sessions = Vec::new();
@@ -732,7 +777,9 @@ impl Shell {
                 let branch = if !metadata.worktree_removed && metadata.branch.as_ref().is_none_or(|branch| branch.is_empty()) {
                     mobile_catalog::checkout_branch(metadata.worktree_cwd.as_deref().unwrap_or(&entry.summary.cwd), &mut branches)
                 } else { String::new() };
-                sessions.push(mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch));
+                let mut card = mobile_catalog::session(&entry.summary, id, &entry.project, &metadata, entry.live.as_ref(), &branch);
+                cloud::annotate_card(&mut card, entry.cloud.as_ref());
+                sessions.push(card);
             }
             sessions.sort_by_key(|s| std::cmp::Reverse(s["updatedAt"].as_u64()));
             let monos: Vec<Value> = monos
@@ -781,19 +828,7 @@ impl Shell {
                 ids,
                 previews,
             ))
-        });
-        cx.spawn(async move |this, cx| {
-            let result = work.await;
-            let _ = this.update(cx, |this, _| {
-                this.mobile.publishing = false;
-                if let Ok((catalog, ids, previews)) = result {
-                    this.mobile.ids = ids;
-                    this.mobile.mono_previews = previews;
-                    let _ = host.publish(catalog);
-                }
-            });
         })
-        .detach();
     }
 
     // MARK: requests
@@ -853,6 +888,20 @@ impl Shell {
         self.sessions.get(&id).cloned()
     }
 
+    /// The session a cloud request names, checked against the device's
+    /// selection like every other request (H-10).
+    pub(super) fn mobile_cloud_session(
+        &self,
+        id: &str,
+        device: &DeviceContext,
+        cx: &App,
+    ) -> Result<i64, Failure> {
+        match self.mobile_target(id, device, cx)? {
+            Target::Session(session) => Ok(session),
+            Target::Mono(_) => Err(policy::Code::UnsupportedTarget.failure()),
+        }
+    }
+
     fn mobile_target(&self, id: &str, device: &DeviceContext, cx: &App) -> Result<Target, Failure> {
         if let Some(mono) = id.strip_prefix("mono:") {
             if !in_selection(&device.monos, mono) {
@@ -874,6 +923,8 @@ impl Shell {
             .or_else(|| locked(&self.store).ok()?.resolve_existing_session_id(id))
             .filter(|id| self.session_summaries.contains_key(id))
             .ok_or("Session is no longer available")?;
+        let paths = self.mobile_projects(cx);
+        cloud::refuse_web_only_for_phone(self, device, session, &paths)?;
         // A Mono's own chat, habit and workflow sessions belong to that Mono
         // and are served only to a device that selected it (H-02).
         if device.monos.is_some()
@@ -909,11 +960,11 @@ impl Shell {
             // A session that maps to no project is refused for a narrowed device.
             let project = self.session_summaries.get(&session).and_then(|summary| {
                 let key = monocode_core::files::path_key(&summary.cwd);
-                self.mobile_projects(cx)
+                paths
                     .iter()
                     .find(|path| monocode_core::files::path_key(path) == key)
                     .map(|path| project_id(path))
-                    .or_else(|| cloud::catalog_project_of(summary))
+                    .or_else(|| cloud::target_project_of(self, device, session, summary, &paths))
             });
             if !project.is_some_and(|project| in_selection(&device.projects, &project)) {
                 return Err(not_selected());
@@ -957,6 +1008,18 @@ impl Shell {
                             projects.contains(path) && cwd.starts_with(path.as_str())
                         })
                     });
+                let web_only = cloud::web_only_session(self, id, &projects);
+                let card_project = match project {
+                    Some(path) => project_id(path),
+                    None => self
+                        .session_summaries
+                        .get(&id)
+                        .and_then(|summary| cloud::catalog_project_of(self, id, summary, &projects))
+                        .unwrap_or_else(|| cloud::opaque_or_local_id(cwd)),
+                };
+                if !launch_shown(device, web_only, &card_project) {
+                    return None;
+                }
                 let name = match project {
                     Some(path) => self.appearance(path).label(path),
                     None => std::path::Path::new(cwd)
@@ -964,12 +1027,6 @@ impl Shell {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                 };
-                let card_project = project_id(project.map_or(cwd, String::as_str));
-                // A card names the project's path, title and state: only for
-                // projects this device selected (H-02).
-                if !in_selection(&device.projects, &card_project) {
-                    return None;
-                }
                 let phone_id = self.mobile.ids.get(&id).cloned().unwrap_or_else(|| {
                     locked(&self.store)
                         .ok()
@@ -990,7 +1047,7 @@ impl Shell {
             .collect()
     }
 
-    fn mobile_session_id(&mut self, id: i64) -> String {
+    pub(super) fn mobile_session_id(&mut self, id: i64) -> String {
         if let Some(value) = self.mobile.ids.get(&id) {
             return value.clone();
         }
@@ -1025,10 +1082,12 @@ impl Shell {
                 request.reply(answer);
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
-            "cloud.instances" | "cloud.startOptions" => {
-                let result = cloud::dispatch(self, &request.device, &method, &request.params, cx);
-                request.reply(result.map_err(Failure::from));
-            }
+            "cloud.instances" | "cloud.startOptions" => cloud::dispatch_request(
+                self,
+                request,
+                |_, request, result| request.reply(result),
+                cx,
+            ),
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
@@ -1048,8 +1107,7 @@ impl Shell {
             command_id: request.command_id.clone(),
         });
         let project = string(&params, "projectId").unwrap_or_default();
-        let cwd = refuse_non_local(&project)
-            .and_then(|()| self.mobile_project_path(&project, &request.device, cx));
+        let cwd = self.mobile_project_path(&project, &request.device, cx);
         let cwd = match cwd {
             Ok(cwd) => cwd,
             Err(error) => {
@@ -1116,11 +1174,6 @@ impl Shell {
             }
             Some(job) => job.result.clone(),
             None => {
-                if let Err(error) =
-                    refuse_non_local(&string(&request.params, "projectId").unwrap_or_default())
-                {
-                    return request.reply(Err(error));
-                }
                 let cwd = match self.mobile_project_path(
                     &string(&request.params, "projectId").unwrap_or_default(),
                     &request.device,
@@ -1268,7 +1321,7 @@ impl Shell {
         let Target::Session(id) = target else {
             return Map::new();
         };
-        let mut fields = cloud::read_fields(*id, device, cx);
+        let mut fields = cloud::read_fields(self, *id, device, cx);
         fields.extend(approvals::read_fields(self, *id, device, cx));
         fields
     }
@@ -1278,7 +1331,7 @@ impl Shell {
         let Target::Session(id) = target else {
             return Value::Null;
         };
-        let mut fields = cloud::frame_fields(*id, device, cx);
+        let mut fields = cloud::frame_fields(self, *id, device, cx);
         fields.extend(approvals::frame_fields(self, *id, device, cx));
         Value::Object(fields)
     }
@@ -1708,10 +1761,14 @@ impl Shell {
                 );
                 finish(self, request, result);
             }
-            method if method.starts_with("cloud.") => {
-                let result = cloud::dispatch(self, &request.device, method, &request.params, cx)
-                    .map_err(Failure::from);
+            "cloud.moveToLocal" => {
+                // Opening the desktop's confirmation needs the window.
+                let result =
+                    cloud::move_to_local(self, &request.device, &request.params, window, cx);
                 finish(self, request, result);
+            }
+            method if method.starts_with("cloud.") => {
+                cloud::dispatch_request(self, request, finish, cx)
             }
             _ => {
                 let result = self.mobile_session_command(
@@ -1768,8 +1825,16 @@ impl Shell {
                         .and_then(|m| m.update(cx, |m, cx| m.mobile_chat(mono, cx))),
                 }
                 .ok_or("This conversation is still opening on desktop; try again")?;
+                // Resuming runs a turn: on a cloud conversation it wakes a stopped instance, so it
+                // follows the same consent, rate limit and live-link rules as a send.
+                let wake = match target {
+                    Target::Session(id) => {
+                        cloud::before_resume_usage(self, device, *id, params, cx)?
+                    }
+                    Target::Mono(_) => false,
+                };
                 view.update(cx, |v, cx| {
-                    v.mobile_resume_usage(&params["token"], automatic, cx)
+                    v.mobile_resume_usage(&params["token"], automatic, wake, cx)
                 })?;
                 Ok(reply)
             }
@@ -1821,8 +1886,10 @@ impl Shell {
                 Ok(reply)
             }
             ("session.archive", Target::Session(id)) => {
-                if !self.session_metadata(*id, cx).summary.archived {
-                    cloud::before_archive(self, device, *id, params, cx)?;
+                if !self.session_metadata(*id, cx).summary.archived
+                    && cloud::before_archive(self, device, *id, params, window, cx)?
+                        == cloud::Archive::Local
+                {
                     self.toggle_archive_now(*id, cx);
                 }
                 Ok(reply)
@@ -1867,57 +1934,93 @@ impl Shell {
         finish: impl FnOnce(&mut Shell, Request, Result<Value, Failure>) + 'static,
         cx: &mut Context<Self>,
     ) {
-        let conversation = string(&request.params, "conversationId").unwrap_or_default();
+        let (device, params) = (request.device.clone(), request.params.clone());
+        self.mobile_send_for(
+            device,
+            params,
+            move |this, result| finish(this, request, result),
+            cx,
+        );
+    }
+
+    /// `conversation.send` for `device`: `finish` gets the reply.
+    pub(super) fn mobile_send_for(
+        &mut self,
+        device: DeviceContext,
+        params: Value,
+        finish: impl FnOnce(&mut Shell, Result<Value, Failure>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let conversation = string(&params, "conversationId").unwrap_or_default();
         let staged = (|| {
-            let target = self.mobile_target(&conversation, &request.device, cx)?;
+            let target = self.mobile_target(&conversation, &device, cx)?;
             // After the conversation is resolved, so a device cannot wake or
             // start anything for one it may not reach.
             let session = match &target {
                 Target::Session(id) => Some(*id),
                 Target::Mono(_) => None,
             };
-            cloud::before_send(self, &request.device, session, &request.params, cx)?;
-            let text = message_text(&request.params)?;
-            Ok::<_, Failure>((target, text))
+            let plan = cloud::before_send(self, &device, session, &params, cx)?;
+            let text = message_text(&params)?;
+            Ok::<_, Failure>((target, text, plan))
         })();
-        let (target, text) = match staged {
+        let (target, text, plan) = match staged {
             Ok(staged) => staged,
-            Err(error) => return finish(self, request, Err(error)),
+            Err(error) => return finish(self, Err(error)),
         };
-        let stage = self.stage_mobile_attachments(&request.params, cx);
+        let stage = self.stage_mobile_attachments(&params, cx);
         cx.spawn(async move |this, cx| {
             let attachments = stage.await;
             let _ = this.update(cx, |this, cx| {
-                let result = attachments.and_then(|attachments| match &target {
-                    Target::Session(id) => {
-                        let view = this
-                            .ensure_session(*id, cx)
-                            .ok_or("Session is no longer available")?;
-                        view.update(cx, |v, cx| v.mobile_submit(text, attachments, cx));
-                        this.mobile.started.insert(*id);
-                        Ok(())
+                let result =
+                    attachments
+                        .map_err(Failure::from)
+                        .and_then(|attachments| match &target {
+                            Target::Session(id) => {
+                                let view = this
+                                    .ensure_session(*id, cx)
+                                    .ok_or("Session is no longer available")?;
+                                if plan.wake {
+                                    // Only now: the text is valid, the files are staged and the
+                                    // submit is queued right below; a failure holds nothing.
+                                    cloud::start_wake_send(this, &device, *id, cx)?;
+                                    view.update(cx, |v, cx| {
+                                        v.mobile_wake_submit(text, attachments, cx)
+                                    });
+                                } else {
+                                    // The link may have dropped while the files were staged.
+                                    cloud::before_send_again(this, *id, cx)?;
+                                    view.update(cx, |v, cx| v.mobile_submit(text, attachments, cx));
+                                }
+                                this.mobile.started.insert(*id);
+                                Ok(())
+                            }
+                            Target::Mono(mono) => this
+                                .monos
+                                .clone()
+                                .ok_or("Mono is no longer available")?
+                                .update(cx, |m, cx| {
+                                    m.mobile_send(
+                                        mono,
+                                        text,
+                                        attachments
+                                            .iter()
+                                            .map(|p| p.to_string_lossy().into_owned())
+                                            .collect(),
+                                        cx,
+                                    )
+                                })
+                                .map_err(Failure::from),
+                        });
+                let result = result.map(|()| {
+                    if plan.wake {
+                        json!({"sessionId": conversation, "wake": true, "queued": true})
+                    } else {
+                        json!({"sessionId": conversation})
                     }
-                    Target::Mono(mono) => this
-                        .monos
-                        .clone()
-                        .ok_or("Mono is no longer available")?
-                        .update(cx, |m, cx| {
-                            m.mobile_send(
-                                mono,
-                                text,
-                                attachments
-                                    .iter()
-                                    .map(|p| p.to_string_lossy().into_owned())
-                                    .collect(),
-                                cx,
-                            )
-                        }),
                 });
-                let result = result
-                    .map(|()| json!({"sessionId": conversation}))
-                    .map_err(Failure::from);
                 this.schedule_mobile_push(cx);
-                finish(this, request, result);
+                finish(this, result);
             });
         })
         .detach();
@@ -1942,7 +2045,9 @@ impl Shell {
             let requested = remote_access(&params)?;
             // After the project is resolved, so a device cannot start
             // anything in one it may not reach.
-            cloud::start_target(self, &request.device, &cwd, &params, cx)?;
+            if let Some(plan) = cloud::start_target(self, &request.device, &cwd, &params, cx)? {
+                return Ok::<_, Failure>(Err((text, cwd, requested, plan)));
+            }
             let (default_kind, default_model, default_access) = self.mobile_defaults(&cwd, cx);
             let chosen = string(&params, "harness").as_deref().and_then(Kind::parse);
             let kind = chosen.unwrap_or(default_kind);
@@ -1955,10 +2060,28 @@ impl Shell {
             );
             let access = requested.unwrap_or(default_access);
             let account = self.mobile_account(kind, &cwd, &params, cx)?;
-            Ok::<_, Failure>((text, cwd, kind, model, access, account))
+            Ok::<_, Failure>(Ok((text, cwd, kind, model, access, account)))
         })();
         let (text, cwd, kind, model, access, account) = match prepared {
-            Ok(prepared) => prepared,
+            Ok(Ok(prepared)) => prepared,
+            // A cloud start: the shell records the session and the instance
+            // comes up in the background (H-11).
+            Ok(Err((text, cwd, access, plan))) => {
+                let start = cloud_start::CloudStartRequest {
+                    device: request.device.clone(),
+                    command_id: request.command_id.clone(),
+                    text,
+                    cwd,
+                    access,
+                    params,
+                    plan,
+                };
+                return self.mobile_start_cloud(
+                    start,
+                    move |this, result| finish(this, request, result),
+                    cx,
+                );
+            }
             Err(error) => return finish(self, request, Err(error)),
         };
         let effort = crate::conversation::preferred_effort(kind.id(), cx);
@@ -3021,6 +3144,14 @@ fn hidden_providers(prefs: &crate::settings::Preferences, cwd: &str) -> Vec<Stri
 }
 
 #[cfg(test)]
+mod cloud_lifecycle_tests;
+mod cloud_start;
+#[cfg(test)]
+mod cloud_start_tests;
+#[cfg(test)]
+mod cloud_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use monocode_core::mobile::{DeviceKind, Permission};
@@ -3358,12 +3489,6 @@ mod tests {
                 assert_ne!(answer, Some(Err(policy::Code::Forbidden.failure())));
             })
             .unwrap();
-    }
-
-    #[test]
-    fn project_methods_refuse_a_non_local_project_hook_but_not_a_local_one() {
-        // The WS-D4 predicate is a stub that answers false today.
-        assert!(refuse_non_local("anything").is_ok());
     }
 
     #[gpui::test]
@@ -3833,13 +3958,13 @@ mod tests {
     ) {
         let (window, id, _) = super::super::tests::window(cx);
         window
-            .update(cx, |shell, _, cx| {
+            .update(cx, |shell, window, cx| {
                 let target = Target::Session(id);
                 // A read result gains no field.
                 assert!(shell.mobile_read_fields(&target, &phone(), cx).is_empty());
                 let read = json!({"id": "c", "turns": [], "busy": false});
                 assert_eq!(merge_fields(read.clone(), Map::new()), read);
-                // A watch frame with the stub fields equals one with none.
+                // A watch frame with the cloud fields equals one with none.
                 let extra = shell.mobile_frame_fields(&target, &phone(), cx);
                 assert_eq!(extra, json!({}));
                 let none = Value::Null;
@@ -3847,7 +3972,14 @@ mod tests {
                 let plain = watch::update(None, true, false, &none, &turns, false, &none, &none);
                 let hooked = watch::update(None, true, false, &none, &turns, false, &none, &extra);
                 assert_eq!(plain.unwrap().0, hooked.unwrap().0);
-                // The new methods answer as an unknown method did.
+                // A phone has no cloud methods: each is answered as an unknown
+                // method was, now with the stable code. A web device's stubs
+                // answer the same until their tickets land.
+                let unsupported = Err(policy::Code::Unsupported.failure());
+                assert_eq!(
+                    policy::Code::Unsupported.failure().error,
+                    "Unsupported mobile operation"
+                );
                 for method in [
                     "cloud.instances",
                     "cloud.startOptions",
@@ -3858,10 +3990,11 @@ mod tests {
                     "cloud.moveToCloud",
                     "cloud.moveToLocal",
                     "cloud.cancelMove",
+                    "cloud.unknown",
                 ] {
                     assert_eq!(
                         cloud::dispatch(shell, &phone(), method, &json!({}), cx),
-                        Err("Unsupported mobile operation".into()),
+                        unsupported,
                         "{method}"
                     );
                 }
@@ -3869,22 +4002,28 @@ mod tests {
                     approvals::dispatch(shell, &phone(), "c", &json!({}), cx),
                     Err(policy::Code::Disabled.failure())
                 );
-                // Archive, delete, send and start are never refused by the stubs.
+                // Archive, delete, send and start are never refused by the
+                // hooks, and a send never wakes anything.
                 assert_eq!(
-                    cloud::before_archive(shell, &phone(), id, &json!({}), cx),
-                    Ok(())
+                    cloud::before_archive(shell, &phone(), id, &json!({}), window, cx),
+                    Ok(cloud::Archive::Local)
                 );
                 assert_eq!(cloud::before_delete(shell, &phone(), id, cx), Ok(()));
                 assert_eq!(
-                    cloud::before_send(shell, &phone(), Some(id), &json!({}), cx),
-                    Ok(())
+                    cloud::before_send(shell, &phone(), Some(id), &json!({"wake": true}), cx),
+                    Ok(cloud::SendPlan::default())
                 );
+                assert!(!cloud::SendPlan::default().wake);
                 assert_eq!(
                     cloud::start_target(shell, &phone(), "/tmp", &json!({}), cx),
-                    Ok(())
+                    Ok(None)
                 );
+                // A phone's session has no cloud binding and no extra project.
                 let summary = shell.session_metadata(id, cx).summary;
-                assert_eq!(cloud::catalog_project_of(summary), None);
+                let paths = shell.mobile_projects(cx);
+                assert_eq!(cloud::catalog_project_of(shell, id, summary, &paths), None);
+                assert_eq!(cloud::read_fields(shell, id, &phone(), cx), Map::new());
+                assert_eq!(cloud::frame_fields(shell, id, &phone(), cx), Map::new());
             })
             .unwrap();
     }
@@ -3913,9 +4052,10 @@ mod tests {
                     v.settings.usage_limit = Some(monocode_core::usage::Limit {
                         resets_at: Some(monocode_core::usage::now_ms() + 60_000),
                         resume_at_reset: false,
+                        no_wake: false,
                     });
                     let token = v.mobile_usage_limit(cx)["token"].clone();
-                    v.mobile_resume_usage(&token, Some(true), cx).unwrap();
+                    v.mobile_resume_usage(&token, Some(true), true, cx).unwrap();
                 });
                 conversation
             })
@@ -3956,6 +4096,7 @@ mod tests {
                 usage_limit: Some(monocode_core::usage::Limit {
                     resets_at: Some(reset),
                     resume_at_reset: true,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

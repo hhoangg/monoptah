@@ -506,6 +506,56 @@ pub(crate) fn run(
 ) {
     run_with_default_client(summary, None, prompt, settings, controls, store, cancel, tx)
 }
+// MARK: no-wake sends from remote devices
+//
+// A remote device's message (without the consent to wake) must never start a stopped
+// codespace: `ensure_before_send` below would. The turn worker runs the whole run on one
+// thread, so the flag the message carried is set for the duration of that run on that thread
+// (no global state, no timer): the run then only checks that the Host answers and fails the
+// send visibly when it does not.
+
+thread_local! {
+    static NO_WAKE_RUN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `run` (a whole turn) as a no-wake one when `no_wake` is set.
+pub(crate) fn run_without_waking<T>(no_wake: bool, run: impl FnOnce() -> T) -> T {
+    /// Clears the flag when the run ends, also by a panic: a pool thread must not keep it.
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            NO_WAKE_RUN.with(|flag| flag.set(false));
+        }
+    }
+    NO_WAKE_RUN.with(|flag| flag.set(no_wake));
+    let _clear = Clear;
+    run()
+}
+
+/// Whether the run on this thread may not wake its instance.
+pub(crate) fn no_wake_run() -> bool {
+    NO_WAKE_RUN.with(std::cell::Cell::get)
+}
+
+/// The text of a send that found its instance down and was not allowed to wake it.
+pub(crate) const NOT_CONNECTED: &str =
+    "The cloud instance is not connected; open it on the desktop";
+
+/// Fails unless the Host of `environment_id` answers now. Never wakes anything: it only asks.
+pub(crate) fn require_connected(
+    host: &dyn monocode_core::cloud_sessions::Host,
+    environment_id: &str,
+) -> Result<(), String> {
+    let machine = host
+        .machines()?
+        .into_iter()
+        .find(|m| m.environment_id == environment_id)
+        .ok_or(NOT_CONNECTED)?;
+    host.request(&machine.id, "environment.describe", json!({}))
+        .map(|_| ())
+        .map_err(|_| NOT_CONNECTED.to_owned())
+}
+
 /// Runs `summary` (a Host session record) for a local session that lives in the cloud:
 /// the Host rows are appended to the local session `mirror`.
 #[allow(clippy::too_many_arguments, reason = "Mirrors the turn worker inputs")]
@@ -654,6 +704,9 @@ pub(crate) fn run_with_client_mirrored(
             // blocking for the boot is fine. Attaching never wakes.
             if binding.project.cloud().is_some() {
                 monocode_core::cloud_sessions::require_claude(&binding.summary.provider)?;
+                if no_wake_run() {
+                    require_connected(&client, &binding.project.environment_id)?;
+                }
                 // Stop cancels the wake; the status line shows it only when a
                 // reconnect actually starts (a connected codespace is instant).
                 let start = latest_rows.len();

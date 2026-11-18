@@ -74,6 +74,7 @@ describe("error codes", () => {
         "instance_busy",
         "not_pending",
         "needs_desktop",
+        "wake_required",
       ].sort(),
     );
   });

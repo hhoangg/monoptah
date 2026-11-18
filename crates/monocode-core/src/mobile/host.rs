@@ -3,6 +3,7 @@
 //! answers them from its own state. No arbitrary app commands are exposed.
 use super::audit::{self, AuditEvent, Outcome, Transport};
 use super::catalog::{recent_sessions, session_page};
+use super::cloud_policy;
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
 use super::policy::{self, DeviceContext, DeviceKind, Permission};
 use super::web_link::{desktop_api, LinkCommand, PairPoll, PairTicket, PermissionRequest};
@@ -1053,6 +1054,9 @@ impl MobileHost {
                 }
                 "workspace.list" => {
                     let mut catalog = inner.catalog.clone();
+                    // Before the lists are cut to a recent few, so web-only
+                    // sessions never take a phone's place in them.
+                    cloud_policy::scope_catalog(&context, &mut catalog);
                     catalog["sessions"] = json!(recent_sessions(&catalog["sessions"]));
                     // The desktop's network addresses are for phones; a browser
                     // reaches it through the relay and never needs them.
@@ -1063,7 +1067,11 @@ impl MobileHost {
                     return Ok(catalog);
                 }
                 "sessions.list" => {
-                    let mut page = session_page(&inner.catalog["sessions"], &params);
+                    // Scoped before paging: a phone's offsets and `hasMore`
+                    // must not count sessions it never sees.
+                    let mut scoped = json!({"sessions": inner.catalog["sessions"].clone()});
+                    cloud_policy::scope_catalog(&context, &mut scoped);
+                    let mut page = session_page(&scoped["sessions"], &params);
                     policy::filter_reply(&context, method, &mut page);
                     return Ok(page);
                 }
@@ -3024,6 +3032,57 @@ mod tests {
         assert_eq!(catalog["sessions"][0]["id"], "s");
         assert!(catalog["addresses"].is_array());
         assert!(host.publish(json!({"projects":[]})).is_err());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_only_sessions_never_displace_a_phones_lists_or_pages() {
+        let (host, _events, peer) = paired();
+        // 25 newer web-only sessions, then 25 that a phone always saw.
+        let sessions: Vec<Value> = (0..50)
+            .map(|i| {
+                let mut card = json!({"id": format!("s{i}"), "projectId": "p", "title": "t"});
+                if i < 25 {
+                    card["webOnly"] = json!(true);
+                    card["target"] = json!({"kind": "codespace"});
+                }
+                card
+            })
+            .collect();
+        host.publish(json!({"projects":[{"id":"p"}],"monos":[],"sessions":sessions}))
+            .unwrap();
+        let ask = |method: &str, params: Value| {
+            host.handle(
+                &peer,
+                json!({"version":VERSION,"id":"c","method":method,"params":params}),
+            )
+        };
+        let poll = ask("workspace.list", json!({})).await.unwrap();
+        let ids: Vec<_> = poll["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].clone())
+            .collect();
+        let expected: Vec<_> = (25..45).map(|i| json!(format!("s{i}"))).collect();
+        assert_eq!(ids, expected, "the recent 20 are the phone's own");
+        let page = ask(
+            "sessions.list",
+            json!({"projectId": "p", "offset": 10, "limit": 10}),
+        )
+        .await
+        .unwrap();
+        let ids: Vec<_> = page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].clone())
+            .collect();
+        let expected: Vec<_> = (35..45).map(|i| json!(format!("s{i}"))).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(page["hasMore"], true);
+        assert!(!page.to_string().contains("webOnly"));
+        assert!(!page.to_string().contains("target"));
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

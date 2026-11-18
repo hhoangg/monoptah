@@ -314,6 +314,13 @@ impl AutoStop {
         }
     }
 
+    /// The clock second (the `now` of [`Self::check`]) from which the idle window of `cloud`
+    /// counts: when it was last seen doing something. `None` for a workspace not checked yet.
+    /// Read only, for the remote-device notice that a stop is near.
+    pub fn idle_since(&self, cloud: &CloudRef) -> Option<u64> {
+        self.since.get(&cloud.key()).copied()
+    }
+
     /// The user resumed the workspace: it starts a fresh idle window, and an earlier "keep
     /// running" no longer applies (the user is using it again).
     pub fn resumed(&mut self, cloud: &CloudRef, now: u64) {

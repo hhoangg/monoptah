@@ -86,7 +86,7 @@ impl Shell {
             web_notice: self.web_notice(cx),
             web_projects: web_choices.0,
             web_monos: web_choices.1,
-            web_policy: Default::default(),
+            web_policy: monocode_core::mobile::policy::flags(),
             quick_error: self.quick.error.clone(),
             inbox_connections: self
                 .inbox
@@ -773,6 +773,7 @@ mod tests {
                         v.settings.usage_limit = Some(Limit {
                             resets_at: reset,
                             resume_at_reset: false,
+                            ..Default::default()
                         });
                         v.settings.auto_resume_opt_out = opt_out;
                     });

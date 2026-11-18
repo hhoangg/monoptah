@@ -401,11 +401,18 @@ impl Conversation {
                 }
             }
         } else {
+            // A message a remote device queued without consent to wake runs without waking.
+            // The id stays until the run launches (`launch_prompt`), so a send that returns early
+            // or is deferred keeps the flag.
+            let carried = self.mobile_no_wake_ids.contains(&message.id);
+            let outer = std::mem::replace(&mut self.mobile_no_wake, carried);
             if self.is_remote() {
                 self.drain_remote_follow_up(message, cx);
+                self.mobile_no_wake = outer;
                 return;
             }
             if self.settings.new_worktree && self.settings.worktree_cwd.is_none() {
+                self.mobile_no_wake = outer;
                 self.prepare_worktree(cx);
                 return;
             }
@@ -413,6 +420,7 @@ impl Conversation {
             let message_id = message.id.clone();
             self.settings.mono_message_id = Some(message.id.clone());
             self.launch_message(message, cx);
+            self.mobile_no_wake = outer;
             self.settings.mono_message_id = None;
             if !self.busy {
                 self.fail_follow_up(&message_id, self.status.clone(), cx);

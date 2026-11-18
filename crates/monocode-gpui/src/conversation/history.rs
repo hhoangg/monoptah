@@ -25,6 +25,7 @@ impl Conversation {
         self.load(cx);
     }
     pub(super) fn run_history_actions(&mut self, cx: &mut Context<Self>) {
+        self.flush_wake_send(cx);
         while self.history_ready() && !self.stopping && !self.editing_last_turn.pending() {
             let Some(action) = self.history_actions.pop_front() else {
                 break;

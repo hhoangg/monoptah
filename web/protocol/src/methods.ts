@@ -311,6 +311,11 @@ export const METHODS = {
       conversationId: ConversationId,
       text: z.string().max(MAX_MESSAGE_CHARS),
       attachments: AttachmentsSchema.optional(),
+      /**
+       * Consent to wake a stopped cloud instance (billable). Without it a send to a session whose
+       * instance would be woken is refused with `wake_required` (architecture.md 6.6).
+       */
+      wake: z.literal(true).optional(),
     }),
     /** `wake` and `queued`: the send woke a stopped cloud instance (web transport, architecture.md 6.6). */
     result: z.looseObject({ sessionId: z.string().optional(), wake: z.boolean().optional(), queued: z.boolean().optional() }),
@@ -359,13 +364,24 @@ export const METHODS = {
   "session.resumeUsage": method({
     class: "control",
     transport: "app",
-    params: z.object({ conversationId: ConversationId, token: z.string() }),
+    params: z.object({
+      conversationId: ConversationId,
+      token: z.string(),
+      /** Consent to wake a stopped cloud instance, as for `conversation.send` (needed only for a cloud session). */
+      wake: z.literal(true).optional(),
+    }),
     result: SessionAck,
   }),
   "session.resumeUsageAtReset": method({
     class: "control",
     transport: "app",
-    params: z.object({ conversationId: ConversationId, token: z.string(), enabled: z.boolean() }),
+    params: z.object({
+      conversationId: ConversationId,
+      token: z.string(),
+      enabled: z.boolean(),
+      /** Consent to wake a stopped cloud instance, as for `conversation.send` (needed only for a cloud session). */
+      wake: z.literal(true).optional(),
+    }),
     result: SessionAck,
   }),
   "session.answerQuestion": method({
