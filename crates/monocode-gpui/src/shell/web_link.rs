@@ -261,9 +261,11 @@ impl Shell {
 
     /// Switches a remote-action toggle. The process flags change at once (a
     /// device is judged by them on its next call), the file is written off the
-    /// UI thread, and the connected web devices are told. A failed save puts
-    /// the flag back and shows the reason, so the page never claims a setting
-    /// that a restart would lose.
+    /// UI thread, and the connected web devices are told. Saves run one at a
+    /// time, each writing the flags as they are when it runs, so the last save
+    /// always holds the latest state. A failed save fails closed: the flag
+    /// ends OFF, whichever way it was being switched, so the page never grants
+    /// more than what was saved, and the notice says so.
     fn web_set_policy_flag(&mut self, flag: WebPolicyFlag, on: bool, cx: &mut Context<Self>) {
         let Some(path) = self
             .data_dir
@@ -276,20 +278,21 @@ impl Shell {
             );
             return;
         };
-        let previous = policy::flags();
-        policy::set_flags(with_flag(previous, flag, on));
+        policy::set_flags(with_flag(policy::flags(), flag, on));
         self.sync_settings(cx);
-        let task = cx
-            .background_executor()
-            .spawn(async move { policy::save_settings(&path, &policy::settings()) });
+        let task = cx.background_executor().spawn(async move {
+            let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+            policy::save_settings(&path, &policy::settings())
+        });
         cx.spawn(async move |this, cx| {
             let saved = task.await;
             let _ = this.update(cx, |this, cx| {
                 let notice = saved.err().map(|error| {
-                    // Only this flag goes back: another toggle may have moved meanwhile.
-                    let current = policy::flags();
-                    policy::set_flags(with_flag(current, flag, flag_of(&previous, flag)));
-                    format!("Web app: could not save the setting: {error}")
+                    // Only this flag moves: another toggle may have changed meanwhile.
+                    policy::set_flags(with_flag(policy::flags(), flag, false));
+                    format!(
+                        "Web app: could not save the setting ({error}). It stays off until it can be saved."
+                    )
                 });
                 monocode_core::mobile::web_link::resend_state();
                 this.web_set_notice(notice, cx);
@@ -438,6 +441,9 @@ impl Shell {
     }
 }
 
+/// Policy saves run one at a time.
+static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `flags` with `flag` set to `on`.
 fn with_flag(mut flags: PolicyFlags, flag: WebPolicyFlag, on: bool) -> PolicyFlags {
     match flag {
@@ -445,13 +451,6 @@ fn with_flag(mut flags: PolicyFlags, flag: WebPolicyFlag, on: bool) -> PolicyFla
         WebPolicyFlag::CloudStart => flags.remote_cloud_start = on,
     }
     flags
-}
-
-fn flag_of(flags: &PolicyFlags, flag: WebPolicyFlag) -> bool {
-    match flag {
-        WebPolicyFlag::GitPush => flags.remote_git_push,
-        WebPolicyFlag::CloudStart => flags.remote_cloud_start,
-    }
 }
 
 #[cfg(test)]
@@ -550,6 +549,48 @@ mod tests {
                 assert!(notice.contains("could not save"), "{notice}");
             })
             .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M1: turning a flag OFF whose save fails leaves it OFF (never back on),
+    /// and the notice says it stays off.
+    #[gpui::test]
+    fn a_failed_save_never_leaves_a_flag_on(cx: &mut gpui::TestAppContext) {
+        let _serial = POLICY.lock().unwrap_or_else(|e| e.into_inner());
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let dir = scratch_dir("closed");
+        policy::install_settings(policy::PolicySettings {
+            flags: PolicyFlags {
+                remote_cloud_start: true,
+                remote_git_push: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                shell.data_dir = Some(dir.join("missing"));
+                shell.web_settings_event(
+                    &SettingsEvent::WebSetPolicyFlag {
+                        flag: WebPolicyFlag::CloudStart,
+                        on: false,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let flags = policy::flags();
+        assert!(!flags.remote_cloud_start, "off stays off");
+        assert!(flags.remote_git_push, "another flag is not touched");
+        window
+            .update(cx, |shell, _, cx| {
+                let notice = shell.web_notice(cx).expect("a notice");
+                assert!(notice.contains("could not save"), "{notice}");
+                assert!(notice.contains("stays off"), "{notice}");
+            })
+            .unwrap();
+        policy::install_settings(Default::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
