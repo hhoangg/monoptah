@@ -23,7 +23,35 @@ function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-/** A short title for an audit event; unknown actions show their key. */
+/** Plain-word titles of the audit actions that carry no meta-dependent wording. Keys mirror web/worker/src/modules/audit/actions.ts. */
+const AUDIT_TITLES: Record<string, string> = {
+  "account.register": "Account created",
+  "account.login": "Signed in",
+  "account.login_refused_counter": "Sign-in refused (passkey looked cloned)",
+  "passkey.add": "Passkey added",
+  "passkey.rename": "Passkey renamed",
+  "passkey.delete": "Passkey removed",
+  "recovery.use": "Recovery code used",
+  "recovery.regenerate": "Recovery codes regenerated",
+  "invite.create": "Invite created",
+  "invite.use": "Invite used",
+  "invite.revoke": "Invite revoked",
+  "pairing.approve": "Desktop paired",
+  "desktop.create": "Desktop added",
+  "desktop.revoke": "Desktop removed",
+  "device.create": "Device added",
+  "device.revoke": "Device removed",
+  "grant.change": "Device access changed",
+  "session.logout": "Signed out",
+  "session.revoke": "Sessions ended",
+  "ratelimit.breach": "Too many requests blocked",
+  "system.deploy": "Server updated",
+  // Older names kept so rows written before the registry still read well.
+  "user.register": "Account created",
+  login: "Signed in",
+};
+
+/** A short title for an audit event in plain words; an action nobody mapped reads "Other change", never its raw id. */
 export function auditTitle(event: AdminAuditEvent): string {
   const meta = event.meta;
   switch (event.action) {
@@ -38,24 +66,8 @@ export function auditTitle(event: AdminAuditEvent): string {
       return typeof meta.count === "number" ? `Granted ${plural(meta.count, "invite", "invites")}` : "Granted invites";
     case "admin.settings_change":
       return meta.invitesPaused === true ? "Paused invites" : meta.invitesPaused === false ? "Resumed invites" : "Changed settings";
-    case "user.register":
-      return "Account created";
-    case "invite.create":
-      return "Invite created";
-    case "invite.use":
-      return "Invite used";
-    case "invite.revoke":
-      return "Invite revoked";
-    case "passkey.add":
-      return "Passkey added";
-    case "recovery.regenerate":
-      return "Recovery codes regenerated";
-    case "pairing.approve":
-      return "Desktop paired";
-    case "login":
-      return "Signed in";
     default:
-      return event.action;
+      return Object.hasOwn(AUDIT_TITLES, event.action) ? (AUDIT_TITLES[event.action] ?? "Other change") : "Other change";
   }
 }
 

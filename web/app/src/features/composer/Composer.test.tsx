@@ -3,7 +3,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Composer, DESKTOP_LAYOUT_QUERY, OFFLINE_PLACEHOLDER, READ_ONLY_REASON, type ComposerProps } from "./Composer";
+import { Composer, DESKTOP_LAYOUT_QUERY, OFFLINE_PLACEHOLDER, READ_ONLY_REASON, STOP_RETRY_MS, UNKNOWN_ERROR_SENTENCE, type ComposerProps } from "./Composer";
 import { SendCancelled } from "./useSendGuard";
 
 function setMedia(desktop: boolean) {
@@ -27,6 +27,13 @@ beforeEach(() => {
   window.scrollTo = vi.fn() as never;
 });
 afterEach(() => vi.restoreAllMocks());
+
+/** Stop is armed STOP_ARM_DELAY_MS after it appears: wait for that, then return the button. */
+async function armedStop() {
+  const stop = screen.getByRole("button", { name: "Stop" });
+  await waitFor(() => expect(stop).not.toHaveAttribute("aria-disabled"));
+  return stop;
+}
 
 function setup(props: Partial<ComposerProps> = {}) {
   const onSubmit = vi.fn<ComposerProps["onSubmit"]>(() => Promise.resolve());
@@ -87,18 +94,90 @@ describe("send", () => {
     expect(field.value).toBe("go");
   });
 
-  it("a draft mid-turn still sends with the follow-up placeholder; an empty draft shows Stop", async () => {
+  it("a draft mid-turn still sends with the follow-up placeholder; Stop stays next to Send", async () => {
     const user = userEvent.setup();
     const onStop = vi.fn(() => Promise.resolve());
     const { onSubmit, field } = setup({ busy: true, onStop });
     expect(field).toHaveAttribute("placeholder", "Send a follow-up...");
     expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Stop" }));
+    await user.click(await armedStop());
     expect(onStop).toHaveBeenCalledTimes(1);
     await user.type(field, "also this");
-    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Stopping..." })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Send" }));
     await waitFor(() => expect(onSubmit).toHaveBeenCalledWith("also this", []));
+  });
+
+  it("ignores a press on Stop until it has been there for the arming delay", async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn(() => Promise.resolve());
+    setup({ busy: true, onStop });
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(stop).toHaveAttribute("aria-disabled", "true");
+    await user.click(stop);
+    expect(onStop).not.toHaveBeenCalled();
+    await armedStop();
+    await user.click(stop);
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("says Stopping... with aria-busy until the turn ends, not only until the cancel resolves", async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn(() => Promise.resolve());
+    const onSubmit = vi.fn<ComposerProps["onSubmit"]>(() => Promise.resolve());
+    const { rerender } = render(<Composer onSubmit={onSubmit} busy onStop={onStop} />);
+    await user.click(await armedStop());
+    const stop = screen.getByRole("button", { name: "Stopping..." });
+    await waitFor(() => expect(stop).toHaveAttribute("aria-busy", "true"));
+    // Visible text inside the button (touch has no tooltip) and one polite live region outside it.
+    expect(stop).toHaveTextContent("Stopping...");
+    expect(screen.getByRole("status")).toHaveTextContent("Stopping...");
+    expect(stop).not.toContainElement(screen.getByRole("status"));
+    await user.click(stop);
+    expect(onStop).toHaveBeenCalledTimes(1);
+    rerender(<Composer onSubmit={onSubmit} busy={false} onStop={onStop} />);
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("re-arms Stop when it changes slot, so a double tap on Send never hits an armed Stop", async () => {
+    const user = userEvent.setup();
+    const onStop = vi.fn(() => Promise.resolve());
+    const { field } = setup({ busy: true, onStop });
+    await armedStop();
+    await user.type(field, "x");
+    // The draft moved Stop to the slot beside Send: not armed until the delay passes again.
+    expect(screen.getByRole("button", { name: "Stop" })).toHaveAttribute("aria-disabled", "true");
+    await user.click(screen.getByRole("button", { name: "Stop" }));
+    expect(onStop).not.toHaveBeenCalled();
+    await armedStop();
+    await user.clear(field);
+    expect(screen.getByRole("button", { name: "Stop" })).toHaveAttribute("aria-disabled", "true");
+    await armedStop();
+  });
+
+  it("lets Stop be pressed again when the turn still runs after the cancel request resolved", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+      const onStop = vi.fn(() => Promise.resolve());
+      setup({ busy: true, onStop });
+      await user.click(await armedStop());
+      const stop = screen.getByRole("button", { name: "Stopping..." });
+      await waitFor(() => expect(stop).toHaveAttribute("aria-busy", "true"));
+      expect(stop).toHaveAttribute("aria-disabled", "true");
+      await user.click(stop);
+      expect(onStop).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        vi.advanceTimersByTime(STOP_RETRY_MS + 50);
+      });
+      expect(stop).not.toHaveAttribute("aria-disabled");
+      expect(stop).toHaveTextContent("Stopping...");
+      await user.click(stop);
+      expect(onStop).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps its layout when Stop takes pointer focus, so the press is not moved from under the pointer", () => {
@@ -125,7 +204,7 @@ describe("send", () => {
     const onStop = vi.fn(() => Promise.resolve());
     const { field } = setup({ busy: true, onStop });
     const shape = () => field.closest("[data-shape]");
-    const stop = screen.getByRole("button", { name: "Stop" });
+    const stop = await armedStop();
     await user.pointer({ keys: "[MouseLeft>]", target: stop });
     expect(shape()).toHaveAttribute("data-shape", "pill");
     expect(stop).not.toHaveFocus();
@@ -147,7 +226,7 @@ describe("send", () => {
   it("shows why Stop failed", async () => {
     const user = userEvent.setup();
     setup({ busy: true, onStop: () => Promise.reject(new Error("timeout")) });
-    await user.click(screen.getByRole("button", { name: "Stop" }));
+    await user.click(await armedStop());
     expect(await screen.findByRole("alert")).toHaveTextContent("Could not stop: timeout");
   });
 });
@@ -172,13 +251,55 @@ describe("disabled states", () => {
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
   });
 
-  it("an error notice takes the field's place until it is tapped away", async () => {
+  it("an error notice is a compact row above the field: the field and toolbar stay usable", async () => {
     const user = userEvent.setup();
     const dismiss = vi.fn();
-    setup({ notice: { text: "Rate limited", dismiss } });
-    expect(screen.queryByRole("textbox")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Couldn't continue: Rate limited" }));
+    setup({ notice: { text: "Rate limited", dismiss }, toolbar: <button type="button">Model</button> });
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Model" })).toBeEnabled();
+    const row = screen.getByTestId("composer-notice");
+    expect(row).toHaveTextContent("Couldn't continue");
+    expect(row).toHaveTextContent("Rate limited");
+    await user.click(screen.getByRole("button", { name: "Details" }));
+    expect(await screen.findByTestId("session-error-dialog")).toHaveTextContent("Rate limited");
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(dismiss).toHaveBeenCalled();
+  });
+
+  it("says an unknown or empty error code in a plain sentence", () => {
+    setup({ notice: { text: "unknown", dismiss: () => {} } });
+    expect(screen.getByTestId("composer-notice")).toHaveTextContent(UNKNOWN_ERROR_SENTENCE);
+    expect(screen.getByTestId("composer-notice")).not.toHaveTextContent(/^unknown$/);
+  });
+
+  it("raises no notice for a turn the user stopped (the desktop sends \"Stopped\")", () => {
+    setup({ notice: { text: "Stopped", dismiss: () => {} } });
+    expect(screen.queryByTestId("composer-notice")).toBeNull();
+  });
+
+  it("still shows a notice that only mentions stopping or cancelling", () => {
+    setup({ notice: { text: "Stopped Docker sandbox box-1 after 10 min idle; send a message to resume.", dismiss: () => {} } });
+    expect(screen.getByTestId("composer-notice")).toHaveTextContent("Stopped Docker sandbox box-1");
+  });
+
+  it("still shows an Interrupted or Cancelled notice: only the desktop's own wording is hidden", () => {
+    setup({ notice: { text: "Connection cancelled", dismiss: () => {} } });
+    expect(screen.getByTestId("composer-notice")).toHaveTextContent("Connection cancelled");
+  });
+
+  it("a read-only device can ask for control, and then sees that it was requested", async () => {
+    const user = userEvent.setup();
+    const request = vi.fn();
+    const { rerender } = render(<Composer onSubmit={vi.fn()} readOnly requestControl={{ state: "idle", request }} />);
+    await user.click(screen.getByRole("button", { name: "Request control" }));
+    expect(request).toHaveBeenCalledTimes(1);
+    rerender(<Composer onSubmit={vi.fn()} readOnly requestControl={{ state: "requested", request }} />);
+    expect(screen.getByText("Requested, confirm on the desktop.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Request control" })).toBeNull();
+    // The user is never stuck: asking again re-sends the request.
+    await user.click(screen.getByRole("button", { name: "Ask again" }));
+    expect(request).toHaveBeenCalledTimes(2);
   });
 });
 

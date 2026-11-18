@@ -13,6 +13,7 @@ import {
   ChartBreakoutSquareIcon,
   CheckmarkCircle02Icon,
   CircleIcon,
+  CloudIcon,
   ComputerIcon,
   ComputerRemoveIcon,
   ComputerTerminal01Icon,
@@ -61,6 +62,7 @@ import {
   SourceCodeIcon,
   SparklesIcon,
   Sun03Icon,
+  UserCircleIcon,
   TextWrapIcon,
   Tick02Icon,
   UnfoldMoreIcon,
@@ -91,6 +93,7 @@ export const ICONS = {
   chevronUpDown: UnfoldMoreIcon,
   chevronRight: ArrowRight01Icon,
   branch: GitBranchIcon,
+  cloud: CloudIcon,
   computer: ComputerIcon,
   computerOff: ComputerRemoveIcon,
   sparkle: SparklesIcon,
@@ -144,6 +147,7 @@ export const ICONS = {
   smartphone: SmartPhone01Icon,
   laptop: LaptopIcon,
   success: CheckmarkCircle02Icon,
+  account: UserCircleIcon,
 } as const satisfies Record<string, IconSvgElement>;
 
 export type IconName = keyof typeof ICONS;

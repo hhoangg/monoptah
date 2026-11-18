@@ -14,9 +14,18 @@ export function lastSeenLabel(lastSeenAt: number | null, online: boolean, now?: 
   return `Last seen ${formatRelative(lastSeenAt, now)}`;
 }
 
+/** A readable name for the OS id a desktop reports ("macos" is "macOS"); unknown ids are shown as sanitized text. */
+export function osLabel(os: string): string {
+  const id = os.trim().toLowerCase();
+  if (id === "macos" || id === "darwin" || id === "mac") return "macOS";
+  if (id === "windows" || id === "win32" || id === "win") return "Windows";
+  if (id === "linux") return "Linux";
+  return safeLabel(os, 32, "");
+}
+
 /** "macOS, v1.2.3", either part alone, or null when neither is known. Both come from the desktop: untrusted. */
 export function versionLabel(os: string | null, appVersion: string | null): string | null {
-  const parts = [os ? safeLabel(os, 32, "") : "", appVersion ? `v${safeLabel(appVersion.replace(/^v/i, ""), 24, "")}` : ""].filter((part) => part !== "" && part !== "v");
+  const parts = [os ? osLabel(os) : "", appVersion ? `v${safeLabel(appVersion.replace(/^v/i, ""), 24, "")}` : ""].filter((part) => part !== "" && part !== "v");
   return parts.length > 0 ? parts.join(", ") : null;
 }
 

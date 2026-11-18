@@ -3,7 +3,9 @@ import { useState } from "react";
 import { Button } from "@/ui/button";
 import { Notice } from "@/ui/Notice";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
-import { PushOnboarding, CATEGORY_EXPLAINERS } from "./PushOnboarding";
+import { PushOnboarding } from "./PushOnboarding";
+import { useDesktops } from "@/features/desktops/api";
+import { safeName } from "@/features/desktops/format";
 import { loadPauseRecord } from "@/features/push/pauseRecord";
 import { pauseAll, resumeAll, type BulkResult } from "./pushPrefs";
 import { useAction } from "./useAction";
@@ -26,6 +28,7 @@ function bulkMessage(enabled: boolean, { changed, skipped }: BulkResult): string
 export function NotificationsCard() {
   const queryClient = useQueryClient();
   const bulk = useAction();
+  const desktops = useDesktops();
   const [last, setLast] = useState<{ enabled: boolean; result: BulkResult } | null>(null);
 
   // Desktops that Pause all turned off and Resume all can turn back on (read again after every action).
@@ -44,17 +47,31 @@ export function NotificationsCard() {
     <SettingsCard
       title="Notifications"
       aria-label="Notifications"
-      footnote="Choose which categories each desktop sends in that desktop's settings. Pause all and Resume all only touch desktops whose settings this browser knows."
+      footnote="Pause all and Resume all only touch desktops whose settings this browser knows."
     >
       <PushOnboarding />
-      <ul className="m-0 flex list-none flex-col p-0" aria-label="Notification categories">
-        {CATEGORY_EXPLAINERS.map((category) => (
-          <SettingsRow key={category.title} as="li" title={category.title} description={category.description} />
-        ))}
-      </ul>
+      <p className="px-1.5 py-1.5 text-small text-muted-text">
+        Each desktop sends approvals and questions, finished agents and messages from Monos. Choose which ones in that desktop's settings.
+      </p>
+      {desktops.data && desktops.data.desktops.length > 0 ? (
+        <ul className="m-0 flex list-none flex-col p-0" aria-label="Notification settings per desktop">
+          {desktops.data.desktops.map((desktop, index) => (
+            <li key={desktop.id}>
+              <SettingsRow
+                icon="computer"
+                title={safeName(desktop.name, "Unnamed desktop")}
+                description="Choose notification categories"
+                to="/d/$desktopId/settings"
+                params={{ desktopId: desktop.id }}
+                className={index > 0 ? "before:block!" : undefined}
+              />
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <SettingsRow
         icon="notifications"
-        title="Pause all"
+        title="Pause notifications"
         description="Turn notifications off for the desktops whose settings this browser knows, and back on later with the same choices. Other desktops are left as they are."
         trailing={
           <span className="flex gap-2">

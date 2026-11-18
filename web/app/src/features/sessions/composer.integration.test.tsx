@@ -118,7 +118,10 @@ describe("composer in the session screen (W-08)", () => {
   it("Stop calls session.cancel while a turn runs", async () => {
     const user = userEvent.setup();
     mount(`/s/${SESSION}`, { seed: (desktop) => void (desktop.world.sessions.get(SESSION)!.busy = true) });
-    await user.click(await screen.findByRole("button", { name: "Stop" }));
+    const stop = await screen.findByRole("button", { name: "Stop" });
+    // A new Stop button is armed a moment after it appears.
+    await waitFor(() => expect(stop).not.toHaveAttribute("aria-disabled"));
+    await user.click(stop);
     await waitFor(() => expect(link.desktop.world.sessions.get(SESSION)!.busy).toBe(false));
   });
 

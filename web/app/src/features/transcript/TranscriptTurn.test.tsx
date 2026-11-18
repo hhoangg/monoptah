@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Turn } from "@monoptah/protocol";
 import { TranscriptActionsContext, type TranscriptActions } from "./context";
+import { ModelNamesContext } from "./modelNames";
 import { resetCollapsedToolCalls, setCollapsedToolCalls, TOOL_CALLS_KEY } from "./toolCallsSetting";
 import { TranscriptTurn } from "./TranscriptTurn";
 
@@ -120,6 +121,19 @@ describe("fold line (F-36)", () => {
   it("is a plain label when there is nothing to open", () => {
     show({ id: "t", items: [{ type: "header", id: "h", live: false, durationMs: 5000, entries: [] }] });
     expect(screen.getByRole("button", { name: "Worked for 5s" })).toBeDisabled();
+  });
+
+  it("shows the catalog's display name for a model id and the raw id when the catalog does not know it", () => {
+    const names: Record<string, string> = { "claude:opus": "Claude Opus" };
+    const turn = (id: string, model: string): Turn => ({ id, items: [{ type: "header", id: `h${id}`, live: false, durationMs: 72_000, model, entries: [] }] });
+    render(
+      <ModelNamesContext value={(id) => names[id] ?? id}>
+        <TranscriptTurn turn={turn("a", "claude:opus")} />
+        <TranscriptTurn turn={turn("b", "mystery-model")} />
+      </ModelNamesContext>,
+    );
+    expect(screen.getByText("Claude Opus worked for 1m 12s")).toBeInTheDocument();
+    expect(screen.getByText("mystery-model worked for 1m 12s")).toBeInTheDocument();
   });
 
   it("ticks while live and shows the waiting label when there is one", () => {

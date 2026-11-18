@@ -5,6 +5,7 @@ import { useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
+import { IconTip } from "@/ui/tooltip";
 import { Notice } from "@/ui/Notice";
 import { FileTypeIcon } from "@/features/files/FileTypeIcon";
 import { GitActionBar } from "./GitActionBar";
@@ -13,12 +14,17 @@ import { useCanPush, useChangesQuery, useGitQuery, useReadOnlyDevice, useRunGitA
 
 type SectionId = "staged" | "changes";
 
+/** Keyboard focus rings are drawn inside the rows: the section cards clip anything outside their rounded edge. */
+const INSET_FOCUS = "focus-visible:outline-offset-[-2px]";
+
 export interface ChangesViewProps {
   projectId: string;
+  /** The file whose diff is open beside the list (split layout): its row is marked current. */
+  selectedPath?: string;
   onOpenFile: (file: ChangedFile) => void;
 }
 
-export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
+export function ChangesView({ projectId, selectedPath, onOpenFile }: ChangesViewProps) {
   const changes = useChangesQuery(projectId);
   const git = useGitQuery(projectId);
   const readOnly = useReadOnlyDevice();
@@ -105,28 +111,30 @@ export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
             type="button"
             aria-expanded={!collapsed.has(id)}
             onClick={() => toggleSection(id)}
-            className="flex min-h-11 min-w-0 flex-1 items-center gap-2 text-left text-label font-semibold"
+            className={cn("flex min-h-11 min-w-0 flex-1 items-center gap-2 text-left text-label font-semibold", INSET_FOCUS)}
           >
             <Icon name={collapsed.has(id) ? "chevronRight" : "chevronDown"} size={16} className="text-muted-text" />
             <span className="truncate">{title}</span>
             <span className="rounded-pill bg-fill px-2 text-small text-muted-text tabular-nums">{formatCount(list.length)}</span>
           </button>
           {readOnly ? null : (
-            <button
-              type="button"
-              aria-label={id === "staged" ? "Unstage All" : "Stage All"}
-              disabled={stagingAll}
-              onClick={() => void stageAll(id !== "staged")}
-              className="inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection pointer-fine:size-9"
-            >
-              <Icon name={id === "staged" ? "minus" : "add"} size={18} />
-            </button>
+            <IconTip label={id === "staged" ? "Unstage All" : "Stage All"}>
+              <button
+                type="button"
+                aria-label={id === "staged" ? "Unstage All" : "Stage All"}
+                disabled={stagingAll}
+                onClick={() => void stageAll(id !== "staged")}
+                className={cn("inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection disabled:opacity-40 disabled:hover:bg-transparent pointer-fine:size-9", INSET_FOCUS)}
+              >
+                <Icon name={id === "staged" ? "minus" : "add"} size={18} />
+              </button>
+            </IconTip>
           )}
         </div>
         {collapsed.has(id) ? null : (
           <ul className="border-t border-stroke">
             {list.map((file) => (
-              <FileRow key={file.relative} file={file} readOnly={readOnly} busy={stagingAll} onOpen={() => onOpenFile(file)} onToggle={() => void stage([file.relative], !isStaged(file))} />
+              <FileRow key={file.relative} file={file} current={file.relative === selectedPath} readOnly={readOnly} busy={stagingAll} onOpen={() => onOpenFile(file)} onToggle={() => void stage([file.relative], !isStaged(file))} />
             ))}
           </ul>
         )}
@@ -137,38 +145,44 @@ export function ChangesView({ projectId, onOpenFile }: ChangesViewProps) {
   const deletions = files.reduce((sum, file) => sum + file.deletions, 0);
 
   return (
-    <div className="flex min-h-0 flex-col gap-3 p-4" data-testid="changes-view">
-      <p className="flex items-center gap-2 text-small text-muted-text">
-        <Icon name="branch" size={16} />
-        <span className="truncate font-medium text-content">{changes.data.branch}</span>
-        {files.length > 0 ? (
-          <span>
-            {files.length} {files.length === 1 ? "file" : "files"}, <span className="text-additions tabular-nums">+{formatCount(additions)}</span>{" "}
-            <span className="text-deletions tabular-nums">-{formatCount(deletions)}</span>
+    <div className="flex min-h-0 flex-1 flex-col" data-testid="changes-view">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+        <p className="flex items-start gap-2 text-small text-muted-text">
+          <Icon name="branch" size={16} className="mt-0.5 shrink-0" />
+          <span className="min-w-0 font-medium text-content wrap-anywhere" title={changes.data.branch}>
+            {changes.data.branch}
           </span>
-        ) : null}
-      </p>
-      {readOnly ? <Notice>This device is read-only. You can look at changes but not stage or commit them.</Notice> : null}
-      {error ? <Notice variant="error">{error}</Notice> : null}
-      {files.length === 0 ? <Notice title="No changes">Your working tree is clean.</Notice> : null}
-      {renderSection("staged", "Staged Changes", staged)}
-      {renderSection("changes", "Changes", unstaged)}
+          {files.length > 0 ? (
+            <span className="shrink-0">
+              {files.length} {files.length === 1 ? "file" : "files"}, <span className="text-additions tabular-nums">+{formatCount(additions)}</span>{" "}
+              <span className="text-deletions tabular-nums">-{formatCount(deletions)}</span>
+            </span>
+          ) : null}
+        </p>
+        {readOnly ? <Notice>This device is read-only. You can look at changes but not stage or commit them.</Notice> : null}
+        {error ? <Notice variant="error">{error}</Notice> : null}
+        {files.length === 0 ? <Notice title="No changes">Your working tree is clean.</Notice> : null}
+        {renderSection("staged", "Staged Changes", staged)}
+        {renderSection("changes", "Changes", unstaged)}
+      </div>
       {readOnly ? null : (
-        <GitActionBar
-          projectId={projectId}
-          files={files}
-          status={git.data}
-          canPush={canPush}
-          stagingAll={stagingAll}
-          onStageAll={() => void stageAll(true)}
-          onChanged={() => void reread()}
-        />
+        <div className="shrink-0 border-t border-stroke bg-surface p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+          <GitActionBar
+            projectId={projectId}
+            files={files}
+            status={git.data}
+            canPush={canPush}
+            stagingAll={stagingAll}
+            onStageAll={() => void stageAll(true)}
+            onChanged={() => void reread()}
+          />
+        </div>
       )}
     </div>
   );
 }
 
-function FileRow({ file, readOnly, busy, onOpen, onToggle }: { file: ChangedFile; readOnly: boolean; busy: boolean; onOpen: () => void; onToggle: () => void }) {
+function FileRow({ file, current, readOnly, busy, onOpen, onToggle }: { file: ChangedFile; current: boolean; readOnly: boolean; busy: boolean; onOpen: () => void; onToggle: () => void }) {
   const { name, dir } = splitPath(file.relative);
   const staged = isStaged(file);
   const partly = isPartlyStaged(file);
@@ -184,7 +198,7 @@ function FileRow({ file, readOnly, busy, onOpen, onToggle }: { file: ChangedFile
           aria-label={staged ? `Unstage ${name}` : `Stage ${name}`}
           disabled={busy}
           onClick={onToggle}
-          className="inline-flex size-11 shrink-0 items-center justify-center pointer-fine:size-9"
+          className={cn("inline-flex size-11 shrink-0 items-center justify-center disabled:opacity-40 pointer-fine:size-9", INSET_FOCUS)}
         >
           <span className={cn("flex size-5 items-center justify-center rounded-pill border border-stroke", staged && "border-transparent bg-primary text-primary-foreground", partly && "bg-selection")}>
             {staged ? <Icon name="check" size={13} /> : partly ? <Icon name="minus" size={13} /> : null}
@@ -194,14 +208,16 @@ function FileRow({ file, readOnly, busy, onOpen, onToggle }: { file: ChangedFile
       <button
         type="button"
         disabled={!openable}
+        aria-current={current ? "true" : undefined}
         onClick={onOpen}
         aria-label={`Open diff of ${file.relative}, ${STATUS_LABEL[file.status]}${file.additions > 0 ? `, ${file.additions} added` : ""}${file.deletions > 0 ? `, ${file.deletions} removed` : ""}`}
-        className={cn("flex min-h-11 min-w-0 flex-1 items-center gap-2 py-1 pr-3 text-left hover:bg-selection disabled:hover:bg-transparent pointer-fine:min-h-9", readOnly && "pl-3")}
+        className={cn("flex min-h-11 min-w-0 flex-1 items-center gap-2 py-1 pr-3 text-left hover:bg-selection disabled:cursor-default disabled:hover:bg-transparent pointer-fine:min-h-9", INSET_FOCUS, current && "bg-selection", readOnly && "pl-3")}
       >
         <FileTypeIcon name={name} isDir={false} />
         <span className="min-w-0 flex-1">
           <span className="block truncate [unicode-bidi:isolate] text-label">{name}</span>
           {dir ? <span className="block truncate [unicode-bidi:isolate] text-small text-muted-text">{dir}</span> : null}
+          {openable ? null : <span className="block text-small text-muted-text">{file.status === "deleted" ? "Deleted, no diff" : "No diff"}</span>}
         </span>
         {file.additions > 0 ? <span className="text-small text-additions tabular-nums">+{formatCount(file.additions)}</span> : null}
         {file.deletions > 0 ? <span className="text-small text-deletions tabular-nums">-{formatCount(file.deletions)}</span> : null}

@@ -4,10 +4,15 @@
 //
 // - Send: the button always; Enter only on a desktop layout (a wide screen with a fine pointer), where
 //   Shift+Enter is a newline. Ctrl or Cmd+Enter sends everywhere. A draft mid-turn still sends (the desktop
-//   steers or queues); Stop shows when the draft is empty.
+//   steers or queues). Stop shows for the whole turn: alone when the draft is empty, left of Send when there is a
+//   draft. It is armed STOP_ARM_DELAY_MS after it appears and again after every slot change (a tap aimed at Send
+//   cannot land on it) and says "Stopping..." until the turn ends. If the turn is still running STOP_RETRY_MS
+//   after the cancel request resolved, Stop can be pressed again.
 // - The parent's `onSubmit` does the guard and the request. It resolves when the message is on its way (the
 //   draft is cleared) and rejects to keep the draft; the rejection's message is shown (a `SendCancelled` is silent).
-// - A read-only device cannot write: the field and buttons are disabled and a line says why.
+// - A read-only device cannot write: the field and buttons are disabled and a line says why, with a "Request
+//   control" action when the page passes `requestControl`.
+// - The session's latest error is a compact notice row inside the card; the field and toolbar stay usable.
 // - Offline (the link is not ready) keeps the field open for writing; only Send and Stop wait.
 // - Attachments: a file picker, paste and drop, limited as in `attachments.ts`.
 // - F-47 morph (design-system.md section 6.2 and the Composer row): at rest the glass is a one-line pill, 50 px
@@ -23,6 +28,8 @@ import { DictationButton } from "@/features/dictation";
 import { cn } from "@/lib/utils";
 import { Glass } from "@/ui/Glass";
 import { Icon } from "@/ui/Icon";
+import { sessionErrorContent } from "@/features/transcript/sessionError";
+import { SessionErrorDialog } from "@/features/transcript/TurnDialogs";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import {
   AttachmentError,
@@ -35,6 +42,7 @@ import {
 } from "./attachments";
 import { AttachmentChip } from "./AttachmentChip";
 import { useKeyboardInset } from "./useKeyboardInset";
+import type { RequestControl } from "./useRequestControl";
 import { SendCancelled } from "./useSendGuard";
 
 export const COMPOSER_PLACEHOLDER = "Plan, ask, build...";
@@ -43,6 +51,11 @@ export const OFFLINE_PLACEHOLDER = "Reconnecting to desktop...";
 export const READ_ONLY_REASON = "Read-only: this device can read sessions but not send messages.";
 /** A wide screen with a mouse or trackpad: Enter sends there, and only there. */
 export const DESKTOP_LAYOUT_QUERY = "(min-width: 640px) and (pointer: fine)";
+/** A new Stop button keeps its press off for this long, so a quick second tap after Send cannot land on it. */
+export const STOP_ARM_DELAY_MS = 500;
+/** How long after a resolved cancel request Stop may be pressed again while the turn still runs. */
+export const STOP_RETRY_MS = 4000;
+export const UNKNOWN_ERROR_SENTENCE = "Something went wrong. Try again, or check the desktop.";
 const INPUT_MIN_PX = 64;
 const INPUT_MAX_PX = 160;
 /** The resting pill: a one-line field with fully round ends. */
@@ -60,9 +73,11 @@ export interface ComposerProps {
   busy?: boolean;
   onStop?: () => Promise<void>;
   readOnly?: boolean;
+  /** A read-only device: lets the notice below the card ask the desktop for control (C-7). */
+  requestControl?: RequestControl;
   /** The link is not ready: Send and Stop wait, writing does not. */
   offline?: boolean;
-  /** Replaces the field with a line (the session's latest error) until dismissed. */
+  /** The session's latest error: a compact row above the field (Details, Dismiss) until dismissed. */
   notice?: { text: string; dismiss: () => void } | null;
   /** Model controls and the like, between the add button and Send. */
   toolbar?: ReactNode;
@@ -75,6 +90,18 @@ export interface ComposerProps {
   className?: string;
 }
 
+/** The desktop sometimes sends a bare code ("unknown") or nothing: say it in a plain sentence. */
+export function plainErrorText(text: string): string {
+  const trimmed = text.trim();
+  return trimmed === "" || /^[a-z][a-z0-9_.-]*$/.test(trimmed) ? UNKNOWN_ERROR_SENTENCE : trimmed;
+}
+
+/** A turn the user stopped is not a failure; the desktop reports it only as text, so match its plain wording. */
+// The desktop ends a stopped turn with the bare text "Stopped" (provider.rs `Err("Stopped".into())`); match only that.
+function isCancelNotice(text: string): boolean {
+  return /^Stopped\.?$/.test(text.trim());
+}
+
 /** True when focus came from the keyboard (`:focus-visible`); a pointer press on a button is not. */
 function isKeyboardFocus(target: EventTarget): boolean {
   try {
@@ -84,7 +111,7 @@ function isKeyboardFocus(target: EventTarget): boolean {
   }
 }
 
-export function Composer({ onSubmit, busy = false, onStop, readOnly = false, offline = false, notice, toolbar, topRow, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
+export function Composer({ onSubmit, busy = false, onStop, readOnly = false, requestControl, offline = false, notice, toolbar, topRow, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
   const [text, setText] = useState(initialText);
   useEffect(() => {
     onTextChange?.(text);
@@ -105,15 +132,47 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
   const errorId = useId();
   const desktopLayout = useMediaQuery(DESKTOP_LAYOUT_QUERY);
   const inset = useKeyboardInset();
-  const blocked = !!notice;
+  const shownNotice = notice && !isCancelNotice(notice.text) ? notice : null;
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const reducedMotion = useReducedMotion();
   const [focusWithin, setFocusWithin] = useState(false);
 
   const hasDraft = text.trim().length > 0 || attachments.length > 0;
-  const card = focusWithin || hasDraft || blocked || !!error;
+  const card = focusWithin || hasDraft || !!shownNotice || !!error;
   const fieldMin = card ? INPUT_MIN_PX : PILL_FIELD_MIN_PX;
-  const canSend = hasDraft && !submitting && !readOnly && !offline && !blocked;
-  const showStop = !hasDraft && busy && !!onStop;
+  const canSend = hasDraft && !submitting && !readOnly && !offline;
+  const showStop = busy && !!onStop;
+  const showSend = !showStop || hasDraft;
+  // Stop is armed STOP_ARM_DELAY_MS after it appears; until then a press does nothing.
+  // It re-arms whenever it moves to another slot (alone, or left of Send once a draft exists), so a double tap on Send
+  // never lands on an armed Stop. `armedSlot` names the slot it was armed in.
+  const [armedSlot, setArmedSlot] = useState<boolean | null>(null);
+  const stopArmed = showStop && armedSlot === hasDraft;
+  useEffect(() => {
+    if (!showStop) return;
+    const timer = window.setTimeout(() => setArmedSlot(hasDraft), STOP_ARM_DELAY_MS);
+    return () => {
+      window.clearTimeout(timer);
+      setArmedSlot(null);
+    };
+  }, [showStop, hasDraft]);
+  // After the cancel request resolved and the turn still runs, Stop is pressable again (keeping its Stopping label).
+  const [retryable, setRetryable] = useState(false);
+  const retryTimer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(retryTimer.current), []);
+  // Stopping lasts until the turn really ends (the desktop frame), not only until `session.cancel` resolves.
+  // Adjusted during render when `busy` changes (React's pattern for state derived from a prop change).
+  const [prevBusy, setPrevBusy] = useState(busy);
+  if (busy !== prevBusy) {
+    setPrevBusy(busy);
+    if (!busy) {
+      setStopping(false);
+      setRetryable(false);
+    }
+  }
+  useEffect(() => {
+    if (!busy) window.clearTimeout(retryTimer.current);
+  }, [busy]);
 
   // Auto-grow: as tall as the text, between 64 and 160 px.
   useLayoutEffect(() => {
@@ -127,7 +186,8 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
     if (autoFocus && !readOnly) area.current?.focus();
   }, [autoFocus, readOnly]);
 
-  // iOS scrolls the page to the focused field; the layout is a fixed shell, so put the page back.
+  // iOS may scroll the page to the focused field. The document no longer scrolls (the session column ends at
+  // the viewport bottom), so this is only a harmless reset.
   const scrollTimer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(scrollTimer.current), []);
   const onFocus = () => {
@@ -188,15 +248,17 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
   };
 
   const stop = async () => {
-    if (!onStop || stopping || offline || readOnly) return;
+    if (!onStop || !stopArmed || (stopping && !retryable) || offline || readOnly) return;
     setStopping(true);
+    setRetryable(false);
+    window.clearTimeout(retryTimer.current);
     setError(null);
     try {
       await onStop();
+      retryTimer.current = window.setTimeout(() => setRetryable(true), STOP_RETRY_MS);
     } catch (reason) {
-      setError(reason instanceof Error && reason.message ? `Could not stop: ${reason.message}` : "Could not stop the session.");
-    } finally {
       setStopping(false);
+      setError(reason instanceof Error && reason.message ? `Could not stop: ${reason.message}` : "Could not stop the session.");
     }
   };
 
@@ -222,6 +284,8 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
     void attach(Array.from(event.dataTransfer.files));
   };
 
+  const noticeContent = shownNotice ? sessionErrorContent(plainErrorText(shownNotice.text)) : null;
+  const noticeMessage = noticeContent ? noticeContent.message : "";
   const placeholder = offline ? OFFLINE_PLACEHOLDER : busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER;
   const describedBy = [readOnly ? reasonId : null, error ? errorId : null].filter(Boolean).join(" ") || undefined;
 
@@ -264,36 +328,47 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
           </ul>
         ) : null}
 
-        {blocked && notice ? (
-          <button
-            type="button"
-            onClick={notice.dismiss}
-            aria-label={`Couldn't continue: ${notice.text}`}
-            className="flex min-h-11 w-full items-center gap-2 rounded-row px-2 text-left text-small text-deletions hover:bg-selection"
-          >
-            <span className="min-w-0 flex-1 truncate">{notice.text}</span>
-            <Icon name="close" size={14} className="shrink-0 text-muted-text" />
-          </button>
-        ) : (
-          <textarea
-            ref={area}
-            value={text}
-            rows={1}
-            disabled={readOnly}
-            aria-label="Message"
-            aria-describedby={describedBy}
-            enterKeyHint={desktopLayout ? "send" : "enter"}
-            placeholder={placeholder}
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={onKeyDown}
-            onPaste={onPaste}
-            onFocus={onFocus}
-            className={cn("order-3 block min-w-0 resize-none bg-transparent text-row text-content outline-none placeholder:text-muted-text disabled:opacity-60", card ? "order-none w-full px-1" : "flex-1 px-2")}
-            style={{ minHeight: fieldMin, maxHeight: INPUT_MAX_PX }}
-          />
-        )}
+        {shownNotice ? (
+          <div role="alert" data-testid="composer-notice" className="flex min-w-0 items-center gap-1 rounded-row bg-fill pl-3 text-small">
+            <span className="min-w-0 flex-1 py-1.5">
+              <span className="block font-medium text-deletions">{noticeContent?.title}</span>
+              <span className="block truncate text-muted-text">{noticeMessage}</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setDetailsOpen(true)}
+              className="inline-flex min-h-11 shrink-0 items-center rounded-row px-2 text-content hover:bg-selection pointer-fine:min-h-8"
+            >
+              Details
+            </button>
+            <button
+              type="button"
+              onClick={shownNotice.dismiss}
+              className="inline-flex min-h-11 shrink-0 items-center rounded-row px-2 text-muted-text hover:bg-selection pointer-fine:min-h-8"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : null}
 
-        <div className={card ? cn("flex min-w-0 items-center gap-2", blocked && "pointer-events-none opacity-50") : "contents"}>
+        <textarea
+          ref={area}
+          value={text}
+          rows={1}
+          disabled={readOnly}
+          aria-label="Message"
+          aria-describedby={describedBy}
+          enterKeyHint={desktopLayout ? "send" : "enter"}
+          placeholder={placeholder}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={onKeyDown}
+          onPaste={onPaste}
+          onFocus={onFocus}
+          className={cn("order-3 block min-w-0 resize-none bg-transparent text-row text-content outline-none placeholder:text-muted-text disabled:opacity-60", card ? "order-none w-full px-1" : "flex-1 px-2")}
+          style={{ minHeight: fieldMin, maxHeight: INPUT_MAX_PX }}
+        />
+
+        <div className={card ? "flex min-w-0 items-center gap-2" : "contents"}>
           <input
             ref={picker}
             type="file"
@@ -309,25 +384,38 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
           <button
             type="button"
             aria-label="Add photos or files"
-            disabled={readOnly || blocked}
+            disabled={readOnly}
             onClick={() => picker.current?.click()}
             className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill text-content hover:bg-selection disabled:opacity-40 pointer-fine:size-9", !card && "order-1")}
           >
             <Icon name="add" size={18} />
           </button>
-          <DictationButton onText={insertText} disabled={readOnly || blocked} className={cn("size-11 pointer-fine:size-9", !card && "order-2")} />
+          <DictationButton onText={insertText} disabled={readOnly} className={cn("size-11 pointer-fine:size-9", !card && "order-2")} />
           <div data-composer-extra className={card ? "flex min-w-0 flex-1 items-center" : "order-4 size-0 overflow-hidden"}>{toolbar}</div>
           {showStop ? (
             <button
               type="button"
-              aria-label="Stop"
-              disabled={stopping || offline || readOnly}
+              aria-label={stopping ? undefined : "Stop"}
+              title={stopping ? "Stopping..." : undefined}
+              aria-busy={stopping}
+              aria-disabled={!stopArmed || (stopping && !retryable) || undefined}
+              disabled={offline || readOnly}
               onClick={() => void stop()}
-              className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 pointer-fine:size-9", !card && "order-5")}
+              className={cn(
+                "inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-pill bg-primary text-primary-foreground disabled:opacity-40 aria-disabled:opacity-60 pointer-fine:h-9",
+                stopping ? "px-3 text-meta font-medium" : "w-11 pointer-fine:w-9",
+                !card && "order-5",
+              )}
             >
-              <span aria-hidden="true" className="block size-3 rounded-[3px] bg-current" />
+              {stopping ? <Icon name="spinner" size={16} className="animate-spin" /> : <span aria-hidden="true" className="block size-3 rounded-[3px] bg-current" />}
+              {stopping ? <span>Stopping...</span> : null}
             </button>
-          ) : (
+          ) : null}
+          {/* One polite live region, outside the button, so the state is announced without changing its name. */}
+          <span role="status" className="sr-only">
+            {showStop && stopping ? "Stopping..." : ""}
+          </span>
+          {showSend ? (
             <button
               type="button"
               aria-label="Send"
@@ -338,7 +426,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
             >
               <Icon name="send" size={18} />
             </button>
-          )}
+          ) : null}
         </div>
       </Glass>
       {readOnly ? (
@@ -346,6 +434,23 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
           {READ_ONLY_REASON}
         </p>
       ) : null}
+      {readOnly && requestControl ? (
+        <div className="flex items-center gap-2 px-2 pt-1 text-meta">
+          {requestControl.state === "requested" ? <p role="status" className="px-2 text-muted-text">Requested, confirm on the desktop.</p> : null}
+          <button
+            type="button"
+            disabled={requestControl.state === "pending" || requestControl.ready === false}
+            title={requestControl.ready === false ? "Checking this device..." : undefined}
+            onClick={requestControl.request}
+            className="inline-flex min-h-11 items-center rounded-row px-2 font-medium text-content hover:bg-selection disabled:opacity-60 pointer-fine:min-h-8"
+          >
+            {requestControl.state === "pending" ? "Requesting..." : requestControl.state === "requested" ? "Ask again" : "Request control"}
+            {requestControl.ready === false ? <span className="sr-only">. Checking this device...</span> : null}
+          </button>
+          {requestControl.state === "error" ? <p role="alert" className="text-deletions">Could not request control. Try again.</p> : null}
+        </div>
+      ) : null}
+      {shownNotice ? <SessionErrorDialog message={plainErrorText(shownNotice.text)} open={detailsOpen} onOpenChange={setDetailsOpen} /> : null}
       {error ? (
         <p id={errorId} role="alert" className="px-4 pt-2 text-meta text-deletions">
           {error}

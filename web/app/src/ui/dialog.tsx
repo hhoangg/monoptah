@@ -52,7 +52,7 @@ export function DialogContent({
           target.focus();
         }}
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-[calc(100%-2.5rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 rounded-dialog border border-stroke bg-sheet p-5 text-content data-[state=open]:animate-[dialog-in_280ms_var(--ease-out-cubic)] data-[state=closed]:animate-[fade-out_180ms_var(--ease-out-cubic)]",
+          "fixed top-1/2 left-1/2 z-50 grid w-[calc(100%-2.5rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100dvh-2rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] gap-4 overflow-y-auto overscroll-contain rounded-dialog border border-stroke bg-sheet p-5 text-content data-[state=open]:animate-[dialog-in_280ms_var(--ease-out-cubic)] data-[state=closed]:animate-[fade-out_180ms_var(--ease-out-cubic)]",
           className,
         )}
         {...props}
@@ -76,7 +76,7 @@ export function DialogHeader({ className, ...props }: ComponentProps<"div">) {
 }
 
 export function DialogFooter({ className, ...props }: ComponentProps<"div">) {
-  return <div data-slot="dialog-footer" className={cn("flex justify-end gap-2", className)} {...props} />;
+  return <div data-slot="dialog-footer" className={cn("flex flex-col-reverse gap-2 max-sm:[&>*]:w-full sm:flex-row sm:flex-wrap sm:justify-end", className)} {...props} />;
 }
 
 export function DialogTitle({ className, ...props }: ComponentProps<typeof DialogPrimitive.Title>) {

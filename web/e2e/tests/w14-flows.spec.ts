@@ -185,7 +185,9 @@ test.describe("W-14 flows through the UI", () => {
       await page.waitForTimeout(1_500);
       await expect(page.getByText("Echo: [hold] keep going")).toHaveCount(0);
       await stop.click();
-      await expect(stop).toHaveCount(0, { timeout: 20_000 });
+      // While the cancel is in flight the button reads "Stopping..."; the turn has ended only when neither is left.
+      await expect(page.getByRole("button", { name: /^Stop(ping)?/ })).toHaveCount(0, { timeout: 20_000 });
+      await expect(stop).toHaveCount(0);
       await expect(send).toBeVisible();
       expect(desktop.matching("request", { method: "session.cancel" }).length).toBeGreaterThan(0);
       await expect(page.getByText("Echo: [hold] keep going")).toHaveCount(0);

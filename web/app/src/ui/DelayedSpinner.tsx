@@ -24,7 +24,7 @@ export interface DelayedSpinnerProps {
   className?: string;
 }
 
-/** Muted spinner that mounts its icon after 250 ms. Renders nothing before that. */
+/** Muted spinner that mounts its icon after 250 ms. Renders nothing before that. Inside a Button it takes the label colour. */
 export function DelayedSpinner({ delayMs = 250, label = "Loading", className }: DelayedSpinnerProps) {
   const visible = useDelayed(true, delayMs);
   if (!visible) return null;

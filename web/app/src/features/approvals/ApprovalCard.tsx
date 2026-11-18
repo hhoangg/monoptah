@@ -222,7 +222,7 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
       aria-describedby={readOnly ? reasonId : undefined}
       data-approval-card
       onFocus={() => (focusInside.current = true)}
-      className={cn("px-3 pb-2 focus-visible:outline-2 focus-visible:outline-brand", className)}
+      className={cn("pb-2 focus-visible:outline-2 focus-visible:outline-brand", className)}
     >
       <Glass className="rounded-card">
         <div className="flex flex-col gap-2 px-4 py-3">
@@ -257,10 +257,11 @@ export function ApprovalCardView({ approvals, onAnswer, disabledReason, classNam
                 >
                   <Segments segments={detail.segments} />
                 </pre>
-                <p className="mt-1 text-caption text-muted-text" data-approval-meta>
-                  {detail.lines} {detail.lines === 1 ? "line" : "lines"}
-                  {overflows ? ". Scroll to see all." : ""}
-                </p>
+                {overflows ? (
+                  <p className="mt-1 text-caption text-muted-text" data-approval-meta>
+                    {detail.lines} lines. Scroll to see all.
+                  </p>
+                ) : null}
               </>
             ) : null}
           </div>

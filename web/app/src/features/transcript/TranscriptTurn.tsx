@@ -10,6 +10,7 @@ import { Icon, type IconName } from "@/ui/Icon";
 import { Markdown } from "@/features/markdown/Markdown";
 import { Collapsible } from "./Collapsible";
 import { TranscriptOpened, useTranscriptActions, type TranscriptAgent } from "./context";
+import { useModelName } from "./modelNames";
 import { dayStamp, formatClockTime, formatWorkingDuration, hasTurnMetrics } from "./format";
 import { DocumentCard, LaunchedSessions, MonoChoices, MonoHeader } from "./MonoCards";
 import { sessionErrorContent } from "./sessionError";
@@ -105,7 +106,7 @@ function TurnFooter({ turn }: { turn: Turn }) {
             type="button"
             aria-label="Turn metrics"
             onClick={() => setShowMetrics(true)}
-            className={cn("rounded-sm p-1 text-[color:var(--content-a40)] hover:bg-[var(--content-a08)]", showMetrics && "bg-[var(--content-a08)]")}
+            className={cn("inline-flex min-h-11 min-w-11 items-center justify-center rounded-sm text-[color:var(--content-a40)] hover:bg-[var(--content-a08)] pointer-fine:min-h-7 pointer-fine:min-w-7", showMetrics && "bg-[var(--content-a08)]")}
           >
             <Icon name="metrics" size={16} />
           </button>
@@ -149,7 +150,7 @@ function CopyButton({ text }: { text: string }) {
         type="button"
         onClick={copy}
         aria-label={copied ? "Copied" : "Copy response"}
-        className="rounded-sm p-1 text-[color:var(--content-a40)] hover:bg-[var(--content-a08)]"
+        className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-sm text-[color:var(--content-a40)] hover:bg-[var(--content-a08)] pointer-fine:min-h-7 pointer-fine:min-w-7"
       >
         <Icon name={copied ? "check" : "copy"} size={16} />
       </button>
@@ -233,7 +234,7 @@ function UserMessage({ item, mono }: { item: UserItem; mono: boolean }) {
           </p>
         ) : null}
         {overflows ? (
-          <button type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)} className="mt-1 text-meta text-[color:var(--content-a60)]">
+          <button type="button" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)} className="-mb-2 mt-0 inline-flex min-h-11 items-center text-meta text-[color:var(--content-a60)] pointer-fine:mb-0 pointer-fine:mt-1 pointer-fine:min-h-6">
             {expanded ? "Show less" : "Show more"}
           </button>
         ) : null}
@@ -275,8 +276,9 @@ function FoldLine({ item }: { item: HeaderItem }) {
   const [open, setOpen] = useState(false);
   const { onOpenFile, onNavigate } = useTranscriptActions();
   const elapsed = useElapsed(item.live ? item.startedAt : undefined);
+  const modelName = useModelName(item.model);
   const label =
-    item.label ?? (item.live ? (item.waiting ?? formatWorkingDuration(elapsed, item.model)) : formatWorkingDuration(item.durationMs ?? null, item.model, true));
+    item.label ?? (item.live ? (item.waiting ?? formatWorkingDuration(elapsed, modelName)) : formatWorkingDuration(item.durationMs ?? null, modelName, true));
   const expandable = item.entries.length > 0;
   const shown = open && expandable;
   const markClass = "size-4 shrink-0 text-[color:var(--content-a45)]";

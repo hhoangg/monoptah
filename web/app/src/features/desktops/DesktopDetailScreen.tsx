@@ -18,6 +18,7 @@ import { Button, buttonVariants } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Field } from "@/ui/Field";
+import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard } from "@/ui/SettingsCard";
@@ -35,7 +36,7 @@ import {
 import { DESKTOP_COLORS, findDesktopColor } from "./colors";
 import { grantStateLabel, lastSeenLabel, permissionLabel, safeName, versionLabel } from "./format";
 import { useKeyStatus } from "./keyStatus";
-import { ColorDot, desktopErrorMessage, Fingerprint, PresenceBadge } from "./parts";
+import { ColorDot, desktopErrorMessage, Fingerprint, FingerprintLines, PresenceBadge } from "./parts";
 import { useThisDevice } from "./thisDevice";
 
 export function DesktopDetailScreen({ id }: { id: string }) {
@@ -73,16 +74,17 @@ function DesktopDetail({ desktop }: { desktop: DesktopDirectory }) {
   const version = versionLabel(desktop.os, desktop.appVersion);
   return (
     <SettingsLayout>
-      <Link to="/desktops" className="self-start text-small text-brand-text hover:underline">
+      <Link to="/desktops" className="-ml-2 inline-flex min-h-11 items-center gap-1 self-start rounded-row px-2 text-small text-brand-text hover:bg-selection pointer-fine:min-h-9">
+        <Icon name="chevronRight" size={16} className="rotate-180" />
         All desktops
       </Link>
       <PageHeader
         title={name}
         description={
           <span className="flex flex-wrap items-center gap-2">
-            <ColorDot color={desktop.color} />
+            {desktop.color === null ? null : <ColorDot color={desktop.color} />}
             <PresenceBadge online={desktop.online} />
-            <span className="text-small">{lastSeenLabel(desktop.lastSeenAt, desktop.online)}</span>
+            {desktop.online ? null : <span className="text-small">{lastSeenLabel(desktop.lastSeenAt, desktop.online)}</span>}
           </span>
         }
         actions={
@@ -93,7 +95,6 @@ function DesktopDetail({ desktop }: { desktop: DesktopDirectory }) {
       />
       <SettingsCard title="About">
         <dl className="m-0 flex flex-col gap-2 px-1.5 py-2">
-          <Detail label="Status">{desktop.online ? "Online" : "Offline"}</Detail>
           {version ? <Detail label="System and version">{version}</Detail> : null}
           <KeyDetail desktop={desktop} />
         </dl>
@@ -125,11 +126,11 @@ function KeyDetail({ desktop }: { desktop: DesktopDirectory }) {
       return (
         <>
           <Detail label="Pinned on this device">
-            <Fingerprint hex={status.pinned} />
+            <FingerprintLines hex={status.pinned} />
           </Detail>
           <Notice variant="error" title="Key changed since this device pinned it">
             The directory now serves a different key, with this fingerprint:
-            <Fingerprint hex={status.directory} className="mt-1 block text-body" />
+            <FingerprintLines hex={status.directory} className="mt-1" />
             Do not trust it yet. On your desktop, open Settings, then Web app, then "Verify on another device", and open that link on this device.
           </Notice>
         </>

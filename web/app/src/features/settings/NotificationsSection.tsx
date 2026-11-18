@@ -77,19 +77,20 @@ export function NotificationsSection({ desktopId }: { desktopId: string }) {
       <SettingsRow
         icon="notifications"
         title="Notifications from this desktop"
-        trailing={<Switch checked={prefs.enabled} disabled={saving} aria-label="Notifications from this desktop" onCheckedChange={(enabled) => change({ ...prefs, enabled })} />}
+        trailing={<Switch checked={prefs.enabled} disabled={saving} aria-label="Notifications from this desktop" className={unknown ? "opacity-60" : undefined} onCheckedChange={(enabled) => change({ ...prefs, enabled })} />}
       />
       {PUSH_CATEGORIES.map((category) => (
         <SettingsRow
           key={category}
           title={CATEGORY_LABELS[category].title}
           description={CATEGORY_LABELS[category].description}
-          className="pl-12"
+          className="pl-[4.5rem]"
           trailing={
             <Switch
               checked={prefs.categories[category] ?? true}
               disabled={saving || !prefs.enabled}
               aria-label={CATEGORY_LABELS[category].title}
+              className={unknown ? "opacity-60" : undefined}
               onCheckedChange={(on) => change({ ...prefs, categories: { ...prefs.categories, [category]: on } })}
             />
           }

@@ -2,7 +2,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import type { CDPSession, Locator, Page } from "@playwright/test";
 import { expect } from "@playwright/test";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { outputDir } from "./paths.ts";
 
@@ -89,6 +89,25 @@ export async function applyViewport(page: Page, viewport: Viewport): Promise<voi
   expect(seen).toEqual({ width: viewport.width, ratio: viewport.scale });
 }
 
+/**
+ * Full-page screenshot laid out at the emulated CSS width. `page.screenshot({ fullPage: true })` re-applies Playwright's own
+ * viewport metrics while it captures, which re-laid the page out at 1280 px and cropped it (the A-0 bug). This captures through
+ * the kept CDP session instead, so the emulation set by `applyViewport` stays in force. The page is asserted to be at the
+ * intended width and scale right before the capture, so the bug cannot return silently.
+ */
+export async function screenshotAtViewport(page: Page, viewport: Viewport, file: string): Promise<void> {
+  const cdp = emulationSessions.get(page);
+  if (!cdp) throw new Error("screenshotAtViewport: call applyViewport first");
+  const seen = await page.evaluate(() => ({ width: window.innerWidth, ratio: window.devicePixelRatio }));
+  expect(seen, `${file}: page must be laid out at ${viewport.width} CSS px, scale ${viewport.scale}`).toEqual({ width: viewport.width, ratio: viewport.scale });
+  const metrics = await cdp.send("Page.getLayoutMetrics");
+  const content = metrics.cssContentSize ?? metrics.contentSize;
+  const width = viewport.width;
+  const height = Math.max(viewport.height, Math.ceil(content.height));
+  const shot = await cdp.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: { x: 0, y: 0, width, height, scale: 1 } });
+  writeFileSync(file, Buffer.from(shot.data, "base64"));
+}
+
 /** Back to the Playwright default viewport (1280 x 720, scale 1). */
 export async function resetViewport(page: Page): Promise<void> {
   await applyViewport(page, { name: "default", width: 1280, height: 720, scale: 1 });
@@ -157,7 +176,7 @@ export async function checkScreen(page: Page, screen: Screen): Promise<void> {
       const label = `${screen.name} ${scheme} ${viewport.name}`;
       await expect(screen.key(page).first(), `${label}: key control`).toBeVisible();
       await expectNoHorizontalOverflow(page, label);
-      await page.screenshot({ path: join(visualDir(), `${screen.name}-${scheme}-${viewport.name}.png`), fullPage: true });
+      await screenshotAtViewport(page, viewport, join(visualDir(), `${screen.name}-${scheme}-${viewport.name}.png`));
     }
   }
   await resetViewport(page);

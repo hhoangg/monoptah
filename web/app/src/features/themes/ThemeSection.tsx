@@ -1,4 +1,4 @@
-import { useRef, type KeyboardEvent } from "react";
+import { useId, useRef, type KeyboardEvent } from "react";
 import { haptic } from "@/lib/haptics";
 import { useAppearance } from "@/lib/appearance";
 import { cn } from "@/lib/utils";
@@ -25,6 +25,7 @@ interface SwatchGroupProps<T extends string> {
 /** A radiogroup of color swatches: roving tabindex, arrows/Home/End move and select, selection is a ring plus a check mark. */
 function SwatchGroup<T extends string>({ label, choices, value, onChange }: SwatchGroupProps<T>) {
   const refs = useRef<Array<HTMLButtonElement | null>>([]);
+  const labelId = useId();
 
   function select(index: number) {
     const choice = choices[index];
@@ -57,8 +58,12 @@ function SwatchGroup<T extends string>({ label, choices, value, onChange }: Swat
   );
 
   return (
-    <div role="radiogroup" aria-label={label} className="flex flex-wrap gap-x-1 gap-y-2 px-1 py-2">
-      {choices.map((choice, index) => {
+    <div className="px-1 py-2">
+      <p id={labelId} className="px-1 pb-1 text-label font-medium text-muted-text">
+        {label}
+      </p>
+      <div role="radiogroup" aria-labelledby={labelId} className="flex flex-wrap gap-x-1 gap-y-2">
+        {choices.map((choice, index) => {
         const checked = choice.value === value;
         return (
           <button
@@ -93,6 +98,7 @@ function SwatchGroup<T extends string>({ label, choices, value, onChange }: Swat
           </button>
         );
       })}
+      </div>
     </div>
   );
 }
@@ -122,7 +128,7 @@ export function ThemeSection() {
     <SettingsCard title="Theme" footnote="Theme tints the surfaces. An accent replaces the theme's own accent color. Saved on this device only.">
       <SwatchGroup label="Theme" choices={themeChoices} value={theme} onChange={setTheme} />
       <div role="separator" className="mx-1.5 h-px bg-stroke" />
-      <SwatchGroup label="Accent color" choices={accentChoices} value={accent} onChange={setAccent} />
+      <SwatchGroup label="Accent" choices={accentChoices} value={accent} onChange={setAccent} />
     </SettingsCard>
   );
 }

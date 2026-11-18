@@ -1,5 +1,6 @@
 // `/d/:desktopId/s/:sessionId` (W-07): the header (back, title, the `session-header-chip` slot host), the
 // transcript of the conversation and the composer region (Task 5 mounts the composer there).
+import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
@@ -71,7 +72,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
     <div
       data-testid="route-stub"
       data-route="/d/:desktopId/s/:sessionId"
-      className="-mb-[calc(env(safe-area-inset-bottom)+2.5rem)] flex h-[calc(100dvh-2.75rem-env(safe-area-inset-top))] flex-col"
+      className="flex h-full min-h-0 flex-1 flex-col"
     >
       <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
@@ -103,18 +104,20 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
       ) : null}
 
       <TranscriptOfflineNote desktopId={desktopId} />
-      <Transcript
-        turns={older.turns}
-        optimistic={state?.optimistic ?? []}
-        loading={!state}
-        hasOlder={older.hasOlder}
-        loadingOlder={older.loading}
-        olderError={older.error}
-        loadOlder={older.loadOlder}
-        onRetry={readOnly ? undefined : replies.onRetry}
-        busy={state?.busy ?? false}
-        actions={actions}
-      />
+      <ModelNamesProvider>
+        <Transcript
+          turns={older.turns}
+          optimistic={state?.optimistic ?? []}
+          loading={!state}
+          hasOlder={older.hasOlder}
+          loadingOlder={older.loading}
+          olderError={older.error}
+          loadOlder={older.loadOlder}
+          onRetry={readOnly ? undefined : replies.onRetry}
+          busy={state?.busy ?? false}
+          actions={actions}
+        />
+      </ModelNamesProvider>
       <DocumentDialog document={document} onClose={() => setDocument(null)} />
       <ComposerRegion
         desktopId={desktopId}

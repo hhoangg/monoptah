@@ -13,8 +13,10 @@ import { makeCatalog } from "./fixtures";
 
 const mutate = vi.fn();
 const mutateAsync = vi.fn(async () => ({}));
-const queryState: { data: unknown; isError: boolean; isPending: boolean; error: null } = { data: undefined, isError: false, isPending: false, error: null };
+const queryState: { data: unknown; isError: boolean; isPending: boolean; error: null; refetch: () => void } = { data: undefined, isError: false, isPending: false, error: null, refetch: () => refetch() };
 const queryParams: Array<[string, unknown]> = [];
+const linkStatus: { value: string } = { value: "ready" };
+const refetch = vi.fn();
 
 vi.mock("@/data", async (importOriginal) => ({
   ...(await importOriginal<typeof DataModule>()),
@@ -28,6 +30,7 @@ vi.mock("@/link", async (importOriginal) => ({
   ...(await importOriginal<typeof LinkModule>()),
   LinkProvider: ({ children }: { children: ReactNode }) => children,
   useLinkDesktopId: () => "dk1",
+  useLinkState: (selector: (state: { status: string }) => unknown) => selector({ status: linkStatus.value }),
 }));
 
 import { getPersistAdapter, MemoryPersistAdapter, registerPersistAdapter } from "@/data";
@@ -53,6 +56,8 @@ beforeAll(() => {
 beforeEach(() => {
   mutate.mockClear();
   mutateAsync.mockClear();
+  refetch.mockClear();
+  linkStatus.value = "ready";
   queryParams.length = 0;
   queryState.data = makeCatalog();
   queryState.isError = false;
@@ -216,7 +221,19 @@ describe("default model (U-07)", () => {
   it("without a link the row says it needs the desktop", () => {
     queryState.data = undefined;
     queryState.isError = true;
+    linkStatus.value = "closed";
     render(<DefaultModelSection desktopId="dk1" />, { wrapper: wrap });
     expect(screen.getByText("Needs a connection to the desktop")).toBeTruthy();
+  });
+
+  it("with a ready link a failed catalog says the models could not load and offers Retry", async () => {
+    queryState.data = undefined;
+    queryState.isError = true;
+    linkStatus.value = "ready";
+    render(<DefaultModelSection desktopId="dk1" />, { wrapper: wrap });
+    expect(screen.getByText("Could not load the models")).toBeTruthy();
+    expect(screen.queryByText("Needs a connection to the desktop")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
   });
 });

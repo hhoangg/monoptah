@@ -88,7 +88,7 @@ describe("register", () => {
     expect(screen.getByLabelText("Invite code")).toHaveValue(SEED_INVITE_CODE);
     // The fragment is gone from the address bar once read.
     expect(window.location.hash).toBe("");
-    expect(screen.getByText("Your handle cannot be changed later.")).toBeInTheDocument();
+    expect(screen.getByText("3 to 32 lowercase letters, digits, - or _. You cannot change it later.")).toBeInTheDocument();
 
     await user.type(screen.getByLabelText("Handle"), "ada");
     await user.type(screen.getByLabelText("Display name"), "Ada Lovelace");

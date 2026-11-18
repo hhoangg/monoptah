@@ -112,7 +112,7 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
 
   return (
     <>
-      <PageHeader title="Desktop settings" description={name} />
+      <PageHeader title="Desktop settings" description={name} back={{ to: "/d/$desktopId", params: { desktopId }, label: "Back to the workspace", className: "sm:hidden" }} />
       <SettingsCard title="Status">
         <SettingsRow
           icon={offline ? "computerOff" : "computer"}

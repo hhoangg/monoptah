@@ -10,8 +10,10 @@ import { SessionStartTargetSchema, type ParamsOf } from "@monoptah/protocol";
 import { catalogKey, useCatalog, useLinkMutation } from "@/data";
 import { BACKGROUND_CONTAINER_CLASS, EmptySessionBackground } from "@/features/backgrounds";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
+import { useRequestControl } from "@/features/composer/useRequestControl";
 import { Composer } from "@/features/composer/Composer";
 import { useLinkReady } from "@/features/composer/SessionComposer";
+import { useKeyboardInset } from "@/features/composer/useKeyboardInset";
 import { useSendGuard } from "@/features/composer/useSendGuard";
 import { ModelControls } from "@/features/models/ModelControls";
 import { startingSelection, useDefaultModels } from "@/features/models/defaultModel";
@@ -46,6 +48,8 @@ function targetKind(target: unknown): { kind: string } | null {
  * has no header (the project screen owns the only h1 and the way back) and fills its pane instead of the viewport.
  */
 export function NewSessionScreen({ desktopId, projectId, embedded = false }: { desktopId: string; projectId: string; embedded?: boolean }) {
+  const keyboardInset = useKeyboardInset();
+  const requestControl = useRequestControl(desktopId);
   useRememberPlace();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -150,10 +154,8 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
     <div
       data-testid="new-session-screen"
       data-embedded={embedded ? "true" : undefined}
-      className={`${BACKGROUND_CONTAINER_CLASS} flex flex-col ${
-        embedded
-          ? "h-[calc(100dvh-9rem)] min-h-[28rem] overflow-hidden rounded-[22px] border border-stroke"
-          : "-mb-[calc(env(safe-area-inset-bottom)+2.5rem)] h-[calc(100dvh-2.75rem-env(safe-area-inset-top))]"
+      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col ${
+        embedded ? "min-h-[28rem] overflow-hidden rounded-[22px] border border-stroke" : ""
       }`}
     >
       <EmptySessionBackground projectId={projectId} />
@@ -183,13 +185,14 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
         </label>
       </div>
 
-      <div className="mx-auto w-full max-w-[768px] shrink-0 px-2 pb-[env(safe-area-inset-bottom)] min-[24rem]:px-5">
+      <div className={`mx-auto w-full max-w-[768px] shrink-0 px-2 min-[24rem]:px-5 ${keyboardInset > 0 ? "" : "pb-[env(safe-area-inset-bottom)]"}`}>
         <Composer
           autoFocus={!embedded}
           initialText={initialDraft.text}
           onTextChange={rememberText}
           onSubmit={submit}
           readOnly={readOnly}
+          requestControl={requestControl}
           offline={!ready}
           topRow={topRow}
           toolbar={

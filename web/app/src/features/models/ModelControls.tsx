@@ -68,7 +68,7 @@ export function ModelControls({
   if (!current || !selection) {
     return (
       <div className={cn("flex items-center gap-2", className)}>
-        <button type="button" disabled className="flex min-h-9 items-center rounded-pill bg-selection px-3 text-caption text-muted-text opacity-60">
+        <button type="button" disabled className="flex min-h-11 items-center rounded-pill bg-selection px-3 text-caption text-muted-text opacity-60 pointer-fine:min-h-9">
           {catalog.isError ? "Models unavailable" : "Model"}
         </button>
       </div>
@@ -88,11 +88,11 @@ export function ModelControls({
         type="button"
         aria-label={`Model: ${summary.name}${summary.effort ? `, ${summary.effort}` : ""}`}
         onClick={() => setOpen(true)}
-        className="flex max-w-64 min-h-9 min-w-0 items-center gap-1.5 rounded-pill bg-selection px-3 text-caption text-content"
+        className="flex max-w-64 min-h-11 min-w-0 items-center gap-1.5 rounded-pill bg-selection px-3 text-caption text-content pointer-fine:min-h-9"
       >
         <HarnessIcon harness={selection.harness} className="size-3.5 shrink-0" />
-        <span className="min-w-0 truncate">{summary.name}</span>
-        {summary.effort ? <span className="shrink-0 text-muted-text">{summary.effort}</span> : null}
+        <span className="min-w-[6ch] truncate">{summary.name}</span>
+        {summary.effort ? <span className="min-w-0 shrink-[8] truncate text-muted-text">{summary.effort}</span> : null}
         <ChevronDown size={12} className="shrink-0 text-muted-text" />
       </button>
       {selection.harness !== "fx" ? (

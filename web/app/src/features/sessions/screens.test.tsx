@@ -98,6 +98,14 @@ describe("catalog home", () => {
     expect(screen.queryByRole("button", { name: /^Open workspace list/ })).toBeNull();
   });
 
+  it("lists no second copy of the projects from 640px up, where the sidebar carries them", async () => {
+    stubMatchMedia(true);
+    mount("");
+    await screen.findByRole("heading", { level: 1, name: "Workspace" });
+    await screen.findByRole("region", { name: "Recent sessions" });
+    expect(screen.queryByRole("region", { name: "Projects" })).toBeNull();
+  });
+
   it("shows 'Make yourself at home' with a Choose projects link when nothing is shared (F-14)", async () => {
     mount("", { empty: true });
     expect(await screen.findByText("Make yourself at home.")).toBeInTheDocument();
@@ -155,10 +163,10 @@ describe("workspace drawer (F-12)", () => {
     mount("");
     const nav = await openDrawer(user);
     await within(nav).findByText("Example Alpha");
-    await user.type(within(nav).getByRole("searchbox", { name: "Search" }), "gamma");
+    await user.type(within(nav).getByRole("searchbox", { name: "Filter projects" }), "gamma");
     expect(within(nav).queryByText("Example Alpha")).toBeNull();
     expect(within(nav).getByText("Gamma Service")).toBeInTheDocument();
-    await user.clear(within(nav).getByRole("searchbox", { name: "Search" }));
+    await user.clear(within(nav).getByRole("searchbox", { name: "Filter projects" }));
 
     await user.click(within(nav).getByRole("button", { name: "Filter" }));
     await user.click(await screen.findByRole("menuitemradio", { name: "Working now" }));
@@ -320,6 +328,13 @@ describe("read-only device", () => {
     expect(screen.getByRole("button", { name: "New session" })).toBeDisabled();
   });
 
+  it("the chip is a button that asks for control", async () => {
+    mount("/p/proj-alpha", { permission: "read" });
+    const chip = await screen.findByTestId("read-only-chip");
+    expect(chip.tagName).toBe("BUTTON");
+    expect(chip).toHaveAccessibleName(/Request control/);
+  });
+
   it("a control device has a live New session link and an enabled Stop", async () => {
     mount("/p/proj-alpha");
     expect(await screen.findByRole("link", { name: "New session" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/p/proj-alpha/new`);
@@ -375,6 +390,11 @@ describe("project screen wide layout (F-18, design-system.md section 11)", () =>
     // One h1 only, and no button that points at the page already open.
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
     expect(screen.queryByRole("link", { name: "New session" })).toBeNull();
+    // The split is a fill frame: the list column scrolls on its own and the pane fills the row.
+    expect(split).toHaveClass("min-h-0", "flex-1");
+    expect(split.firstElementChild).toHaveClass("overflow-y-auto");
+    expect(detail).toHaveClass("h-full");
+    expect(screen.getByTestId("workspace-frame")).toHaveClass("h-full");
   });
 
   it("from 1024 px the /new URL shows the same split, so a bookmark or a link still lands on both panes", async () => {

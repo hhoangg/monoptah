@@ -20,7 +20,7 @@ describe("ThemeSection", () => {
   it("lists six themes and eight accent options as radios", () => {
     render(<ThemeSection />);
     expect(themeRadios().map((el) => el.textContent)).toEqual(["Classic", "Cobalt", "Jade", "Copper", "Violet", "Blush"]);
-    const accents = screen.getByRole("radiogroup", { name: "Accent color" });
+    const accents = screen.getByRole("radiogroup", { name: "Accent" });
     expect(accents.querySelectorAll('[role="radio"]')).toHaveLength(8);
     expect(screen.getByRole("radio", { name: "Theme default" })).toHaveAttribute("aria-checked", "true");
   });

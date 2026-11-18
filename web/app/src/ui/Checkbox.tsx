@@ -7,7 +7,7 @@ export interface CheckboxProps extends Omit<ComponentProps<"input">, "type" | "i
   id?: string;
 }
 
-/** Native checkbox (design-system.md 3.3): 18x18, 1.5px border faint, radius 5, active fill content. Row is >= 44px. */
+/** Native checkbox (design-system.md 3.3): 18x18, 1.5px border muted-text, radius 5, active fill content. Row is >= 44px. */
 export function Checkbox({ label, id, className, ...input }: CheckboxProps) {
   const generated = useId();
   const inputId = id ?? generated;
@@ -17,7 +17,7 @@ export function Checkbox({ label, id, className, ...input }: CheckboxProps) {
         <input
           id={inputId}
           type="checkbox"
-          className="peer size-[18px] cursor-pointer appearance-none rounded-[5px] border-[1.5px] border-faint bg-transparent checked:border-content checked:bg-content"
+          className="peer size-[18px] cursor-pointer appearance-none rounded-[5px] border-[1.5px] border-muted-text bg-transparent checked:border-content checked:bg-content"
           {...input}
         />
         <Icon name="check" size={14} strokeWidth={2.5} className="pointer-events-none absolute top-0.5 left-0.5 hidden text-inverse peer-checked:block" />

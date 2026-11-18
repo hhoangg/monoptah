@@ -13,6 +13,7 @@ import { UsageLimitCard } from "@/features/models/UsageLimitCard";
 import { useUsageLimitActions } from "@/features/models/hooks";
 import { assertFitsRequest, toWire } from "./attachments";
 import { Composer } from "./Composer";
+import { useRequestControl } from "./useRequestControl";
 import { QuestionForm } from "./QuestionForm";
 import { sendErrorMessage } from "./sendErrors";
 import { WAKE_REQUIRED_NOTICE } from "@/ui/hooks";
@@ -42,6 +43,7 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
   const ready = useLinkReady();
   const navigate = useNavigate();
   const guard = useSendGuard();
+  const requestControl = useRequestControl(desktopId);
   const cancel = useLinkMutation("session.cancel");
   const defaults = useDefaultModels(desktopId).defaults;
   const [configError, setConfigError] = useState<string | null>(null);
@@ -82,6 +84,7 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
           await cancel.mutateAsync({ conversationId: sessionId });
         }}
         readOnly={readOnly}
+        requestControl={requestControl}
         offline={!ready}
         notice={notice ?? null}
         toolbar={toolbar}

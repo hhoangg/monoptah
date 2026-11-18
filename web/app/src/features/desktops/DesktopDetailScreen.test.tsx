@@ -4,6 +4,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
 import { base64UrlEncode } from "@/link/base64url";
+import { fingerprintLines } from "@/features/accounts/pair/fingerprint";
 import { displayFingerprint, fingerprint } from "@/link/fingerprint";
 import { checkPin } from "@/link/pins";
 import type * as KeysModule from "@/link/keys";
@@ -86,7 +87,9 @@ describe("/desktops/:id", () => {
     expect(alert).toHaveTextContent(displayFingerprint(fingerprint(KEY)));
     // The pin is shown as the trusted one, and the lying claim is never presented as a match.
     expect(screen.getByText("Pinned on this device")).toBeInTheDocument();
-    expect(screen.getAllByText(displayFingerprint(fingerprint(OTHER_KEY)))).toHaveLength(1);
+    // Both fingerprints are shown as two comparable lines each.
+    for (const line of fingerprintLines(fingerprint(OTHER_KEY))) expect(screen.getAllByText(line)).toHaveLength(1);
+    for (const line of fingerprintLines(fingerprint(KEY))) expect(within(alert).getByText(line)).toBeInTheDocument();
   });
 
   it("says so when the key cannot be read", async () => {

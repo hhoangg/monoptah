@@ -3,7 +3,8 @@
 // start with these (see `startingSelection` in ./defaultModel.ts). Access offers the sendable modes only.
 import { useState } from "react";
 import type { SendableRuntimeMode } from "@monoptah/protocol";
-import { LinkProvider } from "@/link";
+import { LinkProvider, useLinkState } from "@/link";
+import { Button } from "@/ui/button";
 import { HarnessIcon } from "@/ui/HarnessIcon";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { accessMode } from "./access";
@@ -23,6 +24,7 @@ export function DefaultModelSection({ desktopId }: { desktopId: string }) {
 
 function DefaultModelRows({ desktopId }: { desktopId: string }) {
   const catalog = useModelCatalog();
+  const linkReady = useLinkState((state) => state.status === "ready");
   const { defaults, loaded, update } = useDefaultModels(desktopId);
   const [open, setOpen] = useState(false);
   const data = catalog.data;
@@ -36,7 +38,14 @@ function DefaultModelRows({ desktopId }: { desktopId: string }) {
         <SettingsRow
           icon="sparkle"
           title="Default model"
-          description={catalog.isError ? "Needs a connection to the desktop" : "Loading models..."}
+          description={catalog.isError ? (linkReady ? "Could not load the models" : "Needs a connection to the desktop") : "Loading models..."}
+          trailing={
+            catalog.isError ? (
+              <Button type="button" variant="outline" size="sm" onClick={() => void catalog.refetch()}>
+                Retry
+              </Button>
+            ) : undefined
+          }
         />
       </SettingsCard>
     );

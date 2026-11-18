@@ -9,6 +9,7 @@ import type { CloudState } from "@monoptah/protocol";
 import { useLinkState } from "@/link/LinkProvider";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
+import { EmptyState } from "@/ui/EmptyState";
 import { Notice } from "@/ui/Notice";
 import { otherLabel } from "./copy";
 import { InstanceRow } from "./InstanceRow";
@@ -103,9 +104,7 @@ export function InstancesScreen({ desktopId }: { desktopId: string }) {
           <DelayedSpinner label="Loading cloud instances" />
         </div>
       ) : instances.length === 0 ? (
-        <p data-testid="cloud-empty" className="py-6 text-center text-body text-muted-text">
-          No cloud instances yet. Instances appear here when a session runs in the cloud.
-        </p>
+        <EmptyState icon="cloud" data-testid="cloud-empty" title="No cloud instances yet" description="Start a session with the Cloud target to create one." />
       ) : (
         <ul aria-label="Cloud instances" className="flex flex-col gap-3">
           {instances.map((instance) => (

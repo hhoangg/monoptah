@@ -357,7 +357,13 @@ function SendStatus({ turn, onRetry }: { turn: OptimisticTurn; onRetry: ((id: st
       <span className="mr-2" data-testid="not-sent-reason">
         {sendErrorMessage(turn.error)}
       </span>
-      <button type="button" disabled={!onRetry} title={turn.error} onClick={() => onRetry?.(turn.id)} className="font-semibold underline">
+      <button
+        type="button"
+        disabled={!onRetry}
+        title={turn.error}
+        onClick={() => onRetry?.(turn.id)}
+        className="-my-2 inline-flex min-h-11 items-center rounded-row px-2 font-semibold underline hover:bg-[var(--content-a08)] disabled:no-underline pointer-fine:my-0 pointer-fine:min-h-7"
+      >
         Not sent, retry
       </button>
     </p>

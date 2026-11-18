@@ -50,14 +50,14 @@ describe("/desktops list", () => {
     });
     mountApp("/desktops");
     await screen.findByRole("heading", { level: 1, name: "Desktops" });
-    const studio = (await screen.findByRole("link", { name: "Open Studio Mac" })).closest("li") as HTMLElement;
+    const studio = (await screen.findByRole("link", { name: /^Open Studio Mac/ })).closest("li") as HTMLElement;
     expect(within(studio).getByText("Online")).toBeInTheDocument();
     expect(within(studio).getByText("2 to confirm")).toBeInTheDocument();
     expect(within(studio).getByText(/macOS, v1\.4\.0/)).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Open Studio Mac" })).toHaveAttribute("href", "/d/d1");
+    expect(screen.getByRole("link", { name: /^Open Studio Mac/ })).toHaveAttribute("href", "/d/d1");
     expect(screen.getByRole("link", { name: "Manage Studio Mac" })).toHaveAttribute("href", "/desktops/d1");
 
-    const linux = screen.getByRole("link", { name: "Open Linux box" }).closest("li") as HTMLElement;
+    const linux = screen.getByRole("link", { name: /^Open Linux box/ }).closest("li") as HTMLElement;
     expect(within(linux).getByText("Offline")).toBeInTheDocument();
     expect(within(linux).getByText(/Last seen 3 hours ago/)).toBeInTheDocument();
     expect(within(linux).queryByText(/to confirm/)).toBeNull();
@@ -66,9 +66,11 @@ describe("/desktops list", () => {
   it("explains how to pair when there is no desktop", async () => {
     install();
     mountApp("/desktops");
-    expect(await screen.findByText("No desktop is paired yet.")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Pair your first desktop" })).toBeInTheDocument();
     expect(screen.getByText(/Settings > Web app > Pair/)).toBeInTheDocument();
     expect(screen.getByLabelText("Paste a pairing link")).toBeInTheDocument();
+    expect(screen.getByText("Paste the link or the 8 character code shown on the desktop.")).toBeInTheDocument();
+    expect(screen.queryByText(/^Optional/)).toBeNull();
   });
 
   it("renders desktop names as text only", async () => {

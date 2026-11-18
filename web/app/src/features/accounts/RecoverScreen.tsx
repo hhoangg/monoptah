@@ -8,7 +8,7 @@ import { Field } from "@/ui/Field";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { AddPasskeyStep } from "./AddPasskeyStep";
-import { recoverErrorMessage } from "./authCopy";
+import { markRecovered, recoverErrorMessage } from "./authCopy";
 import { LOW_CODES_THRESHOLD, setLowCodes } from "./lowCodes";
 import { ApiError, isApiError } from "./api";
 import { meQuery, recoverAccount, signOut } from "./queries";
@@ -27,18 +27,24 @@ export function RecoverScreen() {
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<{ handle?: string; code?: string }>({});
   // The server lets a recovery-only session call GET /api/me and logout, and nothing else but
   // adding a passkey. A 403 `recovery_only` from `me` (an older server) means the same thing.
   const recoverySession = me.data?.recoveryOnly === true || (me.error instanceof ApiError && me.error.code === "recovery_only");
   const step: Step = localStep ?? (recoverySession ? "passkey" : "form");
 
-  async function submit(event: FormEvent) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const normalized = normalizeRecoveryCode(code);
     const cleanHandle = handle.trim().toLowerCase();
     setError(null);
-    if (!cleanHandle || !normalized) {
-      setError("Enter your handle and one recovery code.");
+    const missing: { handle?: string; code?: string } = {};
+    if (!cleanHandle) missing.handle = "Enter your handle.";
+    if (!normalized) missing.code = "Enter one of your recovery codes.";
+    setFieldErrors(missing);
+    if (missing.handle || missing.code) {
+      const first = missing.handle ? "handle" : "code";
+      (event.currentTarget.elements.namedItem(first) as HTMLInputElement | null)?.focus();
       return;
     }
     setBusy(true);
@@ -58,7 +64,7 @@ export function RecoverScreen() {
    * The server keeps a recovery session recovery-only even after it holds a passkey, so the user
    * signs out here and signs in with the new passkey. The cache is cleared even if logout fails.
    */
-  async function leave() {
+  async function leave(passkeyAdded: boolean) {
     setBusy(true);
     setError(null);
     try {
@@ -73,6 +79,7 @@ export function RecoverScreen() {
       }
     }
     setBusy(false);
+    if (passkeyAdded) markRecovered();
     void router.navigate({ to: "/login" });
   }
 
@@ -80,7 +87,7 @@ export function RecoverScreen() {
     return (
       <AuthLayout>
         <PageHeader title="Recover your account" />
-        <DelayedSpinner label="Loading" />
+        <DelayedSpinner label="Loading" className="text-muted-text" />
       </AuthLayout>
     );
   }
@@ -90,9 +97,9 @@ export function RecoverScreen() {
       <AuthLayout>
         <PageHeader title="Add a new passkey" description="Your recovery code worked. Add a passkey on this device, then sign in with it." />
         {error ? <Notice variant="error">{error}</Notice> : null}
-        <AddPasskeyStep label="Add a passkey" onDone={() => void leave()} />
+        <AddPasskeyStep label="Add a passkey" onDone={() => void leave(true)} />
         {/* A recovery session lasts 30 minutes and can add a passkey without a re-auth: never leave it open on a shared browser. */}
-        <Button type="button" variant="ghost" className="w-full" disabled={busy} onClick={() => void leave()}>
+        <Button type="button" variant="ghost" className="w-full" disabled={busy} onClick={() => void leave(false)}>
           Cancel and sign out
         </Button>
       </AuthLayout>
@@ -107,7 +114,12 @@ export function RecoverScreen() {
           label="Handle"
           name="handle"
           value={handle}
-          onChange={(event) => setHandle(event.target.value)}
+          onChange={(event) => {
+            setHandle(event.target.value);
+            setFieldErrors((current) => ({ ...current, handle: undefined }));
+            setError(null);
+          }}
+          error={fieldErrors.handle}
           autoComplete="username"
           autoCapitalize="none"
           autoCorrect="off"
@@ -117,7 +129,12 @@ export function RecoverScreen() {
           label="Recovery code"
           name="code"
           value={code}
-          onChange={(event) => setCode(event.target.value)}
+          onChange={(event) => {
+            setCode(event.target.value);
+            setFieldErrors((current) => ({ ...current, code: undefined }));
+            setError(null);
+          }}
+          error={fieldErrors.code}
           hint="Spaces, dashes and lower case are fine."
           autoComplete="off"
           autoCapitalize="characters"

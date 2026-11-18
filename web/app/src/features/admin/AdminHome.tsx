@@ -51,7 +51,6 @@ function Overview({ settings }: { settings: AdminSettings }) {
             />
           }
         />
-        <SettingsRow icon="people" title="Users" description="Accounts on this instance, blocked ones included" trailing={<span className="tabular text-content">{userCountText(settings)}</span>} />
       </SettingsCard>
       {toggle.error ? <Notice variant="error">{toggle.error}</Notice> : null}
       {toggle.notice ? <Notice variant="info">{toggle.notice}</Notice> : null}
@@ -62,7 +61,13 @@ function Overview({ settings }: { settings: AdminSettings }) {
       ) : null}
 
       <SettingsCard title="Manage">
-        <SettingsRow icon="people" title="Users" description="Block, unblock and grant invites" to="/admin/users" />
+        <SettingsRow
+          icon="people"
+          title="Users"
+          description="Block, unblock and grant invites. Count includes blocked accounts."
+          trailing={<span className="tabular text-content">{userCountText(settings)}</span>}
+          to="/admin/users"
+        />
         <SettingsRow icon="link" title="Invites" description="Who invited whom" to="/admin/invites" />
       </SettingsCard>
 

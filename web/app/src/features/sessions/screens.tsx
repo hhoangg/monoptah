@@ -3,7 +3,10 @@ import { Link } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useCatalog } from "@/data";
+import { ProjectBar } from "@/features/layout/ProjectBar";
 import { Button } from "@/ui/button";
+import { DelayedSpinner } from "@/ui/DelayedSpinner";
+import { EmptyState } from "@/ui/EmptyState";
 import { Icon } from "@/ui/Icon";
 import { Input } from "@/ui/input";
 import { useMediaQuery } from "@/ui/useMediaQuery";
@@ -20,21 +23,26 @@ import { MonoRow, ProjectRow } from "./WorkspaceNav";
 import { NewSessionScreen } from "./NewSessionScreen";
 import { MonoHome } from "@/features/monos/MonoHome";
 import { useMonoPrefs } from "@/features/monos/monoPrefs";
-import { WorkspaceFrame, useReadOnly } from "./WorkspaceFrame";
+import { WIDE_QUERY, WorkspaceFrame, useReadOnly } from "./WorkspaceFrame";
 import { SEARCH_DEBOUNCE_MS, useDebouncedValue } from "./useSessionPages";
 
 /** F-14 empty state: nothing is shared with this device yet. */
 export function WorkspaceEmpty({ desktopId }: { desktopId: string }) {
   return (
-    <section className="flex min-h-[50dvh] flex-col items-start justify-center gap-5 py-8" data-testid="workspace-empty">
-      <h2 className="text-display font-semibold">Make yourself at home.</h2>
-      <p className="text-body text-muted-text">Choose the projects and Monos you want on this device.</p>
-      <Button asChild size="lg">
-        <Link to="/d/$desktopId/settings" params={{ desktopId }}>
-          Choose projects
-        </Link>
-      </Button>
-    </section>
+    <EmptyState
+      data-testid="workspace-empty"
+      icon="folder"
+      title="Make yourself at home."
+      description="Choose the projects and Monos you want on this device."
+      className="min-h-[50dvh] justify-center"
+      action={
+        <Button asChild size="lg">
+          <Link to="/d/$desktopId/settings" params={{ desktopId }}>
+            Choose projects
+          </Link>
+        </Button>
+      }
+    />
   );
 }
 
@@ -50,23 +58,37 @@ export function HomeScreen({ desktopId }: { desktopId: string }) {
   const empty = !!data && data.projects.length === 0 && data.monos.length === 0;
   // F-13: with "Monos only" on, the home is the messaging-style Mono list instead of projects and sessions.
   const monosOnly = useMonoPrefs((state) => state.monosOnly);
+  // From 640 px the sidebar lists the projects and Monos; the home repeats them only on a phone.
+  const wide = useMediaQuery(WIDE_QUERY);
 
   return (
     // "route-stub" is kept as the outlet marker used by link/LinkProvider.test.tsx and version/layout.test.tsx (WS-L); rename when their owner switches to a real marker.
-    <WorkspaceFrame desktopId={desktopId} title="Workspace" testId="route-stub">
+    <WorkspaceFrame desktopId={desktopId} title="Workspace" testId="route-stub" narrow>
       {monosOnly ? (
         <MonoHome desktopId={desktopId} />
       ) : !data ? (
         catalog.isError ? (
-          <Notice variant="error">Could not load your workspace.</Notice>
+          <div className="flex flex-col items-start gap-3">
+            <Notice variant="error" className="w-full">
+              Could not load your workspace.
+            </Notice>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button type="button" variant="outline" size="sm" onClick={() => void catalog.refetch()}>
+                Try again
+              </Button>
+              <Button asChild variant="ghost" size="sm">
+                <Link to="/desktops">All desktops</Link>
+              </Button>
+            </div>
+          </div>
         ) : (
-          <p role="status" className="text-label text-muted-text">Loading…</p>
+          <DelayedSpinner label="Loading your workspace" className="m-6" />
         )
       ) : empty ? (
         <WorkspaceEmpty desktopId={desktopId} />
       ) : (
         <div className="flex flex-col gap-6">
-          {data.projects.length > 0 ? (
+          {!wide && data.projects.length > 0 ? (
             <section aria-label="Projects" className="flex flex-col gap-0.5">
               <h2 className="px-2.5 pb-1 text-meta font-medium text-muted-text">Projects</h2>
               {data.projects.map((project) => (
@@ -114,6 +136,7 @@ export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string
   // while the host is still in the document is a real one and clears it.
   const [state] = useState(() => {
     const element = document.createElement("div");
+    element.className = "flex min-h-0 flex-1 flex-col";
     const created = { host: element, focused: null as HTMLElement | null };
     element.addEventListener("focusin", (event) => {
       created.focused = event.target instanceof HTMLElement ? event.target : null;
@@ -138,7 +161,7 @@ export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string
   return (
     <>
       {page === "new" && !split ? null : <ProjectScreen desktopId={desktopId} projectId={projectId} split={split} detailRef={place} />}
-      {split ? null : page === "new" ? <div ref={place} /> : null}
+      {split ? null : page === "new" ? <div ref={place} className="flex min-h-0 flex-1 flex-col" /> : null}
       {/* Mounted only while it can be seen: a phone on the sessions page must not fetch models for it. The draft survives in the per-project store (newSessionDraft.ts). */}
       {split || page === "new" ? createPortal(<NewSessionScreen desktopId={desktopId} projectId={projectId} embedded={split} />, host) : null}
     </>
@@ -160,6 +183,7 @@ export function ProjectScreen({
 }) {
   const catalog = useCatalog();
   const readOnly = useReadOnly();
+  const wide = useMediaQuery(WIDE_QUERY);
   const [text, setText] = useState("");
   const query = useDebouncedValue(text, SEARCH_DEBOUNCE_MS);
   const [filter, updateFilter] = useSessionFilter();
@@ -184,7 +208,12 @@ export function ProjectScreen({
   );
 
   return (
-    <WorkspaceFrame desktopId={desktopId} title={project?.name ?? "Project"} subtitle={project?.path} actions={missing ? null : newSession}>
+    <WorkspaceFrame desktopId={desktopId} title={project?.name ?? "Project"} subtitle={project?.path} actions={missing ? null : newSession} fill={split}>
+      {wide ? null : (
+        <div className="-mx-4 min-[24rem]:-mx-5">
+          <ProjectBar variant="bar" />
+        </div>
+      )}
       {missing ? (
         <section className="flex flex-col items-start gap-4 py-8">
           <h2 className="text-title font-semibold">This project is not on this device</h2>
@@ -196,8 +225,8 @@ export function ProjectScreen({
           </Button>
         </section>
       ) : (
-        <div className={split ? "grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-start gap-6" : undefined} data-testid={split ? "project-split" : undefined}>
-          <div className="min-w-0">
+        <div className={split ? "grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] grid-rows-[minmax(0,1fr)] gap-6" : undefined} data-testid={split ? "project-split" : undefined}>
+          <div className={split ? "min-h-0 min-w-0 overflow-y-auto pb-6" : "flex min-h-full min-w-0 flex-col"}>
           {project ? (
             <div className="pb-2">
               <WorkspaceMenu
@@ -219,7 +248,7 @@ export function ProjectScreen({
           <NowWorking desktopId={desktopId} projectId={projectId} readOnly={readOnly} />
           </div>
           {split ? (
-            <section ref={detailRef} aria-label="New session" data-testid="project-split-detail" className="min-w-0" />
+            <section ref={detailRef} aria-label="New session" data-testid="project-split-detail" className="flex h-full min-h-0 min-w-0 flex-col" />
           ) : null}
         </div>
       )}

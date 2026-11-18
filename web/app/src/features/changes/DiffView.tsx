@@ -5,9 +5,12 @@ import { memo, useEffect, useMemo, useState } from "react";
 import { requestCodeHighlight } from "@/features/markdown/highlight/plugin";
 import { MAX_HIGHLIGHT_CHARS, type CodeToken } from "@/features/markdown/highlight/types";
 import { CodeLine } from "@/features/files/highlightSpans";
+import { useFilePrefs } from "@/features/files/filePrefs";
 import { languageId } from "@/lib/fileKind";
 import { cn } from "@/lib/utils";
 import { Icon } from "@/ui/Icon";
+import { IconTip } from "@/ui/tooltip";
+import { PathLabel } from "@/ui/PathLabel";
 import { UNIFIED_FOLD_STEP, expandFold, foldUnifiedLines, revealedFold, type FoldReveal } from "./diffFold";
 import { STATUS_LABEL, formatCount, splitPath, type ChangedFile, type DiffLine } from "./gitModel";
 
@@ -47,10 +50,10 @@ const Row = memo(function Row({ line, tokens, wrap }: { line: DiffLine; tokens: 
       data-kind={line.kind}
       className={cn("flex", line.kind === "add" && "bg-additions/10", line.kind === "del" && "bg-deletions/10")}
     >
-      <span aria-hidden="true" className="w-10 shrink-0 pr-2 text-right text-faint select-none">
+      <span aria-hidden="true" className="hidden w-10 shrink-0 pr-2 text-right text-faint select-none @md:block">
         {line.oldNumber ?? ""}
       </span>
-      <span aria-hidden="true" className="w-10 shrink-0 pr-2 text-right text-faint select-none">
+      <span aria-hidden="true" className="w-8 shrink-0 pr-1 text-right text-faint select-none @md:w-10 @md:pr-2">
         {line.newNumber ?? ""}
       </span>
       <span aria-hidden="true" className={cn("w-4 shrink-0 select-none", line.kind === "add" && "text-additions", line.kind === "del" && "text-deletions")}>
@@ -64,7 +67,9 @@ const Row = memo(function Row({ line, tokens, wrap }: { line: DiffLine; tokens: 
 });
 
 export function DiffView({ file }: { file: ChangedFile }) {
-  const [wrap, setWrap] = useState(false);
+  // Shared with the file viewer: remembered across files, and on by default on a phone-width window.
+  const wrap = useFilePrefs((state) => state.wrap);
+  const setWrap = useFilePrefs((state) => state.setWrap);
   const [reveals, setReveals] = useState<ReadonlyMap<string, FoldReveal>>(new Map());
   const blocks = useMemo(() => foldUnifiedLines(file.lines), [file.lines]);
   const tokens = useDiffTokens(file.lines, languageId(splitPath(file.relative).name));
@@ -73,23 +78,23 @@ export function DiffView({ file }: { file: ChangedFile }) {
     setReveals((current) => new Map(current).set(id, expandFold(current.get(id), total, direction)));
 
   return (
-    <section aria-label={`Diff of ${file.relative}`} data-testid="diff-view" className="flex min-h-0 flex-1 flex-col">
+    <section aria-label={`Diff of ${file.relative}`} data-testid="diff-view" className="@container flex min-h-0 flex-1 flex-col">
       <header className="flex min-h-11 shrink-0 items-center gap-2 border-b border-stroke px-3">
-        <span className="min-w-0 flex-1 truncate [unicode-bidi:isolate] text-label font-medium" title={file.relative}>
-          {file.relative}
-        </span>
+        <PathLabel path={file.relative} className="flex-1 text-label" />
         <span className="text-small text-muted-text">{STATUS_LABEL[file.status]}</span>
         {file.additions > 0 ? <span className="text-small text-additions tabular-nums">+{formatCount(file.additions)}</span> : null}
         {file.deletions > 0 ? <span className="text-small text-deletions tabular-nums">-{formatCount(file.deletions)}</span> : null}
-        <button
-          type="button"
-          aria-label="Wrap lines"
-          aria-pressed={wrap}
-          onClick={() => setWrap((value) => !value)}
-          className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill hover:bg-selection pointer-fine:size-9", wrap ? "bg-selection text-content" : "text-muted-text")}
-        >
-          <Icon name="wrap" size={18} />
-        </button>
+        <IconTip label="Wrap lines">
+          <button
+            type="button"
+            aria-label="Wrap lines"
+            aria-pressed={wrap}
+            onClick={() => setWrap(!wrap)}
+            className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill hover:bg-selection pointer-fine:size-9", wrap ? "bg-selection text-content" : "text-muted-text")}
+          >
+            <Icon name="wrap" size={18} />
+          </button>
+        </IconTip>
       </header>
       <div role="list" aria-label="Changed lines" tabIndex={0} className="min-h-0 flex-1 overflow-auto font-mono text-small leading-5">
         <div className={wrap ? "" : "w-max min-w-full"}>

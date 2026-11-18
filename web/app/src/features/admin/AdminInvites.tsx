@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { formatDate } from "@/features/settings/format";
 import { Badge } from "@/ui/badge";
+import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { SettingsCard } from "@/ui/SettingsCard";
 import { adminSettingsQuery, adminUsersQuery, type AdminSettings, type AdminUser } from "./adminApi";
@@ -21,7 +22,7 @@ export function AdminInvites() {
   const settings = useQuery(adminSettingsQuery);
   const users = useQuery(adminUsersQuery);
   return (
-    <AdminLayout title="Invites" description="Who invited whom, and whether new invites are open." wide>
+    <AdminLayout title="Invites" description="Who invited whom, and whether new invites are open.">
       <AdminBoundary query={settings} label="admin settings">
         {(data) => <PausedState settings={data} />}
       </AdminBoundary>
@@ -88,6 +89,7 @@ function TreeItem({ node, depth }: { node: TreeNode; depth: number }) {
         {user.role === "admin" ? <Badge variant="outline">Admin</Badge> : null}
         {user.status === "blocked" ? <Badge variant="destructive">Blocked</Badge> : null}
         <span className="text-meta text-muted-text">{`joined ${formatDate(user.createdAt)}${invited > 0 ? `, invited ${invited}` : ""}`}</span>
+        <Icon name="chevronRight" size={18} className="ml-auto shrink-0 text-faint" />
       </Link>
       {invited > 0 ? (
         <ul className={depth < MAX_INDENT ? "m-0 ml-4 list-none border-l border-stroke pl-2" : "m-0 list-none p-0"} aria-label={`Invited by @${user.handle}`}>

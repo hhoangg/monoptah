@@ -49,12 +49,13 @@ export function AccessPicker({
           title={`${hint}${busy ? " Changes apply to the next turn." : ""}`}
           aria-label={`Access: ${label}`}
           className={cn(
-            "flex max-w-52 min-h-9 items-center gap-1.5 text-caption text-content disabled:opacity-40 data-[state=open]:bg-selection",
+            "flex max-w-52 min-h-11 min-w-0 shrink-[4] items-center gap-1.5 text-caption pointer-fine:min-h-9 text-content disabled:opacity-40 data-[state=open]:bg-selection",
             variant === "plain" ? "rounded-row px-2 hover:bg-selection" : "rounded-pill bg-selection px-3",
           )}
         >
           <TriggerIcon size={14} className="shrink-0" />
-          <span className="min-w-0 truncate">{label}</span>
+          {/* Icon-only on a narrow toolbar: the model name keeps the room; the label stays in aria-label. */}
+          <span className="min-w-0 truncate max-[400px]:hidden">{label}</span>
           <ChevronDown size={12} className="shrink-0 text-muted-text" />
         </button>
       </DropdownMenuTrigger>

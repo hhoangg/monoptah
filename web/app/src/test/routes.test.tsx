@@ -213,8 +213,9 @@ describe("route stubs", () => {
     for (const [key, value] of Object.entries(params)) expect(last?.params).toHaveProperty(key, value);
     if (SCREENS[route]) {
       expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-      // The sign-in family shows no app navigation; /install keeps it and offers a way back.
-      if (["/login", "/register", "/recover"].includes(new URL(url, "http://x").pathname)) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+      // The sign-in family shows no app navigation. /install is public and rendered here for a signed-out
+      // visitor, so it shows the brand only as well (A-9); the signed-in /install case is in settings.test.tsx.
+      if (["/login", "/register", "/recover", "/install"].includes(new URL(url, "http://x").pathname)) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
       else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
       return;
     }
@@ -244,7 +245,8 @@ describe("route stubs", () => {
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
-    expect(await screen.findByText(/Signed in as .* \(@dev-user\)/)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 1, name: "Continue as @dev-user" })).toBeInTheDocument();
+    expect(screen.getByText(/^Signed in as .+/)).toBeInTheDocument();
     expect(router.state.location.pathname).toBe("/login");
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
     await screen.findByRole("heading", { level: 1, name: "Settings" });

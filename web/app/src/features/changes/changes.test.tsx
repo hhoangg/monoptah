@@ -8,6 +8,7 @@ import { KNOWN_CAPABILITIES } from "@monoptah/protocol";
 import { FIXTURE_HANDLERS, FixtureError } from "@monoptah/mock-desktop";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
+import { reloadFilePrefs, WRAP_KEY } from "@/features/files/filePrefs";
 import { clearPanels, openPanel, registerPanel } from "@/features/layout/panels";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace } from "@/features/sessions/dev/mockLink";
 import { resetSessionActivity } from "@/features/sessions/activityStore";
@@ -92,6 +93,7 @@ beforeEach(() => {
 let previous: PersistAdapter;
 beforeEach(() => {
   localStorage.clear();
+  reloadFilePrefs();
   clearKeptDiffs();
   previous = registerPersistAdapter(new MemoryPersistAdapter());
 });
@@ -412,6 +414,8 @@ describe("diff screen (F-68)", () => {
     expect(toggle).toHaveAttribute("aria-pressed", "false");
     await user.click(toggle);
     expect(toggle).toHaveAttribute("aria-pressed", "true");
+    // The choice is the shared file preference: remembered, and kept for the next file.
+    expect(localStorage.getItem(WRAP_KEY)).toBe("1");
   });
 
   it("opens from the list and keeps showing a diff that left the list", async () => {
@@ -429,7 +433,7 @@ describe("diff screen (F-68)", () => {
     const cached = queryClient.getQueryCache().getAll().find((query) => query.queryKey[2] === "project.changes");
     expect((cached?.state.data as { files: unknown[] } | undefined)?.files).toEqual([]);
     expect(keptDiff(DESKTOP_ID, "proj-alpha", "src/b.ts")).toBeDefined();
-    expect(screen.getByTestId("diff-view")).toHaveTextContent("src/b.ts");
+    expect(within(screen.getByTestId("diff-view")).getByTitle("src/b.ts")).toBeInTheDocument();
     expect(screen.queryByText("No longer changed")).toBeNull();
   });
 

@@ -732,6 +732,20 @@ describe("project tools (project bar and palette)", () => {
     expect(screen.queryByTestId("right-panel")).toBeNull();
   });
 
+  it("shows the tool of the current route as current and never docks a second copy of it", async () => {
+    const user = userEvent.setup();
+    mount(1280, `${ALPHA}/files`);
+    const bar = await screen.findByRole("toolbar", { name: "Project tools" });
+    const files = within(bar).getByRole("button", { name: "Files" });
+    expect(files).toHaveAttribute("aria-current", "page");
+    expect(files).not.toHaveAttribute("aria-pressed");
+    expect(within(bar).getByRole("button", { name: "Changes" })).not.toHaveAttribute("aria-current");
+    await user.click(files);
+    expect(screen.queryByTestId("right-panel")).toBeNull();
+    await user.click(within(bar).getByRole("button", { name: "Git" }));
+    expect(await screen.findByTestId("right-panel")).toHaveAttribute("data-kind", "git");
+  });
+
   it("toggles the overlay at 768 without the outside press closing and reopening it", async () => {
     const user = userEvent.setup();
     mount(768, ALPHA);
@@ -742,8 +756,17 @@ describe("project tools (project bar and palette)", () => {
     expect(screen.queryByTestId("panel-overlay")).toBeNull();
   });
 
-  it("is absent below 640px and outside a project", async () => {
+  it("is the bar above the screen below 640px in a project, and absent outside a project", async () => {
     mount(390, ALPHA);
+    await screen.findByTestId("app-shell");
+    const bar = await screen.findByRole("toolbar", { name: "Project tools" });
+    expect(bar).toHaveAttribute("data-variant", "bar");
+    expect(screen.queryByTestId("app-sidebar")).toBeNull();
+    expect(within(bar).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Files", "Changes", "Git", "Background"]);
+  });
+
+  it("is absent below 640px on a screen without a project", async () => {
+    mount(390, "/settings");
     await screen.findByTestId("app-shell");
     expect(screen.queryByRole("toolbar", { name: "Project tools" })).toBeNull();
   });
@@ -758,9 +781,9 @@ describe("project tools (project bar and palette)", () => {
     registerSessionCapabilities(localOnly);
     const { router } = mount(1280, "/s/sess-local-1");
     const bar = await screen.findByRole("toolbar", { name: "Project tools" });
-    expect(within(bar).getAllByRole("button").map((button) => button.textContent)).toEqual(["Files", "Changes", "Git", "Background"]);
+    expect(within(bar).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Files", "Changes", "Git", "Background"]);
     await act(async () => router.history.push(`/d/${DESKTOP_ID}/s/sess-codespace-1`));
-    await waitFor(() => expect(within(screen.getByRole("toolbar", { name: "Project tools" })).getAllByRole("button").map((button) => button.textContent)).toEqual(["Background"]));
+    await waitFor(() => expect(within(screen.getByRole("toolbar", { name: "Project tools" })).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Background"]));
   });
 
   it.each([768, 1280])("adds no element above the screen on a session route at %i, the tools sit in the sidebar", async (width) => {
