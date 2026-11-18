@@ -280,6 +280,9 @@ impl Store {
                 ));
             }
         }
+        if !read_only {
+            super::restrict_database_files(path);
+        }
         let (extras, extras_db) = settings::open(path, read_only)?;
         let store = Self {
             conn,
