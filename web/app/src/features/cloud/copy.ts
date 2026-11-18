@@ -20,3 +20,7 @@ export const NOT_CONNECTED_NOTE = "Not connected. The desktop cannot reach this 
 export const KEPT_NOTE = "The instance was kept after the failed start and still bills until it is stopped.";
 export const STOP_CONFIRM = "Stopping interrupts any work running on the instance. The desktop tells you what was interrupted.";
 export const CLOUD_NAV_LABEL = "Cloud";
+export const CLAUDE_ONLY_NOTE = "Cloud sessions run Claude.";
+export const START_DISABLED_NOTE = "Remote cloud start is turned off on your desktop. Turn it on in the desktop settings to start cloud sessions.";
+export const MOVE_DISABLED_NOTE = "Remote cloud start or Remote push in Git is turned off on your desktop. Turn them on in the desktop settings to move sessions.";
+export const CANCEL_MOVE_CONFIRM = "Cancelling stops the move. Your session and its workspace are kept as they are, and nothing is deleted.";
