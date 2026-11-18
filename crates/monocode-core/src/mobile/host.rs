@@ -22,6 +22,19 @@ use std::{
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 
+/// Methods the host answers itself (the `match` in `call_from`, pairing and
+/// the watch). Every one needs a class in `policy::METHODS`; `authorize`
+/// refuses a method with none, and a test walks this list.
+pub(super) const HOST_METHODS: &[&str] = &[
+    "device.enroll",
+    "device.leave",
+    "workspace.list",
+    "sessions.list",
+    "device.push",
+    "device.selection",
+    "conversation.watch",
+];
+
 /// Methods the app answers. Pairing, leaving and the catalog are the host's.
 pub(super) const APP_METHODS: &[&str] = &[
     "conversation.read",
@@ -763,7 +776,8 @@ impl MobileHost {
         drop(inner);
         let service = self.clone();
         let watching = self.clone();
-        runtime.spawn(monocode_mobile_link::serve(
+        let observing = self.clone();
+        runtime.spawn(monocode_mobile_link::serve_observed(
             endpoint,
             self.gate.clone(),
             move |peer, request| {
@@ -774,9 +788,38 @@ impl MobileHost {
                 let host = watching.clone();
                 async move { host.watch(&peer, request, sink).await }
             },
+            move |peer: &str, connected| {
+                observing.record_connection(DeviceKind::Phone, peer, connected)
+            },
         ));
         super::router::restart(self);
         Ok(())
+    }
+
+    /// Writes the audit line of a paired device's link opening or ending: one
+    /// per connection, for either transport. A device with no row is not
+    /// written (it was never admitted).
+    pub(super) fn record_connection(&self, via: DeviceKind, peer: &str, connected: bool) {
+        let device = {
+            let Ok(inner) = self.inner.lock() else {
+                return;
+            };
+            let Ok(device) = find_device(&inner, via, peer) else {
+                return;
+            };
+            device
+        };
+        audit::record_lifecycle(
+            if connected {
+                audit::Lifecycle::Connect
+            } else {
+                audit::Lifecycle::Disconnect
+            },
+            &device.id,
+            &device.fingerprint,
+            via.into(),
+            None,
+        );
     }
 
     fn save(&self, config: &Config) -> Result<(), String> {
@@ -962,6 +1005,11 @@ impl MobileHost {
                 mark_denied(audited, &denial);
                 return Err(denial.into());
             }
+            // A host arm below must be listed in `HOST_METHODS` (and so be
+            // classified); one that is not is unreachable.
+            if !HOST_METHODS.contains(&method) && !APP_METHODS.contains(&method) {
+                return Err(unsupported());
+            }
             match method {
                 "device.selection" => {
                     let answer = policy::device_selection(&context, &params)?;
@@ -972,6 +1020,14 @@ impl MobileHost {
                     config
                         .devices
                         .retain(|v| !(v.id == device.id && v.kind == device.kind));
+                    // A web device that leaves is revoked: remembered, so the
+                    // next grant sync neither lists it as pending nor reports
+                    // `pending` for it.
+                    if via == DeviceKind::Web {
+                        if let Some(id) = &device.server_device_id {
+                            note_revoked(&mut config, id);
+                        }
+                    }
                     self.save(&config)?;
                     inner.config = config;
                     audit::record_lifecycle(
@@ -985,6 +1041,14 @@ impl MobileHost {
                         self.gate.remove(peer);
                     }
                     close_device_watches(&mut inner, peer);
+                    drop(inner);
+                    if via == DeviceKind::Web {
+                        self.web.drop_request(&device.id);
+                        self.web.command(LinkCommand::Revoke {
+                            fingerprint: device.fingerprint.clone(),
+                        });
+                        self.report_async(device.server_device_id.clone(), "revoked", None);
+                    }
                     return Ok(Value::Null);
                 }
                 "workspace.list" => {
@@ -1879,20 +1943,45 @@ impl MobileHost {
         .map(|_| ())
     }
 
-    /// Unpairs the web link: tells the server (best effort, a few seconds at
-    /// most), stops the link, wipes the sealed identity and every web device
-    /// row. A re-pair resets the grants on the server to pending, so a stale
-    /// confirmed row would otherwise skip the re-confirmation. Blocking.
-    /// Safe to repeat.
+    /// Unpairs the web link: tells the server (a few seconds at most), stops
+    /// the link, wipes the sealed identity and every web device row. A re-pair
+    /// resets the grants on the server to pending, so a stale confirmed row
+    /// would otherwise skip the re-confirmation. Blocking. Safe to repeat.
+    ///
+    /// When the server does not confirm the deletion (unreachable, or it
+    /// answered an error), nothing is wiped and this fails: the token is still
+    /// valid on the server, so the identity stays sealed for another try, and
+    /// the text tells the user the other way to revoke it. A server that says
+    /// the token is already unknown (401 or 404) counts as done.
     pub fn web_unpair(&self) -> Result<(), String> {
+        self.unpair(true)
+    }
+
+    /// [`MobileHost::web_unpair`] without needing the server's answer: the
+    /// local identity and rows are wiped even when the token could not be
+    /// revoked there. For an explicit "unpair anyway" after the server failed.
+    pub fn web_unpair_local(&self) -> Result<(), String> {
+        self.unpair(false)
+    }
+
+    fn unpair(&self, require_server: bool) -> Result<(), String> {
         let mut unpaired = None;
         if let Ok(Some(identity)) = self.load_web_identity() {
-            if let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) {
-                let _ = desktop_api::delete_me(
-                    &base,
-                    &identity.desktop_token,
-                    desktop_api::UNPAIR_TIMEOUT,
-                );
+            let deleted = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions))
+                .and_then(|base| {
+                    desktop_api::delete_me(
+                        &base,
+                        &identity.desktop_token,
+                        desktop_api::UNPAIR_TIMEOUT,
+                    )
+                });
+            if let Err(error) = deleted {
+                let gone = error.contains("answered 401") || error.contains("answered 404");
+                if require_server && !gone {
+                    return Err(format!(
+                        "The web server did not confirm the unpairing ({error}), so this desktop's token is still valid there. Try again, or delete this desktop in the web app to revoke it."
+                    ));
+                }
             }
             unpaired = Some((
                 identity.desktop_id.clone(),
@@ -2442,7 +2531,11 @@ mod tests {
         let text = String::from_utf8_lossy(&bytes);
         assert!(!text.contains("test-token-not-real"));
         assert!(!text.contains("relay.example.test"));
-        host.web_unpair().unwrap();
+        // The relay is not reachable here, so only the local unpair works and
+        // the plain one keeps the identity.
+        assert!(host.web_unpair().is_err());
+        assert!(host.load_web_identity().unwrap().is_some());
+        host.web_unpair_local().unwrap();
         assert_eq!(host.load_web_identity(), Ok(None));
         host.web_unpair().unwrap();
     }
@@ -2996,6 +3089,53 @@ mod tests {
         );
         // A habit run names both: each must be selected.
         assert_eq!(tokens(Some("p1"), Some("m2")), ["ExponentPushToken[all]"]);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_phone_connecting_and_going_is_audited() {
+        let (host, _events, phone) = paired();
+        let log =
+            std::env::temp_dir().join(format!("monoptah-connect-audit-{}", uuid::Uuid::new_v4()));
+        let _turn = audit::test_log(&log);
+        host.record_connection(DeviceKind::Phone, &phone, true);
+        host.record_connection(DeviceKind::Phone, &phone, false);
+        // A key with no row was never admitted and writes nothing.
+        host.record_connection(DeviceKind::Phone, "unknown-key", true);
+        let mut lines = audit::read_recent(&log, 50);
+        lines.reverse();
+        let ours: Vec<_> = lines
+            .iter()
+            .filter(|line| line["fingerprint"] == phone[..8] && line["transport"] == "quic")
+            .map(|line| line["event"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ours, ["connect", "disconnect"], "{lines:?}");
+        drop(_turn);
+        let _ = std::fs::remove_dir_all(&log);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_method_with_no_class_is_unsupported_for_every_device() {
+        let (host, _events, phone) = paired();
+        host.set_flags_for_test(true, true);
+        host.add_device_for_test(web_row("web-1", "web-fingerprint"));
+        let unknown = json!({"version":VERSION,"id":"u","method":"device.rename","params":{}});
+        let phone_error = host.handle(&phone, unknown.clone()).await.unwrap_err();
+        assert_eq!(phone_error, "Unsupported mobile operation");
+        let web_error = host
+            .handle_web("web-fingerprint", unknown)
+            .await
+            .unwrap_err();
+        assert_eq!(web_error.code.as_deref(), Some("unsupported"));
+        assert!(matches!(
+            policy::authorize(
+                &DeviceContext::phone(&phone_row()),
+                "device.rename",
+                &json!({})
+            ),
+            Err(denial) if denial.code == policy::Code::Unsupported
+        ));
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

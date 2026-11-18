@@ -3,6 +3,7 @@
 use super::*;
 use crate::notifications::approvals::InputKind;
 use monocode_core::agent::{Question, QuestionItem, QuestionOption};
+use monocode_core::mobile::policy::{self, Failure};
 use serde_json::{Value, json};
 
 /// The phone's own "Other" choice, as the desktop's question form names it.
@@ -18,17 +19,45 @@ pub(crate) const APPROVAL_LABEL_MAX: usize = 200;
 /// An approval waiting on the desktop, as a remote device shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MobileApproval {
+    /// The desktop's own opaque id, never the provider's.
     pub request_id: String,
     pub label: String,
     pub detail: String,
+    /// The label or detail was cut for the device, which then cannot allow it.
+    pub truncated: bool,
+}
+
+/// An approval a remote device was shown, kept so its answer finds the
+/// request it saw (and no other that reuses the provider's id).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RemoteApproval {
+    remote_id: String,
+    provider_id: String,
+    title: String,
+    detail: String,
+    truncated: bool,
+}
+
+/// A fresh opaque id: random per process (a keyed hash of a counter), never
+/// repeated.
+fn new_remote_id() -> String {
+    use std::hash::BuildHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let (a, b) = (
+        std::collections::hash_map::RandomState::new().hash_one(n),
+        std::collections::hash_map::RandomState::new().hash_one(n.wrapping_add(1 << 40)),
+    );
+    format!("ap-{a:016x}{b:016x}-{n}")
 }
 
 /// `text` cut to `max` characters, with an ellipsis when it was longer. Cuts
-/// on a character boundary.
-fn capped(text: &str, max: usize) -> String {
+/// on a character boundary. The flag says it was cut.
+fn capped(text: &str, max: usize) -> (String, bool) {
     match text.char_indices().nth(max) {
-        Some((end, _)) => format!("{}\u{2026}", &text[..end]),
-        None => text.to_owned(),
+        Some((end, _)) => (format!("{}\u{2026}", &text[..end]), true),
+        None => (text.to_owned(), false),
     }
 }
 
@@ -246,14 +275,38 @@ impl Conversation {
     }
 
     /// The approvals waiting on the desktop, with text capped for a remote
-    /// device. Questions are not approvals and are left out.
+    /// device. Questions are not approvals and are left out. Each gets the
+    /// desktop's own opaque id the first time it is shown; an approval that
+    /// left, or whose provider id now stands for other content, loses its id.
     pub(crate) fn mobile_approvals(&self, _cx: &gpui::App) -> Vec<MobileApproval> {
+        let mut known = self.remote_approvals.borrow_mut();
+        known.retain(|k| self.approvals.iter().any(|a| k.matches(a)));
         self.approvals
             .iter()
-            .map(|approval| MobileApproval {
-                request_id: approval.id.clone(),
-                label: capped(&approval.title, APPROVAL_LABEL_MAX),
-                detail: capped(&approval.detail, APPROVAL_DETAIL_MAX),
+            .map(|approval| {
+                let (label, label_cut) = capped(&approval.title, APPROVAL_LABEL_MAX);
+                let (detail, detail_cut) = capped(&approval.detail, APPROVAL_DETAIL_MAX);
+                let truncated = label_cut || detail_cut;
+                let remote_id = match known.iter().find(|k| k.matches(approval)) {
+                    Some(k) => k.remote_id.clone(),
+                    None => {
+                        let remote_id = new_remote_id();
+                        known.push(RemoteApproval {
+                            remote_id: remote_id.clone(),
+                            provider_id: approval.id.clone(),
+                            title: approval.title.clone(),
+                            detail: approval.detail.clone(),
+                            truncated,
+                        });
+                        remote_id
+                    }
+                };
+                MobileApproval {
+                    request_id: remote_id,
+                    label,
+                    detail,
+                    truncated,
+                }
             })
             .collect()
     }
@@ -264,24 +317,48 @@ impl Conversation {
         self.settings.access == AccessMode::FullAccess
     }
 
-    /// A remote device's answer to one pending approval: allow once or deny
-    /// once, through the desktop approval card's own path. Never "always
-    /// allow". Refused when the request is not pending (stale or answered).
+    /// A remote device's answer to one pending approval, named by the opaque
+    /// id it was shown: allow once or deny once, through the desktop approval
+    /// card's own path. Never "always allow". Refused as `not_pending` when the
+    /// id was never shown, or the request is gone or now stands for other
+    /// content. An allow is refused (`needs_desktop`) when the device saw only
+    /// part of the request or the provider has no one-time allow; a deny is
+    /// always possible.
     pub(crate) fn mobile_decide_approval(
         &mut self,
         request_id: &str,
         allow: bool,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failure> {
+        let stale = || policy::Code::NotPending.failure();
+        let known = self
+            .remote_approvals
+            .borrow()
+            .iter()
+            .find(|k| k.remote_id == request_id)
+            .cloned()
+            .ok_or_else(stale)?;
+        let approval = self
+            .approvals
+            .iter()
+            .find(|a| known.matches(a))
+            .ok_or_else(stale)?;
+        if allow && (known.truncated || !approval.can_allow_once) {
+            return Err(policy::Code::NeedsDesktop.failure());
+        }
+        let provider_id = known.provider_id.clone();
         let decision = if allow {
             Decision::Allow
         } else {
             Decision::Deny
         };
-        if self.decide_notification_request(request_id, decision, cx) {
+        if self.decide_notification_request(&provider_id, decision, cx) {
+            self.remote_approvals
+                .borrow_mut()
+                .retain(|k| k.remote_id != request_id);
             Ok(())
         } else {
-            Err("Approval is no longer pending".into())
+            Err(stale())
         }
     }
 
@@ -349,9 +426,25 @@ impl Conversation {
                 title: (*title).into(),
                 detail: (*detail).into(),
                 can_remember: true,
+                can_allow_once: true,
             })
             .collect();
         receive
+    }
+
+    /// Makes every pending approval one the provider can only allow "always".
+    pub(crate) fn mobile_test_without_allow_once(&mut self) {
+        for approval in &mut self.approvals {
+            approval.can_allow_once = false;
+        }
+    }
+}
+
+impl RemoteApproval {
+    fn matches(&self, approval: &Approval) -> bool {
+        self.provider_id == approval.id
+            && self.title == approval.title
+            && self.detail == approval.detail
     }
 }
 

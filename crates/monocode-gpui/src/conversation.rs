@@ -62,6 +62,8 @@ use gpui::{
     AnyElement, Context, Entity, EventEmitter, Focusable, MouseButton, Role, SharedString,
     StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
 };
+#[cfg(test)]
+pub(crate) use mobile::MobileApproval;
 pub(crate) use mobile::{
     Waiting as MobileWaiting, mobile_access_modes, usage_state as mobile_usage_state,
 };
@@ -296,6 +298,8 @@ pub(crate) struct Conversation {
     auto_resume_shown: Option<monocode_core::usage::AutoResume>,
     approvals: std::collections::VecDeque<Approval>,
     approval_ui: approvals::State,
+    /// Approvals a remote device was shown, by the desktop's own opaque id.
+    remote_approvals: std::cell::RefCell<Vec<mobile::RemoteApproval>>,
     questions:
         std::collections::VecDeque<(Entity<crate::questions::QuestionCard>, Vec<Subscription>)>,
     question_overlay: crate::questions::Overlay,
@@ -798,6 +802,7 @@ impl Conversation {
             auto_resume_shown: None,
             approvals: Default::default(),
             approval_ui: Default::default(),
+            remote_approvals: Default::default(),
             questions: Default::default(),
             question_overlay: Default::default(),
             controls: None,

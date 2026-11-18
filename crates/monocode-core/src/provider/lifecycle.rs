@@ -33,6 +33,7 @@ impl Protocol {
             title,
             detail: String::new(),
             can_remember: false,
+            can_allow_once: true,
         }));
         Ok(())
     }

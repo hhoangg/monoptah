@@ -172,6 +172,7 @@ mod tests {
             title: "Run a command?".into(),
             detail: "git status --short".into(),
             can_remember,
+            can_allow_once: true,
         }
     }
 

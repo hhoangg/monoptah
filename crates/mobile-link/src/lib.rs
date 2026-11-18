@@ -21,7 +21,8 @@ use std::{
 
 pub use duplex::{serve_stream, Duplex, ServeOptions};
 pub use transport::{
-    exchange, read_frame, serve, server_endpoint, watch, write_frame, Watch, WatchSink,
+    exchange, read_frame, serve, serve_observed, server_endpoint, watch, write_frame, Watch,
+    WatchSink,
 };
 pub type LinkResult<T> = Result<T, String>;
 

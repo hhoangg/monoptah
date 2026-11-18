@@ -103,6 +103,27 @@ pub async fn serve<F, Fut, E, W, WFut, WE>(
     WFut: Future<Output = Result<(), WE>> + Send + 'static,
     WE: Into<Failure> + 'static,
 {
+    serve_observed(endpoint, gate, handler, watcher, |_, _| {}).await;
+}
+
+/// [`serve`] that also tells `observer` when an admitted peer's connection
+/// opens (`true`) and when it ends (`false`), with the peer's key fingerprint.
+pub async fn serve_observed<F, Fut, E, W, WFut, WE, O>(
+    endpoint: quinn::Endpoint,
+    gate: Gate,
+    handler: F,
+    watcher: W,
+    observer: O,
+) where
+    F: Fn(String, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value, E>> + Send + 'static,
+    E: Into<Failure> + 'static,
+    W: Fn(String, Value, WatchSink) -> WFut + Send + Sync + 'static,
+    WFut: Future<Output = Result<(), WE>> + Send + 'static,
+    WE: Into<Failure> + 'static,
+    O: Fn(&str, bool) + Send + Sync + 'static,
+{
+    let observer = Arc::new(observer);
     let handler = Arc::new(handler);
     let watcher = Arc::new(watcher);
     let slots = Arc::new(Semaphore::new(32));
@@ -114,6 +135,7 @@ pub async fn serve<F, Fut, E, W, WFut, WE>(
         let handler = handler.clone();
         let watcher = watcher.clone();
         let gate = gate.clone();
+        let observer = observer.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let Ok(Ok(connection)) = timeout(Duration::from_secs(10), incoming).await else {
@@ -129,6 +151,10 @@ pub async fn serve<F, Fut, E, W, WFut, WE>(
                 return;
             };
             let key = crate::fingerprint(cert.as_ref());
+            let admitted = gate.admits(&key);
+            if admitted {
+                observer(&key, true);
+            }
             while let Ok((send, recv)) = connection.accept_bi().await {
                 if !gate.admits(&key) {
                     connection.close(1_u32.into(), b"Device revoked");
@@ -156,6 +182,9 @@ pub async fn serve<F, Fut, E, W, WFut, WE>(
                 if let Accepted::Watch(run) = accepted {
                     tokio::spawn(run.run());
                 }
+            }
+            if admitted {
+                observer(&key, false);
             }
         });
     }
@@ -783,6 +812,41 @@ mod tests {
         assert_eq!(endpoint.open_connections(), 1);
         endpoint.close(0_u32.into(), b"Test complete");
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_observer_hears_an_admitted_peer_connect_and_disconnect() {
+        let desktop = Identity::generate().unwrap();
+        let phone = Identity::generate().unwrap();
+        let gate = Gate::default();
+        gate.allow(phone.fingerprint().unwrap(), None);
+        let endpoint =
+            server_endpoint(&desktop, gate.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (events, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(serve_observed(
+            endpoint.clone(),
+            gate,
+            |_, request| async move { Ok::<_, String>(request) },
+            |_, _, _sink: WatchSink| async move { Ok::<_, String>(()) },
+            move |peer: &str, connected| {
+                let _ = events.send((peer.to_string(), connected));
+            },
+        ));
+        let address = [Address {
+            host: "127.0.0.1".into(),
+            port: endpoint.local_addr().unwrap().port(),
+        }];
+        let pin = desktop.fingerprint().unwrap();
+        exchange(&phone, &pin, &address, json!("hi")).await.unwrap();
+        assert_eq!(
+            heard.recv().await,
+            Some((phone.fingerprint().unwrap(), true))
+        );
+        endpoint.close(0_u32.into(), b"Test complete");
+        task.await.unwrap();
+        // The connection ends with the endpoint; the end is reported.
+        let closed = tokio::time::timeout(Duration::from_secs(5), heard.recv()).await;
+        assert_eq!(closed, Ok(Some((phone.fingerprint().unwrap(), false))));
     }
 
     #[tokio::test]

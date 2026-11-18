@@ -6,41 +6,110 @@
 //! `(session, requestId)` pair is recorded before the decision is applied.
 use crate::shell::Shell;
 use gpui::{App, Context};
-use monocode_core::mobile::{DeviceContext, policy, policy::Failure};
+use monocode_core::mobile::{DeviceContext, audit, policy, policy::Failure};
 use serde_json::{Map, Value, json};
 
 const INVALID: &str = "Invalid mobile parameters";
-const NOT_PENDING: &str = "Approval is no longer pending";
+
+/// What the audit line of one answer knows, filled as the call is checked.
+#[derive(Default)]
+struct Seen {
+    conversation: Option<String>,
+    request: Option<String>,
+    decision: Option<&'static str>,
+    project: Option<String>,
+}
 
 /// Answers `session.answerApproval {conversationId, requestId, decision}`.
 pub(crate) fn dispatch(
     shell: &mut Shell,
     device: &DeviceContext,
-    _method: &str,
+    command_id: &str,
     params: &Value,
     cx: &mut Context<Shell>,
 ) -> Result<Value, Failure> {
-    dispatch_with(shell, device, params, policy::approvals_enabled(), cx)
+    dispatch_with(
+        shell,
+        device,
+        command_id,
+        params,
+        policy::approvals_enabled(),
+        cx,
+    )
 }
 
 /// [`dispatch`] with the effective flag given (gate and toggle), so tests can
-/// force it on. Checks in order: flag, parameter shape, decision, selection (`not_selected`), full
-/// access, that the request was not answered before, then that it is still
-/// pending.
+/// force it on. Checks in order: flag, parameter shape, decision, selection
+/// (`not_selected`), full access, that the request was not answered before,
+/// then that it is still pending and may be allowed. Writes one audit line,
+/// with the decision, the ids and the refusal code, never the request's text;
+/// an uncoded failure is left to the host's own line.
 pub(crate) fn dispatch_with(
     shell: &mut Shell,
     device: &DeviceContext,
+    command_id: &str,
     params: &Value,
     enabled: bool,
     cx: &mut Context<Shell>,
 ) -> Result<Value, Failure> {
+    let mut seen = Seen::default();
+    let result = answer(shell, device, params, enabled, &mut seen, cx);
+    let outcome = match &result {
+        Ok(_) => Some(audit::Outcome::Ok),
+        Err(failure) => policy::code_of_failure(failure).map(audit::Outcome::Denied),
+    };
+    if let Some(outcome) = outcome {
+        let fingerprint = shell.mobile_fingerprint(&device.id);
+        audit::record_approval_answer_with(
+            device,
+            &audit::ApprovalAnswer {
+                fingerprint: &fingerprint,
+                project_id: seen.project.as_deref(),
+                conversation_id: seen.conversation.as_deref(),
+                request_id: seen.request.as_deref(),
+                decision: seen.decision,
+                command_id: Some(command_id),
+                transport: device.kind.into(),
+                outcome,
+            },
+        );
+    }
+    result
+}
+
+fn answer(
+    shell: &mut Shell,
+    device: &DeviceContext,
+    params: &Value,
+    enabled: bool,
+    seen: &mut Seen,
+    cx: &mut Context<Shell>,
+) -> Result<Value, Failure> {
+    let not_pending = || policy::Code::NotPending.failure();
+    let forbidden = || policy::Code::Forbidden.failure();
+    let Some(map) = params.as_object() else {
+        return Err(if enabled {
+            INVALID.into()
+        } else {
+            policy::Code::Disabled.failure()
+        });
+    };
+    seen.conversation = map
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    seen.request = map
+        .get("requestId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    seen.decision = match map.get("decision").and_then(Value::as_str) {
+        Some("allow") => Some("allow"),
+        Some("deny") => Some("deny"),
+        _ => None,
+    };
     if !enabled {
         return Err(policy::Code::Disabled.failure());
     }
-    let forbidden = || policy::Code::Forbidden.failure();
-    let Some(map) = params.as_object() else {
-        return Err(INVALID.into());
-    };
     // No scope, always or remember: an answer is once, for one request.
     if map
         .keys()
@@ -48,30 +117,32 @@ pub(crate) fn dispatch_with(
     {
         return Err(forbidden());
     }
-    let allow = match map.get("decision").and_then(Value::as_str) {
+    let allow = match seen.decision {
         Some("allow") => true,
-        Some("deny") => false,
-        _ => return Err(INVALID.into()),
+        Some(_) => false,
+        None => return Err(INVALID.into()),
     };
-    let (Some(conversation), Some(request_id)) = (
-        map.get("conversationId").and_then(Value::as_str),
-        map.get("requestId").and_then(Value::as_str),
-    ) else {
+    // The id is the desktop's own opaque string: a number or anything else is
+    // refused as malformed, never converted.
+    let (Some(conversation), Some(request_id)) = (seen.conversation.clone(), seen.request.clone())
+    else {
         return Err(INVALID.into());
     };
-    let id = shell.mobile_approval_session(conversation, device, cx)?;
-    let view = shell.mobile_session_view(id).ok_or(NOT_PENDING)?;
+    let id = shell.mobile_approval_session(&conversation, device, cx)?;
+    seen.project = shell.mobile_session_project(id, cx);
+    let view = shell.mobile_session_view(id).ok_or_else(not_pending)?;
     if view.read(cx).mobile_is_full_access() {
         return Err(forbidden());
     }
-    // One answer per request: recorded before the decision is applied, so a
-    // repeat is refused even while the desktop still shows the request.
-    if !shell.mobile_claim_answer(id, request_id) {
-        return Err(NOT_PENDING.into());
+    // One answer per request, also while the desktop still shows it.
+    if shell.mobile_was_answered(id, &request_id) {
+        return Err(not_pending());
     }
     view.update(cx, |view, cx| {
-        view.mobile_decide_approval(request_id, allow, cx)
+        view.mobile_decide_approval(&request_id, allow, cx)
     })?;
+    // Remembered only once applied: a refused allow leaves a deny possible.
+    shell.mobile_claim_answer(id, &request_id);
     Ok(json!({}))
 }
 
@@ -83,7 +154,14 @@ fn approvals_field(shell: &Shell, session: i64, cx: &App) -> Value {
         .unwrap_or_default();
     Value::Array(
         list.into_iter()
-            .map(|a| json!({"requestId": a.request_id, "label": a.label, "detail": a.detail}))
+            .map(|a| {
+                json!({
+                    "requestId": a.request_id,
+                    "label": a.label,
+                    "detail": a.detail,
+                    "truncated": a.truncated,
+                })
+            })
             .collect(),
     )
 }

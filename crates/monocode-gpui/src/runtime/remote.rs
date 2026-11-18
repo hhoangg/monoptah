@@ -465,6 +465,7 @@ pub(crate) fn approvals(snapshot: &Value) -> Vec<Approval> {
                     .unwrap_or("")
                     .into(),
                 can_remember: false,
+                can_allow_once: true,
             })
         })
         .collect()

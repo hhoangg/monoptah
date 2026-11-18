@@ -130,6 +130,25 @@ struct Session {
     next_msg_id: u32,
 }
 
+/// Writes the audit line of a confirmed device's session opening or ending. A
+/// pending session is not a connected device and writes nothing.
+fn audit_link(session: &Session, connected: bool) {
+    let Mode::Ready(device) = &session.mode else {
+        return;
+    };
+    crate::mobile::audit::record_lifecycle(
+        if connected {
+            crate::mobile::audit::Lifecycle::Connect
+        } else {
+            crate::mobile::audit::Lifecycle::Disconnect
+        },
+        &device.id,
+        &device.fingerprint,
+        crate::mobile::audit::Transport::Web,
+        None,
+    );
+}
+
 /// The sessions of one relay connection.
 ///
 /// The desktop static private key is held in a [`Zeroizing`] wrapper and wiped
@@ -259,6 +278,18 @@ impl SessionTable {
         self.sessions.is_empty()
     }
 
+    /// Removes a session and writes its disconnect line when it was ready.
+    /// False when there was none.
+    fn remove_session(&mut self, key: &SessionKey) -> bool {
+        match self.sessions.remove(key) {
+            Some(session) => {
+                audit_link(&session, false);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A BYE frame for `key`.
     pub fn bye_frame(key: SessionKey) -> Frame {
         bye(key)
@@ -274,7 +305,7 @@ impl SessionTable {
             FrameType::Hs1 => self.on_hs1(key, &frame.body, now_ms),
             FrameType::Transport => self.on_transport(key, &frame.body, now_ms),
             FrameType::Bye => {
-                if self.sessions.remove(&key).is_some() {
+                if self.remove_session(&key) {
                     vec![Action::Closed { key }]
                 } else {
                     Vec::new()
@@ -290,7 +321,7 @@ impl SessionTable {
 
     fn drop_with_bye(&mut self, key: SessionKey) -> Vec<Action> {
         let mut out = vec![Action::Send(bye(key))];
-        if self.sessions.remove(&key).is_some() {
+        if self.remove_session(&key) {
             out.push(Action::Closed { key });
         }
         out
@@ -401,8 +432,10 @@ impl SessionTable {
                 name,
             });
         }
-        if self.sessions.insert(key, session).is_some() {
+        audit_link(&session, true);
+        if let Some(old) = self.sessions.insert(key, session) {
             // The old session for the key ends with the new one's start.
+            audit_link(&old, false);
             out.insert(0, Action::Closed { key });
         }
         Some(out)
@@ -505,7 +538,7 @@ impl SessionTable {
         }
         let result = encrypt_envelope(session, key, envelope, now_ms, threshold);
         if result == Err(SendError::Encrypt) {
-            self.sessions.remove(&key);
+            self.remove_session(&key);
         }
         result
     }
@@ -580,6 +613,7 @@ impl SessionTable {
             return Vec::new();
         }
         session.mode = Mode::Ready(Box::new(device));
+        audit_link(session, true);
         match encrypt_envelope(session, key, &state, now_ms, threshold) {
             Ok(frames) => frames.into_iter().map(Action::Send).collect(),
             Err(_) => self.drop_with_bye(key),
@@ -1003,6 +1037,33 @@ mod tests {
         assert_eq!(h.table.len(), 1);
         assert!(h.table.tick(100 + PENDING_TIMEOUT_MS - 1).is_empty());
         assert_closed_with_bye(&h.table.tick(100 + PENDING_TIMEOUT_MS), key);
+    }
+
+    #[test]
+    fn a_confirmed_web_session_writes_connect_and_disconnect_lines() {
+        let log = std::env::temp_dir().join(format!("monoptah-web-audit-{}", uuid::Uuid::new_v4()));
+        let _turn = crate::mobile::audit::test_log(&log);
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.confirmed(&dev);
+        let key = dev.key(1);
+        let mut init = Initiator::new(&dev.private, &h.desktop_pub, &DESKTOP, &dev.id, 1).unwrap();
+        let hs1 = init.write_hs1(br#"{"name":"x"}"#).unwrap();
+        let _ = h.table.on_frame(frame(FrameType::Hs1, key, hs1), 0);
+        let events = |fp: &str| -> Vec<String> {
+            let mut lines = crate::mobile::audit::read_recent(&log, 50);
+            lines.reverse();
+            lines
+                .iter()
+                .filter(|line| line["fingerprint"] == fp[..8] && line["transport"] == "web")
+                .map(|line| line["event"].as_str().unwrap_or_default().to_owned())
+                .collect()
+        };
+        assert_eq!(events(&dev.fp()), ["connect"]);
+        let _ = h.table.on_frame(frame(FrameType::Bye, key, Vec::new()), 5);
+        assert_eq!(events(&dev.fp()), ["connect", "disconnect"]);
+        drop(_turn);
+        let _ = std::fs::remove_dir_all(&log);
     }
 
     #[test]

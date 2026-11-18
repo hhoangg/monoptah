@@ -468,7 +468,7 @@ impl Shell {
 
     /// The key fingerprint of a paired device, for the audit lines the app
     /// writes itself. Empty for a device the host no longer lists.
-    fn mobile_fingerprint(&self, device_id: &str) -> String {
+    pub(crate) fn mobile_fingerprint(&self, device_id: &str) -> String {
         self.mobile
             .host
             .as_ref()
@@ -828,6 +828,24 @@ impl Shell {
             }
         }
         true
+    }
+
+    /// Whether a remote device already answered `request_id` of `session`.
+    pub(crate) fn mobile_was_answered(&self, session: i64, request_id: &str) -> bool {
+        self.mobile
+            .answered_set
+            .contains(&(session, request_id.to_owned()))
+    }
+
+    /// The catalog project id of a session, for audit lines.
+    pub(crate) fn mobile_session_project(&self, session: i64, cx: &App) -> Option<String> {
+        let summary = self.session_summaries.get(&session)?;
+        let key = monocode_core::files::path_key(&summary.cwd);
+        self.mobile_projects(cx)
+            .iter()
+            .find(|path| monocode_core::files::path_key(path) == key)
+            .map(|path| project_id(path))
+            .or_else(|| cloud::catalog_project_of(summary))
     }
 
     /// The open conversation of a session, for the approvals module.
@@ -1684,7 +1702,7 @@ impl Shell {
                 let result = approvals::dispatch(
                     self,
                     &request.device,
-                    &request.method,
+                    &request.command_id,
                     &request.params,
                     cx,
                 );
@@ -3194,7 +3212,7 @@ mod tests {
                     // The approval answer, with the remote flag forced on.
                     let params = json!({"conversationId": conversation, "requestId": "r", "decision": "allow"});
                     assert_eq!(
-                        approvals::dispatch_with(shell, &device, &params, true, cx),
+                        approvals::dispatch_with(shell, &device, "c", &params, true, cx),
                         Err(policy::Code::NotSelected.failure())
                     );
                 }
@@ -3435,6 +3453,14 @@ mod tests {
             .unwrap();
     }
 
+    /// The approvals a remote device is shown for `view`, with their opaque ids.
+    fn shown(
+        view: &Entity<Conversation>,
+        cx: &mut Context<Shell>,
+    ) -> Vec<crate::conversation::MobileApproval> {
+        view.read(cx).mobile_approvals(cx)
+    }
+
     #[gpui::test]
     fn remote_approval_answers_follow_the_flag_and_the_checks(cx: &mut gpui::TestAppContext) {
         use monocode_core::agent::{AccessMode, Decision};
@@ -3444,19 +3470,21 @@ mod tests {
                 let conversation = shell.mobile_session_id(id);
                 let view = shell.sessions[&id].clone();
                 let ask = |shell: &mut Shell, device: &DeviceContext, params: Value, cx: &mut Context<Shell>| {
-                    approvals::dispatch_with(shell, device, &params, true, cx)
+                    approvals::dispatch_with(shell, device, "c", &params, true, cx)
                 };
                 let params = |request: &str, decision: &str| {
                     json!({"conversationId": conversation, "requestId": request, "decision": decision})
                 };
-                let pending = |cx: &mut Context<Shell>| view.read(cx).mobile_approvals(cx).len();
+                let pending = |cx: &mut Context<Shell>| shown(&view, cx).len();
 
                 // Flag off: the canonical text, and no fields.
                 let receive = view.update(cx, |v, _| {
                     v.mobile_test_wait_on(&[("r1", "Run ls", "ls -la")], AccessMode::Supervised)
                 });
+                let r1 = shown(&view, cx)[0].request_id.clone();
+                assert_ne!(r1, "r1", "the id is the desktop's own, not the provider's");
                 assert_eq!(
-                    approvals::dispatch_with(shell, &phone(), &params("r1", "allow"), false, cx),
+                    approvals::dispatch_with(shell, &phone(), "c", &params(&r1, "allow"), false, cx),
                     Err(policy::Code::Disabled.failure())
                 );
                 assert_eq!(pending(cx), 1);
@@ -3471,7 +3499,7 @@ mod tests {
                     policy::authorize_with(
                         &reader,
                         "session.answerApproval",
-                        &params("r1", "allow"),
+                        &params(&r1, "allow"),
                         &policy::PolicyFlags::default(),
                         true
                     )
@@ -3483,19 +3511,19 @@ mod tests {
                 // Unselected project.
                 let narrowed = web(Some(vec!["not-this-project".into()]), None);
                 assert_eq!(
-                    ask(shell, &narrowed, params("r1", "allow"), cx),
+                    ask(shell, &narrowed, params(&r1, "allow"), cx),
                     Err(not_selected())
                 );
                 // Extra keys are forbidden, a bad decision is invalid.
                 let forbidden = Err(policy::Code::Forbidden.failure());
                 for key in ["scope", "always", "remember", "other"] {
-                    let mut extra = params("r1", "allow");
+                    let mut extra = params(&r1, "allow");
                     extra[key] = json!(true);
                     assert_eq!(ask(shell, &phone(), extra, cx), forbidden, "{key}");
                 }
                 for decision in ["session", "always", "ALLOW", ""] {
                     assert_eq!(
-                        ask(shell, &phone(), params("r1", decision), cx),
+                        ask(shell, &phone(), params(&r1, decision), cx),
                         Err("Invalid mobile parameters".into()),
                         "{decision}"
                     );
@@ -3504,39 +3532,50 @@ mod tests {
                     ask(shell, &phone(), json!({"conversationId": conversation, "decision": "allow"}), cx),
                     Err("Invalid mobile parameters".into())
                 );
+                // A number is not an id, whatever the provider's id looks like.
+                let numeric = json!({"conversationId": conversation, "requestId": 1, "decision": "allow"});
+                assert_eq!(
+                    ask(shell, &phone(), numeric, cx),
+                    Err("Invalid mobile parameters".into())
+                );
                 assert_eq!(pending(cx), 1);
                 assert!(receive.try_recv().is_err());
 
-                // A stale request is refused.
-                let stale = Err(Failure::from("Approval is no longer pending"));
+                // A stale or never-shown request is refused, as is the
+                // provider's own id: only the desktop's id answers.
+                let stale = Err(policy::Code::NotPending.failure());
                 assert_eq!(ask(shell, &phone(), params("nope", "allow"), cx), stale);
+                assert_eq!(ask(shell, &phone(), params("r1", "allow"), cx), stale);
 
                 // Allow resolves once; a second answer is refused.
-                assert_eq!(ask(shell, &phone(), params("r1", "allow"), cx), Ok(json!({})));
+                assert_eq!(ask(shell, &phone(), params(&r1, "allow"), cx), Ok(json!({})));
                 assert!(matches!(receive.try_recv().unwrap().decision, Decision::Allow));
                 assert_eq!(pending(cx), 0);
-                assert_eq!(ask(shell, &phone(), params("r1", "deny"), cx), stale);
+                assert_eq!(ask(shell, &phone(), params(&r1, "deny"), cx), stale);
                 assert!(receive.try_recv().is_err());
 
-                // One answer per request, even when the desktop shows the same
-                // id pending again (a replay or a race with the desktop's UI):
-                // the pair was recorded, so the decision is applied once.
+                // The provider reuses its id for a new request: the old answer
+                // (a replay, or a card that was left armed) finds nothing, and
+                // the new request has an id of its own.
                 let replay = view.update(cx, |v, _| {
                     v.mobile_test_wait_on(&[("r1", "Run ls", "ls -la")], AccessMode::Supervised)
                 });
                 assert_eq!(pending(cx), 1);
-                assert_eq!(ask(shell, &phone(), params("r1", "allow"), cx), stale);
+                assert_eq!(ask(shell, &phone(), params(&r1, "allow"), cx), stale);
                 assert_eq!(pending(cx), 1);
                 assert!(replay.try_recv().is_err());
-                // The record is per session and request: another id is answered.
-                assert!(!shell.mobile_claim_answer(id, "r1"));
-                assert!(shell.mobile_claim_answer(id + 1_000_000, "r1"));
+                let reused = shown(&view, cx)[0].request_id.clone();
+                assert_ne!(reused, r1);
+                // The record is per session and request id.
+                assert!(!shell.mobile_claim_answer(id, &r1));
+                assert!(shell.mobile_claim_answer(id + 1_000_000, &r1));
 
                 // Deny resolves once too.
                 let receive = view.update(cx, |v, _| {
                     v.mobile_test_wait_on(&[("r2", "Edit", "x")], AccessMode::Supervised)
                 });
-                assert_eq!(ask(shell, &phone(), params("r2", "deny"), cx), Ok(json!({})));
+                let r2 = shown(&view, cx)[0].request_id.clone();
+                assert_eq!(ask(shell, &phone(), params(&r2, "deny"), cx), Ok(json!({})));
                 assert!(matches!(receive.try_recv().unwrap().decision, Decision::Deny));
                 assert!(receive.try_recv().is_err());
 
@@ -3544,11 +3583,147 @@ mod tests {
                 let receive = view.update(cx, |v, _| {
                     v.mobile_test_wait_on(&[("r3", "Run", "rm")], AccessMode::FullAccess)
                 });
-                assert_eq!(ask(shell, &phone(), params("r3", "allow"), cx), forbidden);
+                let r3 = shown(&view, cx)[0].request_id.clone();
+                assert_eq!(ask(shell, &phone(), params(&r3, "allow"), cx), forbidden);
                 assert_eq!(pending(cx), 1);
                 assert!(receive.try_recv().is_err());
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_remote_allow_needs_the_whole_request_and_a_one_time_option(cx: &mut gpui::TestAppContext) {
+        use monocode_core::agent::{AccessMode, Decision};
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let conversation = shell.mobile_session_id(id);
+                let view = shell.sessions[&id].clone();
+                let ask = |shell: &mut Shell, request: &str, decision: &str, cx: &mut Context<Shell>| {
+                    let params = json!({"conversationId": conversation, "requestId": request, "decision": decision});
+                    approvals::dispatch_with(shell, &phone(), "c", &params, true, cx)
+                };
+                let needs_desktop = Err(policy::Code::NeedsDesktop.failure());
+
+                // U13-2: a cut detail is flagged, cannot be allowed, can be denied.
+                let long = "x".repeat(2500);
+                let receive = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("t1", "Run", &long)], AccessMode::Supervised)
+                });
+                let shown_now = shown(&view, cx);
+                assert!(shown_now[0].truncated);
+                let fields = approvals::fields_with(shell, id, true, cx);
+                assert_eq!(fields["approvals"][0]["truncated"], true);
+                let t1 = shown_now[0].request_id.clone();
+                assert_eq!(ask(shell, &t1, "allow", cx), needs_desktop);
+                assert!(receive.try_recv().is_err());
+                assert_eq!(shown(&view, cx).len(), 1);
+                assert_eq!(ask(shell, &t1, "deny", cx), Ok(json!({})));
+                assert!(matches!(receive.try_recv().unwrap().decision, Decision::Deny));
+
+                // U13-1: a request with no one-time allow is never allowed from here.
+                let receive = view.update(cx, |v, _| {
+                    let rx = v.mobile_test_wait_on(&[("o1", "Run", "ls")], AccessMode::Supervised);
+                    v.mobile_test_without_allow_once();
+                    rx
+                });
+                assert!(!shown(&view, cx)[0].truncated);
+                let o1 = shown(&view, cx)[0].request_id.clone();
+                assert_eq!(ask(shell, &o1, "allow", cx), needs_desktop);
+                assert!(receive.try_recv().is_err());
+                assert_eq!(ask(shell, &o1, "deny", cx), Ok(json!({})));
+                assert!(matches!(receive.try_recv().unwrap().decision, Decision::Deny));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_desktop_and_a_remote_device_race_for_one_approval(cx: &mut gpui::TestAppContext) {
+        use monocode_core::agent::{AccessMode, Decision};
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let conversation = shell.mobile_session_id(id);
+                let view = shell.sessions[&id].clone();
+                let ask = |shell: &mut Shell, request: &str, cx: &mut Context<Shell>| {
+                    let params = json!({"conversationId": conversation, "requestId": request, "decision": "allow"});
+                    approvals::dispatch_with(shell, &phone(), "c", &params, true, cx)
+                };
+                // The desktop's own card answers first: the remote answer is stale.
+                let receive = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("a1", "Run", "ls")], AccessMode::Supervised)
+                });
+                let a1 = shown(&view, cx)[0].request_id.clone();
+                assert!(view.update(cx, |v, cx| v.decide_notification_request("a1", Decision::Deny, cx)));
+                assert!(matches!(receive.try_recv().unwrap().decision, Decision::Deny));
+                assert_eq!(
+                    ask(shell, &a1, cx),
+                    Err(policy::Code::NotPending.failure())
+                );
+                assert!(receive.try_recv().is_err(), "the provider heard one answer");
+                // The remote answer first: the desktop's click is a no-op.
+                let receive = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("a2", "Run", "ls")], AccessMode::Supervised)
+                });
+                let a2 = shown(&view, cx)[0].request_id.clone();
+                assert_eq!(ask(shell, &a2, cx), Ok(json!({})));
+                assert!(matches!(receive.try_recv().unwrap().decision, Decision::Allow));
+                assert!(!view.update(cx, |v, cx| v.decide_notification_request("a2", Decision::Deny, cx)));
+                assert!(receive.try_recv().is_err(), "the provider heard one answer");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn every_approval_answer_writes_one_audit_line_with_the_decision_and_ids(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use monocode_core::agent::AccessMode;
+        let log =
+            std::env::temp_dir().join(format!("monoptah-approval-audit-{}", std::process::id()));
+        let _turn = audit::test_log(&log);
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                let conversation = shell.mobile_session_id(id);
+                let view = shell.sessions[&id].clone();
+                let secret_label = "label-text-never-logged";
+                let secret_detail = "detail-text-never-logged";
+                let _rx = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("p1", secret_label, secret_detail)], AccessMode::Supervised)
+                });
+                let r = shown(&view, cx)[0].request_id.clone();
+                let ask = |shell: &mut Shell, request: &str, decision: &str, command: &str, cx: &mut Context<Shell>| {
+                    let params = json!({"conversationId": conversation, "requestId": request, "decision": decision});
+                    approvals::dispatch_with(shell, &phone(), command, &params, true, cx)
+                };
+                assert!(ask(shell, &r, "allow", "audit-c1", cx).is_ok());
+                // The same request again: stale, with its own code on the line.
+                assert!(ask(shell, &r, "allow", "audit-c2", cx).is_err());
+            })
+            .unwrap();
+        let mut lines: Vec<Value> = audit::read_recent(&log, 50)
+            .into_iter()
+            .filter(|line| {
+                line["method"] == "session.answerApproval"
+                    && line["commandId"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("audit-c"))
+            })
+            .collect();
+        lines.reverse();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["outcome"], "ok");
+        assert_eq!(lines[0]["decision"], "allow");
+        assert_eq!(lines[0]["commandId"], "audit-c1");
+        assert!(lines[0]["requestId"].as_str().unwrap().starts_with("ap-"));
+        assert!(lines[0]["conversationId"].is_string());
+        assert_eq!(lines[1]["outcome"], "denied:not_pending");
+        assert_eq!(lines[1]["commandId"], "audit-c2");
+        let text = std::fs::read_to_string(log.join(audit::FILE)).unwrap_or_default();
+        assert!(!text.contains("never-logged"));
+        drop(_turn);
+        let _ = std::fs::remove_dir_all(&log);
     }
 
     #[gpui::test]
@@ -3587,7 +3762,9 @@ mod tests {
                 let fields = approvals::fields_with(shell, id, true, cx);
                 let list = fields["approvals"].as_array().unwrap();
                 assert_eq!(list.len(), 1);
-                assert_eq!(list[0]["requestId"], "r1");
+                assert!(list[0]["requestId"].as_str().unwrap().starts_with("ap-"));
+                assert_eq!(list[0]["truncated"], true);
+                let remote_id = list[0]["requestId"].as_str().unwrap().to_owned();
                 assert_eq!(list[0]["label"], "Run ls");
                 assert_eq!(list[0]["detail"].as_str().unwrap().chars().count(), 2001);
                 assert!(list[0]["detail"].as_str().unwrap().ends_with('\u{2026}'));
@@ -3599,7 +3776,9 @@ mod tests {
                 assert_eq!(frame["approvals"].as_array().unwrap().len(), 1);
                 // Answered: the cleared list is sent once, then not repeated.
                 view.update(cx, |v, cx| {
-                    assert!(v.mobile_decide_approval("r1", true, cx).is_ok());
+                    // Cut for the device, so it can be denied but never allowed.
+                    assert!(v.mobile_decide_approval(&remote_id, true, cx).is_err());
+                    assert!(v.mobile_decide_approval(&remote_id, false, cx).is_ok());
                 });
                 let cleared = Value::Object(approvals::fields_with(shell, id, true, cx));
                 assert_eq!(cleared["approvals"], json!([]));
@@ -3673,7 +3852,7 @@ mod tests {
                     );
                 }
                 assert_eq!(
-                    approvals::dispatch(shell, &phone(), "session.answerApproval", &json!({}), cx),
+                    approvals::dispatch(shell, &phone(), "c", &json!({}), cx),
                     Err(policy::Code::Disabled.failure())
                 );
                 // Archive, delete, send and start are never refused by the stubs.

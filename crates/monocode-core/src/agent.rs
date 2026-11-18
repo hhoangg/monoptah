@@ -222,6 +222,10 @@ pub struct Approval {
     pub title: String,
     pub detail: String,
     pub can_remember: bool,
+    /// Whether "allow" is exactly one time. False when the provider offers
+    /// no one-time option, so an allow would fall back to "always"; a remote
+    /// device never answers such a request (U-13).
+    pub can_allow_once: bool,
 }
 #[derive(Clone, Debug)]
 pub enum Decision {

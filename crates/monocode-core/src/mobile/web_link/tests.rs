@@ -735,7 +735,7 @@ fn unpair_stops_the_client_and_no_identity_means_off() {
     rt.block_on(async {
         let mut conn = stub.accept().await;
         status_is(&env.host, WebState::Connected).await;
-        env.host.web_unpair().unwrap();
+        env.host.web_unpair_local().unwrap();
         assert!(conn.ended().await);
         let status = env.host.web_status();
         assert_eq!((status.state, status.error), (WebState::Off, None));
@@ -1899,6 +1899,12 @@ mod seam {
         });
         world.host.web_revoke("row-r").unwrap();
         world.hub.rt.block_on(async {
+            // R13A-4: the ready session hears `state: revoked` (encrypted), then BYE.
+            let frame = conn.frame().await;
+            assert_eq!(
+                (frame.kind, frame.device_id),
+                (FrameType::Transport, revoked.id)
+            );
             let frame = conn.frame().await;
             assert_eq!((frame.kind, frame.device_id), (FrameType::Bye, revoked.id));
         });
@@ -1944,7 +1950,7 @@ mod seam {
             env.host.web_revoke(&device.id).unwrap();
             pending.replace(vec![(denied.clone(), "Tab".into(), "srv-denied".into())]);
             env.host.web_deny(&denied).unwrap();
-            env.host.web_unpair().unwrap();
+            env.host.web_unpair_local().unwrap();
             // Newest first; oldest first reads better.
             let mut lines = audit::read_recent(log.path(), 50);
             lines.reverse();
@@ -1983,6 +1989,42 @@ mod seam {
                 line("revoke", Some("unpair")),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_web_device_that_leaves_is_revoked_and_never_comes_back_as_pending() {
+        use crate::mobile::web_link::desktop_api::ServerGrant;
+        let env = env(1);
+        env.host.set_flags_for_test(true, true);
+        let peer = &env.peer;
+        let leave = json!({"version": 1, "id": "leave-1", "method": "device.leave", "params": {}});
+        env.host
+            .handle_web(&peer.fingerprint(), leave)
+            .await
+            .unwrap();
+        assert!(env.host.web_status().devices.is_empty());
+        // The server still lists the grant as confirmed: the sync revokes it
+        // again and never reports `pending` or lists a request.
+        let grant = ServerGrant {
+            device_id: peer.relay_id(),
+            device_name: "Laptop".into(),
+            public_key: URL_SAFE_NO_PAD.encode(peer.public),
+            fingerprint: peer.fingerprint(),
+            state: "confirmed".into(),
+            requested: None,
+            permission: Some(Permission::Control),
+        };
+        let reports = env
+            .host
+            .apply_server_grants(&[grant], env.host.web_link().generation());
+        assert!(
+            reports
+                .iter()
+                .any(|r| r.0 == peer.relay_id() && r.1 == "revoked"),
+            "{reports:?}"
+        );
+        assert!(reports.iter().all(|r| r.1 != "pending"), "{reports:?}");
+        assert!(env.host.web_status().pending.is_empty());
     }
 
     #[test]
@@ -2086,6 +2128,41 @@ mod seam {
         assert!(started.elapsed() < Duration::from_secs(5));
         let saved = std::fs::read_to_string(env._dir.path().join("mobile-access.json")).unwrap();
         assert!(!saved.contains(&env.peer.fingerprint()));
+    }
+
+    fn delete_answers(status: u16) -> Handler {
+        Arc::new(move |req| match (req.method.as_str(), req.path.as_str()) {
+            ("DELETE", "/api/desktop/me") => (status, "{}".into()),
+            _ => (404, "{}".into()),
+        })
+    }
+
+    #[test]
+    fn a_failed_server_delete_keeps_the_identity_and_fails_the_unpair() {
+        let world = world(delete_answers(500), true);
+        let web = world.peer(51);
+        world
+            .host
+            .add_device_for_test(confirmed_row(&web, "row-w", Permission::Control));
+        let error = world.host.web_unpair().unwrap_err();
+        assert!(error.contains("still valid"), "{error}");
+        assert_eq!(world.hub.requests("DELETE", "/api/desktop/me").len(), 1);
+        // Nothing was wiped, so the unpair can be tried again.
+        assert!(world.host.load_web_identity().unwrap().is_some());
+        assert!(world.status().paired);
+        assert_eq!(world.status().devices.len(), 1);
+        assert!(world.host.web_unpair().is_err());
+        // The explicit local unpair wipes anyway.
+        world.host.web_unpair_local().unwrap();
+        assert_eq!(world.host.load_web_identity().unwrap(), None);
+        assert!(world.status().devices.is_empty());
+    }
+
+    #[test]
+    fn a_token_the_server_no_longer_knows_unpairs_cleanly() {
+        let world = world(delete_answers(401), true);
+        world.host.web_unpair().unwrap();
+        assert_eq!(world.host.load_web_identity().unwrap(), None);
     }
 
     #[test]

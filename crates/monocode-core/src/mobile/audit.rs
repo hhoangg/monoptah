@@ -167,6 +167,21 @@ pub struct FileRead<'a> {
     pub outcome: Outcome,
 }
 
+/// One answer to a remote approval, written by the app once it resolved the
+/// project. Ids and the decision only: never the label or detail text.
+#[derive(Clone, Copy)]
+pub struct ApprovalAnswer<'a> {
+    pub fingerprint: &'a str,
+    pub project_id: Option<&'a str>,
+    pub conversation_id: Option<&'a str>,
+    pub request_id: Option<&'a str>,
+    /// `allow` or `deny` when the call named a valid decision.
+    pub decision: Option<&'a str>,
+    pub command_id: Option<&'a str>,
+    pub transport: Transport,
+    pub outcome: Outcome,
+}
+
 /// Methods whose class depends on parameters `record` does not get. They are
 /// written even when they succeed, because the no-parameter class may be the
 /// harmless one while the call was an edit (a selection change, a git action,
@@ -200,6 +215,11 @@ fn should_write(event: &AuditEvent) -> bool {
 /// `not_selected`, `path_denied`, `unsupported_target`). A refusal from the
 /// core before the app, and any other failure, still write theirs.
 fn written_by_the_app(event: &AuditEvent) -> bool {
+    // An approval answer is written by the app for every outcome it words with
+    // a code (and `ok`); an uncoded failure is still the host's line.
+    if event.method == "session.answerApproval" {
+        return event.from_app && matches!(event.outcome, Outcome::Ok | Outcome::Denied(_));
+    }
     event.method == "project.file"
         && event.from_app
         && matches!(
@@ -300,6 +320,36 @@ impl Log {
         }));
     }
 
+    /// One line per remote approval answer: decision, conversation, request
+    /// and project ids, and the outcome with its refusal code.
+    pub fn record_approval_answer(&self, device: &DeviceContext, answer: &ApprovalAnswer) {
+        let ApprovalAnswer {
+            fingerprint,
+            project_id,
+            conversation_id,
+            request_id,
+            decision,
+            command_id,
+            transport,
+            outcome,
+        } = *answer;
+        let id = |value: Option<&str>| value.map(|v| capped(v, ID_CHARS));
+        self.append(&json!({
+            "ts": now_ms(),
+            "deviceId": capped(&device.id, ID_CHARS),
+            "fingerprint": prefix(fingerprint),
+            "transport": transport.as_str(),
+            "event": "call",
+            "method": "session.answerApproval",
+            "projectId": id(project_id),
+            "outcome": outcome.text(),
+            "commandId": id(command_id),
+            "conversationId": id(conversation_id),
+            "requestId": id(request_id),
+            "decision": decision.filter(|d| matches!(*d, "allow" | "deny")),
+        }));
+    }
+
     pub fn record_lifecycle(
         &self,
         kind: Lifecycle,
@@ -383,6 +433,13 @@ pub fn record_file_read_with(device: &DeviceContext, read: &FileRead) {
     }
 }
 
+/// Records one remote approval answer. A no-op before [`init`].
+pub fn record_approval_answer_with(device: &DeviceContext, answer: &ApprovalAnswer) {
+    if let Some(log) = global() {
+        log.record_approval_answer(device, answer);
+    }
+}
+
 /// Records a moment in a device's life. A no-op before [`init`].
 pub fn record_lifecycle(
     kind: Lifecycle,
@@ -399,10 +456,10 @@ pub fn record_lifecycle(
 /// Holds the process-wide log on a test's directory; dropping it switches the
 /// log off again, so later tests neither write into a deleted directory nor
 /// recreate it.
-#[cfg(test)]
-pub(crate) struct TestLog(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestLog(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestLog {
     fn drop(&mut self) {
         if let Ok(mut log) = LOG.lock() {
@@ -415,8 +472,8 @@ impl Drop for TestLog {
 /// the log back take turns here, so one cannot redirect another's lines.
 /// Lines of tests that do not take a turn can still land in `dir`: filter by
 /// the device's own fingerprint.
-#[cfg(test)]
-pub(crate) fn test_log(dir: &Path) -> TestLog {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_log(dir: &Path) -> TestLog {
     static TURN: Mutex<()> = Mutex::new(());
     let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     init(dir);
@@ -529,6 +586,49 @@ mod tests {
         log.record(&device(), &event("device.selection", Outcome::Ok));
         log.record(&device(), &event("made.up", Outcome::Ok));
         assert_eq!(lines(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn an_approval_answer_writes_one_line_with_ids_and_the_refusal_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        for (decision, outcome) in [
+            (Some("allow"), Outcome::Ok),
+            (Some("deny"), Outcome::Denied(Code::NotPending)),
+            (Some("allow"), Outcome::Denied(Code::NeedsDesktop)),
+        ] {
+            log.record_approval_answer(
+                &device(),
+                &ApprovalAnswer {
+                    fingerprint: "abcdef0123456789",
+                    project_id: Some("p1"),
+                    conversation_id: Some("conv-1"),
+                    request_id: Some("ap-1"),
+                    decision,
+                    command_id: Some("c1"),
+                    transport: Transport::Web,
+                    outcome,
+                },
+            );
+            // The host's own line for what the app wrote is dropped.
+            let mut answered = event("session.answerApproval", outcome);
+            answered.from_app = true;
+            log.record(&device(), &answered);
+        }
+        let written = lines(dir.path());
+        assert_eq!(written.len(), 3, "{written:?}");
+        assert_eq!(written[0]["decision"], "allow");
+        assert_eq!(written[0]["conversationId"], "conv-1");
+        assert_eq!(written[0]["requestId"], "ap-1");
+        assert_eq!(written[0]["projectId"], "p1");
+        assert_eq!(written[1]["outcome"], "denied:not_pending");
+        assert_eq!(written[1]["decision"], "deny");
+        assert_eq!(written[2]["outcome"], "denied:needs_desktop");
+        // An uncoded failure is still the host's line, without ids.
+        let mut failed = event("session.answerApproval", Outcome::Error);
+        failed.from_app = true;
+        log.record(&device(), &failed);
+        assert_eq!(lines(dir.path()).len(), 4);
     }
 
     #[test]

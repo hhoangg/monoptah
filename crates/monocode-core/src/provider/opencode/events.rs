@@ -475,6 +475,7 @@ impl State {
                             title: action.into(),
                             detail: permission.to_string(),
                             can_remember: false,
+                            can_allow_once: true,
                         }));
                     }
                 }

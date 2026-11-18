@@ -185,6 +185,8 @@ codes! {
     Starting => "starting",
     AutoStopping => "auto_stopping",
     InstanceBusy => "instance_busy",
+    NotPending => "not_pending",
+    NeedsDesktop => "needs_desktop",
 }
 
 impl Code {
@@ -210,6 +212,8 @@ impl Code {
             Code::Starting => "The cloud instance is still starting",
             Code::AutoStopping => "The cloud instance is stopping on its own",
             Code::InstanceBusy => "The cloud instance is busy with another operation",
+            Code::NotPending => "Approval is no longer pending",
+            Code::NeedsDesktop => "Answer this request on the desktop",
         }
     }
 }
@@ -519,9 +523,9 @@ pub fn authorize_with(
     flags: &PolicyFlags,
     approvals_gate: bool,
 ) -> Result<(), Denial> {
-    // An unknown method is answered "Unsupported mobile operation" by the host.
+    // Fail closed: a method with no class is unsupported, whoever answers it.
     let Some(access) = classify(method, params) else {
-        return Ok(());
+        return Err(Denial::new(Code::Unsupported));
     };
     let web = device.kind == DeviceKind::Web;
     match access {
@@ -662,14 +666,14 @@ fn requested(params: &Value, key: &str) -> Result<Requested, String> {
 fn narrowed_field(
     current: &Option<Vec<String>>,
     request: Requested,
-) -> Result<Option<Vec<String>>, String> {
+) -> Result<Option<Vec<String>>, Failure> {
     match request {
         Requested::Keep => Ok(current.clone()),
         Requested::All if current.is_none() => Ok(None),
-        Requested::All => Err(Denial::new(Code::Forbidden).error),
+        Requested::All => Err(Code::Forbidden.failure()),
         Requested::List(list) => match current {
             Some(have) if !list.iter().all(|id| have.contains(id)) => {
-                Err(Denial::new(Code::Forbidden).error)
+                Err(Code::Forbidden.failure())
             }
             _ => Ok(Some(list)),
         },
@@ -680,7 +684,10 @@ fn narrowed_field(
 /// current selection. With them, a device may only narrow its selection;
 /// widening it needs the desktop owner to confirm on the desktop, so it is
 /// refused here as `forbidden`.
-pub fn device_selection(device: &DeviceContext, params: &Value) -> Result<SelectionAnswer, String> {
+pub fn device_selection(
+    device: &DeviceContext,
+    params: &Value,
+) -> Result<SelectionAnswer, Failure> {
     let projects = requested(params, "projects")?;
     let monos = requested(params, "monos")?;
     let selection = Selection {
@@ -714,20 +721,10 @@ fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::host::APP_METHODS;
+    use super::super::host::{APP_METHODS, HOST_METHODS};
     use super::*;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
-
-    const HOST_METHODS: &[&str] = &[
-        "device.enroll",
-        "device.leave",
-        "workspace.list",
-        "sessions.list",
-        "device.push",
-        "device.selection",
-        "conversation.watch",
-    ];
 
     #[test]
     fn every_app_and_host_method_has_a_class() {
@@ -997,9 +994,17 @@ mod tests {
                 );
             }
         }
-        // Unknown methods are the host's to refuse.
-        let web = ctx(DeviceKind::Web, Permission::Read);
-        assert_eq!(call(&web, "cloud.delete", json!({}), &off), None);
+        // An unclassified method fails closed, for every device.
+        for device in [
+            ctx(DeviceKind::Web, Permission::Read),
+            ctx(DeviceKind::Web, Permission::Control),
+            ctx(DeviceKind::Phone, Permission::Control),
+        ] {
+            assert_eq!(
+                call(&device, "cloud.delete", json!({}), &off),
+                Some(Code::Unsupported)
+            );
+        }
     }
 
     #[test]
@@ -1256,7 +1261,7 @@ mod tests {
             })
         );
 
-        let widen = Denial::new(Code::Forbidden).error;
+        let widen = Code::Forbidden.failure();
         assert_eq!(
             device_selection(&device, &json!({"projects": null})).unwrap_err(),
             widen
@@ -1265,6 +1270,7 @@ mod tests {
             device_selection(&device, &json!({"projects": ["a", "c"]})).unwrap_err(),
             widen
         );
+        assert_eq!(widen.code.as_deref(), Some("forbidden"));
 
         let invalid = "Invalid mobile parameters";
         let too_long = "x".repeat(513);
@@ -1278,7 +1284,7 @@ mod tests {
         ] {
             assert_eq!(
                 device_selection(&device, &params).unwrap_err(),
-                invalid,
+                Failure::from(invalid),
                 "{params}"
             );
         }

@@ -637,14 +637,24 @@ fn confirmed_state(permission: policy::Permission) -> Value {
     })
 }
 
-/// Ends every session of the relay devices behind `fingerprint` with a BYE.
+/// Ends every session of the relay devices behind `fingerprint` with a BYE,
+/// after telling each ready one `state: revoked` so the browser shows "Access
+/// revoked" and wipes its cache even when the server report is late.
 fn close_fingerprint(
     fingerprint: &str,
     table: &mut SessionTable,
     requests: &mut Requests,
     link: &WebLink,
+    now: u64,
     frames: &mut Vec<Frame>,
 ) {
+    let revoked = json!({"type": "state", "state": "revoked"});
+    for key in table.live_channels(fingerprint) {
+        // A session that is not ready (pending) cannot carry it; it gets BYE only.
+        if let Ok(sent) = table.send(key, &revoked, now) {
+            frames.extend(sent);
+        }
+    }
     let mut devices: Vec<[u8; 16]> = table
         .live_channels(fingerprint)
         .iter()
@@ -689,7 +699,7 @@ fn run_command(
             }
         }
         LinkCommand::Deny { fingerprint } | LinkCommand::Revoke { fingerprint } => {
-            close_fingerprint(&fingerprint, table, requests, link, frames);
+            close_fingerprint(&fingerprint, table, requests, link, now, frames);
         }
         LinkCommand::Resend { fingerprint } => {
             let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
