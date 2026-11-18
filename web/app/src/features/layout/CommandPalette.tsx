@@ -6,6 +6,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useCatalog } from "@/data";
 import { fuzzyMatch } from "@/lib/fuzzy";
 import { cn } from "@/lib/utils";
+import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon, type IconName } from "@/ui/Icon";
 import { Input } from "@/ui/input";
 import { MatchText } from "@/ui/MatchText";
@@ -132,7 +133,7 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
   };
 
   return (
-    <div className="flex flex-col gap-3" data-testid="command-palette">
+    <div className="flex flex-col gap-3" data-testid="command-palette" data-command-palette="">
       <Input
         type="search"
         role="combobox"
@@ -185,7 +186,7 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
           );
         })}
         {data && items.length === 0 ? <p className="px-2.5 py-3 text-label text-muted-text">Nothing matches.</p> : null}
-        {!data && catalog.isPending ? <p className="px-2.5 py-3 text-label text-muted-text">Loading…</p> : null}
+        {!data && catalog.isPending ? <div className="px-2.5 py-3"><DelayedSpinner label="Loading" /></div> : null}
         {!data && catalog.isError ? <p className="px-2.5 py-3 text-label text-muted-text">Could not load the workspace.</p> : null}
       </div>
     </div>

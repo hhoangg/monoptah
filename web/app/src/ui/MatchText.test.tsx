@@ -8,7 +8,7 @@ describe("MatchText", () => {
     expect(container.textContent).toBe("readme");
     const marked = [...container.querySelectorAll("[data-match]")].map((el) => el.textContent);
     expect(marked).toEqual(["re", "m"]);
-    expect(container.querySelector("[data-match]")).toHaveClass("text-accent");
+    expect(container.querySelector("[data-match]")).toHaveClass("text-brand-text");
   });
 
   it("renders plain text when inactive or without positions", () => {

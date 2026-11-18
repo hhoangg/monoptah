@@ -1,4 +1,4 @@
-// Copied from src/features/source-control/model/unifiedDiff.test.ts at 5c00fe2a
+// Copied from src/features/source-control/model/unifiedDiff.test.ts at c579af2e
 // (fold and reveal cases only), plus wire-line and edge cases.
 import { describe, expect, it } from "vitest";
 import { expandFold, foldUnifiedLines, revealedFold, type FoldableLine } from "./diffFold";

@@ -12,14 +12,17 @@ export interface SplitterProps {
   value: number;
   min: number;
   max: number;
+  /** Called while resizing (every key press or pointer move): update the layout, do not persist. */
   onChange: (width: number) => void;
+  /** Called once a resize ends (key press, pointer up): persist the width. */
+  onCommit?: (width: number) => void;
   /** `1` when dragging right grows the pane (a pane left of the splitter), `-1` for a pane to its right. */
   grow: 1 | -1;
   className?: string;
 }
 
-export function Splitter({ label, value, min, max, onChange, grow, className }: SplitterProps) {
-  const drag = useRef<{ x: number; start: number } | null>(null);
+export function Splitter({ label, value, min, max, onChange, onCommit, grow, className }: SplitterProps) {
+  const drag = useRef<{ x: number; start: number; last: number } | null>(null);
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const step = event.shiftKey ? BIG_STEP : STEP;
@@ -30,19 +33,25 @@ export function Splitter({ label, value, min, max, onChange, grow, className }: 
     else if (event.key === "End") next = max;
     if (next === null) return;
     event.preventDefault();
-    onChange(Math.min(max, Math.max(min, next)));
+    const clamped = Math.min(max, Math.max(min, next));
+    onChange(clamped);
+    onCommit?.(clamped);
   };
 
   const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
-    drag.current = { x: event.clientX, start: value };
+    drag.current = { x: event.clientX, start: value, last: value };
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
   const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
     if (!drag.current) return;
-    onChange(drag.current.start + grow * (event.clientX - drag.current.x));
+    const next = Math.min(max, Math.max(min, drag.current.start + grow * (event.clientX - drag.current.x)));
+    drag.current.last = next;
+    onChange(next);
   };
   const onPointerUp = () => {
+    const finished = drag.current;
     drag.current = null;
+    if (finished && finished.last !== finished.start) onCommit?.(finished.last);
   };
 
   return (

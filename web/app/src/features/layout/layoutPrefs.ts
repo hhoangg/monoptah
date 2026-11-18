@@ -10,6 +10,8 @@ export const PANEL_WIDTH_KEY = "monoptah.layout.panelWidth";
 
 export const SIDEBAR_WIDTH = { min: 320, max: 360, default: 320 } as const;
 export const PANEL_WIDTH = { min: 380, max: 480, default: 420 } as const;
+/** The main pane never gets narrower than this while a panel is docked. */
+export const MIN_MAIN_WIDTH = 320;
 /** The tablet sidebar is fixed (design-system.md section 11). */
 export const TABLET_SIDEBAR_WIDTH = 300;
 /** The tablet right panel, an overlay. */
@@ -38,9 +40,19 @@ function write(key: string, value: string): void {
   }
 }
 
+/** A stored width: digits only, clamped to the range; anything else (empty, text, negative) is the default. */
 function readWidth(key: string, range: Range): number {
   const raw = read(key);
-  return raw === null ? range.default : clampWidth(range, Number(raw));
+  return raw !== null && /^\d+$/.test(raw) ? clampWidth(range, Number(raw)) : range.default;
+}
+
+/**
+ * The widest a docked panel may be at `viewport` px with a `sidebar` px sidebar, keeping `MIN_MAIN_WIDTH`
+ * for the main pane; null when even the narrowest panel (380) does not fit, so the shell uses the overlay.
+ */
+export function dockedPanelMax(viewport: number, sidebar: number): number | null {
+  const room = viewport - sidebar - MIN_MAIN_WIDTH;
+  return room < PANEL_WIDTH.min ? null : Math.min(PANEL_WIDTH.max, room);
 }
 
 interface LayoutPrefsState {
@@ -50,6 +62,9 @@ interface LayoutPrefsState {
   setSidebarCollapsed: (collapsed: boolean) => void;
   setSidebarWidth: (width: number) => void;
   setPanelWidth: (width: number) => void;
+  /** Widths change in memory while dragging; these write the current value to localStorage. */
+  persistSidebarWidth: () => void;
+  persistPanelWidth: () => void;
 }
 
 function load(): Pick<LayoutPrefsState, "sidebarCollapsed" | "sidebarWidth" | "panelWidth"> {
@@ -60,22 +75,16 @@ function load(): Pick<LayoutPrefsState, "sidebarCollapsed" | "sidebarWidth" | "p
   };
 }
 
-export const useLayoutPrefs = create<LayoutPrefsState>((set) => ({
+export const useLayoutPrefs = create<LayoutPrefsState>((set, get) => ({
   ...load(),
   setSidebarCollapsed: (collapsed) => {
     write(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
     set({ sidebarCollapsed: collapsed });
   },
-  setSidebarWidth: (width) => {
-    const next = clampWidth(SIDEBAR_WIDTH, width);
-    write(SIDEBAR_WIDTH_KEY, String(next));
-    set({ sidebarWidth: next });
-  },
-  setPanelWidth: (width) => {
-    const next = clampWidth(PANEL_WIDTH, width);
-    write(PANEL_WIDTH_KEY, String(next));
-    set({ panelWidth: next });
-  },
+  setSidebarWidth: (width) => set({ sidebarWidth: clampWidth(SIDEBAR_WIDTH, width) }),
+  setPanelWidth: (width) => set({ panelWidth: clampWidth(PANEL_WIDTH, width) }),
+  persistSidebarWidth: () => write(SIDEBAR_WIDTH_KEY, String(get().sidebarWidth)),
+  persistPanelWidth: () => write(PANEL_WIDTH_KEY, String(get().panelWidth)),
 }));
 
 /** Re-reads the stored values (for tests, after seeding or clearing localStorage). */

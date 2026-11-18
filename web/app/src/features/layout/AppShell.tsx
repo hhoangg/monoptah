@@ -4,19 +4,25 @@
 //   640-1024px   persistent 300px sidebar, collapsible to a rail (monoptah.layout.sidebarCollapsed).
 //                Right panels slide over as a 360px overlay.
 //   >= 1024px    persistent 320-360px sidebar with a splitter (monoptah.layout.sidebarWidth). Right panels
-//                dock beside the main pane, 380-480px with a splitter (monoptah.layout.panelWidth).
+//                dock beside the main pane, 380-480px with a splitter (monoptah.layout.panelWidth), never
+//                squeezing the main pane below 320px: the panel narrows to fit, and where even 380px does
+//                not fit it opens as the overlay instead.
+// A right panel belongs to a project: it shows only on that project's screens (`p/$projectId/...` and the
+// sessions of that project).
 // The shell also mounts the global shortcuts (shortcuts.ts) and the command palette (F-15).
 import { useParams, useRouterState } from "@tanstack/react-router";
-import type { ReactNode } from "react";
+import { useEffect, useSyncExternalStore, type ReactNode } from "react";
+import { useCatalog } from "@/data";
 import { WorkspaceNav } from "@/features/sessions/WorkspaceNav";
 import { Icon } from "@/ui/Icon";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import { CommandPalette } from "./CommandPalette";
-import { SIDEBAR_WIDTH, TABLET_SIDEBAR_WIDTH, useLayoutPrefs } from "./layoutPrefs";
+import { SIDEBAR_WIDTH, TABLET_SIDEBAR_WIDTH, dockedPanelMax, useLayoutPrefs } from "./layoutPrefs";
 import { openCommandPalette } from "./palette";
+import { setPanelScope } from "./panels";
 import { RightPanel, type PanelMode } from "./RightPanel";
 import { routeHasOwnSidebar } from "./shellRoutes";
-import { useGlobalShortcuts } from "./shortcuts";
+import { isMac, useGlobalShortcuts } from "./shortcuts";
 import { Splitter } from "./Splitter";
 
 const TABLET_QUERY = "(min-width: 640px)";
@@ -24,6 +30,9 @@ const DESKTOP_QUERY = "(min-width: 1024px)";
 
 /** The sticky offset the WS-T sidebar uses below the 2.75rem bar. */
 const STICKY = "sticky top-[calc(2.75rem+env(safe-area-inset-top))] h-[calc(100dvh-2.75rem-env(safe-area-inset-top))]";
+
+/** The width of the sidebar WS-T's `WorkspaceFrame` draws itself (`w-80`) on the screens that own one. */
+const FRAME_SIDEBAR_WIDTH = 320;
 
 const barButton =
   "inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill text-content hover:bg-selection pointer-fine:size-9";
@@ -43,7 +52,7 @@ function SearchButton({ compact }: { compact?: boolean }) {
     >
       <Icon name="search" size={18} />
       <span className="flex-1 text-left">Search</span>
-      <kbd className="font-sans text-meta text-faint">Ctrl K</kbd>
+      <kbd className="font-sans text-meta text-faint">{isMac() ? "\u2318K" : "Ctrl K"}</kbd>
     </button>
   );
 }
@@ -53,6 +62,7 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
   const setCollapsed = useLayoutPrefs((state) => state.setSidebarCollapsed);
   const width = useLayoutPrefs((state) => state.sidebarWidth);
   const setWidth = useLayoutPrefs((state) => state.setSidebarWidth);
+  const persistWidth = useLayoutPrefs((state) => state.persistSidebarWidth);
 
   if (tablet && collapsed) {
     return (
@@ -70,7 +80,7 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
         data-testid="app-sidebar"
         data-state="expanded"
         style={{ width: tablet ? TABLET_SIDEBAR_WIDTH : width }}
-        className={`${STICKY} flex shrink-0 flex-col border-r border-stroke bg-drawer`}
+        className={`${STICKY} flex shrink-0 flex-col bg-drawer ${tablet ? "border-r border-stroke" : ""}`}
       >
         <div className="flex items-center gap-2 px-4 pt-3">
           <SearchButton />
@@ -84,31 +94,63 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
           <WorkspaceNav desktopId={desktopId} />
         </div>
       </aside>
-      {tablet ? null : <Splitter label="Resize sidebar" value={width} min={SIDEBAR_WIDTH.min} max={SIDEBAR_WIDTH.max} onChange={setWidth} grow={1} />}
+      {tablet ? null : <Splitter label="Resize sidebar" value={width} min={SIDEBAR_WIDTH.min} max={SIDEBAR_WIDTH.max} onChange={setWidth} onCommit={persistWidth} grow={1} />}
     </>
   );
 }
 
-export function AppShell({ children }: { children?: ReactNode }) {
-  const { desktopId } = useParams({ strict: false }) as { desktopId?: string };
+function subscribeResize(listener: () => void): () => void {
+  window.addEventListener("resize", listener);
+  return () => window.removeEventListener("resize", listener);
+}
+
+/** The window width in px. */
+function useViewportWidth(): number {
+  return useSyncExternalStore(subscribeResize, () => window.innerWidth, () => 1280);
+}
+
+/** The project the current screen belongs to: a project route, or the session's project on a session route. */
+function useCurrentProjectId(): string | null {
+  const { projectId, sessionId } = useParams({ strict: false }) as { projectId?: string; sessionId?: string };
+  const catalog = useCatalog();
+  if (projectId) return projectId;
+  if (sessionId) return catalog.data?.sessions.find((session) => session.id === sessionId)?.projectId ?? null;
+  return null;
+}
+
+function Shell({ desktopId, children }: { desktopId: string; children?: ReactNode }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const wide = useMediaQuery(TABLET_QUERY);
   const desktop = useMediaQuery(DESKTOP_QUERY);
+  const viewport = useViewportWidth();
+  const sidebarWidth = useLayoutPrefs((state) => state.sidebarWidth);
+  const projectId = useCurrentProjectId();
   useGlobalShortcuts();
 
-  if (!desktopId) return <>{children}</>;
-  const mode: PanelMode = !wide ? "sheet" : desktop ? "docked" : "overlay";
+  useEffect(() => {
+    setPanelScope(projectId ? { desktopId, projectId } : null);
+    return () => setPanelScope(null);
+  }, [desktopId, projectId]);
+
   const sidebar = wide && !routeHasOwnSidebar(pathname);
+  const dockMax = desktop ? dockedPanelMax(viewport, sidebar ? sidebarWidth : FRAME_SIDEBAR_WIDTH) : null;
+  const mode: PanelMode = !wide ? "sheet" : dockMax !== null ? "docked" : "overlay";
 
   return (
     <>
       <div data-testid="app-shell" data-layout={!wide ? "mobile" : desktop ? "desktop" : "tablet"} className="flex w-full">
         {sidebar ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
         <div className="@container min-w-0 flex-1">{children}</div>
-        {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} /> : null}
+        {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}
       </div>
-      {mode === "docked" ? null : <RightPanel mode={mode} desktopId={desktopId} />}
+      {mode === "docked" ? null : <RightPanel mode={mode} desktopId={desktopId} projectId={projectId} />}
       <CommandPalette desktopId={desktopId} />
     </>
   );
+}
+
+export function AppShell({ children }: { children?: ReactNode }) {
+  const { desktopId } = useParams({ strict: false }) as { desktopId?: string };
+  if (!desktopId) return <>{children}</>;
+  return <Shell desktopId={desktopId}>{children}</Shell>;
 }

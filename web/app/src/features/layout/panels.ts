@@ -10,11 +10,14 @@
 //   interface PanelProps extends PanelTarget { onClose(): void }       props of a panel component
 //   registerPanel(kind, { title, component }): void   once per kind at startup, a second call throws
 //   getPanel(kind) / hasPanel(kind) / usePanelRegistered(kind)         look a registration up
-//   openPanel(kind, target, context?): boolean   false when the kind is unregistered or the optional
-//                                                session-capabilities `context` refuses it (the kinds
-//                                                are capability names, so non-local sessions hide them)
-//   closePanel(): void, togglePanel(kind, target, context?): void, closeTopmostPanel(): boolean
-//   usePanels: zustand store `{ open: (PanelTarget & { kind }) | null }`; clearPanels() for tests
+//   openPanel(kind, target, context): boolean   false when the kind is unregistered or the session-capabilities
+//                                               `context` (required, so callers cannot skip the check)
+//                                               refuses it (the kinds are capability names, so non-local
+//                                               sessions hide them)
+//   closePanel(): void, togglePanel(kind, target, context): void, closeTopmostPanel(): boolean
+//   usePanels: zustand store `{ open, scope }`; `open` is the last opened panel (a PanelTarget and a kind),
+//     `scope` the project the shell currently shows (setPanelScope, set by AppShell). A panel is visible
+//     only while its target equals the scope, and Esc closes only a visible one. clearPanels() for tests
 import type { ComponentType } from "react";
 import { create } from "zustand";
 import { sessionCan, type SessionCapabilityContext } from "@/ui/hooks";
@@ -59,18 +62,28 @@ export function usePanelRegistered(kind: PanelKind): boolean {
 /** Drops every registration and closes the open panel. For tests. */
 export function clearPanels(): void {
   registry.clear();
-  usePanels.setState({ open: null });
+  usePanels.setState({ open: null, scope: null });
 }
 
 export interface OpenPanel extends PanelTarget {
   kind: PanelKind;
 }
 
-export const usePanels = create<{ open: OpenPanel | null }>(() => ({ open: null }));
+export const usePanels = create<{ open: OpenPanel | null; scope: PanelTarget | null }>(() => ({ open: null, scope: null }));
 
-export function openPanel(kind: PanelKind, target: PanelTarget, context?: SessionCapabilityContext): boolean {
+/** The project the shell currently shows (null outside a project or session screen). */
+export function setPanelScope(scope: PanelTarget | null): void {
+  usePanels.setState({ scope });
+}
+
+/** True when `open` belongs to the project in `scope`. */
+export function panelMatchesScope(open: OpenPanel | null, scope: PanelTarget | null): open is OpenPanel {
+  return !!open && !!scope && open.desktopId === scope.desktopId && open.projectId === scope.projectId;
+}
+
+export function openPanel(kind: PanelKind, target: PanelTarget, context: SessionCapabilityContext): boolean {
   if (!registry.has(kind)) return false;
-  if (context && !sessionCan(kind, context)) return false;
+  if (!sessionCan(kind, context)) return false;
   usePanels.setState({ open: { kind, desktopId: target.desktopId, projectId: target.projectId } });
   return true;
 }
@@ -79,15 +92,16 @@ export function closePanel(): void {
   usePanels.setState({ open: null });
 }
 
-export function togglePanel(kind: PanelKind, target: PanelTarget, context?: SessionCapabilityContext): void {
+export function togglePanel(kind: PanelKind, target: PanelTarget, context: SessionCapabilityContext): void {
   const open = usePanels.getState().open;
   if (open && open.kind === kind && open.desktopId === target.desktopId && open.projectId === target.projectId) closePanel();
   else openPanel(kind, target, context);
 }
 
-/** Esc: closes the open panel. True when there was one. */
+/** Esc: closes the visible panel (one of the current project). True when there was one. */
 export function closeTopmostPanel(): boolean {
-  if (!usePanels.getState().open) return false;
+  const { open, scope } = usePanels.getState();
+  if (!panelMatchesScope(open, scope)) return false;
   closePanel();
   return true;
 }

@@ -24,7 +24,7 @@ export function MatchText({ text, positions, active }: MatchTextProps): ReactNod
   }
   return runs.map((run, index) =>
     run.match ? (
-      <span key={index} className="text-accent" data-match="">
+      <span key={index} className="text-brand-text" data-match="">
         {run.text}
       </span>
     ) : (

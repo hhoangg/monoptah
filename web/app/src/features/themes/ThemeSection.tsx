@@ -22,7 +22,7 @@ interface SwatchGroupProps<T extends string> {
   onChange: (value: T) => void;
 }
 
-/** A radiogroup of colour swatches: roving tabindex, arrows/Home/End move and select, selection is a ring plus a check mark. */
+/** A radiogroup of color swatches: roving tabindex, arrows/Home/End move and select, selection is a ring plus a check mark. */
 function SwatchGroup<T extends string>({ label, choices, value, onChange }: SwatchGroupProps<T>) {
   const refs = useRef<Array<HTMLButtonElement | null>>([]);
 
@@ -119,10 +119,10 @@ export function ThemeSection() {
   }));
 
   return (
-    <SettingsCard title="Theme" footnote="Theme tints the surfaces. An accent replaces the theme's own accent colour. Saved on this device only.">
+    <SettingsCard title="Theme" footnote="Theme tints the surfaces. An accent replaces the theme's own accent color. Saved on this device only.">
       <SwatchGroup label="Theme" choices={themeChoices} value={theme} onChange={setTheme} />
       <div role="separator" className="mx-1.5 h-px bg-stroke" />
-      <SwatchGroup label="Accent colour" choices={accentChoices} value={accent} onChange={setAccent} />
+      <SwatchGroup label="Accent color" choices={accentChoices} value={accent} onChange={setAccent} />
     </SettingsCard>
   );
 }

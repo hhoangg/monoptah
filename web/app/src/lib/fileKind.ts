@@ -1,5 +1,5 @@
-// Copied from src/features/files/model/fileName.ts at ea83dd1f
-// Copied from src/features/files/ui/FileTypeIcon.tsx at ea83dd1f
+// Copied from src/features/files/model/fileName.ts at c579af2e
+// Copied from src/features/files/ui/FileTypeIcon.tsx at c579af2e
 // (leafName and its helpers come from the first file; the name -> icon
 // resolution is now a pure name -> kind mapping, the Material icon pack and its
 // raw SVG strings are gone).

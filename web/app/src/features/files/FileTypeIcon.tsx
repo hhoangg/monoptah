@@ -1,4 +1,4 @@
-// Adapted from src/features/files/ui/FileTypeIcon.tsx at ea83dd1f
+// Copied from src/features/files/ui/FileTypeIcon.tsx at c579af2e
 // (the Material icon pack and its dangerouslySetInnerHTML SVG sink are replaced
 // by hugeicons through @/ui/Icon; the name -> kind logic lives in @/lib/fileKind).
 /**
@@ -46,7 +46,7 @@ export const FileTypeIcon = memo(function FileTypeIcon({ name, isDir, isOpen = f
     <span
       aria-hidden
       data-kind={isDir ? (isOpen ? "folder-open" : "folder") : fileKind(name)}
-      className={`inline-flex shrink-0 items-center justify-center align-middle ${isDir ? "text-accent" : "text-content-muted"} ${className ?? ""}`}
+      className={`inline-flex shrink-0 items-center justify-center align-middle ${isDir ? "text-brand" : "text-muted-text"} ${className ?? ""}`}
       style={{ width: size, height: size }}
     >
       <Icon name={icon} size={size} />

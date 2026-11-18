@@ -2,7 +2,10 @@
 //
 // Built in: Mod+K opens/closes the command palette, Esc closes the command palette, then the top-most
 // right panel. Mod+P runs the handler registered for "quick-open", and does nothing (the browser keeps
-// the key) while none is registered. Mod is Cmd on macOS and Ctrl elsewhere. Nothing fires while an IME
+// the key) while none is registered. Mod is Cmd on macOS and Ctrl elsewhere. The letter is matched by
+// `event.key` and, for layouts that type another script, by the physical `event.code` (KeyK, KeyP).
+// Mod+K / Mod+P never stack a second overlay: while a dialog, sheet or menu other than the palette is open
+// they do nothing, and Mod+P closes the palette before it runs quick-open. Nothing fires while an IME
 // composes. A handled shortcut calls preventDefault.
 //
 // Public API:
@@ -42,13 +45,35 @@ export function clearShortcuts(): void {
   handlers.clear();
 }
 
-function isMac(): boolean {
+/** True on Apple platforms, where Mod is Cmd. */
+export function isMac(): boolean {
   return typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
 }
 
 /** Cmd on macOS, Ctrl elsewhere (and no other of the two). */
 export function isMod(event: Pick<KeyboardEvent, "metaKey" | "ctrlKey">): boolean {
   return isMac() ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+}
+
+const OVERLAY_SELECTOR = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
+
+/** True while a dialog, sheet or menu is mounted anywhere, except the command palette's own (and its list). */
+function otherOverlayOpen(): boolean {
+  const palette = isCommandPaletteOpen();
+  for (const element of document.querySelectorAll(OVERLAY_SELECTOR)) {
+    if (palette && (element.querySelector("[data-command-palette]") || element.closest("[data-command-palette]"))) continue;
+    // A closed radix/vaul layer unmounts; a hidden one must not block the shortcut.
+    if (element.closest("[hidden], [aria-hidden='true']")) continue;
+    return true;
+  }
+  return false;
+}
+
+/** The pressed letter: `event.key` when it is Latin, else the physical key (non-Latin layouts). */
+function pressedLetter(event: KeyboardEvent): string {
+  const key = event.key.toLowerCase();
+  if (/^[a-z]$/.test(key)) return key;
+  return /^Key[A-Z]$/.test(event.code) ? event.code.slice(3).toLowerCase() : key;
 }
 
 /** An open dialog, sheet or menu other than the panel host owns Esc. */
@@ -73,16 +98,18 @@ export function handleGlobalKeydown(event: KeyboardEvent): boolean {
     return false;
   }
   if (!isMod(event) || event.altKey || event.shiftKey) return false;
-  const key = event.key.toLowerCase();
+  const key = pressedLetter(event);
   if (key === "k") {
+    if (otherOverlayOpen()) return false;
     event.preventDefault();
     toggleCommandPalette();
     return true;
   }
   if (key === "p") {
     const handler = handlers.get("quick-open");
-    if (!handler) return false;
+    if (!handler || otherOverlayOpen()) return false;
     event.preventDefault();
+    closeCommandPalette();
     handler();
     return true;
   }
