@@ -554,7 +554,7 @@ impl MobileHost {
         let removed = config
             .devices
             .iter()
-            .find(|v| v.id == device_id)
+            .find(|v| v.id == device_id && v.kind == DeviceKind::Phone)
             .map(|device| (device.kind, device.fingerprint.clone()));
         if let Some((kind, peer)) = &removed {
             if *kind == DeviceKind::Phone {

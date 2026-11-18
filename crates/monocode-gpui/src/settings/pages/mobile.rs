@@ -202,12 +202,7 @@ impl SettingsView {
         let paired = showing
             .then(|| {
                 let known = self.mobile.known.as_ref()?;
-                self.ctx
-                    .mobile
-                    .as_ref()?
-                    .devices
-                    .iter()
-                    .find(|device| !known.contains(&device.id))
+                phones(self.ctx.mobile.as_ref()?).find(|device| !known.contains(&device.id))
             })
             .flatten();
         if let Some(device) = paired {
@@ -1489,6 +1484,51 @@ mod tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
         window
+    }
+
+    fn row(id: &str, name: &str, kind: DeviceKind) -> monocode_core::mobile::host::Device {
+        monocode_core::mobile::host::Device {
+            id: id.into(),
+            name: name.into(),
+            fingerprint: format!("fp-{id}"),
+            push: None,
+            kind,
+            permission: monocode_core::mobile::Permission::Read,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: Some(1),
+            last_seen: Some(2),
+        }
+    }
+
+    #[gpui::test]
+    fn a_web_row_does_not_end_a_phone_pairing_but_a_new_phone_does(cx: &mut TestAppContext) {
+        let window = preview(cx);
+        let visual = &mut VisualTestContext::from_window(window.into(), cx);
+        let settings = window.update(visual, |p, _, _| p.settings.clone()).unwrap();
+        let refresh = |visual: &mut VisualTestContext, devices: Vec<_>| {
+            settings.update(visual, |view, cx| {
+                let status = view.ctx.mobile.as_mut().unwrap();
+                status.devices = devices;
+                view.mobile_context_changed(cx);
+            });
+        };
+        let web = row("w1", "Browser", DeviceKind::Web);
+        settings.update(visual, |view, cx| {
+            view.ctx.mobile.as_mut().unwrap().devices = vec![web.clone()];
+            view.pair_phone(cx);
+        });
+        refresh(visual, vec![web.clone()]);
+        settings.update(visual, |view, _| {
+            assert!(view.mobile.notice.is_none(), "{:?}", view.mobile.notice);
+            assert!(view.mobile.known.is_some());
+        });
+        refresh(visual, vec![web, row("p1", "Pixel", DeviceKind::Phone)]);
+        settings.update(visual, |view, _| {
+            assert_eq!(view.mobile.notice.as_deref(), Some("Pixel is paired."));
+            assert!(view.mobile.known.is_none());
+        });
     }
 
     #[gpui::test]
