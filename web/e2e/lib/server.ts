@@ -16,7 +16,9 @@ export interface RunningServer {
   /** The one-use bootstrap invite. Never print it. */
   invite: string;
   /** More bootstrap invites, one per spec that needs its own account. Never print them. */
-  extraInvites: { pairing: string; devices: string; ui: string; w14: string; w14b: string };
+  extraInvites: { pairing: string; devices: string; ui: string; w14: string; w14b: string; r12: string };
+  /** Kills wrangler and starts it again on the same port with the same local persistence (D1 and DO state survive). */
+  restart(): Promise<void>;
   /** Stops wrangler and removes the temp dir. Waits for exit, escalates to SIGKILL, never throws. */
   stop(): Promise<void>;
 }
@@ -120,7 +122,7 @@ export async function startServer(logFile: string): Promise<RunningServer> {
       return code;
     };
     const invite = bootstrap();
-    const extraInvites = { pairing: bootstrap(), devices: bootstrap(), ui: bootstrap(), w14: bootstrap(), w14b: bootstrap() };
+    const extraInvites = { pairing: bootstrap(), devices: bootstrap(), ui: bootstrap(), w14: bootstrap(), w14b: bootstrap(), r12: bootstrap() };
 
     // Obviously fake secrets, passed with --var so a developer's web/.dev.vars is never read.
     const fake = {
@@ -131,17 +133,12 @@ export async function startServer(logFile: string): Promise<RunningServer> {
     mkdirSync(dirname(logFile), { recursive: true });
     const log = createWriteStream(logFile);
 
-    // The free port can be taken between the probe and wrangler's bind: retry with a new port.
-    let origin = "";
-    let lastError: unknown;
-    for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
-      const port = await freePort();
-      origin = `http://localhost:${port}`;
+    const launch = async (port: number): Promise<ChildProcess> => {
       const args = [
         "dev", "--local", "--persist-to", persist, "--port", String(port), "--ip", "127.0.0.1", "-c", wranglerConfig,
         "--show-interactive-dev-session=false",
         ...(assetsDir ? ["--assets", assetsDir] : []),
-        "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:${origin}`,
+        "--var", `RP_ID:${RP_ID}`, "--var", `RP_ORIGIN:http://localhost:${port}`,
         ...Object.entries(fake).flatMap(([name, value]) => ["--var", `${name}:${value}`]),
       ];
       const child = spawn(wranglerBin, args, {
@@ -154,23 +151,54 @@ export async function startServer(logFile: string): Promise<RunningServer> {
       child.stdout?.pipe(log, { end: false });
       child.stderr?.pipe(log, { end: false });
       try {
-        await waitForHealth(origin, child);
+        await waitForHealth(`http://localhost:${port}`, child);
+      } catch (err) {
+        await killTree(child);
+        wrangler = null;
+        throw err;
+      }
+      return child;
+    };
+
+    // The free port can be taken between the probe and wrangler's bind: retry with a new port.
+    let origin = "";
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+      const port = await freePort();
+      origin = `http://localhost:${port}`;
+      try {
+        await launch(port);
         lastError = undefined;
         break;
       } catch (err) {
         lastError = err;
-        await killTree(child);
-        wrangler = null;
       }
     }
     if (lastError !== undefined) throw lastError;
+
+    const restart = async (): Promise<void> => {
+      const port = Number(new URL(origin).port);
+      await killTree(wrangler);
+      wrangler = null;
+      let failure: unknown;
+      for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+        try {
+          await launch(port);
+          return;
+        } catch (err) {
+          failure = err;
+          await sleep(1000);
+        }
+      }
+      throw failure;
+    };
 
     const onSignal = (code: number) => (): void => {
       void stop().then(() => process.exit(code));
     };
     process.once("SIGINT", onSignal(130));
     process.once("SIGTERM", onSignal(143));
-    return { origin, invite, extraInvites, stop };
+    return { origin, invite, extraInvites, restart, stop };
   } catch (err) {
     await stop();
     throw err;

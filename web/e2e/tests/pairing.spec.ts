@@ -3,10 +3,10 @@
 // Test 1 runs now: the headless desktop plays the desktop side of the pairing (`pair`, architecture.md 6.4) and an
 // account registered with the virtual authenticator approves its user code through the API (the WS-S /pair/:code
 // page is still a RouteStub, so the API is used and the approval is checked against the same data the page shows).
-// Test 2 needs `web_link_headless serve`; it skips with its TODO marker until the binary reports `serve: true`.
+// Test 2 serves the paired desktop (`serve --confirm-pending`), confirms a browser device and reads the catalog.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { E2E_CATALOG } from "../lib/catalog.ts";
@@ -103,15 +103,11 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
       const paired = eventOf(pair, "paired") as { desktopId: string; account: string; fingerprint: string };
       expect(paired).toMatchObject({ desktopId: approved.json["desktopId"], account: "e2epair", fingerprint: started.fingerprint });
       desktopId = paired.desktopId;
-      // The token is minted by the poll and never printed: its value (read from the private file) appears in neither
-      // stream, and the file is not readable by group or others.
-      const file = join(dataDir, "data", "web-pairing.json");
-      const token = (JSON.parse(readFileSync(file, "utf8")) as { desktopToken: string }).desktopToken;
-      expect(token.length).toBeGreaterThan(8);
-      expect(pair.stdoutText()).not.toContain(token);
-      expect(pair.stderr()).not.toContain(token);
+      // The token is minted by the poll, sealed in the data dir's store and never printed: no stream or event carries
+      // a credential, and no plain token file is left behind.
+      expect(pair.stdoutText() + pair.stderr()).not.toMatch(/desktopToken|deviceCode|verifier/);
       expect(JSON.stringify(pair.events)).not.toMatch(/desktopToken|deviceCode|verifier/);
-      if (process.platform !== "win32") expect(statSync(file).mode & 0o077).toBe(0);
+      expect(existsSync(join(dataDir, "data", "web-pairing.json"))).toBe(false);
     } finally {
       pair.child.kill("SIGTERM");
     }
@@ -125,7 +121,7 @@ test.describe.serial("pair the headless desktop (E-01)", () => {
     expect(directory.json["fingerprint"]).toBe((eventOf(pair, "paired") as { fingerprint: string }).fingerprint);
   });
 
-  test("TODO(E-01:WS-D1 R-05, R-15) serve, confirm a device, read the catalog", async () => {
+  test("serve, confirm a device, read the catalog", async () => {
     const headless = probeHeadless();
     if (!headless.run) console.log(`skip reason: ${headless.reason}`);
     test.skip(!headless.run, headless.reason);

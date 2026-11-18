@@ -2,6 +2,7 @@
 // client of web/mock-desktop (`@monoptah/mock-desktop/test-client`). The app has no route that renders a catalog yet
 // (WS-M desktop pages are stubs), so the app's own link client cannot be driven from a page. The e2e package has no
 // workspace link to mock-desktop (and `pnpm add` is not allowed for this task), so the sources are imported by path.
+import type { FrameSocket } from "../../mock-desktop/src/transport.ts";
 import { TestClient } from "../../mock-desktop/src/client.ts";
 import { generateKeyPair, type KeyPair } from "../../mock-desktop/src/noise.ts";
 import { connectRelay } from "../../mock-desktop/src/transport.ts";
@@ -20,6 +21,10 @@ export interface DeviceLinkOptions {
   /** `name=value` of the session cookie. Never logged. */
   cookie: string;
   deviceName: string;
+  /** Noise channel (default 1). Two live clients of one device need two channels. */
+  channel?: number;
+  /** Wraps the socket before the handshake (a recorder that captures the frames sent). */
+  wrapSocket?: (socket: FrameSocket) => FrameSocket;
 }
 
 /** Opens `/relay/device/:desktopId?device=:id` with the session cookie and handshakes (Noise IK). */
@@ -30,7 +35,8 @@ export async function connectDevice(options: DeviceLinkOptions): Promise<TestCli
     Origin: options.origin,
   });
   return TestClient.connect({
-    socket,
+    socket: options.wrapSocket ? options.wrapSocket(socket) : socket,
+    ...(options.channel === undefined ? {} : { channel: options.channel }),
     desktopId: options.desktopId,
     deviceId: options.deviceId,
     desktopPublicKey: base64urlDecode(options.desktopPublicKey),

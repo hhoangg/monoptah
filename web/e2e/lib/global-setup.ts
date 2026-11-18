@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { outputDir } from "./paths.ts";
 import { startServer } from "./server.ts";
@@ -18,5 +19,23 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
   process.env["E2E_INVITE_UI"] = server.extraInvites.ui;
   process.env["E2E_INVITE_W14"] = server.extraInvites.w14;
   process.env["E2E_INVITE_W14B"] = server.extraInvites.w14b;
-  return () => server.stop();
+  process.env["E2E_INVITE_R12"] = server.extraInvites.r12;
+  // The tests run in another process: a loopback control port lets the R-12 spec restart the relay (the Worker).
+  const control = createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/restart") {
+      res.writeHead(404).end();
+      return;
+    }
+    server.restart().then(
+      () => res.writeHead(200).end("ok"),
+      (err: unknown) => res.writeHead(500).end(String(err)),
+    );
+  });
+  await new Promise<void>((resolve) => control.listen(0, "127.0.0.1", resolve));
+  const address = control.address();
+  process.env["E2E_CONTROL"] = `http://127.0.0.1:${typeof address === "object" && address !== null ? address.port : 0}`;
+  return async () => {
+    control.close();
+    await server.stop();
+  };
 }
