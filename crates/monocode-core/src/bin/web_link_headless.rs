@@ -1,4 +1,4 @@
-//! Headless desktop binary for the web link (E-01 seam of the e2e harness).
+//! Headless desktop binary for the web link (the desktop side of the E2E harness).
 //!
 //! Commands (parsed by hand, clap is not a dependency):
 //!
@@ -9,22 +9,73 @@
 //! web_link_headless serve --data-dir <dir> [--confirm-pending <read-only|control>]
 //! ```
 //!
-//! Exit codes: 0 ok, 1 check-vectors found a failure, 2 usage or IO error, 3 `serve` cannot run yet,
+//! Exit codes: 0 ok, 1 check-vectors found a failure, 2 usage or IO error (also `serve` without a pairing),
 //! 4 pairing was denied, expired or timed out, 5 the server could not be reached.
 //!
-//! `pair` plays the desktop side of the device authorization of architecture.md 6.4 (`/api/pair/start`, then
-//! `/api/pair/poll` until a signed-in user approves the user code) and stores the result in
-//! `<data-dir>/web-pairing.json`. It prints JSON lines on stdout and never the token.
+//! `pair` plays the desktop side of the device authorization of architecture.md 6.4 through the public host
+//! API (`MobileHost::web_pair_start` and `web_pair_poll`): the identity is sealed in `<data-dir>/store.db`,
+//! the same store the app uses. stdout carries JSON lines, never a token, a device code or a verifier:
 //!
-//! `serve` is NOT wired yet: the web identity save, grant confirm and grant sync a binary needs are not `pub` in monocode-core. TODO(E-01:WS-D1 R-05, R-15):
-//! see `SERVE_NOT_WIRED` below for the exact items. `capabilities` keeps `"serve": false` until then.
+//! ```text
+//! {"event":"pairing","userCode","confirmationCode","fingerprint","link","expiresIn"}
+//! {"event":"paired","desktopId","account","fingerprint"}
+//! ```
+//!
+//! `serve` opens the host in `<data-dir>` (after `pair`), publishes the E2E catalog (project "E2E Project",
+//! session "E2E session", ids `e2e-project` and `e2e-session`; the values of `web/e2e/lib/catalog.ts`), turns the
+//! web link on and answers the app requests with a deterministic fake until it is killed, told to `quit`, or
+//! unpaired:
+//!
+//! - `conversation.read` gives the turns of `e2e-session` (a seeded user and assistant turn, then the sent ones).
+//! - `conversation.send` appends the user text and answers `{sessionId}`; 400 ms later an assistant turn
+//!   `Echo: <text>` is pushed over every watch. A text containing `[hold]` gets no reply until `session.cancel`.
+//! - `session.cancel` (the stop method of `web/protocol/methods.json`) ends the streaming: busy turns false.
+//! - `conversation.watch` opens a watch: the current turns at once, then one frame per change.
+//! - any other app method answers the error code `unsupported`.
+//!
+//! `--confirm-pending` is for the E2E harness only: it confirms every pending device with that permission on
+//! its own. It is never a default; without it a device stays pending until an `approve` command.
+//!
+//! stdout events of `serve`, one JSON object per line (none carries a token):
+//!
+//! ```text
+//! {"event":"online","desktopId","fingerprint"}              the relay link is connected
+//! {"event":"offline"}                                       the link dropped (it retries by itself)
+//! {"event":"confirmed","deviceId","permission"}             a device was confirmed ("read" or "control")
+//! {"event":"permission","deviceId","permission"}            a `permission` command changed a device
+//! {"event":"request","method"}                              the app received a request
+//! {"event":"watch","action":"start"|"stop"}
+//! {"event":"revoked","scope":"device","deviceId"}           a paired device is gone (revoked on either side)
+//! {"event":"revoked","scope":"desktop"}                     the relay refused this desktop for good
+//! {"event":"unpaired"}                                      after the `unpair` command
+//! {"event":"error","message"}
+//! ```
+//!
+//! `deviceId` is the relay's device id (what `POST /api/devices` returned). Commands are JSON lines on stdin;
+//! the end of stdin does not stop `serve`:
+//!
+//! ```text
+//! {"cmd":"approve","deviceId":ID,"permission":"read-only"|"control"}    confirm a pending device
+//! {"cmd":"deny","deviceId":ID}                                          refuse a pending device
+//! {"cmd":"permission","deviceId":ID,"permission":"read-only"|"control"} change a paired device
+//! {"cmd":"revoke","deviceId":ID}                                        desktop-side revoke of a paired device
+//! {"cmd":"unpair"}                                                      unpair (revokes the token), then exit 0
+//! {"cmd":"quit"}                                                        exit 0
+//! ```
+use monocode_core::mobile::host::{Event, MobileHost, Push, Request};
 use monocode_core::mobile::web_link::frame::{
     split_message, Frame, FrameType, Plaintext, MAX_REQUEST_BYTES,
 };
-use monocode_core::mobile::web_link::noise::{fingerprint, generate_static};
+use monocode_core::mobile::web_link::{self, PairPoll};
+use monocode_core::mobile::{DeviceKind, Permission, WebState};
+use monocode_core::store::Store;
+use monocode_mobile_link::Failure;
 use serde_json::{json, Value};
-use std::io::Write;
+use std::collections::HashSet;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
@@ -34,18 +85,13 @@ const USAGE: &str = "usage:
   web_link_headless serve --data-dir <dir> [--confirm-pending <read-only|control>]
   web_link_headless --help
 
-  --confirm-pending is for the E2E harness only: it confirms every pending grant on its own. It is never a default.";
+  --confirm-pending is for the E2E harness only: it confirms every pending device on its own. It is never a default.
+  serve reads JSON-line commands on stdin (approve, deny, permission, revoke, unpair, quit); see the module doc.";
 
-const CAPABILITIES_LINE: &str = r#"{"version":1,"serve":false,"pair":true,"reason":"serve needs a pub web identity save, grant confirm and grant sync from WS-D1 (R-05, R-15)","checkVectors":true}"#;
-const SERVE_NOT_WIRED: &str = "web_link serve not wired yet: TODO(E-01:WS-D1 R-05, R-15). Public today and enough for the rest of serve: \
-store::Store::open (registers the database), MobileHost::open, MobileHost::publish (the catalog), set_web_enabled, \
-web_link::start and web_status. Still crate-private: MobileHost::save_web_identity with mobile::identity_store::WebIdentity \
-(a binary cannot seal the pairing result), a way to confirm a pending grant, and the R-15 grant sync that fills pending grants.";
-const PAIRING_FILE: &str = "web-pairing.json";
+const CAPABILITIES_LINE: &str =
+    r#"{"version":1,"serve":true,"pair":true,"reason":null,"checkVectors":true}"#;
 const DEFAULT_MACHINE_NAME: &str = "e2e-headless";
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
-/// Consecutive failed HTTP calls (no answer from the server) before `pair` gives up.
-const MAX_NETWORK_FAILURES: u32 = 5;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -179,60 +225,30 @@ fn parse_serve(rest: &[String]) -> Result<Command, String> {
     })
 }
 
-// ---------------------------------------------------------------- pair
+// ---------------------------------------------------------------- host
 
-fn b64(bytes: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
+const STORE_FILE: &str = "store.db";
+const MOBILE_FILE: &str = "mobile-access.json";
+/// The one conversation the fake app knows, and the catalog it publishes. These are the values of
+/// `web/e2e/lib/catalog.ts`: change both together.
+const PROJECT_ID: &str = "e2e-project";
+const PROJECT_NAME: &str = "E2E Project";
+const SESSION_ID: &str = "e2e-session";
+const SESSION_TITLE: &str = "E2E session";
+/// How long the fake assistant "thinks" before its reply; a `conversation.send` whose text holds
+/// [`HOLD_MARKER`] never gets one until `session.cancel` ends it.
+const REPLY_DELAY: Duration = Duration::from_millis(400);
+const HOLD_MARKER: &str = "[hold]";
 
-fn os_name() -> &'static str {
-    match std::env::consts::OS {
-        "macos" => "macos",
-        "windows" => "windows",
-        _ => "linux",
-    }
-}
-
-/// One JSON call. `Ok((status, body))` for any HTTP answer, `Err` when there was none.
-fn post_json(url: &str, body: &Value) -> Result<(u16, Value, Option<u64>), String> {
-    let request = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .post(url)
-        .set("Content-Type", "application/json");
-    let response = match request.send_string(&body.to_string()) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(ureq::Error::Transport(e)) => return Err(e.to_string()),
-    };
-    let status = response.status();
-    let retry_after = response
-        .header("Retry-After")
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    let text = response.into_string().map_err(|e| e.to_string())?;
-    Ok((
-        status,
-        serde_json::from_str(&text).unwrap_or(Value::Null),
-        retry_after,
-    ))
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+/// Opens the desktop state in `data_dir`: the native store (it creates the tables the sealed web identity
+/// lives in and registers the database, `credentials.key` sits next to it) and the mobile host.
+fn open_host(data_dir: &Path) -> Result<(MobileHost, async_channel::Receiver<Event>), String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+    let dir = std::fs::canonicalize(data_dir)
+        .map_err(|e| format!("cannot resolve {}: {e}", data_dir.display()))?;
+    Store::open(&dir.join(STORE_FILE))?;
+    MobileHost::open(dir.join(MOBILE_FILE))
 }
 
 fn emit(out: &mut dyn Write, line: Value) {
@@ -240,7 +256,18 @@ fn emit(out: &mut dyn Write, line: Value) {
     let _ = out.flush();
 }
 
-/// The desktop half of the device authorization. `poll_every` overrides the server's interval (tests only).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+// ---------------------------------------------------------------- pair
+
+/// The desktop half of the device authorization, through the public host API (`web_pair_start` and
+/// `web_pair_poll`): the identity is sealed in the store of `data_dir`, exactly as the app does it. The
+/// device code, the verifier and the token never leave the host and are never printed.
+/// `poll_every` overrides the server's interval (tests only).
 fn run_pair(
     server: &str,
     data_dir: &Path,
@@ -250,152 +277,624 @@ fn run_pair(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    use rand::RngCore;
-    use sha2::{Digest, Sha256};
-    if let Err(e) = std::fs::create_dir_all(data_dir) {
-        let _ = writeln!(err, "error: cannot create {}: {e}", data_dir.display());
-        return 2;
-    }
-    let (private, public) = match generate_static() {
-        Ok(pair) => pair,
+    let (host, _events) = match open_host(data_dir) {
+        Ok(opened) => opened,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
             return 2;
         }
     };
-    let mut verifier = [0u8; 32];
-    rand::rng().fill_bytes(&mut verifier);
-    let challenge = Sha256::digest(verifier);
     let started = Instant::now();
-    let start_body = json!({
-        "publicKey": b64(&public),
-        "machineName": machine_name,
-        "os": os_name(),
-        "appVersion": concat!(env!("CARGO_PKG_VERSION"), "-headless"),
-        "challenge": b64(&challenge),
-    });
-    let (status, started_json, _) =
-        match post_json(&format!("{server}/api/pair/start"), &start_body) {
-            Ok(answer) => answer,
-            Err(e) => {
-                let _ = writeln!(err, "error: cannot reach the server: {e}");
-                return 5;
-            }
-        };
-    let text = |key: &str| started_json.get(key).and_then(Value::as_str);
-    let (Some(user_code), Some(device_code), Some(confirmation)) = (
-        text("userCode"),
-        text("deviceCode"),
-        text("confirmationCode"),
-    ) else {
-        let _ = writeln!(err, "error: pair/start answered {status} without a pairing");
-        return 2;
+    let ticket = match host.web_pair_start(server, machine_name) {
+        Ok(ticket) => ticket,
+        Err(e) if e.contains("Cannot reach") => {
+            let _ = writeln!(err, "error: cannot reach the server: {e}");
+            return 5;
+        }
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return 2;
+        }
     };
-    let interval = poll_every.unwrap_or_else(|| {
-        Duration::from_secs(
-            started_json
-                .get("interval")
-                .and_then(Value::as_u64)
-                .unwrap_or(3)
-                .max(1),
-        )
-    });
-    // The device code and the verifier stay in this function: they are never printed.
     emit(
         out,
         json!({
             "event": "pairing",
-            "userCode": user_code,
-            "confirmationCode": confirmation,
-            "fingerprint": fingerprint(&public),
-            "expiresIn": started_json.get("expiresIn"),
+            "userCode": ticket.user_code,
+            "confirmationCode": ticket.confirmation_code,
+            "fingerprint": ticket.fingerprint,
+            "link": ticket.link,
+            "expiresIn": ticket.expires_at.saturating_sub(unix_now()),
         }),
     );
-    let poll_body = json!({"deviceCode": device_code, "verifier": b64(&verifier)});
-    let mut failures = 0;
+    let interval = poll_every.unwrap_or_else(|| Duration::from_secs(ticket.interval.max(1)));
     loop {
         if started.elapsed() >= timeout {
+            host.web_pair_cancel();
             let _ = writeln!(err, "error: pairing timed out");
             return 4;
         }
-        let mut wait = interval;
-        match post_json(&format!("{server}/api/pair/poll"), &poll_body) {
-            Err(e) => {
-                failures += 1;
-                if failures >= MAX_NETWORK_FAILURES {
-                    let _ = writeln!(err, "error: the server stopped answering: {e}");
-                    return 5;
-                }
+        match host.web_pair_poll() {
+            Ok(PairPoll::Pending) => {}
+            Ok(PairPoll::Approved { account }) => {
+                emit(
+                    out,
+                    json!({
+                        "event": "paired",
+                        "desktopId": host.web_status().desktop_id,
+                        "account": account,
+                        "fingerprint": ticket.fingerprint,
+                    }),
+                );
+                return 0;
             }
-            Ok((code, body, retry_after)) => {
-                failures = 0;
-                match body.get("status").and_then(Value::as_str) {
-                    Some("approved") => {
-                        return store_pairing(&body, &private, &public, data_dir, out, err);
-                    }
-                    Some("denied" | "expired") => {
-                        let _ = writeln!(err, "error: pairing was {}", body["status"]);
-                        return 4;
-                    }
-                    Some("pending" | "slow_down") => {}
-                    _ if code == 429 => {
-                        wait = wait.max(Duration::from_secs(retry_after.unwrap_or(0)));
-                    }
-                    _ => {
-                        let _ = writeln!(err, "error: pair/poll answered {code}");
-                        return 2;
-                    }
-                }
+            Ok(PairPoll::Denied) => {
+                let _ = writeln!(err, "error: pairing was denied");
+                return 4;
+            }
+            Ok(PairPoll::Expired) => {
+                let _ = writeln!(err, "error: pairing was expired");
+                return 4;
+            }
+            Err(e) => {
+                let _ = writeln!(err, "error: {e}");
+                return 2;
             }
         }
-        std::thread::sleep(wait);
+        std::thread::sleep(interval);
     }
 }
 
-fn store_pairing(
-    body: &Value,
-    private: &[u8; 32],
-    public: &[u8; 32],
+// ---------------------------------------------------------------- serve
+
+/// What the fake app says about the one conversation: its turns and whether the assistant is busy.
+struct Conversation {
+    turns: Vec<Value>,
+    busy: bool,
+    next_turn: u64,
+    /// Replies not yet sent: when they are due and their text. Cleared by `session.cancel`.
+    replies: Vec<(Instant, String)>,
+}
+
+impl Conversation {
+    fn new() -> Self {
+        let mut conversation = Self {
+            turns: Vec::new(),
+            busy: false,
+            next_turn: 1,
+            replies: Vec::new(),
+        };
+        conversation.add_user("Please look at the E2E task.");
+        conversation.add_assistant("Canned E2E answer.");
+        conversation
+    }
+
+    fn turn_id(&mut self) -> String {
+        let id = format!("t{}", self.next_turn);
+        self.next_turn += 1;
+        id
+    }
+
+    fn add_user(&mut self, text: &str) {
+        let id = self.turn_id();
+        self.turns.push(json!({
+            "id": id,
+            "stampAt": 1_700_000_000_000u64 + self.next_turn,
+            "items": [{"type": "user", "id": format!("{id}-u"), "text": text}],
+        }));
+    }
+
+    fn add_assistant(&mut self, text: &str) {
+        let id = self.turn_id();
+        self.turns.push(json!({
+            "id": id,
+            "stampAt": 1_700_000_000_000u64 + self.next_turn,
+            "completedAt": 1_700_000_000_000u64 + self.next_turn,
+            "durationMs": 1,
+            "items": [{"type": "text", "id": format!("{id}-a"), "text": text}],
+        }));
+    }
+
+    /// `conversation.read`.
+    fn read(&self) -> Value {
+        json!({
+            "id": SESSION_ID,
+            "turns": self.turns,
+            "busy": self.busy,
+            "usageLimit": null,
+            "older": false,
+        })
+    }
+
+    /// A watch frame: every turn, in order (a frame that carries all of them is valid).
+    fn frame(&self) -> Value {
+        let order: Vec<&Value> = self.turns.iter().map(|turn| &turn["id"]).collect();
+        json!({
+            "usageLimit": null,
+            "busy": self.busy,
+            "older": false,
+            "order": order,
+            "turns": self.turns,
+            "question": null,
+        })
+    }
+
+    /// `conversation.send`: the user turn is appended at once, the reply comes later over the watch.
+    fn send(&mut self, text: &str, now: Instant) {
+        self.add_user(text);
+        self.busy = true;
+        if !text.contains(HOLD_MARKER) {
+            self.replies
+                .push((now + REPLY_DELAY, format!("Echo: {text}")));
+        }
+    }
+
+    /// `session.cancel`: no reply is coming any more.
+    fn cancel(&mut self) {
+        self.replies.clear();
+        self.busy = false;
+    }
+
+    /// Sends the replies that are due; returns whether anything changed.
+    fn tick(&mut self, now: Instant) -> bool {
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.replies)
+            .into_iter()
+            .partition(|(at, _)| *at <= now);
+        self.replies = later;
+        for (_, text) in &due {
+            self.add_assistant(text);
+        }
+        if !due.is_empty() && self.replies.is_empty() {
+            self.busy = false;
+        }
+        !due.is_empty()
+    }
+}
+
+/// The catalog the fake app publishes (the values of `web/e2e/lib/catalog.ts`).
+fn e2e_catalog() -> Value {
+    json!({
+        "projects": [{
+            "id": PROJECT_ID,
+            "name": PROJECT_NAME,
+            "path": "/e2e/project",
+            "branch": "main",
+        }],
+        "monos": [],
+        "sessions": [{
+            "id": SESSION_ID,
+            "projectId": PROJECT_ID,
+            "title": SESSION_TITLE,
+            "harness": "claude",
+            "model": "e2e-model",
+            "branch": "main",
+            "updatedAt": 1_700_000_000u64,
+        }],
+    })
+}
+
+/// One line the serve loop prints, or the end of the run.
+enum Output {
+    Line(Value),
+    Exit(i32),
+}
+
+type Lines = std::sync::mpsc::Sender<Output>;
+
+fn say(lines: &Lines, line: Value) {
+    let _ = lines.send(Output::Line(line));
+}
+
+fn permission_name(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Read => "read",
+        Permission::Control => "control",
+    }
+}
+
+impl ConfirmPermission {
+    fn permission(self) -> Permission {
+        match self {
+            ConfirmPermission::ReadOnly => Permission::Read,
+            ConfirmPermission::Control => Permission::Control,
+        }
+    }
+}
+
+/// The fake app: answers the events of the host from a deterministic conversation, on its own thread.
+fn app_loop(
+    host: MobileHost,
+    events: async_channel::Receiver<Event>,
+    lines: Lines,
+    stop: Arc<AtomicBool>,
+) {
+    let mut conversation = Conversation::new();
+    // Watch ids and whether the watch still has to be sent the current state.
+    let mut watches: Vec<(String, bool)> = Vec::new();
+    while !stop.load(Ordering::SeqCst) {
+        let mut idle = true;
+        while let Ok(event) = events.try_recv() {
+            idle = false;
+            match event {
+                Event::Request(request) => {
+                    say(
+                        &lines,
+                        json!({"event": "request", "method": request.method}),
+                    );
+                    let result = answer(&mut conversation, &request);
+                    if request.method == "conversation.send" || request.method == "session.cancel" {
+                        for watch in &mut watches {
+                            watch.1 = true;
+                        }
+                    }
+                    request.reply(result);
+                }
+                Event::Watch(start) => {
+                    if start.conversation_id == SESSION_ID {
+                        say(
+                            &lines,
+                            json!({"event": "watch", "action": "start", "conversationId": start.conversation_id}),
+                        );
+                        watches.push((start.id.clone(), true));
+                        start.accept(Ok(()));
+                    } else {
+                        start.accept(Err(Failure::from("Unknown conversation")));
+                    }
+                }
+                Event::WatchStop(id) => {
+                    say(&lines, json!({"event": "watch", "action": "stop"}));
+                    watches.retain(|(watch, _)| *watch != id);
+                }
+            }
+        }
+        if conversation.tick(Instant::now()) {
+            idle = false;
+            for watch in &mut watches {
+                watch.1 = true;
+            }
+        }
+        // Send the state to watches that are behind; a busy watch keeps its flag and is retried.
+        watches.retain_mut(|(id, dirty)| {
+            if !*dirty {
+                return true;
+            }
+            match host.push(id, conversation.frame()) {
+                Ok(()) => {
+                    *dirty = false;
+                    true
+                }
+                Err(Push::Busy) => true,
+                Err(Push::Gone) => false,
+            }
+        });
+        if idle {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn answer(conversation: &mut Conversation, request: &Request) -> Result<Value, Failure> {
+    let known = request.params["conversationId"].as_str() == Some(SESSION_ID);
+    match request.method.as_str() {
+        "conversation.read" if known => Ok(conversation.read()),
+        "conversation.send" if known => match request.params["text"].as_str() {
+            Some(text) if !text.is_empty() => {
+                conversation.send(text, Instant::now());
+                Ok(json!({"sessionId": SESSION_ID}))
+            }
+            _ => Err(Failure::from("Message text is missing")),
+        },
+        "session.cancel" if known => {
+            conversation.cancel();
+            Ok(json!({"sessionId": SESSION_ID}))
+        }
+        "conversation.read" | "conversation.send" | "session.cancel" => {
+            Err(Failure::from("Unknown conversation"))
+        }
+        _ => Err(Failure::coded(
+            "unsupported",
+            "The E2E desktop does not serve this method",
+        )),
+    }
+}
+
+/// Watches the web link: prints state changes, confirms pending devices when asked to (E2E only) and prints
+/// devices that disappeared.
+fn monitor_loop(
+    host: MobileHost,
+    confirm: Option<ConfirmPermission>,
+    known: Known,
+    lines: Lines,
+    stop: Arc<AtomicBool>,
+) {
+    let mut last_state = None;
+    let mut last_error: Option<String> = None;
+    while !stop.load(Ordering::SeqCst) {
+        let status = host.web_status();
+        if last_state != Some(status.state) {
+            match status.state {
+                WebState::Connected => say(
+                    &lines,
+                    json!({"event": "online", "desktopId": status.desktop_id, "fingerprint": status.fingerprint}),
+                ),
+                WebState::Revoked => say(&lines, json!({"event": "revoked", "scope": "desktop"})),
+                WebState::Offline if last_state == Some(WebState::Connected) => {
+                    say(&lines, json!({"event": "offline"}));
+                }
+                _ => {}
+            }
+            last_state = Some(status.state);
+        }
+        if status.error != last_error {
+            if let Some(message) = &status.error {
+                say(&lines, json!({"event": "error", "message": message}));
+            }
+            last_error = status.error.clone();
+        }
+        if let Some(confirm) = confirm {
+            for pending in &status.pending {
+                match host.web_confirm(&pending.fingerprint, confirm.permission(), None, None) {
+                    Ok(device) => say(
+                        &lines,
+                        json!({
+                            "event": "confirmed",
+                            "deviceId": device.server_device_id,
+                            "permission": permission_name(device.permission),
+                        }),
+                    ),
+                    Err(message) => say(&lines, json!({"event": "error", "message": message})),
+                }
+            }
+        }
+        let now: HashSet<String> = status
+            .devices
+            .iter()
+            .filter_map(|device| device.server_device_id.clone())
+            .collect();
+        let mut known = known.lock().unwrap_or_else(|e| e.into_inner());
+        for gone in known.difference(&now) {
+            say(
+                &lines,
+                json!({"event": "revoked", "scope": "device", "deviceId": gone}),
+            );
+        }
+        *known = now;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The relay ids of the paired devices the monitor saw last. A desktop-side `revoke` command removes its device
+/// here and prints the event itself, so a device revoked between two monitor ticks is still reported, once.
+type Known = Arc<std::sync::Mutex<HashSet<String>>>;
+
+/// A stdin command of `serve`.
+#[derive(Debug, PartialEq, Eq)]
+enum Cmd {
+    Revoke {
+        device_id: String,
+    },
+    Approve {
+        device_id: String,
+        permission: Permission,
+    },
+    Deny {
+        device_id: String,
+    },
+    Permission {
+        device_id: String,
+        permission: Permission,
+    },
+    Unpair,
+    Quit,
+}
+
+fn parse_command(line: &str) -> Result<Cmd, String> {
+    let value: Value = serde_json::from_str(line).map_err(|e| format!("not a JSON line: {e}"))?;
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{key} is missing"))
+    };
+    let permission = || match text("permission")?.as_str() {
+        "read-only" => Ok(Permission::Read),
+        "control" => Ok(Permission::Control),
+        _ => Err("permission must be read-only or control".to_owned()),
+    };
+    match text("cmd")?.as_str() {
+        "revoke" => Ok(Cmd::Revoke {
+            device_id: text("deviceId")?,
+        }),
+        "approve" => Ok(Cmd::Approve {
+            device_id: text("deviceId")?,
+            permission: permission()?,
+        }),
+        "deny" => Ok(Cmd::Deny {
+            device_id: text("deviceId")?,
+        }),
+        "permission" => Ok(Cmd::Permission {
+            device_id: text("deviceId")?,
+            permission: permission()?,
+        }),
+        "unpair" => Ok(Cmd::Unpair),
+        "quit" => Ok(Cmd::Quit),
+        other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// Runs one command. `Ok(Some(code))` ends the run.
+fn run_command(
+    host: &MobileHost,
+    command: Cmd,
+    known: &Known,
+    lines: &Lines,
+) -> Result<Option<i32>, String> {
+    let status = host.web_status();
+    // A device is named by the relay's id (what the web app and the directory call `deviceId`).
+    let paired = |id: &str| {
+        status
+            .devices
+            .iter()
+            .find(|d| d.server_device_id.as_deref() == Some(id) || d.id == id)
+            .cloned()
+            .ok_or_else(|| format!("no paired web device {id}"))
+    };
+    let pending = |id: &str| {
+        status
+            .pending
+            .iter()
+            .find(|p| p.server_device_id == id || p.fingerprint == id)
+            .cloned()
+            .ok_or_else(|| format!("no pending web device {id}"))
+    };
+    match command {
+        Cmd::Revoke { device_id } => {
+            let device = paired(&device_id)?;
+            host.web_revoke(&device.id)?;
+            if let Some(server_id) = device.server_device_id {
+                known
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&server_id);
+                say(
+                    lines,
+                    json!({"event": "revoked", "scope": "device", "deviceId": server_id}),
+                );
+            }
+        }
+        Cmd::Approve {
+            device_id,
+            permission,
+        } => {
+            let device =
+                host.web_confirm(&pending(&device_id)?.fingerprint, permission, None, None)?;
+            say(
+                lines,
+                json!({
+                    "event": "confirmed",
+                    "deviceId": device.server_device_id,
+                    "permission": permission_name(permission),
+                }),
+            );
+        }
+        Cmd::Deny { device_id } => host.web_deny(&pending(&device_id)?.fingerprint)?,
+        Cmd::Permission {
+            device_id,
+            permission,
+        } => {
+            let device = paired(&device_id)?;
+            host.set_device_access(
+                &device.id,
+                DeviceKind::Web,
+                permission,
+                device.projects.clone(),
+                device.monos.clone(),
+            )?;
+            say(
+                lines,
+                json!({
+                    "event": "permission",
+                    "deviceId": device.server_device_id,
+                    "permission": permission_name(permission),
+                }),
+            );
+        }
+        Cmd::Unpair => {
+            host.web_unpair()?;
+            say(lines, json!({"event": "unpaired"}));
+            return Ok(Some(0));
+        }
+        Cmd::Quit => return Ok(Some(0)),
+    }
+    Ok(None)
+}
+
+/// Reads commands until `quit`, `unpair` or the end of the input. The end of the input does NOT end the
+/// run (a harness may start `serve` with no stdin at all).
+fn command_loop(host: MobileHost, input: Box<dyn BufRead + Send>, known: Known, lines: Lines) {
+    for line in input.lines() {
+        let Ok(line) = line else { return };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let outcome =
+            parse_command(&line).and_then(|command| run_command(&host, command, &known, &lines));
+        match outcome {
+            Ok(Some(code)) => {
+                let _ = lines.send(Output::Exit(code));
+                return;
+            }
+            Ok(None) => {}
+            Err(message) => say(&lines, json!({"event": "error", "message": message})),
+        }
+    }
+}
+
+/// The desktop side of the web link for the E2E harness. Prints JSON lines on `out`, takes commands on
+/// `input`. Runs until `quit`, `unpair` or the process is killed.
+fn run_serve(
     data_dir: &Path,
+    confirm: Option<ConfirmPermission>,
+    input: Box<dyn BufRead + Send>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    let text = |key: &str| body.get(key).and_then(Value::as_str);
-    let handle = body["account"]["handle"].as_str();
-    let (Some(desktop_id), Some(token), Some(relay_url), Some(handle)) = (
-        text("desktopId"),
-        text("desktopToken"),
-        text("relayUrl"),
-        handle,
-    ) else {
-        let _ = writeln!(err, "error: the approval is missing fields");
-        return 2;
+    let (host, events) = match open_host(data_dir) {
+        Ok(opened) => opened,
+        Err(e) => {
+            let _ = writeln!(err, "error: {e}");
+            return 2;
+        }
     };
-    // E2E stand-in for the sealed web identity (identity_store::WebIdentity, not reachable from a binary):
-    // the same fields, in a 0600 file inside the throwaway data dir. It holds the token: never commit it.
-    let record = json!({
-        "format": "web-link-headless-pairing-v1",
-        "desktopId": desktop_id,
-        "desktopToken": token,
-        "relayUrl": relay_url,
-        "account": handle,
-        "staticPrivate": b64(private),
-        "staticPublic": b64(public),
-    });
-    if let Err(e) = write_private(&data_dir.join(PAIRING_FILE), record.to_string().as_bytes()) {
-        let _ = writeln!(err, "error: cannot save the pairing: {e}");
+    let _ = host.web_refresh_identity();
+    if !host.web_status().paired {
+        let _ = writeln!(
+            err,
+            "error: {} has no web pairing: run `pair` first",
+            data_dir.display()
+        );
         return 2;
     }
-    emit(
-        out,
-        json!({
-            "event": "paired",
-            "desktopId": desktop_id,
-            "account": handle,
-            "fingerprint": fingerprint(public),
-        }),
-    );
-    0
+    if let Err(e) = host.publish(e2e_catalog()) {
+        let _ = writeln!(err, "error: cannot publish the catalog: {e}");
+        return 2;
+    }
+    web_link::start(&host);
+    if let Err(e) = host.set_web_enabled(true) {
+        let _ = writeln!(err, "error: cannot start the web link: {e}");
+        return 2;
+    }
+    let (sender, receiver) = std::sync::mpsc::channel::<Output>();
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let (host, lines, stop) = (host.clone(), sender.clone(), stop.clone());
+        std::thread::spawn(move || app_loop(host, events, lines, stop));
+    }
+    let known = Known::default();
+    {
+        let (host, lines, stop, known) =
+            (host.clone(), sender.clone(), stop.clone(), known.clone());
+        std::thread::spawn(move || monitor_loop(host, confirm, known, lines, stop));
+    }
+    {
+        let (host, lines) = (host.clone(), sender.clone());
+        std::thread::spawn(move || command_loop(host, input, known, lines));
+    }
+    drop(sender);
+    let code = loop {
+        match receiver.recv() {
+            Ok(Output::Line(line)) => emit(out, line),
+            Ok(Output::Exit(code)) => break code,
+            Err(_) => break 0,
+        }
+    };
+    while let Ok(Output::Line(line)) = receiver.try_recv() {
+        emit(out, line);
+    }
+    stop.store(true, Ordering::SeqCst);
+    host.shutdown();
+    code
 }
 
 // ---------------------------------------------------------------- check-vectors
@@ -693,19 +1192,16 @@ fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             machine_name,
             timeout,
         } => run_pair(&server, &data_dir, &machine_name, timeout, None, out, err),
-        Command::Serve { data_dir, .. } => {
-            // The pairing must exist first; its token is never printed.
-            if !data_dir.join(PAIRING_FILE).is_file() {
-                let _ = writeln!(
-                    err,
-                    "error: {} has no {PAIRING_FILE}: run `pair` first",
-                    data_dir.display()
-                );
-                return 2;
-            }
-            let _ = writeln!(err, "{SERVE_NOT_WIRED}");
-            3
-        }
+        Command::Serve {
+            data_dir,
+            confirm_pending,
+        } => run_serve(
+            &data_dir,
+            confirm_pending,
+            Box::new(std::io::BufReader::new(std::io::stdin())),
+            out,
+            err,
+        ),
     }
 }
 
@@ -909,7 +1405,7 @@ mod tests {
         let value: Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(
             value,
-            json!({"version": 1, "serve": false, "pair": true, "reason": "serve needs a pub web identity save, grant confirm and grant sync from WS-D1 (R-05, R-15)", "checkVectors": true})
+            json!({"version": 1, "serve": true, "pair": true, "reason": null, "checkVectors": true})
         );
     }
 
@@ -965,36 +1461,164 @@ mod tests {
     }
 
     #[test]
-    fn serve_needs_a_pairing_and_then_reports_what_is_missing() {
+    fn serve_needs_a_pairing() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().to_str().unwrap();
-        let (code, _, err) = run_capture(&["serve", "--data-dir", data]);
+        let (code, out, err) = run_capture(&["serve", "--data-dir", data]);
         assert_eq!(code, 2);
-        assert!(err.contains("run `pair` first"));
-        std::fs::write(
-            dir.path().join(PAIRING_FILE),
-            r#"{"desktopToken":"obviously-fake-token-value"}"#,
+        assert!(err.contains("run `pair` first"), "{err}");
+        assert!(out.is_empty());
+    }
+
+    // ------------------------------------------------------------ the fake app
+
+    #[test]
+    fn the_catalog_holds_the_e2e_names() {
+        let catalog = e2e_catalog();
+        assert_eq!(catalog["projects"][0]["name"], "E2E Project");
+        assert_eq!(catalog["sessions"][0]["title"], "E2E session");
+        assert_eq!(
+            catalog["sessions"][0]["projectId"],
+            catalog["projects"][0]["id"]
+        );
+    }
+
+    #[test]
+    fn send_appends_the_text_and_the_reply_comes_later() {
+        let mut conversation = Conversation::new();
+        let seeded = conversation.turns.len();
+        let now = Instant::now();
+        conversation.send("hello", now);
+        assert_eq!(conversation.turns.len(), seeded + 1);
+        assert_eq!(conversation.turns[seeded]["items"][0]["text"], "hello");
+        assert!(conversation.read()["busy"].as_bool().unwrap());
+        assert!(!conversation.tick(now), "the reply is not due yet");
+        assert!(conversation.tick(now + REPLY_DELAY));
+        assert_eq!(conversation.turns.len(), seeded + 2);
+        assert_eq!(
+            conversation.turns[seeded + 1]["items"][0]["text"],
+            "Echo: hello"
+        );
+        assert!(!conversation.busy);
+        let frame = conversation.frame();
+        assert_eq!(frame["order"].as_array().unwrap().len(), seeded + 2);
+        assert_eq!(frame["turns"], json!(conversation.turns));
+    }
+
+    #[test]
+    fn a_held_send_streams_until_cancel() {
+        let mut conversation = Conversation::new();
+        let now = Instant::now();
+        conversation.send("keep going [hold]", now);
+        assert!(!conversation.tick(now + Duration::from_secs(60)));
+        assert!(conversation.busy);
+        conversation.cancel();
+        assert!(!conversation.busy);
+        assert!(!conversation.tick(now + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn requests_for_other_conversations_and_methods_are_refused() {
+        use monocode_core::mobile::DeviceContext;
+        let context = DeviceContext {
+            id: "d".into(),
+            kind: DeviceKind::Web,
+            permission: Permission::Control,
+            projects: None,
+            monos: None,
+        };
+        let mut conversation = Conversation::new();
+        let ask = |conversation: &mut Conversation, method: &str, params: Value| {
+            let (request, _) = Request::with_receiver("c", method, params, context.clone());
+            answer(conversation, &request)
+        };
+        let read = ask(
+            &mut conversation,
+            "conversation.read",
+            json!({"conversationId": SESSION_ID}),
         )
         .unwrap();
-        let (code, out, err) = run_capture(&["serve", "--data-dir", data]);
-        assert_eq!(code, 3);
-        assert!(err.contains("TODO(E-01:WS-D1 R-05, R-15)"));
-        assert!(!out.contains("obviously-fake") && !err.contains("obviously-fake"));
+        assert_eq!(read["turns"].as_array().unwrap().len(), 2);
+        let other = ask(
+            &mut conversation,
+            "conversation.read",
+            json!({"conversationId": "nope"}),
+        );
+        assert!(other.is_err());
+        let empty = ask(
+            &mut conversation,
+            "conversation.send",
+            json!({"conversationId": SESSION_ID, "text": ""}),
+        );
+        assert!(empty.is_err());
+        let unsupported = ask(&mut conversation, "project.files", json!({})).unwrap_err();
+        assert_eq!(unsupported.code.as_deref(), Some("unsupported"));
+    }
+
+    #[test]
+    fn commands_parse() {
+        assert_eq!(parse_command(r#"{"cmd":"quit"}"#), Ok(Cmd::Quit));
+        assert_eq!(parse_command(r#"{"cmd":"unpair"}"#), Ok(Cmd::Unpair));
+        assert_eq!(
+            parse_command(r#"{"cmd":"revoke","deviceId":"x"}"#),
+            Ok(Cmd::Revoke {
+                device_id: "x".into()
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"approve","deviceId":"x","permission":"read-only"}"#),
+            Ok(Cmd::Approve {
+                device_id: "x".into(),
+                permission: Permission::Read
+            })
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"permission","deviceId":"x","permission":"control"}"#),
+            Ok(Cmd::Permission {
+                device_id: "x".into(),
+                permission: Permission::Control
+            })
+        );
+        for bad in [
+            "not json",
+            r#"{"cmd":"revoke"}"#,
+            r#"{"cmd":"approve","deviceId":"x"}"#,
+            r#"{"cmd":"approve","deviceId":"x","permission":"admin"}"#,
+            r#"{"cmd":"dance"}"#,
+            "{}",
+        ] {
+            assert!(parse_command(bad).is_err(), "{bad}");
+        }
     }
 
     // ------------------------------------------------------------ pair against a local HTTP stub
 
-    use std::io::{BufRead, BufReader, Read};
+    use std::io::{BufReader, Read};
     use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     type Seen = Arc<Mutex<Vec<(String, Value)>>>;
 
+    const FAKE_TOKEN: &str = "obviously-fake-desktop-token";
+    const FAKE_DEVICE_CODE: &str = "obviously-fake-device-code";
+    const DESKTOP_ID: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn approved() -> (u16, String) {
+        (
+            200,
+            format!(
+                r#"{{"status":"approved","desktopId":"{DESKTOP_ID}","desktopToken":"{FAKE_TOKEN}","account":{{"handle":"alice"}},"relayUrl":"ws://127.0.0.1:{{PORT}}/relay/desktop/{DESKTOP_ID}"}}"#
+            ),
+        )
+    }
+
     /// A one-thread HTTP stub of `/api/pair/start` and `/api/pair/poll`. Answers each poll from `polls`
-    /// (a status line and a body); records every request body.
-    fn stub(polls: Vec<(u16, &'static str)>) -> (String, Seen) {
+    /// (a status and a body, `{PORT}` replaced by the stub's port); records every request body. Any other
+    /// path (the relay the host dials after an approval) gets a 404.
+    fn stub(polls: Vec<(u16, String)>) -> (String, Seen) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
         let seen: Seen = Arc::default();
         let log = seen.clone();
         std::thread::spawn(move || {
@@ -1020,18 +1644,25 @@ mod tests {
                 let mut body = vec![0u8; length];
                 reader.read_exact(&mut body).unwrap();
                 let path = request_line.split_whitespace().nth(1).unwrap().to_string();
-                log.lock().unwrap().push((
-                    path.clone(),
-                    serde_json::from_slice(&body).unwrap_or(Value::Null),
-                ));
                 let (status, text) = if path == "/api/pair/start" {
                     (
                         200,
-                        r#"{"userCode":"ABCD-2345","deviceCode":"obviously-fake-device-code","confirmationCode":"123456","expiresIn":600,"interval":3}"#,
+                        format!(
+                            r#"{{"userCode":"ABCD-2345","deviceCode":"{FAKE_DEVICE_CODE}","confirmationCode":"123456","expiresIn":600,"interval":3}}"#
+                        ),
                     )
+                } else if path == "/api/pair/poll" {
+                    polls.next().unwrap_or((500, "{}".into()))
                 } else {
-                    polls.next().unwrap_or((500, "{}"))
+                    (404, "{}".into())
                 };
+                if path.starts_with("/api/pair/") {
+                    log.lock().unwrap().push((
+                        path.clone(),
+                        serde_json::from_slice(&body).unwrap_or(Value::Null),
+                    ));
+                }
+                let text = text.replace("{PORT}", &port.to_string());
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
                     text.len()
@@ -1061,15 +1692,8 @@ mod tests {
     }
 
     #[test]
-    fn pair_prints_the_user_code_polls_and_stores_the_identity() {
-        let (base, seen) = stub(vec![
-            (200, r#"{"status":"pending"}"#),
-            (429, r#"{"error":"slow","code":"rate_limited"}"#),
-            (
-                200,
-                r#"{"status":"approved","desktopId":"11111111-2222-4333-8444-555555555555","desktopToken":"obviously-fake-desktop-token","account":{"handle":"alice"},"relayUrl":"ws://127.0.0.1:1/relay/desktop/x"}"#,
-            ),
-        ]);
+    fn pair_prints_the_user_code_polls_and_seals_the_identity() {
+        let (base, seen) = stub(vec![(200, r#"{"status":"pending"}"#.into()), approved()]);
         let dir = tempfile::tempdir().unwrap();
         let (code, out, err) = pair_capture(&base, dir.path(), Duration::from_secs(20));
         assert_eq!(code, 0, "stderr: {err}");
@@ -1083,52 +1707,61 @@ mod tests {
         assert_eq!(lines[0]["confirmationCode"], "123456");
         assert_eq!(lines[1]["event"], "paired");
         assert_eq!(lines[1]["account"], "alice");
-        // The token and the device code never reach stdout or stderr.
+        assert_eq!(lines[1]["desktopId"], DESKTOP_ID);
+        assert_eq!(lines[1]["fingerprint"], lines[0]["fingerprint"]);
+        // The token and the device code never reach stdout or stderr, and no plain token file exists.
         let output = format!("{out}{err}");
         assert!(!output.contains("obviously-fake"));
-        // The stored identity is complete.
-        let stored: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join(PAIRING_FILE)).unwrap())
-                .unwrap();
-        assert_eq!(stored["desktopToken"], "obviously-fake-desktop-token");
-        assert_eq!(stored["desktopId"], "11111111-2222-4333-8444-555555555555");
-        assert_eq!(stored["staticPublic"].as_str().unwrap().len(), 43);
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && path.extension().is_none_or(|e| e != "db") {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                assert!(
+                    !String::from_utf8_lossy(&bytes).contains(FAKE_TOKEN),
+                    "{} holds the token in clear",
+                    path.display()
+                );
+            }
+        }
+        // A new host on the same directory finds the sealed identity.
+        let (host, _events) = open_host(dir.path()).unwrap();
+        host.web_refresh_identity().unwrap();
+        let status = host.web_status();
+        assert!(status.paired);
+        assert_eq!(status.desktop_id.as_deref(), Some(DESKTOP_ID));
+        assert_eq!(status.account.as_deref(), Some("alice"));
+        assert_eq!(
+            status.fingerprint.as_deref(),
+            lines[1]["fingerprint"].as_str()
+        );
         // The start body carries the key and a challenge that the poll's verifier answers.
         let seen = seen.lock().unwrap();
         let (start_path, start) = &seen[0];
         assert_eq!(start_path, "/api/pair/start");
         assert_eq!(start["machineName"], "stub-machine");
-        assert_eq!(start["publicKey"], stored["staticPublic"]);
         use base64::Engine;
         use sha2::{Digest, Sha256};
         let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(seen[1].1["verifier"].as_str().unwrap())
             .unwrap();
         assert_eq!(
-            b64(&Sha256::digest(verifier)),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier)),
             start["challenge"].as_str().unwrap()
         );
-        assert_eq!(seen[1].1["deviceCode"], "obviously-fake-device-code");
-        assert_eq!(seen.len(), 4);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(PAIRING_FILE))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o077, 0, "the pairing file must be private");
-        }
+        assert_eq!(seen[1].1["deviceCode"], FAKE_DEVICE_CODE);
+        assert_eq!(seen.len(), 3);
     }
 
     #[test]
-    fn pair_exit_4_when_denied_and_stores_nothing() {
-        let (base, _) = stub(vec![(200, r#"{"status":"denied"}"#)]);
+    fn pair_exit_4_when_denied_and_seals_nothing() {
+        let (base, _) = stub(vec![(200, r#"{"status":"denied"}"#.into())]);
         let dir = tempfile::tempdir().unwrap();
         let (code, out, _) = pair_capture(&base, dir.path(), Duration::from_secs(20));
         assert_eq!(code, 4);
         assert!(out.contains("ABCD-2345"));
-        assert!(!dir.path().join(PAIRING_FILE).exists());
+        let (host, _events) = open_host(dir.path()).unwrap();
+        host.web_refresh_identity().unwrap();
+        assert!(!host.web_status().paired);
     }
 
     #[test]
@@ -1150,10 +1783,37 @@ mod tests {
 
     #[test]
     fn pair_times_out_with_exit_4() {
-        let (base, _) = stub(vec![(200, r#"{"status":"pending"}"#); 1000]);
+        let (base, _) = stub(vec![(200, r#"{"status":"pending"}"#.into()); 1000]);
         let dir = tempfile::tempdir().unwrap();
         let (code, _, err) = pair_capture(&base, dir.path(), Duration::from_millis(200));
         assert_eq!(code, 4);
         assert!(err.contains("timed out"));
+    }
+
+    #[test]
+    fn serve_runs_after_a_pairing_until_quit_and_prints_no_token() {
+        let (base, _) = stub(vec![approved()]);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            pair_capture(&base, dir.path(), Duration::from_secs(20)).0,
+            0
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let input = std::io::Cursor::new(
+            "not json\n{\"cmd\":\"revoke\",\"deviceId\":\"nobody\"}\n{\"cmd\":\"quit\"}\n",
+        );
+        let code = run_serve(dir.path(), None, Box::new(input), &mut out, &mut err);
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let out = String::from_utf8(out).unwrap();
+        let events: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let errors = events.iter().filter(|e| e["event"] == "error").count();
+        assert!(errors >= 2, "bad commands are reported: {out}");
+        assert!(
+            !out.contains("obviously-fake")
+                && !String::from_utf8_lossy(&err).contains("obviously-fake")
+        );
     }
 }
