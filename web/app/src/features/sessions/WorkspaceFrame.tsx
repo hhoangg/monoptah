@@ -12,6 +12,7 @@ import { Glass } from "@/ui/Glass";
 import { Icon } from "@/ui/Icon";
 import { trackSessions } from "./activityStore";
 import { useRememberPlace } from "./lastPlace";
+import { useCatalogUnreadMonos } from "./monoSeen";
 import { WorkspaceNav } from "./WorkspaceNav";
 
 /** True when the device may only read (`permission: read`). */
@@ -46,6 +47,8 @@ export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, 
   const readOnly = useReadOnly();
   const wide = useMediaQuery(WIDE_QUERY);
   const [open, setOpen] = useState(false);
+  // F-17: the menu button says when a Mono has a reply not seen on this device.
+  const hasUnread = useCatalogUnreadMonos(desktopId).size > 0;
 
   return (
     <div className="mx-auto flex w-full max-w-[1280px]" data-testid={testId}>
@@ -59,8 +62,14 @@ export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, 
           {wide ? null : (
             <DrawerPrimitive.Root direction="left" open={open} onOpenChange={setOpen}>
               <DrawerPrimitive.Trigger asChild>
-                <button type="button" aria-label="Open workspace list" className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection">
+                <button
+                  type="button"
+                  aria-label={hasUnread ? "Open workspace list, new replies" : "Open workspace list"}
+                  data-unread={hasUnread}
+                  className="relative inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection"
+                >
                   <Icon name="sidebar" size={20} />
+                  {hasUnread ? <span aria-hidden="true" data-testid="drawer-unread-badge" className="absolute top-2 right-2 size-2.5 rounded-pill border-2 border-background bg-brand" /> : null}
                 </button>
               </DrawerPrimitive.Trigger>
               <DrawerPortal>

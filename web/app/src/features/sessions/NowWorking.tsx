@@ -14,7 +14,9 @@ import { HarnessIcon } from "@/ui/HarnessIcon";
 import { Icon } from "@/ui/Icon";
 import { TerminalSpinner } from "@/features/transcript/TerminalSpinner";
 import { markStoppedHere, useSessionActivity } from "./activityStore";
+import { FinishedDeck } from "./FinishedDeck";
 import { statusLabel } from "./SessionCard";
+import { Ticker } from "./Ticker";
 
 export const READ_ONLY_STOP_REASON = "This device is read-only";
 
@@ -65,7 +67,7 @@ function Artwork({ session }: { session: SessionCard }) {
 }
 
 export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: string; projectId: string; readOnly: boolean }) {
-  const { working: live, arrivals } = useSessionActivity(projectId);
+  const { working: live, finished, arrivals } = useSessionActivity(projectId);
   const [active, setActive] = useState(0);
   const [open, setOpen] = useState(false);
   const { stop, error } = useStop(desktopId);
@@ -82,7 +84,14 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
     }
   }
 
-  if (live.length === 0) return null;
+  if (live.length === 0 && finished.length === 0) return null;
+  if (live.length === 0) {
+    return (
+      <div data-testid="now-working" className="pointer-events-none fixed inset-x-0 bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3">
+        <FinishedDeck desktopId={desktopId} entries={finished} />
+      </div>
+    );
+  }
   const index = Math.min(active, live.length - 1);
   const current = live[index] as SessionCard;
   const many = live.length > 1;
@@ -104,6 +113,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
       data-testid="now-working"
       className="pointer-events-none fixed inset-x-0 bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3"
     >
+      <FinishedDeck desktopId={desktopId} entries={finished} />
       {expanded ? (
         <ul aria-label="Working sessions" className="pointer-events-auto flex w-full max-w-[560px] flex-col gap-2">
           {live.map((session) => (
@@ -134,7 +144,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
             onClick={() => setOpen((was) => !was)}
             className="flex min-w-0 flex-1 flex-col text-left"
           >
-            <span className="truncate text-label font-semibold">{current.title}</span>
+            <Ticker text={current.title} className="text-label font-semibold" />
             {subtitle}
           </button>
         ) : (
@@ -144,7 +154,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
             aria-label={`${current.title}, ${statusLabel(current).toLowerCase()}. Open`}
             className="flex min-w-0 flex-1 flex-col"
           >
-            <span className="truncate text-label font-semibold">{current.title}</span>
+            <Ticker text={current.title} className="text-label font-semibold" />
             {subtitle}
           </Link>
         )}

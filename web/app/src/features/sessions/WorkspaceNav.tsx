@@ -4,7 +4,7 @@
 // vaul drawer on the mobile layout and of the persistent sidebar from 768 px up. The desktop nav entries
 // (`desktop-nav-items` slot, Settings, Desktops) sit at the foot.
 import { Link, useRouterState } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useCatalog } from "@/data";
 import { useCapability } from "@/version";
 import { safeHexColor } from "@/lib/color";
@@ -14,7 +14,9 @@ import { Icon } from "@/ui/Icon";
 import { Input } from "@/ui/input";
 import { Slot } from "@/ui/slots";
 import { useDrawerFilter, type DrawerFilter, type DrawerShow } from "./drawerFilter";
+import { markMonoSeen, useCatalogUnreadMonos } from "./monoSeen";
 import { projectColor } from "./projectColors";
+import { ProjectMascot } from "./ProjectMascot";
 import { chatListTime } from "./relativeTime";
 import { canCreateMono, filterWorkspace, monoUnread, type CatalogMono, type CatalogProject } from "./workspaceFilter";
 
@@ -57,9 +59,7 @@ export function ProjectRow({ desktopId, project, active, onNavigate }: { desktop
       className={cn("flex min-h-13 items-center gap-3.5 rounded-row px-2.5 py-2 hover:bg-content-a04", active && "bg-selection hover:bg-selection")}
     >
       <span className="flex w-10 shrink-0 justify-center">
-        <span aria-hidden="true" className="flex size-6 items-center justify-center rounded-md" style={{ backgroundColor: accentFor(project.name, project.color) }}>
-          <Icon name="folder" size={14} className="text-white" />
-        </span>
+        <ProjectMascot project={project.path} name={project.mascot} color={accentFor(project.name, project.color)} size={24} active={!!project.busy} />
       </span>
       <span className="min-w-0 flex-1 truncate text-row font-semibold">{project.name}</span>
       {project.busy ? <span aria-label="Working" className="size-2 shrink-0 rounded-pill bg-brand" /> : null}
@@ -67,8 +67,21 @@ export function ProjectRow({ desktopId, project, active, onNavigate }: { desktop
   );
 }
 
-export function MonoRow({ desktopId, mono, active, onNavigate }: { desktopId: string; mono: CatalogMono; active: boolean; onNavigate?: () => void }) {
-  const unread = monoUnread(mono);
+export function MonoRow({
+  desktopId,
+  mono,
+  active,
+  unread: unreadGiven,
+  onNavigate,
+}: {
+  desktopId: string;
+  mono: CatalogMono;
+  active: boolean;
+  /** A reply not seen on this device (F-17); the desktop's own count when omitted. */
+  unread?: boolean;
+  onNavigate?: () => void;
+}) {
+  const unread = unreadGiven ?? monoUnread(mono);
   const detail = mono.status === "working" ? "Working…" : mono.status === "needs-you" ? "Needs you" : oneLine(mono.lastMessage ?? "") || "No messages yet";
   return (
     <Link
@@ -161,7 +174,14 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
   const [query, setQuery] = useState("");
   const active = useActivePlace(desktopId);
   const data = catalog.data;
-  const { monos, projects } = data ? filterWorkspace(data, query, { filter, show }) : { monos: [], projects: [] };
+  const unreadIds = useCatalogUnreadMonos(desktopId);
+  const { monos, projects } = data ? filterWorkspace(data, query, { filter, show }, unreadIds) : { monos: [], projects: [] };
+
+  // A Mono open on screen has its latest reply seen (F-17).
+  const openMono = data?.monos.find((mono) => mono.id === active.monoId);
+  useEffect(() => {
+    if (openMono) markMonoSeen(desktopId, openMono);
+  }, [desktopId, openMono]);
   const narrowed = query.trim() !== "" || filter !== "all" || show !== "both";
 
   return (
@@ -183,7 +203,7 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
           <section aria-label="Monos" className="flex flex-col gap-0.5">
             <h2 className="px-2.5 pb-1 text-meta font-medium text-muted-text">Monos</h2>
             {monos.map((mono) => (
-              <MonoRow key={mono.id} desktopId={desktopId} mono={mono} active={mono.id === active.monoId} onNavigate={onNavigate} />
+              <MonoRow key={mono.id} desktopId={desktopId} mono={mono} active={mono.id === active.monoId} unread={unreadIds.has(mono.id)} onNavigate={onNavigate} />
             ))}
           </section>
         ) : null}
