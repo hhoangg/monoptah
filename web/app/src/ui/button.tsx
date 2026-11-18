@@ -8,16 +8,16 @@ import { cn } from "@/lib/utils";
 // (bg primary = inverseSurface, text inverse), never accent-colored. No shadows, radii from the
 // scale, >= 44px on touch and 36px on pointer: fine, visible focus comes from the global outline.
 export const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 text-center text-small font-semibold outline-offset-2 transition-[opacity,background-color] duration-150 select-none active:opacity-60 disabled:pointer-events-none disabled:opacity-40 [&_svg]:pointer-events-none [&_svg]:shrink-0",
+  "inline-flex shrink-0 items-center justify-center gap-2 text-center text-small font-semibold outline-offset-2 transition-[opacity,background-color] duration-150 select-none active:opacity-60 disabled:pointer-events-none disabled:opacity-40 aria-busy:cursor-progress aria-busy:opacity-100 [&_[role=status]]:text-current [&_svg]:pointer-events-none [&_svg]:shrink-0",
   {
     variants: {
       variant: {
-        default: "bg-primary text-primary-foreground",
+        default: "bg-primary text-primary-foreground hover:opacity-90",
         secondary: "bg-secondary text-secondary-foreground hover:bg-selection",
-        outline: "border border-stroke bg-transparent text-content hover:bg-selection",
+        outline: "border border-stroke bg-fill text-content hover:bg-selection",
         ghost: "bg-transparent text-content hover:bg-selection",
         link: "bg-transparent text-brand-text hover:underline",
-        destructive: "bg-destructive text-inverse",
+        destructive: "bg-destructive text-inverse hover:opacity-90",
         /** Round icon button over content: bg fill, icon turns brand when `data-on`. */
         circle: "bg-fill text-content hover:bg-selection data-[on=true]:text-brand",
       },
