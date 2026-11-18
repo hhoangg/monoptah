@@ -10,10 +10,13 @@
 // - A read-only device cannot write: the field and buttons are disabled and a line says why.
 // - Offline (the link is not ready) keeps the field open for writing; only Send and Stop wait.
 // - Attachments: a file picker, paste and drop, limited as in `attachments.ts`.
-// - F-47 morph: the glass is a pill (round, one line) at rest and morphs to a card (26 px corners, a taller field)
-//   while it has focus, a draft, an attachment, a notice or an error. The radius and the field height animate with
-//   `motion` (it writes through the CSSOM, so the CSP needs no inline style attribute); with
-//   `prefers-reduced-motion` the change is instant. `data-shape` says which one it is.
+// - F-47 morph (design-system.md section 6.2 and the Composer row): at rest the glass is a one-line pill, 50 px
+//   high with 25 px corners: add, dictation, the field and Send in one row; the workspace row and the model
+//   controls are clipped to nothing (still in the DOM, so a Tab into them focuses and opens the card). It becomes
+//   the card (26 px corners, field min 64, two rows) while it has focus, a draft, an attachment, a notice or an
+//   error. The size change is a `motion` layout animation of 280 ms out-cubic (`--ease-out-cubic`); motion writes
+//   through the CSSOM, so the CSP needs no inline style attribute. With `prefers-reduced-motion` it is instant.
+//   `data-shape` says which one it is.
 import { useReducedMotion } from "motion/react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
 import { DictationButton } from "@/features/dictation";
@@ -43,10 +46,12 @@ export const DESKTOP_LAYOUT_QUERY = "(min-width: 640px) and (pointer: fine)";
 const INPUT_MIN_PX = 64;
 const INPUT_MAX_PX = 160;
 /** The resting pill: a one-line field with fully round ends. */
-export const PILL_FIELD_MIN_PX = 40;
-export const PILL_RADIUS_PX = 32;
+export const PILL_FIELD_MIN_PX = 24;
+export const PILL_HEIGHT_PX = 50;
+export const PILL_RADIUS_PX = 25;
 export const CARD_RADIUS_PX = 26;
-const MORPH_TRANSITION = { type: "spring", stiffness: 260, damping: 26, mass: 0.8 } as const;
+/** design-system.md section 6.2: 280 ms with `--ease-out-cubic` (cubic-bezier(0.215, 0.61, 0.355, 1)). */
+export const MORPH_TRANSITION = { duration: 0.28, ease: [0.215, 0.61, 0.355, 1] } as const;
 
 export interface ComposerProps {
   /** Guards and sends. Resolve to clear the draft, reject to keep it. */
@@ -208,8 +213,9 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
   return (
     <div data-testid="composer" className={cn("pb-3 pt-1", className)} style={inset ? { marginBottom: inset } : undefined}>
       <Glass
-        className="flex flex-col gap-1 px-3 pb-2 pt-3"
+        className={cn("flex", card ? "flex-col gap-1 px-3 pb-2 pt-3" : "min-h-[50px] flex-row items-center gap-1 px-1.5 py-[3px]")}
         data-shape={card ? "card" : "pill"}
+        layout
         initial={false}
         animate={{ borderRadius: card ? CARD_RADIUS_PX : PILL_RADIUS_PX }}
         transition={reducedMotion ? { duration: 0 } : MORPH_TRANSITION}
@@ -222,7 +228,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
         }}
         onDrop={onDrop}
       >
-        {topRow ? <div className="flex min-w-0 items-center gap-2 px-1">{topRow}</div> : null}
+        {topRow ? <div className={card ? "flex min-w-0 items-center gap-2 px-1" : "size-0 overflow-hidden"}>{topRow}</div> : null}
 
         {attachments.length > 0 ? (
           <ul aria-label="Attachments" className="m-0 flex list-none gap-2 overflow-x-auto px-1 py-1">
@@ -258,12 +264,12 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
             onKeyDown={onKeyDown}
             onPaste={onPaste}
             onFocus={onFocus}
-            className="block w-full resize-none bg-transparent px-1 motion-safe:transition-[height] motion-safe:duration-200 text-row text-content outline-none placeholder:text-muted-text disabled:opacity-60"
+            className={cn("order-3 block min-w-0 resize-none bg-transparent text-row text-content outline-none placeholder:text-muted-text disabled:opacity-60", card ? "order-none w-full px-1" : "flex-1 px-2")}
             style={{ minHeight: fieldMin, maxHeight: INPUT_MAX_PX }}
           />
         )}
 
-        <div className={cn("flex min-w-0 items-center gap-2", blocked && "pointer-events-none opacity-50")}>
+        <div className={card ? cn("flex min-w-0 items-center gap-2", blocked && "pointer-events-none opacity-50") : "contents"}>
           <input
             ref={picker}
             type="file"
@@ -281,19 +287,19 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
             aria-label="Add photos or files"
             disabled={readOnly || blocked}
             onClick={() => picker.current?.click()}
-            className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill text-content hover:bg-selection disabled:opacity-40 pointer-fine:size-9"
+            className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill text-content hover:bg-selection disabled:opacity-40 pointer-fine:size-9", !card && "order-1")}
           >
             <Icon name="add" size={18} />
           </button>
-          <DictationButton onText={insertText} disabled={readOnly || blocked} className="size-11 pointer-fine:size-9" />
-          <div className="flex min-w-0 flex-1 items-center">{toolbar}</div>
+          <DictationButton onText={insertText} disabled={readOnly || blocked} className={cn("size-11 pointer-fine:size-9", !card && "order-2")} />
+          <div className={card ? "flex min-w-0 flex-1 items-center" : "order-4 size-0 overflow-hidden"}>{toolbar}</div>
           {showStop ? (
             <button
               type="button"
               aria-label="Stop"
               disabled={stopping || offline || readOnly}
               onClick={() => void stop()}
-              className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 pointer-fine:size-9"
+              className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 pointer-fine:size-9", !card && "order-5")}
             >
               <span aria-hidden="true" className="block size-3 rounded-[3px] bg-current" />
             </button>
@@ -304,7 +310,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, off
               disabled={!canSend}
               aria-busy={submitting}
               onClick={() => void submit()}
-              className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 pointer-fine:size-9"
+              className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 pointer-fine:size-9", !card && "order-5")}
             >
               <Icon name="send" size={18} />
             </button>
