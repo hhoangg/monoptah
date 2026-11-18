@@ -240,7 +240,7 @@ export async function forgetDevice(queryClient: QueryClient, deviceId: string): 
   const local = await getDeviceKeyInfo().catch(() => null);
   const wasThisDevice = local?.deviceId === deviceId;
   try {
-    await apiFetch(desktopEndpoints.forgetDevice, { params: { id: deviceId } });
+    await withFreshAuth(() => apiFetch(desktopEndpoints.forgetDevice, { params: { id: deviceId } }));
   } catch (error) {
     if (!(wasThisDevice && isApiError(error, "not_found"))) throw error;
   }

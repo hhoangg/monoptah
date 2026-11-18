@@ -16,6 +16,7 @@ const ME = {
   user: { id: "u1", handle: "dev-user", displayName: "Dev", role: "user" },
   invitesLeft: 3,
   recoveryOnly: false,
+  recoveryCodesLeft: 10,
   recoveryAckAt: 1,
 };
 

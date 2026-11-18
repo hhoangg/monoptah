@@ -1,6 +1,6 @@
 // Handlers of the session routes: `GET /api/sessions`, `DELETE /api/sessions/:id`, `POST /api/auth/logout`.
 import type { Handler } from "hono";
-import { SessionsResponse } from "@monoptah/protocol";
+import { LogoutBody, SessionsResponse } from "@monoptah/protocol";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { requireAuth } from "../../middleware/auth.ts";
 import { nowSeconds } from "../../lib/time.ts";
@@ -10,6 +10,9 @@ import { clearSessionCookie, publicSessionId, revokeSessions } from "./session.t
 /** Live sessions of a user: not revoked, before both expiries. Uses `sessions_user_id_idx`. */
 export const LIST_USER_SESSIONS_SQL =
   "SELECT id_hash, created_at, last_seen_at, user_agent, amr FROM sessions WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ? AND idle_expires_at > ? ORDER BY created_at DESC";
+
+/** The caller's push subscriptions on one device (index `push_subscriptions_device_id_idx`); `user_id` keeps it to their own. */
+export const LOGOUT_PUSH_SQL = "DELETE FROM push_subscriptions WHERE device_id = ? AND user_id = ?";
 
 interface ListRow {
   id_hash: string;
@@ -65,8 +68,14 @@ export const revokeSession: Handler<AppEnv> = async (c) => {
 /** Deletes the current session row, closes its sockets and clears the cookie. */
 export const logout: Handler<AppEnv> = async (c) => {
   const { user, session } = requireAuth(c);
+  // The optional body names this browser's device. A missing or malformed body only skips the push cleanup:
+  // signing out must never fail because of it.
+  const body = LogoutBody.safeParse(await c.req.json().catch(() => undefined));
+  const deviceId = body.success ? body.data?.deviceId : undefined;
+  // The push cleanup goes after the audit INSERT, which reads the changes() of the session DELETE before it.
+  const pushCleanup = deviceId === undefined ? [] : [c.env.DB.prepare(LOGOUT_PUSH_SQL).bind(deviceId, user.id)];
   // Idempotent: a logout that finds its session already deleted (a parallel one) still clears the cookie, without an event.
-  await revokeSessions(c.env, user.id, [session.idHash], [auditStatement(c.env, { action: "session.logout", actorUserId: user.id, meta: {} }, PREVIOUS_CHANGED)]);
+  await revokeSessions(c.env, user.id, [session.idHash], [auditStatement(c.env, { action: "session.logout", actorUserId: user.id, meta: {} }, PREVIOUS_CHANGED), ...pushCleanup]);
   c.header("Set-Cookie", clearSessionCookie(), { append: true });
   return c.json({ ok: true as const });
 };

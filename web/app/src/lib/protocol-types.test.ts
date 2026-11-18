@@ -14,6 +14,7 @@ describe("the app compiles against @monoptah/protocol", () => {
       user: { id: "u1", handle: "alice", displayName: "Alice", role: "user" },
       invitesLeft: 3,
       recoveryOnly: false,
+      recoveryCodesLeft: 10,
       recoveryAckAt: null,
     };
     expect(route?.response.safeParse(me).success).toBe(true);

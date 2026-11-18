@@ -68,7 +68,7 @@ interface PlanCase {
 
 const s = "x";
 const CASES: PlanCase[] = [
-  { name: "pair/start: insert request", sql: INSERT_PAIRING_SQL, bind: [s, s, s, s, s, s, s, s, 1, 2, s] },
+  { name: "pair/start: insert request", sql: INSERT_PAIRING_SQL, bind: [s, s, s, s, s, s, s, s, s, 1, 2, s] },
   { name: "pair/poll: lookup by device code hash", sql: POLL_LOOKUP_SQL, bind: [s] },
   { name: "pair/poll: touch", sql: POLL_TOUCH_SQL, bind: [1, s, 0] },
   { name: "pair/poll: consume", sql: CONSUME_PAIRING_SQL, bind: [s] },
@@ -77,7 +77,7 @@ const CASES: PlanCase[] = [
   { name: "approve: insert desktop (quota)", sql: INSERT_DESKTOP_SQL, bind: [s, s, s, 1, s, 1, s, 5] },
   { name: "approve: bind request", sql: APPROVE_NEW_SQL, bind: [s, s, s, s] },
   { name: "replace: target desktop", sql: REPLACE_TARGET_SQL, bind: [s, s] },
-  { name: "replace: swap key", sql: REPLACE_KEY_SQL, bind: [s, s, s, s, s, 1, s, s] },
+  { name: "replace: swap key", sql: REPLACE_KEY_SQL, bind: [s, s, s, s, s, s, 1, s, s] },
   { name: "replace: revoke tokens", sql: REPLACE_REVOKE_TOKENS_SQL, bind: [1, s, s, 1, s, s] },
   { name: "replace: reset grants", sql: REPLACE_RESET_GRANTS_SQL, bind: [1, s, s, 1, s, s] },
   { name: "replace: bind request", sql: APPROVE_REPLACE_SQL, bind: [s, s, s, 1, s, s] },

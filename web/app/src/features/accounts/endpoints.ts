@@ -61,6 +61,7 @@ export const endpoints = {
   deletePasskey: endpoint("DELETE", "/api/passkeys/:id", Ok),
 
   regenerateRecoveryCodes: endpoint("POST", "/api/recovery-codes/regenerate", RegenerateRecoveryResponse),
+  ackRecoveryCodes: endpoint("POST", "/api/recovery-codes/ack", Ok),
 
   invites: endpoint("GET", "/api/invites", InvitesResponse),
   createInvite: endpoint("POST", "/api/invites", CreateInviteResponse),

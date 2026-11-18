@@ -348,6 +348,7 @@ export const pairingRequests = sqliteTable(
     desktopPublicKey: text("desktop_public_key").notNull(),
     machineName: text("machine_name").notNull(),
     os: text("os"),
+    appVersion: text("app_version"),
     confirmationCode: text("confirmation_code").notNull(),
     status: text("status", { enum: PAIRING_STATUSES }).notNull().default("pending"),
     userId: text("user_id").references(() => users.id, { onDelete: "set null" }),

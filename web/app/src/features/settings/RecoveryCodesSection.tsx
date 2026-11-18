@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { regenerateRecoveryCodes } from "@/features/accounts/queries";
+import { acknowledgeRecoveryCodes, regenerateRecoveryCodes } from "@/features/accounts/queries";
 import { RecoveryCodes } from "@/features/accounts/RecoveryCodes";
 import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
@@ -26,13 +26,20 @@ export function RecoveryCodesSection({ handle }: { handle: string }) {
     if (ok) setConfirming(false);
   }
 
+  async function done() {
+    // The Worker cleared the ack when it issued the codes: set it again now that the user saved them.
+    const ok = await action.run(() => acknowledgeRecoveryCodes(queryClient));
+    if (ok) setCodes(null);
+  }
+
   if (codes) {
     return (
       <SettingsCard title="Recovery codes">
         <div className="flex flex-col gap-4 p-3.5">
           <p className="text-body font-semibold text-content">Your new recovery codes</p>
           <Notice variant="info">Your older codes no longer work.</Notice>
-          <RecoveryCodes handle={handle} codes={codes} continueLabel="Done" onContinue={() => setCodes(null)} />
+          {action.error ? <Notice variant="error">{action.error}</Notice> : null}
+          <RecoveryCodes handle={handle} codes={codes} continueLabel="Done" onContinue={done} />
         </div>
       </SettingsCard>
     );

@@ -34,8 +34,8 @@ const START_ATTEMPTS = 5;
 const REVOKED = 4003;
 
 /** Unique `user_code` and `device_code_hash`: a collision changes no row. */
-export const INSERT_PAIRING_SQL = `INSERT INTO pairing_requests (id, user_code, device_code_hash, challenge, desktop_public_key, machine_name, os, confirmation_code, status, created_at, expires_at, ip_hash)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?) ON CONFLICT DO NOTHING`;
+export const INSERT_PAIRING_SQL = `INSERT INTO pairing_requests (id, user_code, device_code_hash, challenge, desktop_public_key, machine_name, os, app_version, confirmation_code, status, created_at, expires_at, ip_hash)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?) ON CONFLICT DO NOTHING`;
 /** Poll lookup by the device code hash (unique index), with the approving account's handle. */
 export const POLL_LOOKUP_SQL =
   "SELECT p.id, p.challenge, p.status, p.expires_at, p.desktop_id, u.handle FROM pairing_requests p LEFT JOIN users u ON u.id = p.user_id WHERE p.device_code_hash = ?";
@@ -57,8 +57,8 @@ export const INSERT_TOKEN_SQL = `INSERT INTO desktop_tokens (id, desktop_id, tok
 export const PAIRING_BY_CODE_SQL =
   "SELECT id, machine_name, os, desktop_public_key, confirmation_code, status, expires_at FROM pairing_requests WHERE user_code = ?";
 /** A new desktop only for a pending, unexpired request and while the account is under its quota. */
-export const INSERT_DESKTOP_SQL = `INSERT INTO desktops (id, user_id, name, public_key, fingerprint, os, created_at)
-  SELECT ?, ?, p.machine_name, p.desktop_public_key, ?, p.os, ? FROM pairing_requests p
+export const INSERT_DESKTOP_SQL = `INSERT INTO desktops (id, user_id, name, public_key, fingerprint, os, app_version, created_at)
+  SELECT ?, ?, p.machine_name, p.desktop_public_key, ?, p.os, p.app_version, ? FROM pairing_requests p
   WHERE p.id = ? AND p.status = 'pending' AND p.expires_at > ?
   AND (SELECT COUNT(*) FROM desktops WHERE user_id = ? AND revoked_at IS NULL) < ?`;
 /** Binds the request to the user and the new desktop; the desktop row must already exist (foreign key). */
@@ -70,7 +70,7 @@ export const REPLACE_TARGET_SQL = "SELECT id, name FROM desktops WHERE id = ? AN
 const REPLACE_GUARD =
   "EXISTS (SELECT 1 FROM pairing_requests WHERE id = ? AND status = 'pending' AND expires_at > ?) AND EXISTS (SELECT 1 FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL)";
 /** Swaps the key of the desktop; id, name and color stay. */
-export const REPLACE_KEY_SQL = `UPDATE desktops SET public_key = (SELECT desktop_public_key FROM pairing_requests WHERE id = ?), fingerprint = ?, os = (SELECT os FROM pairing_requests WHERE id = ?) WHERE id = ? AND ${REPLACE_GUARD}`;
+export const REPLACE_KEY_SQL = `UPDATE desktops SET public_key = (SELECT desktop_public_key FROM pairing_requests WHERE id = ?), fingerprint = ?, os = (SELECT os FROM pairing_requests WHERE id = ?), app_version = coalesce((SELECT app_version FROM pairing_requests WHERE id = ?), app_version) WHERE id = ? AND ${REPLACE_GUARD}`;
 export const REPLACE_REVOKE_TOKENS_SQL = `UPDATE desktop_tokens SET revoked_at = ? WHERE desktop_id = ? AND revoked_at IS NULL AND ${REPLACE_GUARD}`;
 /** Every non-revoked grant goes back to `pending`; revoked ones stay revoked. */
 export const REPLACE_RESET_GRANTS_SQL = `UPDATE device_grants SET state = 'pending', permission = NULL, requested_permission = NULL, confirmed_at = NULL, updated_at = ? WHERE desktop_id = ? AND state != 'revoked' AND ${REPLACE_GUARD}`;
@@ -135,7 +135,7 @@ export const pairStart: Handler<AppEnv> = async (c) => {
   for (let attempt = 0; attempt < START_ATTEMPTS; attempt += 1) {
     const userCode = newUserCode();
     const result = await c.env.DB.prepare(INSERT_PAIRING_SQL)
-      .bind(crypto.randomUUID(), userCode, deviceCodeHash, body.data.challenge, body.data.publicKey, body.data.machineName, body.data.os, confirmationCode, now, now + PAIRING_TTL_SECONDS, hash)
+      .bind(crypto.randomUUID(), userCode, deviceCodeHash, body.data.challenge, body.data.publicKey, body.data.machineName, body.data.os, body.data.appVersion, confirmationCode, now, now + PAIRING_TTL_SECONDS, hash)
       .run();
     if (result.meta.changes === 1) {
       return respond(c, PairStartResponse, {
@@ -259,7 +259,7 @@ export const pairApprove: Handler<AppEnv> = async (c) => {
     if (!target) return apiError(c, 404, "not_found", "Desktop not found");
     const guard = [row.id, now, desktopId, user.id];
     const results = await c.env.DB.batch([
-      c.env.DB.prepare(REPLACE_KEY_SQL).bind(row.id, fingerprint, row.id, desktopId, ...guard),
+      c.env.DB.prepare(REPLACE_KEY_SQL).bind(row.id, fingerprint, row.id, row.id, desktopId, ...guard),
       c.env.DB.prepare(REPLACE_REVOKE_TOKENS_SQL).bind(now, desktopId, ...guard),
       c.env.DB.prepare(REPLACE_RESET_GRANTS_SQL).bind(now, desktopId, ...guard),
       c.env.DB.prepare(APPROVE_REPLACE_SQL).bind(user.id, desktopId, row.id, now, desktopId, user.id),

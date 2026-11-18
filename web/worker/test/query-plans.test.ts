@@ -57,10 +57,10 @@ import {
 } from "../src/modules/admin/branch.ts";
 import { INSERT_INVITE_SQL, INVITE_BY_ID_SQL, LIST_INVITES_SQL, REVOKE_INVITE_SQL } from "../src/modules/invites/handlers.ts";
 import { CONSUME_CHALLENGE_SQL, INSERT_CHALLENGE_SQL } from "../src/modules/passkeys/challenges.ts";
-import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL } from "../src/modules/me/handlers.ts";
+import { INVITES_USED_SQL, ME_ROW_SQL, PATCH_DISPLAY_NAME_SQL, RECOVERY_LEFT_SQL } from "../src/modules/me/handlers.ts";
 import { CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
 import { OUTSTANDING_PAIRINGS_SQL } from "../src/modules/ratelimit/pairings.ts";
-import { LIST_USER_SESSIONS_SQL } from "../src/modules/sessions/handlers.ts";
+import { LIST_USER_SESSIONS_SQL, LOGOUT_PUSH_SQL } from "../src/modules/sessions/handlers.ts";
 import {
   DELETE_ALL_SESSIONS_EXCEPT_SQL,
   DELETE_ALL_SESSIONS_SQL,
@@ -115,6 +115,8 @@ const CASES: PlanCase[] = [
   { name: "list desktops of a user", sql: LIST_DESKTOP_IDS_SQL, bind: ["u", 5] },
   { name: "me row", sql: ME_ROW_SQL, bind: ["u"] },
   { name: "invites used by a user", sql: INVITES_USED_SQL, bind: ["u"] },
+  { name: "unused recovery codes of a user", sql: RECOVERY_LEFT_SQL, bind: ["u"] },
+  { name: "logout: delete the push subscriptions of a device", sql: LOGOUT_PUSH_SQL, bind: ["d", "u"] },
   { name: "patch display name", sql: PATCH_DISPLAY_NAME_SQL, bind: ["n", "u"] },
   { name: "invite lookup by code hash", sql: INVITE_LOOKUP_SQL, bind: ["h", 1] },
   { name: "handle taken", sql: HANDLE_TAKEN_SQL, bind: ["h"] },

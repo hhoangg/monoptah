@@ -24,6 +24,7 @@ describe("GET /api/me", () => {
       user: { id: user.id, handle: "me-reader", displayName: "Reader", role: "admin" },
       invitesLeft: 5,
       recoveryOnly: false,
+      recoveryCodesLeft: 0,
       recoveryAckAt: 1234,
     });
   });

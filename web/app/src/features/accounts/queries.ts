@@ -9,6 +9,7 @@ import { endpoints } from "./endpoints";
 import { releaseDevice } from "./deviceBinding";
 import { clearLowCodes } from "./lowCodes";
 import { unsubscribeFromPush } from "@/features/push/subscribe";
+import { getDeviceKeyInfo } from "@/link/keys";
 import { createPasskey, getPasskey } from "./webauthn";
 
 type Me = ReturnType<typeof MeResponse.parse>;
@@ -148,8 +149,10 @@ export async function signOut(queryClient: QueryClient, options: { keepLowCodes?
   // The subscription belongs to this browser and this account: remove it while the session still works.
   // A failure here must not keep the user signed in.
   await unsubscribeFromPush().catch(() => undefined);
+  // The server also deletes this device's push subscriptions with the session, in case the call above failed.
+  const device = await getDeviceKeyInfo().catch(() => null);
   try {
-    await apiFetch(endpoints.logout);
+    await apiFetch(endpoints.logout, device?.deviceId ? { body: { deviceId: device.deviceId } } : {});
   } finally {
     queryClient.clear();
     // The encrypted content cache, the snapshots and any push subscription left behind go with the session.
@@ -200,12 +203,21 @@ export async function deletePasskey(queryClient: QueryClient, id: string): Promi
   await queryClient.invalidateQueries({ queryKey: passkeysQuery.queryKey });
 }
 
-/** New recovery codes, shown once; every older code stops working. Sets `recoveryAckAt` in `me`. */
-export async function regenerateRecoveryCodes(queryClient: QueryClient): Promise<string[]> {
+/**
+ * New recovery codes, shown once; every older code stops working. The Worker clears `recoveryAckAt`, so `me` is NOT
+ * refreshed here (the guard would swap the screen and drop the codes before they are saved): the caller calls
+ * `acknowledgeRecoveryCodes` when the user confirms.
+ */
+export async function regenerateRecoveryCodes(_queryClient: QueryClient): Promise<string[]> {
   const { recoveryCodes } = await withFreshAuth(() => apiFetch(endpoints.regenerateRecoveryCodes));
   clearLowCodes();
-  await queryClient.invalidateQueries({ queryKey: ME_KEY });
   return recoveryCodes;
+}
+
+/** "I saved these": records the acknowledgement on the server (`recoveryAckAt`) and refreshes `me`. */
+export async function acknowledgeRecoveryCodes(queryClient: QueryClient): Promise<void> {
+  await apiFetch(endpoints.ackRecoveryCodes);
+  await queryClient.invalidateQueries({ queryKey: ME_KEY });
 }
 
 /** Fails with `invites_paused` or `quota_exceeded`. `code` is shown once. */

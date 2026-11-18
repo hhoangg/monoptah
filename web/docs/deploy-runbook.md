@@ -53,6 +53,24 @@ the Cloudflare D1 docs do not state. On the first internal deploy, check on the 
 
 If either row is missing or doubled, treat the deploy as bad and roll back.
 
+## VAPID key rotation
+
+Only during a rotation, the Worker also reads a previous key pair, so subscriptions made with the old key keep
+receiving pushes until their browsers re-subscribe. The full procedure (why, who, drain check, staging drill) is
+security.md section 9.1; this is the configuration it needs:
+
+| Name | Where | Value |
+|---|---|---|
+| `VAPID_PREVIOUS_PUBLIC_KEY` | `wrangler.jsonc` `vars` (public) | The old public key, base64url |
+| `VAPID_PREVIOUS_KEY_ID` | `wrangler.jsonc` `vars` | The old key id (`push_subscriptions.vapid_key_id` of its rows) |
+| `VAPID_PREVIOUS_PRIVATE_KEY` | `wrangler secret put` | The old private key. A secret, never in `vars` |
+
+All three are unset normally and are declared optional in `worker/src/cloudflare-env.d.ts`. While they are set,
+`VAPID_PUBLIC_KEY`, `VAPID_KEY_ID` and `VAPID_PRIVATE_KEY` hold the new pair; a push is signed with the key whose
+id matches the subscription, and new subscriptions are accepted only on the current id. When the old key drains (or
+leaked: leave the previous slot empty), delete the two vars and run `wrangler secret delete VAPID_PREVIOUS_PRIVATE_KEY`,
+then deploy. A half-set trio is ignored by the Worker (the previous key stays off).
+
 ## Rollback
 
 Migrations are forward-only and backward compatible for one release (architecture.md section 9), so the previous

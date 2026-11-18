@@ -116,7 +116,7 @@ describe("a sign-in or registration replaces the session cookie it carries", () 
     const newHash = await sha256Hex((setCookies(res)[0] ?? "").split(";")[0]?.split("=")[1] ?? "");
     expect(await sessionExists(newHash)).toBe(true);
     expect(await count("SELECT count(*) AS n FROM sessions WHERE user_id = ?", user.userId)).toBe(1);
-    expect(room.calls.map((call) => call.target)).toEqual([{ sessionIdHash: oldHash }]);
+    expect(room.calls.map((call) => call.target)).toEqual([{ sessionIdHashes: [oldHash] }]);
   });
 
   it("login with the cookie of another user's session removes that row too", async () => {
@@ -148,7 +148,7 @@ describe("a sign-in or registration replaces the session cookie it carries", () 
     const res = await postJson("/api/auth/register/verify", { challengeId: attempt.challengeId, response }, { cookie: existing.cookie, testEnv: withRoom(env, room) });
     expect(res.status).toBe(200);
     expect(await sessionExists(existing.idHash)).toBe(false);
-    expect(room.calls.map((call) => call.target)).toEqual([{ sessionIdHash: existing.idHash }]);
+    expect(room.calls.map((call) => call.target)).toEqual([{ sessionIdHashes: [existing.idHash] }]);
     expect(await count("SELECT count(*) AS n FROM sessions WHERE id_hash = ?", await sha256Hex((setCookies(res)[0] ?? "").split(";")[0]?.split("=")[1] ?? ""))).toBe(1);
   });
 

@@ -1,11 +1,10 @@
-// `POST /api/recovery-codes/regenerate` (A-05, fresh) and the "I saved these" ack. Regeneration is ONE batch that
+// `POST /api/recovery-codes/regenerate` (A-05, fresh) and `POST /api/recovery-codes/ack` ("I saved these"). Regeneration is ONE batch that
 // inserts the 10 new codes (batch = old max + 1), deletes every older code of the user, clears
 // `users.recovery_ack_at` (the next sign-in forces the user to confirm they saved the new codes) and audits.
 // Every statement after the first insert keys on that first row, so a parallel regenerate that lost the race
 // writes nothing and answers 409 instead of leaving two live batches.
 import type { Handler } from "hono";
 import { RegenerateRecoveryResponse } from "@monoptah/protocol";
-import type { Env } from "../../env.ts";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
@@ -50,9 +49,11 @@ export const regenerateRecoveryCodes: Handler<AppEnv> = async (c) => {
 };
 
 /**
- * "I saved these": sets `users.recovery_ack_at`. A null value at the next sign-in makes the client force a
- * regenerate. There is no protocol route for it yet (WS-K owns `api.ts`), so this is the handler logic only.
+ * `POST /api/recovery-codes/ack` ("I saved these"): sets `users.recovery_ack_at`. A null value at the next sign-in
+ * makes the client force a regenerate; regenerating clears it again. Idempotent: it only moves the timestamp.
  */
-export async function ackRecoveryCodes(env: Pick<Env, "DB">, userId: string, now: number = nowSeconds()): Promise<void> {
-  await env.DB.prepare(SET_ACK_SQL).bind(now, userId).run();
-}
+export const ackRecoveryCodes: Handler<AppEnv> = async (c) => {
+  const { user } = requireAuth(c);
+  await c.env.DB.prepare(SET_ACK_SQL).bind(nowSeconds(), user.id).run();
+  return c.json({ ok: true as const });
+};

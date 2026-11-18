@@ -18,7 +18,7 @@ const SPEC_COLUMNS: Record<string, string[]> = {
   device_grants: ["device_id", "desktop_id", "state", "permission", "requested_permission", "confirmed_at", "updated_at"],
   push_subscriptions: ["id", "user_id", "device_id", "endpoint", "p256dh", "auth", "vapid_key_id", "ua", "created_at", "last_success_at", "failures"],
   push_prefs: ["user_id", "desktop_id", "enabled", "categories"],
-  pairing_requests: ["id", "user_code", "device_code_hash", "challenge", "desktop_public_key", "machine_name", "os", "confirmation_code", "status", "user_id", "desktop_id", "created_at", "expires_at", "last_polled_at", "ip_hash"],
+  pairing_requests: ["id", "user_code", "device_code_hash", "challenge", "desktop_public_key", "machine_name", "os", "app_version", "confirmation_code", "status", "user_id", "desktop_id", "created_at", "expires_at", "last_polled_at", "ip_hash"],
   settings: ["key", "value", "updated_at", "updated_by"],
   audit_log: ["id", "ts", "actor_user_id", "actor_kind", "action", "target_type", "target_id", "meta"],
   rate_limits: ["key", "window_start", "count"],

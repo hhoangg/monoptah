@@ -20,8 +20,8 @@ export interface RecoveryCodesProps {
 /**
  * Shared recovery codes view (register, regenerate in settings, forced regenerate): shown once,
  * Copy, Download, Print, and a Continue that stays disabled until the "I saved these codes" box is ticked.
- * The server records the acknowledgement itself when it issues the codes (register or regenerate),
- * so the gate here is client-side only: the contract has no route to say "I saved these".
+ * The box gates Continue here; the caller then records it with `POST /api/recovery-codes/ack`
+ * (`acknowledgeRecoveryCodes`), because the Worker leaves `recoveryAckAt` null when it issues codes.
  */
 export function RecoveryCodes({ handle, codes, onContinue, continueLabel = "Continue", busy = false }: RecoveryCodesProps) {
   const [saved, setSaved] = useState(false);

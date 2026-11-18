@@ -3,7 +3,7 @@
 import { toBase64Url } from "../../lib/crypto.ts";
 import { nowSeconds } from "../../lib/time.ts";
 
-/** Optional previous key. Not declared in wrangler.jsonc until a rotation starts, so read through this view. */
+/** The key pairs the push code reads. The previous pair is optional (declared in `cloudflare-env.d.ts`, set only during a rotation). */
 export interface VapidEnv {
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;

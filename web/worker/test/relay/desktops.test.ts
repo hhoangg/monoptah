@@ -27,7 +27,7 @@ describe("GET /api/desktops", () => {
     expect(res.status).toBe(200);
     const { desktops } = (await res.json()) as { desktops: { id: string; name: string; online: boolean; pendingCount: number; os: string | null; appVersion: string | null; color: string | null }[] };
     expect(desktops.map((d) => d.name).sort()).toEqual(["Alpha", "Beta"]);
-    expect(desktops.find((d) => d.id === a.desktopId)).toMatchObject({ online: false, pendingCount: 1, os: "macos", appVersion: null, color: null });
+    expect(desktops.find((d) => d.id === a.desktopId)).toMatchObject({ online: false, pendingCount: 1, os: "macos", appVersion: "1.0.0", color: null });
     expect(desktops.find((d) => d.id === b.desktopId)).toMatchObject({ online: true, pendingCount: 0 });
   });
 

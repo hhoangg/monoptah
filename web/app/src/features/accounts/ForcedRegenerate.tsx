@@ -9,7 +9,7 @@ import { apiFetch } from "./api";
 import { passkeyErrorMessage } from "./authCopy";
 import { endpoints } from "./endpoints";
 import { clearLowCodes } from "./lowCodes";
-import { ME_KEY, ReauthCancelledError, withFreshAuth } from "./queries";
+import { acknowledgeRecoveryCodes, ReauthCancelledError, withFreshAuth } from "./queries";
 import { RecoveryCodes } from "./RecoveryCodes";
 
 /**
@@ -44,15 +44,23 @@ export function ForcedRegenerate({ handle }: { handle: string }) {
 
   async function done() {
     // Cleared on Continue only: until then the codes stay on screen and nothing may unmount this component.
+    // The server records "I saved these" first; on a failure the codes stay on screen so they are not lost.
+    setError(null);
+    try {
+      await acknowledgeRecoveryCodes(queryClient);
+    } catch (caught) {
+      setError(passkeyErrorMessage(caught));
+      return;
+    }
     clearLowCodes();
     setCodes(null);
-    await queryClient.invalidateQueries({ queryKey: ME_KEY });
   }
 
   if (codes) {
     return (
       <AuthLayout>
         <PageHeader title="Save your new recovery codes" description="Older codes no longer work." />
+        {error ? <Notice variant="error">{error}</Notice> : null}
         <RecoveryCodes handle={handle} codes={codes} onContinue={() => void done()} />
       </AuthLayout>
     );

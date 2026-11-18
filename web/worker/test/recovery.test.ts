@@ -4,7 +4,6 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { API_ROUTES } from "@monoptah/protocol";
 import { RECOVERY_ONLY_ALLOWLIST } from "../src/middleware/auth.ts";
-import { ackRecoveryCodes } from "../src/modules/recovery/regenerate.ts";
 import { hashRecoveryCode, normalizeRecoveryCode } from "../src/modules/recovery/codes.ts";
 import { sha256Hex } from "../src/lib/crypto.ts";
 import { authedCall, createTestDesktop, createTestInvite, createTestUser, loginAs, postJson, registerUser, setCookies, withRoom, fakeRoomNamespace, recordingEnv, type RegisteredUser } from "./support/accounts.ts";
@@ -12,6 +11,7 @@ import { authedCall, createTestDesktop, createTestInvite, createTestUser, loginA
 const errorCode = async (res: Response) => ((await res.json()) as { code: string }).code;
 const recover = (handle: string, code: string, init: Parameters<typeof postJson>[2] = {}) => postJson("/api/auth/recover", { handle, code }, init);
 const regenerate = (cookie: string) => authedCall({ cookie }, "/api/recovery-codes/regenerate", { method: "POST" });
+const ackCodes = (cookie: string) => authedCall({ cookie }, "/api/recovery-codes/ack", { method: "POST" });
 const newUser = async (): Promise<RegisteredUser> => registerUser((await createTestInvite(env)).code);
 const cookieOf = (res: Response) => setCookies(res)[0]?.split(";")[0] ?? "";
 
@@ -42,7 +42,7 @@ describe("POST /api/auth/recover", () => {
     expect(JSON.parse(audit.results[0]?.meta ?? "{}")).toMatchObject({ codesLeft: 9, revokedSessions: 2 });
   });
 
-  it("calls room.revoke({sessionIdHash}, 4001) for every old session on each of the user's desktops", async () => {
+  it("calls room.revoke({sessionIdHashes}, 4001) once per desktop with every old session", async () => {
     const user = await newUser();
     const second = await loginAs(user.userId, { fresh: true });
     const desktops = [await createTestDesktop(env, user.userId), await createTestDesktop(env, user.userId), await createTestDesktop(env, user.userId)];
@@ -50,15 +50,16 @@ describe("POST /api/auth/recover", () => {
     const room = fakeRoomNamespace();
     const res = await recover(user.handle, user.recoveryCodes[0] ?? "", { testEnv: withRoom(env, room) });
     expect(res.status).toBe(200);
-    expect(room.calls).toHaveLength(desktops.length * oldHashes.length);
+    expect(room.calls).toHaveLength(desktops.length);
     for (const desktopId of desktops) {
       const forDesktop = room.calls.filter((call) => call.desktopId === desktopId);
-      expect(forDesktop.map((call) => (call.target as { sessionIdHash: string }).sessionIdHash).sort()).toEqual([...oldHashes].sort());
+      expect(forDesktop).toHaveLength(1);
+      expect((forDesktop[0]?.target as { sessionIdHashes: string[] }).sessionIdHashes.sort()).toEqual([...oldHashes].sort());
       expect(forDesktop.every((call) => call.code === 4001)).toBe(true);
     }
     // The new recovery session is not revoked.
     const newHash = await sha256Hex(cookieOf(res).split("=")[1] ?? "");
-    expect(room.calls.some((call) => (call.target as { sessionIdHash: string }).sessionIdHash === newHash)).toBe(false);
+    expect(room.calls.some((call) => (call.target as { sessionIdHashes: string[] }).sessionIdHashes.includes(newHash))).toBe(false);
   });
 
   it("a code works once", async () => {
@@ -187,7 +188,7 @@ describe("POST /api/recovery-codes/regenerate", () => {
 
   it("returns 10 new codes, kills the whole old batch and clears the ack", async () => {
     const user = await newUser();
-    await ackRecoveryCodes(env, user.userId);
+    expect((await ackCodes(user.cookie)).status).toBe(200);
     // One old code is already used: regenerate removes used ones too.
     await recover(user.handle, user.recoveryCodes[0] ?? "");
     const session = await loginAs(user.userId, { fresh: true });
@@ -250,17 +251,49 @@ describe("POST /api/recovery-codes/regenerate", () => {
 });
 
 describe("recovery_ack_at", () => {
-  const ackOf = async (cookie: string) => ((await (await authedCall({ cookie }, "/api/me")).json()) as { recoveryAckAt: number | null }).recoveryAckAt;
+  const meOf = async (cookie: string) => (await (await authedCall({ cookie }, "/api/me")).json()) as { recoveryAckAt: number | null; recoveryCodesLeft: number };
+  const ackOf = async (cookie: string) => (await meOf(cookie)).recoveryAckAt;
 
-  it("is null after registration and after regenerate, and set after ackRecoveryCodes", async () => {
+  it("is null after registration and after regenerate, and set by POST /api/recovery-codes/ack", async () => {
     const user = await newUser();
     expect(await ackOf(user.cookie)).toBeNull();
-    await ackRecoveryCodes(env, user.userId, 1234);
-    expect(await ackOf(user.cookie)).toBe(1234);
+    const first = await ackCodes(user.cookie);
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ ok: true });
+    const stamp = await ackOf(user.cookie);
+    expect(stamp).toBeGreaterThan(0);
     expect((await regenerate(user.cookie)).status).toBe(200);
     expect(await ackOf(user.cookie)).toBeNull();
-    await ackRecoveryCodes(env, user.userId);
-    expect(await ackOf(user.cookie)).toBeGreaterThan(1234);
+    expect((await ackCodes(user.cookie)).status).toBe(200);
+    expect(await ackOf(user.cookie)).toBeGreaterThanOrEqual(stamp ?? 0);
+  });
+
+  it("the ack is idempotent, needs a session and is not open to a recovery-only session", async () => {
+    const user = await newUser();
+    expect((await ackCodes(user.cookie)).status).toBe(200);
+    expect((await ackCodes(user.cookie)).status).toBe(200);
+    expect((await postJson("/api/recovery-codes/ack", {})).status).toBe(401);
+    const session = await loginAs(user.userId, { recoveryOnly: true });
+    const res = await ackCodes(session.cookie);
+    expect(res.status).toBe(403);
+    expect(await errorCode(res)).toBe("recovery_only");
+  });
+
+  it("only moves the ack of the caller", async () => {
+    const a = await newUser();
+    const b = await newUser();
+    await ackCodes(a.cookie);
+    expect(await ackOf(b.cookie)).toBeNull();
+  });
+
+  it("GET /api/me reports how many recovery codes are left", async () => {
+    const user = await newUser();
+    expect((await meOf(user.cookie)).recoveryCodesLeft).toBe(10);
+    expect((await recover(user.handle, user.recoveryCodes[0] ?? "")).status).toBe(200);
+    const session = await loginAs(user.userId);
+    expect((await meOf(session.cookie)).recoveryCodesLeft).toBe(9);
+    expect((await regenerate((await loginAs(user.userId, { fresh: true })).cookie)).status).toBe(200);
+    expect((await meOf(session.cookie)).recoveryCodesLeft).toBe(10);
   });
 });
 
