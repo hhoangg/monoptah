@@ -56,6 +56,8 @@ pub(in crate::settings) struct MobileState {
     notice: Option<String>,
     /// The device whose removal is waiting for confirmation.
     removing: Option<String>,
+    /// The device whose Projects list is open.
+    pub(in crate::settings) projects_open: Option<String>,
     copied: bool,
     copied_reset: Option<Task<()>>,
     /// "Connect away from home" is open.
@@ -158,6 +160,7 @@ impl SettingsView {
         self.mobile.known = None;
         self.mobile.pairing = None;
         self.mobile.removing = None;
+        self.mobile.projects_open = None;
         self.mobile.notice = None;
     }
 
@@ -512,6 +515,80 @@ impl SettingsView {
             .into_any_element()
     }
 
+    /// The projects a phone may see, as checkboxes. A phone with no saved
+    /// selection (`None`) has every project ticked; ticking them all again
+    /// goes back to `None`, so existing phones keep seeing new projects.
+    fn phone_projects(
+        &self,
+        device: &monocode_core::mobile::host::Device,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let choices = self.ctx.web_projects.clone();
+        let ticked: Vec<String> = match &device.projects {
+            None => choices.iter().map(|(id, _)| id.clone()).collect(),
+            Some(selected) => selected.clone(),
+        };
+        div()
+            .id(SharedString::from(format!(
+                "mobile-project-list-{}",
+                device.id
+            )))
+            .role(Role::Group)
+            .aria_label("Projects this phone can see")
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .border_t_1()
+            .border_color(content(0.1))
+            .bg(content(0.03))
+            .px_4()
+            .py_3()
+            .text_size(px(13.))
+            .when(choices.is_empty(), |d| {
+                d.text_color(content(0.5))
+                    .child("No projects to choose from.")
+            })
+            .children(choices.iter().map(|(project, label)| {
+                let on = ticked.contains(project);
+                let (device_id, project) = (device.id.clone(), project.clone());
+                let all = choices.clone();
+                let current = ticked.clone();
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        crate::settings::widgets::checkbox(
+                            SharedString::from(format!("mobile-project-{device_id}-{project}")),
+                            label.clone(),
+                            on,
+                            false,
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let mut next: Vec<String> = all
+                                .iter()
+                                .map(|(id, _)| id.clone())
+                                .filter(|id| {
+                                    if *id == project {
+                                        !on
+                                    } else {
+                                        current.contains(id)
+                                    }
+                                })
+                                .collect();
+                            let projects =
+                                (next.len() != all.len()).then(|| std::mem::take(&mut next));
+                            cx.emit(SettingsEvent::PhoneSetProjects {
+                                device_id: device_id.clone(),
+                                projects,
+                            });
+                        })),
+                    )
+                    .child(div().min_w_0().truncate().child(label.clone()))
+            }))
+            .into_any_element()
+    }
+
     fn mobile_devices(&self, status: &Status, showing: bool, cx: &mut Context<Self>) -> AnyElement {
         if status.devices.is_empty() {
             return div()
@@ -541,6 +618,7 @@ impl SettingsView {
                 let id = device.id.clone();
                 let name = device.name.clone();
                 let confirming = self.mobile.removing.as_deref() == Some(id.as_str());
+                let projects_open = self.mobile.projects_open.as_deref() == Some(id.as_str());
                 div()
                     .when(ix > 0, |d| d.border_t_1().border_color(content(0.1)))
                     .child(
@@ -571,6 +649,29 @@ impl SettingsView {
                                     ),
                             )
                             .child(
+                                secondary_button(
+                                    SharedString::from(format!("mobile-projects-{id}")),
+                                    "Projects",
+                                    false,
+                                    false,
+                                )
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("mobile-projects-{id}")
+                                })
+                                .child("Projects")
+                                .on_click({
+                                    let id = id.clone();
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.mobile.projects_open =
+                                            (this.mobile.projects_open.as_deref()
+                                                != Some(id.as_str()))
+                                            .then(|| id.clone());
+                                        cx.notify();
+                                    })
+                                }),
+                            )
+                            .child(
                                 icon_action(
                                     SharedString::from(format!("mobile-remove-{id}")),
                                     format!("Remove {name}"),
@@ -589,6 +690,9 @@ impl SettingsView {
                                 }),
                             ),
                     )
+                    .when(projects_open, |d| {
+                        d.child(self.phone_projects(device, cx))
+                    })
                     .when(confirming, |d| {
                         let remote = remote.clone();
                         d.child(

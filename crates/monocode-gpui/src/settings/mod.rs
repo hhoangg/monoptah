@@ -82,6 +82,10 @@ pub(crate) struct SettingsContext {
     pub web_pairing: Option<monocode_core::mobile::web_link::PairTicket>,
     /// The last web action's error, or a result worth showing, from the shell.
     pub web_notice: Option<String>,
+    /// The projects and Monos the host publishes, as (id, name) pairs in
+    /// catalog order: what a device can be given access to.
+    pub web_projects: Vec<(String, String)>,
+    pub web_monos: Vec<(String, String)>,
     /// Minutes after midnight when the Today work day starts; `None` until Today has loaded it.
     pub today_rollover_minutes: Option<u32>,
     /// The native store, for the Cloud page's Docker accounts. `None` without one.
@@ -113,6 +117,8 @@ impl PartialEq for SettingsContext {
             && self.web == other.web
             && self.web_pairing == other.web_pairing
             && self.web_notice == other.web_notice
+            && self.web_projects == other.web_projects
+            && self.web_monos == other.web_monos
             && self.today_rollover_minutes == other.today_rollover_minutes
             && self.store == other.store
     }
@@ -179,6 +185,19 @@ pub(crate) enum SettingsEvent {
         permission: monocode_core::mobile::Permission,
     },
     WebRevokeDevice(String),
+    /// Confirm a pending device by key fingerprint, with what the user
+    /// ticked. `projects` / `monos` of `None` mean all of them.
+    WebConfirmDevice {
+        fingerprint: String,
+        permission: monocode_core::mobile::Permission,
+        projects: Option<Vec<String>>,
+        monos: Option<Vec<String>>,
+    },
+    /// The projects a paired phone may see (`None` is all), permission kept.
+    PhoneSetProjects {
+        device_id: String,
+        projects: Option<Vec<String>>,
+    },
     /// Approve or refuse a confirmed device's request for more permission.
     WebAnswerRequest {
         device_id: String,
@@ -1010,6 +1029,7 @@ pub(crate) fn nav(
     search: AnyElement,
     select: impl Fn(Section, &mut Window, &mut App) + Clone + 'static,
     back: impl Fn(&mut Window, &mut App) + 'static,
+    web_waiting: usize,
 ) -> AnyElement {
     let row = |id: SharedString, label: &'static str, path: &'static str, active: bool| {
         div()
@@ -1111,6 +1131,24 @@ pub(crate) fn nav(
                                         item.icon(),
                                         item == section,
                                     )
+                                    .when(item == Section::Connections && web_waiting > 0, |d| {
+                                        d.child(
+                                            div()
+                                                .id("settings-nav-connections-badge")
+                                                .debug_selector(|| {
+                                                    "settings-nav-connections-badge".into()
+                                                })
+                                                .aria_label(format!("{web_waiting} waiting"))
+                                                .flex_shrink_0()
+                                                .rounded_full()
+                                                .bg(accent_color())
+                                                .px(px(6.))
+                                                .text_size(px(11.))
+                                                .line_height(px(16.))
+                                                .text_color(gpui::white())
+                                                .child(web_waiting.to_string()),
+                                        )
+                                    })
                                     .on_click(move |_, window, cx| select(item, window, cx))
                                 }),
                         )

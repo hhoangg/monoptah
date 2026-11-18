@@ -52,6 +52,16 @@ fn tag(event: &SettingsEvent) -> Option<String> {
         SettingsEvent::WebAnswerRequest { device_id, approve } => {
             format!("answer:{device_id}:{approve}")
         }
+        SettingsEvent::WebConfirmDevice {
+            fingerprint,
+            permission,
+            projects,
+            monos,
+        } => format!("confirm:{fingerprint}:{permission:?}:{projects:?}:{monos:?}"),
+        SettingsEvent::PhoneSetProjects {
+            device_id,
+            projects,
+        } => format!("phone-projects:{device_id}:{projects:?}"),
         _ => return None,
     })
 }
@@ -477,4 +487,210 @@ fn small_formatters_read_as_the_mockup() {
         Some("https://zptah.app/desktops/d/verify#fp=ff")
     );
     assert_eq!(web::verify_link(&WebStatus::default()), None);
+}
+
+fn waiting() -> PendingDevice {
+    PendingDevice {
+        fingerprint: FP.into(),
+        name: "Browser".into(),
+        server_device_id: "srv".into(),
+        online: true,
+    }
+}
+
+fn choices(ids: &[&str]) -> Vec<(String, String)> {
+    ids.iter()
+        .map(|id| (id.to_string(), format!("Name {id}")))
+        .collect()
+}
+
+/// A paired desktop with one pending device and a catalog of two projects
+/// and one Mono.
+fn with_pending(window: &WindowHandle<Preview>, visual: &mut VisualTestContext) {
+    set_web(window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            pending: vec![waiting()],
+            ..paired()
+        });
+        ctx.web_projects = choices(&["p1", "p2"]);
+        ctx.web_monos = choices(&["m1"]);
+    });
+}
+
+fn draft_state(
+    window: &WindowHandle<Preview>,
+    visual: &mut VisualTestContext,
+) -> Option<(Permission, bool, bool, bool)> {
+    window
+        .update(visual, |preview, _, cx| {
+            preview.settings.read(cx).web_app.confirm.as_ref().map(|d| {
+                (
+                    d.permission,
+                    d.project_ticked("p1"),
+                    d.project_ticked("p2"),
+                    d.mono_ticked("m1"),
+                )
+            })
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn a_pending_rows_confirm_opens_the_dialog_with_the_defaults_and_confirms_nothing(
+    cx: &mut TestAppContext,
+) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    with_pending(&window, visual);
+    assert!(visual.debug_bounds("web-confirm-dialog").is_none());
+    click(visual, "web-confirm-0123456789abcdef");
+    for selector in [
+        "web-confirm-dialog",
+        "web-confirm-name",
+        "web-confirm-device-fp",
+        "web-confirm-desktop-fp",
+        "web-confirm-account",
+        "web-confirm-project-p1",
+        "web-confirm-project-p2",
+        "web-confirm-mono-m1",
+        "settings-web-confirm-permission-read",
+        "settings-web-confirm-permission-control",
+        "web-confirm-ok",
+        "web-confirm-deny",
+    ] {
+        assert!(visual.debug_bounds(selector).is_some(), "{selector}");
+    }
+    // Every project ticked, the Mono not, Read-only.
+    assert_eq!(
+        draft_state(&window, visual),
+        Some((Permission::Read, true, true, false))
+    );
+    // Opening the dialog sent nothing.
+    assert!(events(&window, visual).is_empty());
+    assert_eq!(
+        web::group_fingerprint(FP),
+        "0123 4567 89ab cdef 0123 4567 89ab cdef"
+    );
+    click(visual, "web-confirm-ok");
+    assert_eq!(
+        events(&window, visual),
+        [format!("confirm:{FP}:Read:None:Some([])")]
+    );
+    assert!(visual.debug_bounds("web-confirm-dialog").is_none());
+}
+
+#[gpui::test]
+fn the_dialog_sends_exactly_what_was_ticked(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    with_pending(&window, visual);
+    click(visual, "web-confirm-0123456789abcdef");
+    click(visual, "settings-web-confirm-permission-control");
+    click(visual, "web-confirm-project-p1");
+    click(visual, "web-confirm-mono-m1");
+    assert_eq!(
+        draft_state(&window, visual),
+        Some((Permission::Control, false, true, true))
+    );
+    click(visual, "web-confirm-ok");
+    assert_eq!(
+        events(&window, visual),
+        [format!(
+            "confirm:{FP}:Control:Some([\"p2\"]):Some([\"m1\"])"
+        )]
+    );
+}
+
+#[gpui::test]
+fn deny_in_the_dialog_emits_deny_and_closes_it(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    with_pending(&window, visual);
+    click(visual, "web-confirm-0123456789abcdef");
+    click(visual, "web-confirm-deny");
+    assert_eq!(events(&window, visual), [format!("deny:{FP}")]);
+    assert!(visual.debug_bounds("web-confirm-dialog").is_none());
+}
+
+#[gpui::test]
+fn the_dialog_closes_when_the_device_is_no_longer_waiting(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    with_pending(&window, visual);
+    click(visual, "web-confirm-0123456789abcdef");
+    assert!(visual.debug_bounds("web-confirm-dialog").is_some());
+    set_web(&window, visual, |ctx| ctx.web = Some(paired()));
+    assert!(visual.debug_bounds("web-confirm-dialog").is_none());
+    assert!(events(&window, visual).is_empty());
+}
+
+#[test]
+fn selection_is_none_for_all_projects_and_some_for_a_narrowed_list() {
+    let projects = choices(&["p1", "p2"]);
+    let monos = choices(&["m1", "m2"]);
+    let mut draft = web::confirm_draft(FP);
+    assert_eq!(draft.selection(&projects, &monos), (None, Some(vec![])));
+    draft.toggle_project("p2");
+    draft.toggle_mono("m2");
+    assert_eq!(
+        draft.selection(&projects, &monos),
+        (Some(vec!["p1".into()]), Some(vec!["m2".into()]))
+    );
+    draft.toggle_mono("m1");
+    // Every Mono ticked is still an explicit list, not "all".
+    assert_eq!(
+        draft.selection(&projects, &monos).1,
+        Some(vec!["m1".into(), "m2".into()])
+    );
+    // No Mono at all still sends an empty list, never "all".
+    assert_eq!(draft.selection(&projects, &[]).1, Some(vec![]));
+}
+
+fn phone(projects: Option<Vec<String>>) -> Device {
+    Device {
+        kind: DeviceKind::Phone,
+        projects,
+        server_device_id: None,
+        ..device("ph1", Permission::Control)
+    }
+}
+
+fn with_phone(
+    window: &WindowHandle<Preview>,
+    visual: &mut VisualTestContext,
+    projects: Option<Vec<String>>,
+) {
+    set_web(window, visual, |ctx| {
+        ctx.mobile = Some(monocode_core::mobile::Status {
+            devices: vec![phone(projects)],
+            ..Default::default()
+        });
+        ctx.web_projects = choices(&["p1", "p2"]);
+    });
+}
+
+#[gpui::test]
+fn a_phone_with_no_selection_shows_all_projects_and_narrowing_emits_the_rest(
+    cx: &mut TestAppContext,
+) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    with_phone(&window, visual, None);
+    assert!(visual.debug_bounds("mobile-project-ph1-p1").is_none());
+    click(visual, "mobile-projects-ph1");
+    click(visual, "mobile-project-ph1-p1");
+    assert_eq!(
+        events(&window, visual),
+        ["phone-projects:ph1:Some([\"p2\"])"]
+    );
+}
+
+#[gpui::test]
+fn ticking_every_project_again_goes_back_to_none(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    with_phone(&window, visual, Some(vec!["p2".into()]));
+    click(visual, "mobile-projects-ph1");
+    click(visual, "mobile-project-ph1-p1");
+    assert_eq!(events(&window, visual), ["phone-projects:ph1:None"]);
 }

@@ -59,6 +59,9 @@ fn fresh_pending<'a>(seen: &HashSet<String>, status: &'a WebStatus) -> Vec<&'a P
         .collect()
 }
 
+/// (id, name) pairs of the projects and the Monos the host publishes.
+pub(super) type CatalogChoices = (Vec<(String, String)>, Vec<(String, String)>);
+
 impl Shell {
     /// Starts the watcher that announces devices waiting for confirmation.
     /// Call right after `init_mobile_host`, which registers the host.
@@ -121,10 +124,16 @@ impl Shell {
 
     /// How many devices and requests wait for the user, for the Connections
     /// section's badge.
-    #[allow(dead_code)]
     pub(super) fn web_badge(&self, cx: &App) -> usize {
         cx.try_global::<WebBridge>()
             .map_or(0, |bridge| bridge.badge)
+    }
+
+    /// The (projects, monos) the host publishes, as (id, name) pairs.
+    pub(super) fn web_catalog_choices(&self) -> CatalogChoices {
+        attached_host()
+            .map(|host| host.catalog_choices())
+            .unwrap_or_default()
     }
 
     pub(super) fn web_status(&self) -> Option<WebStatus> {
@@ -173,6 +182,35 @@ impl Shell {
                         .find(|device| device.id == device_id)
                         .ok_or("That device is no longer paired")?;
                     host.set_device_access(&device_id, permission, device.projects, device.monos)
+                        .map(|_| ())
+                });
+            }
+            SettingsEvent::WebConfirmDevice {
+                fingerprint,
+                permission,
+                projects,
+                monos,
+            } => {
+                let (fingerprint, permission) = (fingerprint.clone(), *permission);
+                let (projects, monos) = (projects.clone(), monos.clone());
+                self.web_action("Confirm", cx, move |host| {
+                    host.web_confirm(&fingerprint, permission, projects, monos)
+                        .map(|_| ())
+                });
+            }
+            SettingsEvent::PhoneSetProjects {
+                device_id,
+                projects,
+            } => {
+                let (device_id, projects) = (device_id.clone(), projects.clone());
+                self.web_action("Projects", cx, move |host| {
+                    let device = host
+                        .status()
+                        .devices
+                        .into_iter()
+                        .find(|device| device.id == device_id)
+                        .ok_or("That device is no longer paired")?;
+                    host.set_device_access(&device_id, device.permission, projects, device.monos)
                         .map(|_| ())
                 });
             }

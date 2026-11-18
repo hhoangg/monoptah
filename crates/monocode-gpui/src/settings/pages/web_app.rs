@@ -1,5 +1,6 @@
 //! Settings > Connections > Web app: pairing with the web server, the
 //! devices that use it and the requests that wait for the user.
+mod confirm;
 pub(in crate::settings) mod devices;
 mod modals;
 
@@ -22,6 +23,11 @@ pub(in crate::settings) const DEFAULT_HOST: &str = "https://zptah.app";
 const PAIRING_WAIT_SECS: u64 = 20;
 const EMERALD: u32 = 0x10b981;
 
+#[cfg(test)]
+pub(in crate::settings) fn confirm_draft(fingerprint: &str) -> confirm::Draft {
+    confirm::Draft::new(fingerprint)
+}
+
 /// What the Web app section remembers between frames.
 #[derive(Default)]
 pub(in crate::settings) struct WebAppState {
@@ -34,6 +40,8 @@ pub(in crate::settings) struct WebAppState {
     pub(in crate::settings) verify: bool,
     /// The device whose revoke waits for confirmation, as (id, name).
     pub(in crate::settings) revoking: Option<(String, String)>,
+    /// The confirmation dialog of a pending device.
+    pub(in crate::settings) confirm: Option<confirm::Draft>,
     pub(in crate::settings) copied: bool,
     copied_reset: Option<Task<()>>,
     /// The QR on show, with the exact text it encodes.
@@ -127,6 +135,22 @@ impl SettingsView {
             self.web_app.verify = false;
             self.web_app.revoking = None;
         }
+        // A device answered elsewhere (denied, confirmed, gone) closes its dialog.
+        let waiting = |fingerprint: &str| {
+            self.ctx.web.as_ref().is_some_and(|web| {
+                web.pending
+                    .iter()
+                    .any(|device| device.fingerprint == fingerprint)
+            })
+        };
+        if self
+            .web_app
+            .confirm
+            .as_ref()
+            .is_some_and(|draft| !waiting(&draft.fingerprint))
+        {
+            self.web_app.confirm = None;
+        }
     }
 
     /// Leaving the page closes its code, as unmounting the page did.
@@ -138,13 +162,15 @@ impl SettingsView {
         self.web_app.confirm_unpair = false;
         self.web_app.verify = false;
         self.web_app.revoking = None;
+        self.web_app.confirm = None;
         self.web_app.host_error = None;
     }
 
     /// Escape closes the innermost Web app dialog.
     pub(in crate::settings) fn dismiss_web_app(&mut self, cx: &mut Context<Self>) -> bool {
         let state = &mut self.web_app;
-        let closed = state.revoking.take().is_some()
+        let closed = state.confirm.take().is_some()
+            || state.revoking.take().is_some()
             || std::mem::take(&mut state.confirm_unpair)
             || std::mem::take(&mut state.verify);
         if closed {
@@ -187,14 +213,22 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// Confirm on a pending row. The confirmation dialog (permission and what
-    /// the device may see) comes in the next task; until then this does
-    /// nothing, and the device stays pending.
+    /// Confirm on a pending row: opens the dialog with the defaults. Nothing
+    /// is confirmed until the user presses Confirm in it.
     pub(in crate::settings) fn open_web_confirm(
         &mut self,
-        _fingerprint: &str,
-        _cx: &mut Context<Self>,
+        fingerprint: &str,
+        cx: &mut Context<Self>,
     ) {
+        let waiting = self.ctx.web.as_ref().is_some_and(|web| {
+            web.pending
+                .iter()
+                .any(|device| device.fingerprint == fingerprint)
+        });
+        if waiting {
+            self.web_app.confirm = Some(confirm::Draft::new(fingerprint));
+            cx.notify();
+        }
     }
 
     pub(super) fn web_app_page(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {

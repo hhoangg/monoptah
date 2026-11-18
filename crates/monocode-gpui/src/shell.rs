@@ -7495,6 +7495,7 @@ impl Shell {
             let search = settings.update(cx, |v, cx| v.search_field(true, cx));
             let select = cx.weak_entity();
             let back = select.clone();
+            let web_waiting = self.web_badge(cx);
             return crate::settings::nav(
                 section,
                 search,
@@ -7504,6 +7505,7 @@ impl Shell {
                 move |window, cx| {
                     let _ = back.update(cx, |this, cx| this.close_settings(window, cx));
                 },
+                web_waiting,
             );
         }
         if self.workspace.classic_layout {

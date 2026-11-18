@@ -70,6 +70,7 @@ impl Shell {
                 catalogs.insert(kind.id().into(), settings_rows(*kind, &models));
             }
         }
+        let web_choices = self.web_catalog_choices();
         SettingsContext {
             today_rollover_minutes: self
                 .today
@@ -83,6 +84,8 @@ impl Shell {
             web: self.web_status(),
             web_pairing: self.web_pairing(cx),
             web_notice: self.web_notice(cx),
+            web_projects: web_choices.0,
+            web_monos: web_choices.1,
             quick_error: self.quick.error.clone(),
             inbox_connections: self
                 .inbox
@@ -305,6 +308,8 @@ impl Shell {
                 | SettingsEvent::WebDenyDevice(_)
                 | SettingsEvent::WebSetPermission { .. }
                 | SettingsEvent::WebRevokeDevice(_)
+                | SettingsEvent::WebConfirmDevice { .. }
+                | SettingsEvent::PhoneSetProjects { .. }
                 | SettingsEvent::WebAnswerRequest { .. } => this.web_settings_event(event, cx),
             },
         ));

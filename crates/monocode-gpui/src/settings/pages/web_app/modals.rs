@@ -31,6 +31,7 @@ impl SettingsView {
             || self.web_app.confirm_unpair
             || self.web_app.verify
             || self.web_app.revoking.is_some()
+            || self.web_app.confirm.is_some()
     }
 
     /// The innermost open Web app dialog, over the whole window.
@@ -45,6 +46,9 @@ impl SettingsView {
                 this.dismiss_web_app(cx);
             });
         };
+        if let Some(card) = self.confirm_card(cx) {
+            return Some(modal::overlay("web-confirm", card, dismiss).into_any_element());
+        }
         if let Some((id, name)) = self.web_app.revoking.clone() {
             return Some(
                 modal::overlay("web-revoke", self.revoke_card(id, name, cx), dismiss)
