@@ -21,6 +21,23 @@ describe("ESLint security bans", () => {
     ["eval", "export function f(s: string) { return eval(s); }"],
     ["window.eval", "export function f(s: string) { return window.eval(s); }"],
     ["new Function", "export function f(s: string) { return new Function(s); }"],
+    ["setHTMLUnsafe", "export function f(el: HTMLElement, h: string) { (el as unknown as { setHTMLUnsafe(h: string): void }).setHTMLUnsafe(h); }"],
+    ["Document.parseHTMLUnsafe", "export function f(h: string) { return (Document as unknown as { parseHTMLUnsafe(h: string): Document }).parseHTMLUnsafe(h); }"],
+    ["createContextualFragment", "export function f(h: string) { return document.createRange().createContextualFragment(h); }"],
+    ["new DOMParser", "export function f() { return new DOMParser(); }"],
+    ["parseFromString", "export function f(p: DOMParser, h: string) { return p.parseFromString(h, 'text/html'); }"],
+    ["iframe srcdoc property", "export function f(el: HTMLIFrameElement, h: string) { el.srcdoc = h; }"],
+    ["JSX srcDoc attribute", "export const A = ({ h }: { h: string }) => <iframe srcDoc={h} />;"],
+    ["setAttribute style", "export function f(el: HTMLElement, v: string) { el.setAttribute('style', v); }"],
+    ["setAttribute srcdoc", "export function f(el: HTMLElement, v: string) { el.setAttribute('srcdoc', v); }"],
+    ["setAttribute onclick", "export function f(el: HTMLElement, v: string) { el.setAttribute('onclick', v); }"],
+    ["new Worker outside the allowlist", "export function f() { return new Worker('x.js'); }"],
+    ["new SharedWorker", "export function f() { return new SharedWorker('x.js'); }"],
+    ["importScripts", "export function f() { importScripts('x.js'); }"],
+    ["createElement script", "export function f() { return document.createElement('script'); }"],
+    ["JSX script element", "export const A = () => <script />;"],
+    ["script src", "export function f(script: HTMLScriptElement, u: string) { script.src = u; }"],
+    ["script textContent", "export function f(script: HTMLScriptElement, u: string) { script.textContent = u; }"],
   ])("reports %s", async (_name, code) => {
     const found = await messages(code);
     expect(found.length, JSON.stringify(found)).toBeGreaterThan(0);
@@ -37,6 +54,15 @@ describe("ESLint security bans", () => {
       const found = await messages(code);
       expect(found.some((m) => m.severity === 2 && m.message.includes("innerHTML")), directive).toBe(true);
     }
+  });
+
+  it("allows new Worker only in the allowlisted modules, and still bans the other sinks there", async () => {
+    const worker = "export function f() { return new Worker(new URL('./x.worker.ts', import.meta.url), { type: 'module' }); }";
+    expect(await messages(worker, "src/features/backgrounds/render.ts")).toEqual([]);
+    expect(await messages(worker, "src/features/markdown/highlight/plugin.ts")).toEqual([]);
+    expect((await messages(worker, "src/features/other/thing.ts")).length).toBeGreaterThan(0);
+    const sink = await messages("export function f(h: string) { return new DOMParser().parseFromString(h, 'text/html'); }", "src/features/backgrounds/render.ts");
+    expect(sink.some((m) => m.severity === 2)).toBe(true);
   });
 
   it("accepts ordinary React code", async () => {
