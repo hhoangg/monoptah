@@ -8,6 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { SessionStartTargetSchema, type ParamsOf } from "@monoptah/protocol";
 import { catalogKey, useCatalog, useLinkMutation } from "@/data";
+import { BACKGROUND_CONTAINER_CLASS, EmptySessionBackground } from "@/features/backgrounds";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { Composer } from "@/features/composer/Composer";
 import { useLinkReady } from "@/features/composer/SessionComposer";
@@ -135,8 +136,9 @@ export function NewSessionScreen({ desktopId, projectId }: { desktopId: string; 
   return (
     <div
       data-testid="new-session-screen"
-      className="-mb-[calc(env(safe-area-inset-bottom)+2.5rem)] flex h-[calc(100dvh-2.75rem-env(safe-area-inset-top))] flex-col"
+      className={`${BACKGROUND_CONTAINER_CLASS} -mb-[calc(env(safe-area-inset-bottom)+2.5rem)] flex h-[calc(100dvh-2.75rem-env(safe-area-inset-top))] flex-col`}
     >
+      <EmptySessionBackground projectId={projectId} />
       <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
           to="/d/$desktopId/p/$projectId"

@@ -15,6 +15,8 @@ import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks, registerSendGuard, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
+import { putBackground } from "@/features/backgrounds/store";
+import { IDBFactory } from "fake-indexeddb";
 import { MAX_FILE_BYTES } from "@/features/composer/attachments";
 import { resetSessionActivity } from "./activityStore";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLink, type MockLinkOptions } from "./dev/mockLink";
@@ -307,6 +309,16 @@ describe("new session page (F-30, F-31)", () => {
     expect(params.runtimeMode).not.toBe("full-access");
     expect(params).not.toHaveProperty("target");
     await waitFor(() => expect(router.state.location.pathname).toMatch(new RegExp(`^/d/${DESKTOP_ID}/s/sess-new-`)));
+  });
+
+  it("shows the project's stored background behind the empty-session screen (F-90)", async () => {
+    globalThis.indexedDB = new IDBFactory();
+    await putBackground({ projectId: "proj-alpha", projectName: "Example Alpha", image: new Blob(["x"], { type: "image/png" }), opacity: 0.3, updatedAt: 1 });
+    mount(NEW);
+    const image = await screen.findByTestId("empty-session-background");
+    expect(image).toHaveStyle({ opacity: "0.3" });
+    expect(screen.getByTestId("new-session-screen")).toContainElement(image);
+    expect(screen.getByTestId("new-session-screen")).toHaveClass("isolate");
   });
 
   it("goes back to the project when Open after starting is off", async () => {
