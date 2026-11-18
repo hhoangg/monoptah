@@ -1,8 +1,10 @@
 // The Files surface shared by the route and the right panel: the tree with a search box, and the viewer.
-//   split  tree on the left, viewer on the right (the files route from 1024px)
-//   stack  tree or viewer, one at a time, with a back button (the panel, and the route below 1024px)
-import { useState } from "react";
+//   split  tree on the left, viewer on the right
+//   stack  tree or viewer, one at a time, with a back button (the panel)
+//   auto   split when this pane is at least SPLIT_MIN_WIDTH wide, else stack (the route: the pane width decides, not the window)
+import { useRef, useState } from "react";
 import { Icon } from "@/ui/Icon";
+import { useElementWidth } from "@/ui/useElementWidth";
 import { FileSearchPane } from "./FileSearchPane";
 import { FileTree } from "./FileTree";
 import { FileViewer } from "./FileViewer";
@@ -18,10 +20,16 @@ export interface FilesBrowserProps {
   /** Whether `path` is a file (otherwise a folder, shown as an opened folder in the tree). */
   isFile: boolean;
   onNavigate: (path: string) => void;
-  layout: "split" | "stack";
+  layout: "split" | "stack" | "auto";
 }
 
-export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, layout }: FilesBrowserProps) {
+/** Pane width (CSS px) from which "auto" shows the tree beside the viewer. */
+export const SPLIT_MIN_WIDTH = 700;
+
+export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, layout: requested }: FilesBrowserProps) {
+  const root = useRef<HTMLDivElement>(null);
+  const width = useElementWidth(root);
+  const layout = requested === "auto" ? (width >= SPLIT_MIN_WIDTH ? "split" : "stack") : requested;
   const [search, setSearch] = useState("");
   const owner = useQuickOpenHost({ desktopId, projectId });
   const open = (next: string) => {
@@ -37,11 +45,11 @@ export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, l
   const viewer = isFile ? <FileViewer key={path} projectId={projectId} path={path} onOpenPath={open} /> : null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col" data-testid="files-browser" data-layout={layout}>
+    <div ref={root} className="flex h-full min-h-0 flex-1 flex-col" data-testid="files-browser" data-layout={layout}>
       {layout === "split" ? (
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(240px,320px)_minmax(0,1fr)]">
           <div className="min-h-0 border-r border-stroke">{tree}</div>
-          <div className="min-h-0">{viewer ?? <p className="p-6 text-small text-muted-text">Choose a file to see it here.</p>}</div>
+          <div className="min-h-0">{viewer ?? <NoFileOpen />}</div>
         </div>
       ) : viewer ? (
         <div className="flex min-h-0 flex-1 flex-col">
@@ -59,6 +67,16 @@ export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, l
         tree
       )}
       <QuickOpen owner={owner} desktopId={desktopId} projectId={projectId} />
+    </div>
+  );
+}
+
+function NoFileOpen() {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center" data-testid="no-file-open">
+      <Icon name="file" size={32} className="text-faint" />
+      <p className="text-title font-semibold">No file open</p>
+      <p className="text-small text-muted-text">Pick a file or press Cmd/Ctrl P</p>
     </div>
   );
 }

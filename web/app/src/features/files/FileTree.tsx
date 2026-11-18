@@ -1,4 +1,4 @@
-// F-59: the file tree. Folders load lazily when opened (`project.files`), ignored entries are dimmed,
+// F-59: the file tree. Folders load lazily when opened (`project.files`), ignored entries are muted,
 // the first four root folders are prefetched, and a refresh button re-reads what is loaded (the web has no pull).
 // Keyboard (WAI-ARIA tree): one tab stop (roving tabindex); Up/Down/Home/End move, Right opens a folder or
 // enters it, Left closes it or goes to the parent, Enter and Space open.
@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { linkQueryOptions, useLinkQuery } from "@/data";
 import { useLinkDesktopId } from "@/link";
 import { cn } from "@/lib/utils";
+import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
@@ -83,8 +84,11 @@ function Folder({ path, depth, context }: { path: string; depth: number; context
   const query = useLinkQuery("project.files", folderParams(context.projectId, path));
   if (query.isError) {
     return (
-      <li role="none" style={{ paddingLeft: depth * 16 + 8 }} className="py-1 text-small text-deletions">
+      <li role="none" style={{ paddingLeft: depth * 16 + 8 }} className="flex items-center gap-2 py-1 text-small text-deletions">
         Could not load this folder.
+        <button type="button" onClick={() => void query.refetch()} className="rounded-pill px-2 py-1 text-content underline hover:bg-selection">
+          Try again
+        </button>
       </li>
     );
   }
@@ -123,12 +127,17 @@ function Folder({ path, depth, context }: { path: string; depth: number; context
               onFocus={() => context.onFocusItem(full)}
               onKeyDown={(event) => onTreeKeyDown(event, entry.isDir, open, full, context.onToggle)}
               onClick={() => (entry.isDir ? context.onToggle(full) : context.onOpenFile(full))}
-              className={cn(rowClass, entry.ignored && "opacity-50", !entry.isDir && context.selected === full && "bg-selection")}
+              className={cn(rowClass, !entry.isDir && context.selected === full && "bg-selection")}
               style={{ paddingLeft: depth * 16 + 8 }}
             >
               {entry.isDir ? <Icon name="chevronRight" size={14} className={cn("shrink-0 text-muted-text transition-transform motion-reduce:transition-none", open && "rotate-90")} /> : <span className="w-3.5 shrink-0" />}
-              <FileTypeIcon name={entry.name} isDir={entry.isDir} isOpen={open} />
-              <span className="min-w-0 flex-1 truncate [unicode-bidi:isolate]">{entry.name}</span>
+              <span className={cn("inline-flex shrink-0", entry.ignored && "opacity-60")}>
+                <FileTypeIcon name={entry.name} isDir={entry.isDir} isOpen={open} />
+              </span>
+              <span className={cn("min-w-0 flex-1 truncate [unicode-bidi:isolate]", entry.ignored && "text-muted-text")}>
+                {entry.name}
+                {entry.ignored ? <span className="sr-only"> (ignored)</span> : null}
+              </span>
             </button>
             {open ? (
               <ul role="group">
@@ -203,8 +212,7 @@ export function FileTree({ projectId, selected, onOpenFile, className }: FileTre
 
   return (
     <div className={cn("flex min-h-0 flex-col", className)} data-testid="file-tree">
-      <div className="flex items-center justify-between gap-2 px-3 pt-1">
-        <h2 className="text-meta font-medium text-muted-text">Files</h2>
+      <div className="flex items-center justify-end gap-2 px-3 pt-1">
         <button
           type="button"
           aria-label="Refresh files"
@@ -216,7 +224,12 @@ export function FileTree({ projectId, selected, onOpenFile, className }: FileTre
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-1 pb-3">
         {root.isError ? (
-          <Notice variant="error" className="m-2">Could not load the files of this project.</Notice>
+          <Notice variant="error" className="m-2">
+            Could not load the files of this project.{" "}
+            <Button type="button" variant="outline" size="sm" onClick={() => void root.refetch()}>
+              Try again
+            </Button>
+          </Notice>
         ) : (
           <ul role="tree" aria-label="Project files">
             <Folder path="" depth={0} context={context} />

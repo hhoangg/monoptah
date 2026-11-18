@@ -14,6 +14,7 @@ import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
+import { PathLabel } from "@/ui/PathLabel";
 import { SegmentedControl } from "@/ui/SegmentedControl";
 import { FileTypeIcon } from "./FileTypeIcon";
 import { FileProblem } from "./FileProblem";
@@ -145,9 +146,7 @@ export function FileViewer({ projectId, path, onOpenPath }: FileViewerProps) {
     <section aria-label={`File ${name}`} data-testid="file-viewer" className="flex h-full min-h-0 flex-col">
       <header className="flex min-h-11 shrink-0 items-center gap-2 border-b border-stroke px-3">
         <FileTypeIcon name={name} isDir={false} />
-        <span className="min-w-0 flex-1 truncate text-label font-medium" title={path}>
-          {path}
-        </span>
+        <PathLabel path={path} className="flex-1 text-label" />
         {isMarkdown && file.data ? (
           <SegmentedControl
             label="Markdown view"

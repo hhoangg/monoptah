@@ -318,12 +318,14 @@ describe("search (F-61)", () => {
       vi.advanceTimersByTime(1);
     });
     // The relay may use timers too: keep the fake clock running until the result shows.
-    for (let i = 0; i < 50 && !screen.queryByRole("button", { name: /src\/main\.ts/ }); i++) {
+    for (let i = 0; i < 50 && !screen.queryByRole("button", { name: /^main\.ts\s*src$/ }); i++) {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(10);
       });
     }
-    expect(screen.getByRole("button", { name: /src\/main\.ts/ })).toBeInTheDocument();
+    // The file name reads first, the folder follows (PathLabel); the full path is the tooltip.
+    const hit = screen.getByRole("button", { name: /^main\.ts\s*src$/ });
+    expect(hit.querySelector('[title="src/main.ts"]')).not.toBeNull();
     expect(calls.search).toEqual(["mai"]);
   });
 });
