@@ -82,6 +82,7 @@ describe("approval card over the mock desktop (U-08)", () => {
     const region = await screen.findByRole("region", { name: "Needs your approval" });
     expect(region).toHaveTextContent("Run example command");
     expect(region).toHaveTextContent("example-cli --check (fake detail)");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Allow once" })).toBeEnabled(), { timeout: 3000 });
     await user.dblClick(screen.getByRole("button", { name: "Allow once" }));
     await waitFor(() => expect(screen.queryByRole("region", { name: "Needs your approval" })).toBeNull());
     expect(calls).toEqual([{ conversationId: SESSION, requestId: 41, decision: "allow" }]);
@@ -91,7 +92,9 @@ describe("approval card over the mock desktop (U-08)", () => {
     const user = userEvent.setup();
     const calls = spyAnswers();
     mount();
-    await user.click(await screen.findByRole("button", { name: "Deny" }));
+    const deny = await screen.findByRole("button", { name: "Deny" });
+    await waitFor(() => expect(deny).toBeEnabled(), { timeout: 3000 });
+    await user.click(deny);
     await waitFor(() => expect(calls).toHaveLength(1));
     expect(calls[0]).toEqual({ conversationId: SESSION, requestId: 41, decision: "deny" });
   });
@@ -114,6 +117,8 @@ describe("approval card over the mock desktop (U-08)", () => {
     const allow = await screen.findByRole("button", { name: "Allow once" });
     expect(allow).toBeDisabled();
     expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(allow).toBeDisabled();
     expect(screen.getByText("Approvals need a device with control access.")).toBeInTheDocument();
     await user.click(allow);
     expect(calls).toHaveLength(0);
