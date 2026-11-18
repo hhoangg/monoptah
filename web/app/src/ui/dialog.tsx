@@ -1,5 +1,5 @@
 import { Dialog as DialogPrimitive } from "radix-ui";
-import type { ComponentProps } from "react";
+import { useRef, type ComponentProps } from "react";
 import { cn } from "@/lib/utils";
 import { Icon } from "./Icon";
 
@@ -26,13 +26,31 @@ export function DialogContent({
   className,
   children,
   showClose = true,
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...props
 }: ComponentProps<typeof DialogPrimitive.Content> & { showClose?: boolean }) {
+  // Radix returns focus only to a `DialogTrigger`. Dialogs here are mostly controlled (opened from state), so without
+  // this focus would fall to the page body when they close and a keyboard user would lose their place.
+  const opener = useRef<HTMLElement | null>(null);
   return (
     <DialogPortal>
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
+        onOpenAutoFocus={(event) => {
+          opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+          onOpenAutoFocus?.(event);
+        }}
+        onCloseAutoFocus={(event) => {
+          onCloseAutoFocus?.(event);
+          const target = opener.current;
+          opener.current = null;
+          // A caller that prevented the default handles focus itself. Radix then runs its own handler, which focuses
+          // the trigger when there is one (after this, so it wins) and does nothing otherwise.
+          if (event.defaultPrevented || target === null || !target.isConnected) return;
+          target.focus();
+        }}
         className={cn(
           "fixed top-1/2 left-1/2 z-50 grid w-[calc(100%-2.5rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 rounded-dialog border border-stroke bg-sheet p-5 text-content data-[state=open]:animate-[dialog-in_280ms_var(--ease-out-cubic)] data-[state=closed]:animate-[fade-out_180ms_var(--ease-out-cubic)]",
           className,
