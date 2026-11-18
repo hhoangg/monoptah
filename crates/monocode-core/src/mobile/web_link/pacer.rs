@@ -456,12 +456,12 @@ mod tests {
                 channel,
                 "peer",
                 move |_| serve_admits.load(Ordering::SeqCst),
-                |_, _| async { Ok(Value::Null) },
+                |_, _| async { Ok::<_, String>(Value::Null) },
                 move |_, _, sink| {
                     let sink_tx = sink_tx.clone();
                     async move {
                         sink_tx.send(sink).await.unwrap();
-                        Ok(())
+                        Ok::<_, String>(())
                     }
                 },
                 ServeOptions::WEB,

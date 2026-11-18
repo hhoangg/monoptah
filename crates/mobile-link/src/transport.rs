@@ -1,5 +1,5 @@
 use crate::duplex::{accept, Accepted, Duplex, ServeOptions};
-use crate::{tls, Address, Gate, Identity, LinkResult, REQUEST_LIMIT, RESPONSE_LIMIT};
+use crate::{tls, Address, Failure, Gate, Identity, LinkResult, REQUEST_LIMIT, RESPONSE_LIMIT};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -90,12 +90,18 @@ pub const WATCH_HEARTBEAT: Duration = Duration::from_secs(10);
 /// goes to `watcher` instead, and its stream stays open: every value the
 /// watcher sends becomes a frame, with heartbeats between, until the watcher
 /// drops its sink or the phone goes away.
-pub async fn serve<F, Fut, W, WFut>(endpoint: quinn::Endpoint, gate: Gate, handler: F, watcher: W)
-where
+pub async fn serve<F, Fut, E, W, WFut, WE>(
+    endpoint: quinn::Endpoint,
+    gate: Gate,
+    handler: F,
+    watcher: W,
+) where
     F: Fn(String, Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = LinkResult<Value>> + Send + 'static,
+    Fut: Future<Output = Result<Value, E>> + Send + 'static,
+    E: Into<Failure> + 'static,
     W: Fn(String, Value, WatchSink) -> WFut + Send + Sync + 'static,
-    WFut: Future<Output = LinkResult<()>> + Send + 'static,
+    WFut: Future<Output = Result<(), WE>> + Send + 'static,
+    WE: Into<Failure> + 'static,
 {
     let handler = Arc::new(handler);
     let watcher = Arc::new(watcher);
@@ -296,15 +302,15 @@ fn give(key: &str, endpoint: quinn::Endpoint, connection: quinn::Connection) {
 
 /// Why a request on a connection failed: the link itself, which a fresh
 /// connection may not hit, or the desktop taking too long, which it would.
-enum Failure {
+enum Attempt {
     Link(String),
     Timeout,
 }
-impl From<Failure> for String {
-    fn from(failure: Failure) -> Self {
+impl From<Attempt> for String {
+    fn from(failure: Attempt) -> Self {
         match failure {
-            Failure::Link(error) => error,
-            Failure::Timeout => "Desktop request timed out".into(),
+            Attempt::Link(error) => error,
+            Attempt::Timeout => "Desktop request timed out".into(),
         }
     }
 }
@@ -321,7 +327,7 @@ async fn on_connection<T, F, Fut>(
 ) -> LinkResult<T>
 where
     F: Fn(quinn::Endpoint, quinn::Connection) -> Fut,
-    Fut: Future<Output = Result<(T, bool), Failure>>,
+    Fut: Future<Output = Result<(T, bool), Attempt>>,
 {
     let key = pool_key(identity, pin, addresses);
     if let Some((endpoint, connection)) = take(&key) {
@@ -332,7 +338,7 @@ where
                 }
                 return Ok(value);
             }
-            Err(Failure::Link(_)) => connection.close(0_u32.into(), b"Stale"),
+            Err(Attempt::Link(_)) => connection.close(0_u32.into(), b"Stale"),
             Err(failure) => {
                 connection.close(0_u32.into(), b"Timed out");
                 return Err(failure.into());
@@ -390,8 +396,8 @@ pub async fn exchange(
                 read_frame(&mut recv, RESPONSE_LIMIT).await
             })
             .await
-            .map_err(|_| Failure::Timeout)?
-            .map_err(Failure::Link)?;
+            .map_err(|_| Attempt::Timeout)?
+            .map_err(Attempt::Link)?;
             Ok((response, true))
         }
     })
@@ -480,8 +486,8 @@ pub async fn watch(
                 Ok::<_, String>((send, recv, answer))
             })
             .await
-            .map_err(|_| Failure::Timeout)?
-            .map_err(Failure::Link)?;
+            .map_err(|_| Attempt::Timeout)?
+            .map_err(Attempt::Link)?;
             let (send, recv, answer) = opened;
             if answer["ok"] != true {
                 let error = answer["error"]
@@ -563,12 +569,12 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             move |_, _, sink| {
                 let sinks = sinks.clone();
                 async move {
                     sinks.send(sink).await.unwrap();
-                    Ok(())
+                    Ok::<_, String>(())
                 }
             },
         ));
@@ -621,10 +627,10 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             |_, request: Value, sink: WatchSink| async move {
                 if request["method"] != "conversation.watch" {
-                    return Err("Unsupported mobile operation".into());
+                    return Err::<_, String>("Unsupported mobile operation".into());
                 }
                 tokio::spawn(async move {
                     for n in 0..3 {
@@ -675,7 +681,7 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             move |_, _, sink: WatchSink| {
                 let released = released.clone();
                 async move {
@@ -683,7 +689,7 @@ mod tests {
                         sink.closed().await;
                         released.send(()).await.unwrap();
                     });
-                    Ok(())
+                    Ok::<_, String>(())
                 }
             },
         ));
@@ -717,7 +723,7 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             no_watch,
         ));
         for host in ["127.0.0.1", "::1"] {
@@ -749,10 +755,10 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             |_, _, sink: WatchSink| async move {
                 tokio::spawn(async move { sink.closed().await });
-                Ok(())
+                Ok::<_, String>(())
             },
         ));
         let address = [Address {
@@ -795,7 +801,7 @@ mod tests {
             gate,
             move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
-                async { Ok(Value::Null) }
+                async { Ok::<_, String>(Value::Null) }
             },
             no_watch,
         ));
@@ -871,7 +877,7 @@ mod tests {
             gate.clone(),
             |_, request| async move {
                 if request["method"] == "fail" {
-                    Err("boom".into())
+                    Err::<_, String>("boom".into())
                 } else {
                     Ok(json!({"a":[2,"x"],"b":1}))
                 }
@@ -880,7 +886,7 @@ mod tests {
                 let sinks = sinks.clone();
                 async move {
                     match request["method"].as_str() {
-                        Some("refuse") => Err("Unsupported mobile operation".into()),
+                        Some("refuse") => Err::<_, String>("Unsupported mobile operation".into()),
                         Some("hold") => {
                             sinks.send(sink).await.unwrap();
                             Ok(())
@@ -1002,7 +1008,7 @@ mod tests {
             gate.clone(),
             move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
-                async { Ok(json!("accepted")) }
+                async { Ok::<_, String>(json!("accepted")) }
             },
             no_watch,
         ));

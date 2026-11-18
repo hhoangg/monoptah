@@ -7,7 +7,7 @@ use super::identity_store::{self, IdentityKeychain, SystemKeychain};
 use super::policy::{self, DeviceContext, DeviceKind, Permission};
 use super::web_link::{desktop_api, LinkCommand, PairPoll, PairTicket, PermissionRequest};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use monocode_mobile_link::{now, Address, Gate, Identity, WatchSink, PORT, VERSION};
+use monocode_mobile_link::{now, Address, Failure, Gate, Identity, WatchSink, PORT, VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -214,10 +214,12 @@ pub struct Request {
     pub params: Value,
     /// Who asked, for the app to check what it alone can resolve.
     pub device: DeviceContext,
-    reply: oneshot::Sender<Result<Value, String>>,
+    reply: oneshot::Sender<Result<Value, Failure>>,
 }
 impl Request {
-    pub fn reply(self, result: Result<Value, String>) {
+    /// Answers the request. A [`Failure`] with a code reaches a web device as
+    /// its `code`; a plain `String` error reaches it as text only.
+    pub fn reply(self, result: Result<Value, Failure>) {
         let _ = self.reply.send(result);
     }
 }
@@ -236,10 +238,10 @@ pub struct WatchStart {
     pub incremental: bool,
     /// Who asked, for the app to check what it alone can resolve.
     pub device: DeviceContext,
-    accept: oneshot::Sender<Result<(), String>>,
+    accept: oneshot::Sender<Result<(), Failure>>,
 }
 impl WatchStart {
-    pub fn accept(self, result: Result<(), String>) {
+    pub fn accept(self, result: Result<(), Failure>) {
         let _ = self.accept.send(result);
     }
 }
@@ -612,10 +614,12 @@ impl MobileHost {
         let mut config = inner.config.clone();
         let mut changed = false;
         for device in &mut config.devices {
-            if device
-                .push
-                .as_ref()
-                .is_some_and(|push| tokens.contains(&push.token))
+            // Only phones hold a push registration; a web row is left as it is.
+            if device.kind == DeviceKind::Phone
+                && device
+                    .push
+                    .as_ref()
+                    .is_some_and(|push| tokens.contains(&push.token))
             {
                 device.push = None;
                 changed = true;
@@ -803,13 +807,16 @@ impl MobileHost {
     }
 
     /// A QUIC phone's request.
+    /// The refusal text only: the phones' wire has no `code`.
     pub(super) async fn handle(&self, peer: &str, request: Value) -> Result<Value, String> {
-        self.handle_from(DeviceKind::Phone, peer, request).await
+        self.handle_from(DeviceKind::Phone, peer, request)
+            .await
+            .map_err(|failure| failure.error)
     }
 
     /// A web device's request, delivered by the web link. Needs `web_enabled`
     /// and a web row; a phone row is never served here.
-    pub(super) async fn handle_web(&self, peer: &str, request: Value) -> Result<Value, String> {
+    pub(super) async fn handle_web(&self, peer: &str, request: Value) -> Result<Value, Failure> {
         self.handle_from(DeviceKind::Web, peer, request).await
     }
 
@@ -818,7 +825,7 @@ impl MobileHost {
         via: DeviceKind,
         peer: &str,
         request: Value,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Failure> {
         let mut audited = None;
         let result = self.call_from(via, peer, &request, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
@@ -841,6 +848,7 @@ impl MobileHost {
     ) -> Result<Value, String> {
         self.call_from(DeviceKind::Phone, peer, request, audited)
             .await
+            .map_err(|failure| failure.error)
     }
 
     /// `handle_call` for the transport `via`.
@@ -850,7 +858,7 @@ impl MobileHost {
         peer: &str,
         request: &Value,
         audited: &mut Option<(DeviceContext, AuditEvent)>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Failure> {
         if request["version"] != VERSION {
             return Err("Update Monoptah on both devices".into());
         }
@@ -866,21 +874,21 @@ impl MobileHost {
             // through the relay, so a web context must never enrol here.
             if method == "device.enroll" {
                 if !enroll_allowed(via) {
-                    return Err("Unsupported mobile operation".into());
+                    return Err(unsupported());
                 }
-                return self.enroll(&mut inner, peer, &params);
+                return Ok(self.enroll(&mut inner, peer, &params)?);
             }
             let device = find_device(&inner, via, peer)?;
             let context = device_context(&device);
             *audited = Some((context.clone(), audit_event(&device, method, request)));
             if let Err(denial) = policy::authorize(&context, method, &params) {
                 mark_denied(audited, &denial);
-                return Err(denial.error);
+                return Err(denial.into());
             }
             match method {
                 "device.selection" => {
                     let answer = policy::device_selection(&context, &params)?;
-                    return self.answer_selection(&mut inner, peer, answer);
+                    return Ok(self.answer_selection(&mut inner, peer, answer)?);
                 }
                 "device.leave" => {
                     let mut config = inner.config.clone();
@@ -912,9 +920,9 @@ impl MobileHost {
                     return Ok(page);
                 }
                 // Push tokens are for the phones' Expo path; the web transport
-                // answers `unsupported` (the code is added on the web channel).
+                // answers `unsupported`, before any config write.
                 "device.push" if via == DeviceKind::Web => {
-                    return Err("Unsupported mobile operation".into());
+                    return Err(unsupported());
                 }
                 "device.push" => {
                     let push = push_registration(&params)?;
@@ -929,7 +937,7 @@ impl MobileHost {
                 _ => {}
             }
             if !APP_METHODS.contains(&method) {
-                return Err("Unsupported mobile operation".into());
+                return Err(unsupported());
             }
             context
         };
@@ -939,7 +947,7 @@ impl MobileHost {
             .ok_or("Missing command ID")?;
         if self.pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
             self.pending.fetch_sub(1, Ordering::SeqCst);
-            return Err("Desktop is busy; try again".into());
+            return Err(busy());
         }
         let (reply, receive) = oneshot::channel();
         let sent = self
@@ -955,10 +963,10 @@ impl MobileHost {
         let response = if sent {
             tokio::time::timeout(REPLY_WAIT, receive)
                 .await
-                .map_err(|_| "Desktop did not answer".to_string())
-                .and_then(|reply| reply.map_err(|_| "Desktop is unavailable".to_string()))
+                .map_err(|_| Failure::from("Desktop did not answer"))
+                .and_then(|reply| reply.map_err(|_| Failure::from("Desktop is unavailable")))
         } else {
-            Err("Desktop is unavailable".to_string())
+            Err(Failure::from("Desktop is unavailable"))
         };
         self.pending.fetch_sub(1, Ordering::SeqCst);
         let response = response?;
@@ -970,7 +978,7 @@ impl MobileHost {
                 .is_ok_and(|inner| find_device(&inner, via, peer).is_ok()),
         };
         if !admitted {
-            return Err("Device revoked".into());
+            return Err(revoked("Device revoked"));
         }
         response
     }
@@ -985,6 +993,7 @@ impl MobileHost {
     ) -> Result<(), String> {
         self.watch_from(DeviceKind::Phone, peer, request, sink)
             .await
+            .map_err(|failure| failure.error)
     }
 
     /// `watch` for a web device, as `handle_web` is to `handle`.
@@ -993,7 +1002,7 @@ impl MobileHost {
         peer: &str,
         request: Value,
         sink: WatchSink,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failure> {
         self.watch_from(DeviceKind::Web, peer, request, sink).await
     }
 
@@ -1003,7 +1012,7 @@ impl MobileHost {
         peer: &str,
         request: Value,
         sink: WatchSink,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failure> {
         let mut audited = None;
         let result = self
             .watch_call_from(via, peer, &request, sink, &mut audited)
@@ -1024,12 +1033,12 @@ impl MobileHost {
         request: &Value,
         sink: WatchSink,
         audited: &mut Option<(DeviceContext, AuditEvent)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failure> {
         if request["version"] != VERSION {
             return Err("Update Monoptah on both devices".into());
         }
         if request["method"] != "conversation.watch" {
-            return Err("Unsupported mobile operation".into());
+            return Err(unsupported());
         }
         let params = &request["params"];
         let conversation = params["conversationId"]
@@ -1049,7 +1058,7 @@ impl MobileHost {
             ));
             if let Err(denial) = policy::authorize(&context, "conversation.watch", params) {
                 mark_denied(audited, &denial);
-                return Err(denial.error);
+                return Err(denial.into());
             }
             inner.watches.retain(|_, watch| !watch.sink.is_closed());
             if inner
@@ -1059,7 +1068,7 @@ impl MobileHost {
                 .count()
                 >= MAX_WATCHES_PER_DEVICE
             {
-                return Err("Desktop is busy; try again".into());
+                return Err(busy());
             }
             inner.watches.insert(
                 id.clone(),
@@ -1087,11 +1096,11 @@ impl MobileHost {
         let accepted = if self.events.try_send(start).is_ok() {
             tokio::time::timeout(REPLY_WAIT, accepted)
                 .await
-                .map_err(|_| "Desktop did not answer".to_string())
-                .and_then(|result| result.map_err(|_| "Desktop is unavailable".to_string()))
+                .map_err(|_| Failure::from("Desktop did not answer"))
+                .and_then(|result| result.map_err(|_| Failure::from("Desktop is unavailable")))
                 .and_then(|result| result)
         } else {
-            Err("Desktop is unavailable".into())
+            Err(Failure::from("Desktop is unavailable"))
         };
         if let Err(error) = accepted {
             if let Ok(mut inner) = self.inner.lock() {
@@ -1153,14 +1162,30 @@ fn check_enabled(inner: &Inner, via: DeviceKind) -> Result<(), String> {
 
 /// The paired device with this fingerprint that belongs to the transport: a
 /// QUIC phone is never found through the web path, nor a web device through QUIC.
-fn find_device(inner: &Inner, via: DeviceKind, peer: &str) -> Result<Device, String> {
+/// The refusal for a method the transport does not serve, with its code.
+fn unsupported() -> Failure {
+    policy::Denial::new(policy::Code::Unsupported).into()
+}
+
+/// The refusal for a full desktop (too many requests or watches).
+fn busy() -> Failure {
+    policy::Denial::new(policy::Code::Busy).into()
+}
+
+/// A refusal because the device is no longer admitted. Keeps `text`, the
+/// words the phones already see.
+fn revoked(text: &str) -> Failure {
+    Failure::coded(policy::Code::Revoked.as_str(), text)
+}
+
+fn find_device(inner: &Inner, via: DeviceKind, peer: &str) -> Result<Device, Failure> {
     inner
         .config
         .devices
         .iter()
         .find(|device| device.fingerprint == peer && device.kind == via)
         .cloned()
-        .ok_or_else(|| "Device revoked or not paired".to_string())
+        .ok_or_else(|| revoked("Device revoked or not paired"))
 }
 
 /// Ends every open watch of the device behind `peer`, as its selection,
@@ -2403,8 +2428,13 @@ mod tests {
     async fn requests_carry_the_phone_context_and_new_methods_reach_the_app() {
         let (host, events, peer) = paired();
         let device = host.inner.lock().unwrap().config.devices[0].clone();
+        // H-01/H-02/H-08: `session.answerApproval` no longer reaches the app,
+        // it is refused in core while remote approvals are off. A new app
+        // method a default phone may call (`cloud.instances`) takes its place
+        // in the list, so new methods still reach the app with the phone context.
+        let reaching = ["cloud.instances", "cloud.stop"];
         let answering = tokio::spawn(async move {
-            for method in ["session.answerApproval", "cloud.stop"] {
+            for method in reaching {
                 let Ok(Event::Request(request)) = events.recv().await else {
                     panic!("expected a request");
                 };
@@ -2413,7 +2443,7 @@ mod tests {
                 request.reply(Err("Unsupported mobile operation".into()));
             }
         });
-        for method in ["session.answerApproval", "cloud.stop"] {
+        for method in reaching {
             let error = host
                 .handle(
                     &peer,
@@ -2424,15 +2454,24 @@ mod tests {
             assert_eq!(error, "Unsupported mobile operation");
         }
         answering.await.unwrap();
-        // device.selection is the host's and answers as an unknown method did.
         let error = host
+            .handle(
+                &peer,
+                json!({"version":VERSION,"id":"a","method":"session.answerApproval","params":{}}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, policy::Code::Disabled.message());
+        // H-02: device.selection is the host's and reports the device's
+        // selection (none set here), instead of the Wave 0 unknown-method answer.
+        let answer = host
             .handle(
                 &peer,
                 json!({"version":VERSION,"id":"s","method":"device.selection","params":{}}),
             )
             .await
-            .unwrap_err();
-        assert_eq!(error, "Unsupported mobile operation");
+            .unwrap();
+        assert_eq!(answer, json!({"projects":null,"monos":null}));
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 
@@ -2736,6 +2775,9 @@ mod tests {
         let (host, _events, phone) = paired();
         host.set_flags_for_test(true, true);
         host.add_device_for_test(web_row("w", "web-fingerprint"));
+        host.save(&host.inner.lock().unwrap().config.clone())
+            .unwrap();
+        let saved = std::fs::read(&host.path).unwrap();
         let error = host
             .handle_web(
                 "web-fingerprint",
@@ -2743,7 +2785,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(error, "Unsupported mobile operation");
+        assert_eq!(error.error, "Unsupported mobile operation");
+        assert_eq!(error.code.as_deref(), Some("unsupported"));
+        // Refused before any config write: the saved file is byte for byte the same.
+        assert_eq!(std::fs::read(&host.path).unwrap(), saved);
         assert!(host
             .inner
             .lock()
@@ -2767,6 +2812,17 @@ mod tests {
             });
         }
         assert!(host.push_tokens("agentInput").is_empty());
+        // Forgetting a token never touches a web row either.
+        host.forget_push_tokens(&["ExponentPushToken[web]".into()])
+            .unwrap();
+        assert!(host
+            .inner
+            .lock()
+            .unwrap()
+            .config
+            .devices
+            .iter()
+            .any(|device| device.kind == DeviceKind::Web && device.push.is_some()));
         host.handle(
             &phone,
             json!({"version":VERSION,"id":"p","method":"device.push","params":{"token":"ExponentPushToken[phone]"}}),
@@ -2774,6 +2830,159 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(host.push_tokens("agentInput"), ["ExponentPushToken[phone]"]);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    /// A watch request from a device, with a sink that is never read.
+    fn watch_request() -> (Value, WatchSink) {
+        let (sink, _receiver) = tokio::sync::mpsc::channel::<Value>(1);
+        (
+            json!({"version":VERSION,"method":"conversation.watch","params":{"conversationId":"c"}}),
+            sink,
+        )
+    }
+
+    /// Every refusal the host words reaches a web device with its stable code,
+    /// and the same refusal on QUIC is the text alone (no `code` on the wire).
+    #[tokio::test]
+    async fn web_refusals_carry_real_codes_and_quic_keeps_plain_text() {
+        let (host, _events, phone) = paired();
+        host.set_flags_for_test(true, true);
+        let mut control = web_row("wc", "web-control");
+        control.permission = Permission::Control;
+        host.add_device_for_test(web_row("wr", "web-read"));
+        host.add_device_for_test(control);
+        let mut narrowed = web_row("wn", "web-narrowed");
+        narrowed.permission = Permission::Control;
+        narrowed.projects = Some(vec!["a".into()]);
+        host.add_device_for_test(narrowed);
+        let call = |method: &str, params: Value| json!({"version":VERSION,"id":"x","method":method,"params":params});
+        let cases = [
+            ("web-read", "session.cancel", json!({}), "read_only"),
+            ("web-control", "mono.reset", json!({}), "forbidden"),
+            (
+                "web-control",
+                "session.answerApproval",
+                json!({}),
+                "disabled",
+            ),
+            ("web-control", "device.push", json!({}), "unsupported"),
+            ("web-control", "no.such.method", json!({}), "unsupported"),
+            (
+                "web-narrowed",
+                "conversation.read",
+                json!({"projectId":"b"}),
+                "not_selected",
+            ),
+            ("unknown-web-device", "workspace.list", json!({}), "revoked"),
+        ];
+        for (peer, method, params, code) in cases {
+            let failure = host
+                .handle_web(peer, call(method, params))
+                .await
+                .unwrap_err();
+            assert_eq!(failure.code.as_deref(), Some(code), "{method} for {peer}");
+            // A code always has its own text; QUIC never sees the code.
+            if let Some(known) = policy::code_of_failure(&failure) {
+                if code != "revoked" {
+                    assert_eq!(failure.error, known.message(), "{method}");
+                }
+            }
+        }
+
+        // The phone's refusal of the same kind is the plain text alone.
+        let mut reader = phone_row();
+        reader.id = "pr".into();
+        reader.fingerprint = "phone-reader".into();
+        reader.permission = Permission::Read;
+        host.add_device_for_test(reader);
+        host.gate.allow("phone-reader".into(), None);
+        let text = host
+            .handle("phone-reader", call("session.cancel", json!({})))
+            .await
+            .unwrap_err();
+        assert_eq!(text, policy::Code::ReadOnly.message());
+        let text = host
+            .handle(&phone, call("no.such.method", json!({})))
+            .await
+            .unwrap_err();
+        assert_eq!(text, "Unsupported mobile operation");
+        let text = host
+            .handle("gone", call("workspace.list", json!({})))
+            .await
+            .unwrap_err();
+        assert_eq!(text, "Device revoked or not paired");
+
+        // Too many requests waiting: busy on web, the same text on QUIC.
+        host.pending.store(MAX_PENDING, Ordering::SeqCst);
+        let request = call("models.list", json!({}));
+        let failure = host
+            .handle_web("web-control", request.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("busy"));
+        assert_eq!(failure.error, "Desktop is busy; try again");
+        assert_eq!(
+            host.handle(&phone, request).await.unwrap_err(),
+            "Desktop is busy; try again"
+        );
+        host.pending.store(0, Ordering::SeqCst);
+
+        // The per-device watch cap: busy on web, plain text on QUIC. The
+        // receivers stay alive, or the host drops the watches as closed.
+        let mut held = Vec::new();
+        {
+            let mut inner = host.inner.lock().unwrap();
+            for (peer, via, tag) in [
+                ("web-control", DeviceKind::Web, "w"),
+                (phone.as_str(), DeviceKind::Phone, "p"),
+            ] {
+                for number in 0..MAX_WATCHES_PER_DEVICE {
+                    let (sink, receiver) = tokio::sync::mpsc::channel::<Value>(1);
+                    held.push(receiver);
+                    inner.watches.insert(
+                        format!("{tag}{number}"),
+                        Watcher {
+                            peer: peer.into(),
+                            via,
+                            sink,
+                        },
+                    );
+                }
+            }
+        }
+        let (request, sink) = watch_request();
+        let failure = host
+            .watch_web("web-control", request.clone(), sink)
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("busy"));
+        let (_, sink) = watch_request();
+        assert_eq!(
+            host.watch(&phone, request.clone(), sink).await.unwrap_err(),
+            "Desktop is busy; try again"
+        );
+        // A watch on a method the host does not serve, and a denied watch.
+        let (_, sink) = watch_request();
+        let failure = host
+            .watch_web(
+                "web-control",
+                json!({"version":VERSION,"method":"workspace.list","params":{}}),
+                sink,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("unsupported"));
+        let (_, sink) = watch_request();
+        let failure = host
+            .watch_web(
+                "web-narrowed",
+                json!({"version":VERSION,"method":"conversation.watch","params":{"conversationId":"mono:zz","projectId":"b"}}),
+                sink,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("not_selected"));
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

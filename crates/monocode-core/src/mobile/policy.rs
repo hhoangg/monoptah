@@ -54,7 +54,7 @@ impl DeviceContext {
     }
 }
 
-/// Desktop toggles that gate parts of the policy. Both default to off.
+/// Desktop toggles that gate parts of the policy. All default to off.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PolicyFlags {
@@ -62,14 +62,28 @@ pub struct PolicyFlags {
     pub remote_git_push: bool,
     /// "Remote cloud start".
     pub remote_cloud_start: bool,
+    /// "Answer approvals from remote devices" (H-08). Only effective while
+    /// [`REMOTE_APPROVALS_ENABLED`] is on as well.
+    pub remote_approvals: bool,
 }
 
 /// The file name of the saved policy settings, next to the mobile config.
 pub const SETTINGS_FILE: &str = "mobile-policy.json";
 
 /// Whether remote devices may answer tool approvals. Stays false until the
-/// U-13 review gate passes (H-08).
+/// U-13 review gate passes (H-08). Even then the desktop's own toggle
+/// (`PolicyFlags::remote_approvals`) must be on: see [`approvals_effective`].
 pub const REMOTE_APPROVALS_ENABLED: bool = false;
+
+/// Whether remote approvals are on: the U-13 `gate` AND the desktop toggle.
+pub fn approvals_effective(flags: &PolicyFlags, gate: bool) -> bool {
+    gate && flags.remote_approvals
+}
+
+/// [`approvals_effective`] for the process-wide toggles and the real gate.
+pub fn approvals_enabled() -> bool {
+    approvals_effective(&flags(), REMOTE_APPROVALS_ENABLED)
+}
 
 /// The desktop's policy settings: the toggles and, per project path, the
 /// extra deny patterns.
@@ -86,6 +100,7 @@ static SETTINGS: RwLock<PolicySettings> = RwLock::new(PolicySettings {
     flags: PolicyFlags {
         remote_git_push: false,
         remote_cloud_start: false,
+        remote_approvals: false,
     },
     deny_patterns: BTreeMap::new(),
 });
@@ -173,8 +188,13 @@ codes! {
 }
 
 impl Code {
+    /// The failure of this code: its canonical text and the code itself.
+    pub fn failure(self) -> Failure {
+        Denial::new(self).into()
+    }
+
     /// The one fixed error text of this code. The QUIC transport sends it
-    /// and the web channel maps it back with [`code_of_error`].
+    /// and the web channel carries the code itself in the failure.
     pub fn message(self) -> &'static str {
         match self {
             Code::ReadOnly => "This device can only read on this desktop",
@@ -194,6 +214,15 @@ impl Code {
     }
 }
 
+/// The code a failure carries, if it carries a known one.
+pub fn code_of_failure(failure: &Failure) -> Option<Code> {
+    let wanted = failure.code.as_deref()?;
+    Code::ALL
+        .iter()
+        .copied()
+        .find(|code| code.as_str() == wanted)
+}
+
 /// The code whose canonical text is exactly `text`.
 pub fn code_of_error(text: &str) -> Option<Code> {
     Code::ALL
@@ -207,6 +236,15 @@ pub fn code_of_error(text: &str) -> Option<Code> {
 pub struct Denial {
     pub code: Code,
     pub error: String,
+}
+
+/// The refusal that carries a code to the web device, with its text.
+pub use monocode_mobile_link::Failure;
+
+impl From<Denial> for Failure {
+    fn from(denial: Denial) -> Self {
+        Self::coded(denial.code.as_str(), denial.error)
+    }
 }
 
 impl Denial {
@@ -474,7 +512,7 @@ pub fn authorize_with(
     method: &str,
     params: &Value,
     flags: &PolicyFlags,
-    approvals_enabled: bool,
+    approvals_gate: bool,
 ) -> Result<(), Denial> {
     // An unknown method is answered "Unsupported mobile operation" by the host.
     let Some(access) = classify(method, params) else {
@@ -509,7 +547,7 @@ pub fn authorize_with(
             }
         }
     }
-    if method == "session.answerApproval" && !approvals_enabled {
+    if method == "session.answerApproval" && !approvals_effective(flags, approvals_gate) {
         return Err(Denial::new(Code::Disabled));
     }
     check_selection(device, params)
@@ -658,12 +696,12 @@ pub fn capabilities(flags: &PolicyFlags) -> Vec<String> {
     capabilities_with(flags, REMOTE_APPROVALS_ENABLED)
 }
 
-fn capabilities_with(flags: &PolicyFlags, approvals_enabled: bool) -> Vec<String> {
+fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
     let mut list = Vec::new();
     if flags.remote_git_push {
         list.push("gitPush".to_owned());
     }
-    if approvals_enabled {
+    if approvals_effective(flags, approvals_gate) {
         list.push("approvals".to_owned());
     }
     list
@@ -798,6 +836,7 @@ mod tests {
     const ON: PolicyFlags = PolicyFlags {
         remote_git_push: true,
         remote_cloud_start: true,
+        remote_approvals: true,
     };
 
     fn code(result: Result<(), Denial>) -> Option<Code> {
@@ -1218,11 +1257,49 @@ mod tests {
     fn capabilities_follow_flags_and_the_approvals_gate() {
         assert!(capabilities_with(&PolicyFlags::default(), false).is_empty());
         assert_eq!(capabilities_with(&ON, false), ["gitPush"]);
-        assert_eq!(
-            capabilities_with(&PolicyFlags::default(), true),
-            ["approvals"]
-        );
+        // The gate alone does not list approvals: the desktop toggle is needed too.
+        assert!(capabilities_with(&PolicyFlags::default(), true).is_empty());
+        let toggle = PolicyFlags {
+            remote_approvals: true,
+            ..PolicyFlags::default()
+        };
+        assert!(capabilities_with(&toggle, false).is_empty());
+        assert_eq!(capabilities_with(&toggle, true), ["approvals"]);
         assert_eq!(capabilities_with(&ON, true), ["gitPush", "approvals"]);
+    }
+
+    /// H-08: approvals are effective only with the U-13 gate AND the toggle.
+    #[test]
+    fn approvals_need_both_the_gate_and_the_desktop_toggle() {
+        let phone = ctx(DeviceKind::Phone, Permission::Control);
+        let web = ctx(DeviceKind::Web, Permission::Control);
+        for (gate, toggle) in [(false, false), (false, true), (true, false), (true, true)] {
+            let flags = PolicyFlags {
+                remote_approvals: toggle,
+                ..PolicyFlags::default()
+            };
+            let on = gate && toggle;
+            assert_eq!(approvals_effective(&flags, gate), on, "{gate}/{toggle}");
+            assert_eq!(
+                capabilities_with(&flags, gate).contains(&"approvals".to_owned()),
+                on,
+                "{gate}/{toggle}"
+            );
+            for device in [&phone, &web] {
+                assert_eq!(
+                    code(authorize_with(
+                        device,
+                        "session.answerApproval",
+                        &json!({}),
+                        &flags,
+                        gate
+                    )),
+                    (!on).then_some(Code::Disabled),
+                    "{gate}/{toggle}/{:?}",
+                    device.kind
+                );
+            }
+        }
     }
 
     #[test]
@@ -1245,7 +1322,7 @@ mod tests {
         let empty = serde_json::to_string(&PolicySettings::default()).unwrap();
         assert_eq!(
             empty,
-            r#"{"remoteGitPush":false,"remoteCloudStart":false,"denyPatterns":{}}"#
+            r#"{"remoteGitPush":false,"remoteCloudStart":false,"remoteApprovals":false,"denyPatterns":{}}"#
         );
         let partial: PolicySettings = serde_json::from_str("{}").unwrap();
         assert_eq!(partial, PolicySettings::default());

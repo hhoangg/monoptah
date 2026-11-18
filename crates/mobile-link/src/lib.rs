@@ -24,6 +24,33 @@ pub use transport::{
     exchange, read_frame, serve, server_endpoint, watch, write_frame, Watch, WatchSink,
 };
 pub type LinkResult<T> = Result<T, String>;
+
+/// A refused request: the text a person reads and, when the refusal has one,
+/// a stable `code` a client can key on. A `Failure` without a code is written
+/// exactly as a plain text error, so the QUIC wire is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub error: String,
+    pub code: Option<String>,
+}
+impl Failure {
+    pub fn coded(code: &str, error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            code: Some(code.to_owned()),
+        }
+    }
+}
+impl From<String> for Failure {
+    fn from(error: String) -> Self {
+        Self { error, code: None }
+    }
+}
+impl From<&str> for Failure {
+    fn from(error: &str) -> Self {
+        Self::from(error.to_owned())
+    }
+}
 pub const VERSION: u32 = 1;
 pub const PORT: u16 = 38416;
 pub const ALPN: &[u8] = b"monocode-mobile/1";

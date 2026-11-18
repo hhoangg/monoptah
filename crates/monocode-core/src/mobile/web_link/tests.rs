@@ -376,7 +376,7 @@ fn web_request_is_refused_when_web_is_disabled() {
                 json!({"version":1,"id":"x","method":"workspace.list","params":{}}),
             )
             .await;
-        assert!(direct.unwrap_err().contains("disabled"));
+        assert!(direct.unwrap_err().error.contains("disabled"));
     });
 }
 
@@ -544,13 +544,14 @@ fn each_path_serves_only_its_own_kind_of_device() {
             env.host.handle(&web, list.clone()).await.unwrap_err(),
             refused
         );
-        assert_eq!(
-            env.host
-                .handle_web(&phone.fingerprint, list.clone())
-                .await
-                .unwrap_err(),
-            refused
-        );
+        let wrong_kind = env
+            .host
+            .handle_web(&phone.fingerprint, list.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(wrong_kind.error, refused);
+        // The web transport also names the refusal for the browser.
+        assert_eq!(wrong_kind.code.as_deref(), Some("revoked"));
         assert!(env.host.handle_web(&web, list.clone()).await.is_ok());
         assert!(env
             .host

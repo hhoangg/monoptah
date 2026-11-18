@@ -1,10 +1,12 @@
 //! Permission requests a paired device may answer (H-08). The whole path is
 //! behind `policy::REMOTE_APPROVALS_ENABLED`, which stays false until the U-13
-//! review gate passes: while it is off a device cannot answer one and sees no
-//! approval fields.
+//! review gate passes, and the desktop's own toggle
+//! (`PolicyFlags::remote_approvals`): while either is off a device cannot
+//! answer one and sees no approval fields. A request is answered once: the
+//! `(session, requestId)` pair is recorded before the decision is applied.
 use crate::shell::Shell;
 use gpui::{App, Context};
-use monocode_core::mobile::{DeviceContext, policy};
+use monocode_core::mobile::{DeviceContext, policy, policy::Failure};
 use serde_json::{Map, Value, json};
 
 const INVALID: &str = "Invalid mobile parameters";
@@ -17,24 +19,25 @@ pub(crate) fn dispatch(
     _method: &str,
     params: &Value,
     cx: &mut Context<Shell>,
-) -> Result<Value, String> {
-    dispatch_with(shell, device, params, policy::REMOTE_APPROVALS_ENABLED, cx)
+) -> Result<Value, Failure> {
+    dispatch_with(shell, device, params, policy::approvals_enabled(), cx)
 }
 
-/// [`dispatch`] with the flag given, so tests can force it on. Checks in
-/// order: flag, parameter shape, decision, selection (`not_selected`), full
-/// access, then that the request is still pending.
+/// [`dispatch`] with the effective flag given (gate and toggle), so tests can
+/// force it on. Checks in order: flag, parameter shape, decision, selection (`not_selected`), full
+/// access, that the request was not answered before, then that it is still
+/// pending.
 pub(crate) fn dispatch_with(
     shell: &mut Shell,
     device: &DeviceContext,
     params: &Value,
     enabled: bool,
     cx: &mut Context<Shell>,
-) -> Result<Value, String> {
+) -> Result<Value, Failure> {
     if !enabled {
-        return Err(policy::Code::Disabled.message().to_owned());
+        return Err(policy::Code::Disabled.failure());
     }
-    let forbidden = || policy::Code::Forbidden.message().to_owned();
+    let forbidden = || policy::Code::Forbidden.failure();
     let Some(map) = params.as_object() else {
         return Err(INVALID.into());
     };
@@ -60,6 +63,11 @@ pub(crate) fn dispatch_with(
     let view = shell.mobile_session_view(id).ok_or(NOT_PENDING)?;
     if view.read(cx).mobile_is_full_access() {
         return Err(forbidden());
+    }
+    // One answer per request: recorded before the decision is applied, so a
+    // repeat is refused even while the desktop still shows the request.
+    if !shell.mobile_claim_answer(id, request_id) {
+        return Err(NOT_PENDING.into());
     }
     view.update(cx, |view, cx| {
         view.mobile_decide_approval(request_id, allow, cx)
@@ -102,7 +110,7 @@ pub(crate) fn read_fields(
     _device: &DeviceContext,
     cx: &App,
 ) -> Map<String, Value> {
-    fields_with(shell, session, policy::REMOTE_APPROVALS_ENABLED, cx)
+    fields_with(shell, session, policy::approvals_enabled(), cx)
 }
 
 /// Fields added to a watch frame for a session; see [`read_fields`].
@@ -112,5 +120,5 @@ pub(crate) fn frame_fields(
     _device: &DeviceContext,
     cx: &App,
 ) -> Map<String, Value> {
-    fields_with(shell, session, policy::REMOTE_APPROVALS_ENABLED, cx)
+    fields_with(shell, session, policy::approvals_enabled(), cx)
 }

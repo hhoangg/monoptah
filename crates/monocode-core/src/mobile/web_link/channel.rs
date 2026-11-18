@@ -37,23 +37,26 @@ pub(super) const MAX_IN_FLIGHT_PER_SESSION: usize = 16;
 /// host, per device).
 pub(super) const MAX_READS_PER_SESSION: usize = 4;
 
-const BUSY: &str = "Desktop is busy; try again";
-const UNSUPPORTED: &str = "Unsupported mobile operation";
+/// The text the desktop app answers with when it does not serve a method on
+/// the cloud route, from callers that predate coded failures.
+const LEGACY_UNSUPPORTED: &str = "Unsupported mobile operation";
 
-/// The stable `code` of an error the host words in plain text. The host's
-/// error path carries text only, so the web channel adds the code the browser
-/// keys on (additive: the text stays, and QUIC is unchanged).
-fn code_of(error: &str) -> Option<&'static str> {
-    match error {
-        BUSY => Some("busy"),
-        UNSUPPORTED => Some("unsupported"),
-        _ => None,
-    }
+/// The one legacy fallback: the cloud stubs (`mobile/cloud.rs`, WS-D4) still
+/// answer a plain `Err(String)` with exactly this text and no code. Everything
+/// the host and the WS-D2 app code refuse arrives as a coded `Failure`, so no
+/// other text is mapped. Remove this once the stubs reply with a code.
+fn legacy_code(error: &str) -> Option<&'static str> {
+    (error == LEGACY_UNSUPPORTED).then_some(policy::Code::Unsupported.as_str())
 }
 
 /// The answer that refuses a request because the desktop or the session is busy.
 fn busy(rid: Value) -> Value {
-    json!({"rid": rid, "ok": false, "error": BUSY, "code": "busy"})
+    json!({
+        "rid": rid,
+        "ok": false,
+        "error": policy::Code::Busy.message(),
+        "code": policy::Code::Busy.as_str(),
+    })
 }
 
 /// A reply to send on a session, from a request task.
@@ -123,7 +126,7 @@ impl Channel {
             if let Some(code) = wrapped
                 .get("error")
                 .and_then(Value::as_str)
-                .and_then(code_of)
+                .and_then(legacy_code)
             {
                 wrapped.insert("code".into(), code.into());
             }
@@ -447,13 +450,13 @@ mod tests {
                 channel,
                 "peer",
                 |_| true,
-                |_, _| async { Ok(Value::Null) },
+                |_, _| async { Ok::<_, String>(Value::Null) },
                 |_, _, sink| async move {
                     // Held open and idle: nothing is ever sent.
                     tokio::spawn(async move {
                         sink.closed().await;
                     });
-                    Ok(())
+                    Ok::<_, String>(())
                 },
                 ServeOptions::WEB,
             ));
@@ -465,5 +468,51 @@ mod tests {
             assert_eq!(started.elapsed(), Duration::from_secs(25));
             task.abort();
         });
+    }
+
+    /// A coded failure reaches the browser with its code and no text mapping;
+    /// the one legacy text still gets `unsupported`; other text gets no code.
+    #[tokio::test]
+    async fn a_failure_code_reaches_the_browser_and_only_the_legacy_text_is_mapped() {
+        use monocode_mobile_link::Failure;
+        async fn answer(failure: Failure) -> Value {
+            let (out, mut frames) = mpsc::channel::<Out>(8);
+            let channel = Channel::for_test(
+                SessionKey {
+                    device_id: [7; 16],
+                    channel: 1,
+                },
+                json!(9),
+                json!({"method": "m"}),
+                out,
+                Arc::new(Notify::new()),
+            );
+            serve_stream(
+                channel,
+                "peer",
+                |_| true,
+                move |_, _| {
+                    let failure = failure.clone();
+                    async move { Err::<Value, Failure>(failure) }
+                },
+                |_, _, _| async { Ok::<_, Failure>(()) },
+                ServeOptions::WEB,
+            )
+            .await;
+            frames.recv().await.unwrap().value
+        }
+        assert_eq!(
+            answer(Failure::coded("not_selected", "Anything")).await,
+            json!({"rid":9,"ok":false,"error":"Anything","code":"not_selected"})
+        );
+        assert_eq!(
+            answer("Unsupported mobile operation".into()).await,
+            json!({"rid":9,"ok":false,"error":"Unsupported mobile operation","code":"unsupported"})
+        );
+        // Text that merely equals a code's canonical message is not mapped.
+        assert_eq!(
+            answer("Desktop is busy; try again".into()).await,
+            json!({"rid":9,"ok":false,"error":"Desktop is busy; try again"})
+        );
     }
 }

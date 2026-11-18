@@ -20,7 +20,10 @@ use monocode_core::{
     diff::{self, Line, LineKind},
     files::{self, ProjectFile},
     git,
-    mobile::{denylist::DenyList, policy::Code},
+    mobile::{
+        denylist::DenyList,
+        policy::{Code, Failure},
+    },
     provider::Kind,
     scm,
 };
@@ -33,7 +36,7 @@ use crate::syntax::LineHighlighter;
 
 /// The project's checkout, or one of its other worktrees when the phone names
 /// one, checked against the project's list rather than trusted (mobileWorktree).
-pub(crate) fn resolve_root(cwd: &Path, worktree: Option<&str>) -> Result<PathBuf, String> {
+pub(crate) fn resolve_root(cwd: &Path, worktree: Option<&str>) -> Result<PathBuf, Failure> {
     let Some(wanted) = worktree else {
         return Ok(cwd.to_path_buf());
     };
@@ -46,12 +49,12 @@ pub(crate) fn resolve_root(cwd: &Path, worktree: Option<&str>) -> Result<PathBuf
                 .find(|tree| !tree.main && !tree.missing && files::path_key(&tree.path) == wanted)
         })
         .map(|tree| PathBuf::from(tree.path))
-        .ok_or_else(|| "That worktree is no longer available".to_string())
+        .ok_or_else(|| "That worktree is no longer available".into())
 }
 
 /// The other working copies a phone can start a session in, as the desktop
 /// composer's workspace picker lists them.
-pub(crate) fn worktrees(cwd: &Path) -> Result<Value, String> {
+pub(crate) fn worktrees(cwd: &Path) -> Result<Value, Failure> {
     let worktrees: Vec<Value> = git::worktrees(cwd)?
         .into_iter()
         .filter(|tree| !tree.main && !tree.missing)
@@ -92,13 +95,13 @@ pub(crate) fn inside_root(root: &Path, relative: &str) -> Result<PathBuf, String
 }
 
 /// The one error a denied path gets, whichever route met it.
-fn denied() -> String {
-    Code::PathDenied.message().to_string()
+fn denied() -> Failure {
+    Code::PathDenied.failure()
 }
 
 /// `relative` (as the phone wrote it) and `path` (where it resolved) must both
 /// pass the deny-list, symlink targets included.
-fn allow(deny: &DenyList, root: &Path, relative: &str, path: &Path) -> Result<(), String> {
+fn allow(deny: &DenyList, root: &Path, relative: &str, path: &Path) -> Result<(), Failure> {
     deny.check(root, Path::new(relative))
         .and_then(|()| deny.check(root, path))
         .map_err(|_| denied())
@@ -106,7 +109,7 @@ fn allow(deny: &DenyList, root: &Path, relative: &str, path: &Path) -> Result<()
 
 /// One folder of a working copy, by its path relative to the root, without
 /// the repository's own `.git` and without anything on the deny-list.
-pub(crate) fn files(root: &Path, relative: &str, deny: &DenyList) -> Result<Value, String> {
+pub(crate) fn files(root: &Path, relative: &str, deny: &DenyList) -> Result<Value, Failure> {
     deny.check(root, Path::new(relative))
         .map_err(|_| denied())?;
     let dir = inside_root(root, relative)?;
@@ -121,7 +124,7 @@ pub(crate) fn files(root: &Path, relative: &str, deny: &DenyList) -> Result<Valu
 
 /// Files whose paths match a phone's search, best first, from the same index
 /// and ranking as the desktop's quick open. The index lists files only.
-pub(crate) fn search(root: &Path, query: &str, deny: &DenyList) -> Result<Value, String> {
+pub(crate) fn search(root: &Path, query: &str, deny: &DenyList) -> Result<Value, Failure> {
     if query.trim().is_empty() {
         return Ok(json!({ "results": [] }));
     }
@@ -152,7 +155,7 @@ const MOBILE_FILE_BYTES: usize = 1024 * 1024;
 /// Denied files are refused before anything is read or highlighted, so no
 /// highlight job ever exists for one (a job holds colours of a file that
 /// passed this check, and carries no path).
-pub(crate) fn file(root: &Path, relative: &str, deny: &DenyList) -> Result<Value, String> {
+pub(crate) fn file(root: &Path, relative: &str, deny: &DenyList) -> Result<Value, Failure> {
     let read = |relative: &str| {
         // Checked as written first, so a denied name answers the same whether
         // or not it exists, then as resolved.
@@ -160,7 +163,7 @@ pub(crate) fn file(root: &Path, relative: &str, deny: &DenyList) -> Result<Value
             .map_err(|_| denied())?;
         let path = inside_root(root, relative)?;
         allow(deny, root, relative, &path)?;
-        read_text(&path)
+        Ok(read_text(&path)?)
     };
     let (path, full) = match read(relative) {
         Ok(text) => (relative.to_string(), text),
@@ -299,7 +302,7 @@ pub(crate) fn changes(
     root: &Path,
     worktree_echo: Option<&str>,
     deny: &DenyList,
-) -> Result<Value, String> {
+) -> Result<Value, Failure> {
     let index = scm::diff_files(root)?;
     let mut budget: usize = 1_000_000;
     let mut files = Vec::new();
@@ -390,7 +393,7 @@ fn diff_line_json(line: &Line, runs: Option<Runs>) -> Value {
 
 /// What the phone's commit sheet needs to offer what the desktop's Changes
 /// panel would: the remote, how the branch stands, and its open pull request.
-pub(crate) fn git(root: &Path) -> Result<Value, String> {
+pub(crate) fn git(root: &Path) -> Result<Value, Failure> {
     let (index, pr) = std::thread::scope(|scope| {
         let pr = scope.spawn(|| scm::pr_status(root).ok().flatten());
         let index = scm::diff_index(root);
@@ -424,8 +427,8 @@ pub(crate) fn git_action(
     root: &Path,
     params: &Value,
     chosen: Option<(Kind, Option<String>)>,
-) -> Result<Value, String> {
-    git_action_inner(root, params, chosen).map_err(phone_error)
+) -> Result<Value, Failure> {
+    Ok(git_action_inner(root, params, chosen).map_err(phone_error)?)
 }
 
 /// The phone has no ahead/behind re-check, so the desktop's "Checking..." would be a lie.
@@ -1156,7 +1159,7 @@ mod tests {
         let dir = sensitive_repo("deny-file");
         let root = &dir.0;
         let deny = DenyList::default();
-        let hidden = Code::PathDenied.message();
+        let hidden = Code::PathDenied.failure();
         for path in [
             ".env",
             ".ENV",
@@ -1188,7 +1191,7 @@ mod tests {
         for path in ["plain.txt", "link.txt"] {
             assert_eq!(
                 file(root, path, &deny).unwrap_err(),
-                Code::PathDenied.message()
+                Code::PathDenied.failure()
             );
         }
         let listing = files(root, "", &deny).unwrap();
@@ -1222,7 +1225,7 @@ mod tests {
         for path in [".ssh", ".git", "src/.aws", "src/.AWS"] {
             assert_eq!(
                 files(root, path, &deny).unwrap_err(),
-                Code::PathDenied.message(),
+                Code::PathDenied.failure(),
                 "{path}"
             );
         }
@@ -1284,7 +1287,7 @@ mod tests {
         let deny = DenyList::default();
         assert_eq!(
             file(&dir.0, "secrets.rs", &deny).unwrap_err(),
-            Code::PathDenied.message()
+            Code::PathDenied.failure()
         );
         let allowed = file(&dir.0, "big.rs", &deny).unwrap();
         assert!(allowed.get("highlightJob").is_some() || allowed.get("highlighted").is_some());

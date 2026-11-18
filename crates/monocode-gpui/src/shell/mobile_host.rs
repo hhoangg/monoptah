@@ -9,6 +9,7 @@ use crate::{
     pickers,
 };
 use gpui::{EntityId, Task};
+use monocode_core::mobile::policy::Failure;
 use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
     mobile::{
@@ -37,6 +38,8 @@ const READ_TURNS: usize = 30;
 const GIT_ACTION_WAIT: Duration = Duration::from_secs(20);
 const MAX_RECEIPTS: usize = 1000;
 const MAX_GIT_JOBS: usize = 100;
+/// How many answered approval requests are remembered (H-08).
+const MAX_ANSWERED: usize = 512;
 const MAX_ATTACHMENTS: usize = 10;
 const MAX_MESSAGE: usize = 100_000;
 
@@ -51,6 +54,11 @@ pub(super) struct Mobile {
     /// Git actions can outlast a request; the phone asks again until done.
     git_jobs: HashMap<String, GitJob>,
     git_order: VecDeque<String>,
+    /// Approval requests a remote device answered, oldest first: one answer
+    /// per `(session, requestId)`, kept apart from what the desktop shows.
+    answered: VecDeque<(i64, String)>,
+    /// The same pairs, for lookup.
+    answered_set: HashSet<(i64, String)>,
     /// Repeats of a Mono reset that is still running, answered with its result.
     joined: HashMap<String, Vec<Request>>,
     watches: HashMap<String, Watch>,
@@ -82,11 +90,11 @@ struct CatalogEntry {
 
 enum Receipt {
     Pending(String),
-    Done(String, Result<Value, String>),
+    Done(String, Result<Value, Failure>),
 }
 struct GitJob {
     signature: String,
-    result: Arc<Mutex<Option<Result<Value, String>>>>,
+    result: Arc<Mutex<Option<Result<Value, Failure>>>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -218,13 +226,13 @@ fn in_selection(selection: &Option<Vec<String>>, id: &str) -> bool {
         .is_none_or(|list| list.iter().any(|entry| entry == id))
 }
 
-fn not_selected() -> String {
-    policy::Code::NotSelected.message().to_owned()
+fn not_selected() -> Failure {
+    policy::Code::NotSelected.failure()
 }
 
 /// The access mode a remote device asked for, if any. Full access is never
 /// enabled remotely, for any device (H-03).
-fn remote_access(params: &Value) -> Result<Option<AccessMode>, String> {
+fn remote_access(params: &Value) -> Result<Option<AccessMode>, Failure> {
     let Some(mode) = params["runtimeMode"].as_str() else {
         return Ok(None);
     };
@@ -232,7 +240,7 @@ fn remote_access(params: &Value) -> Result<Option<AccessMode>, String> {
         return Ok(None);
     }
     match AccessMode::from_id(mode) {
-        AccessMode::FullAccess => Err(policy::Code::Forbidden.message().to_owned()),
+        AccessMode::FullAccess => Err(policy::Code::Forbidden.failure()),
         access => Ok(Some(access)),
     }
 }
@@ -450,7 +458,7 @@ impl Shell {
         id: &str,
         device: &DeviceContext,
         cx: &App,
-    ) -> Result<String, String> {
+    ) -> Result<String, Failure> {
         if !in_selection(&device.projects, id) {
             return Err(not_selected());
         }
@@ -718,11 +726,29 @@ impl Shell {
         id: &str,
         device: &DeviceContext,
         cx: &App,
-    ) -> Result<i64, String> {
+    ) -> Result<i64, Failure> {
         match self.mobile_target(id, device, cx)? {
             Target::Session(id) => Ok(id),
-            Target::Mono(_) => Err(policy::Code::UnsupportedTarget.message().to_owned()),
+            Target::Mono(_) => Err(policy::Code::UnsupportedTarget.failure()),
         }
+    }
+
+    /// Records that `request_id` of `session` is being answered by a remote
+    /// device. False when it was answered before, so the second answer is
+    /// refused. Checked and recorded in one step; the oldest of the last
+    /// [`MAX_ANSWERED`] pairs is forgotten first.
+    pub(crate) fn mobile_claim_answer(&mut self, session: i64, request_id: &str) -> bool {
+        let key = (session, request_id.to_owned());
+        if !self.mobile.answered_set.insert(key.clone()) {
+            return false;
+        }
+        self.mobile.answered.push_back(key);
+        while self.mobile.answered.len() > MAX_ANSWERED {
+            if let Some(oldest) = self.mobile.answered.pop_front() {
+                self.mobile.answered_set.remove(&oldest);
+            }
+        }
+        true
     }
 
     /// The open conversation of a session, for the approvals module.
@@ -730,7 +756,7 @@ impl Shell {
         self.sessions.get(&id).cloned()
     }
 
-    fn mobile_target(&self, id: &str, device: &DeviceContext, cx: &App) -> Result<Target, String> {
+    fn mobile_target(&self, id: &str, device: &DeviceContext, cx: &App) -> Result<Target, Failure> {
         if let Some(mono) = id.strip_prefix("mono:") {
             if !in_selection(&device.monos, mono) {
                 return Err(not_selected());
@@ -861,7 +887,7 @@ impl Shell {
             "project.gitAction" => self.mobile_git_action(request, cx),
             "cloud.instances" | "cloud.startOptions" => {
                 let result = cloud::dispatch(self, &request.device, &method, &request.params, cx);
-                request.reply(result);
+                request.reply(result.map_err(Failure::from));
             }
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
@@ -920,7 +946,7 @@ impl Shell {
             if let Some((device, project, path, command_id)) = file_read {
                 let outcome = match &result {
                     Ok(_) => audit::Outcome::Ok,
-                    Err(error) => policy::code_of_error(error)
+                    Err(error) => policy::code_of_failure(error)
                         .map_or(audit::Outcome::Error, audit::Outcome::Denied),
                 };
                 audit::record_file_read_with(
@@ -1067,7 +1093,7 @@ impl Shell {
             Some(Ok(Read::Page(cursor))) => {
                 self.mobile_older_page(request, &target, cursor, None, limit, cx)
             }
-            Some(Err(error)) => request.reply(Err(error)),
+            Some(Err(error)) => request.reply(Err(error.into())),
             None => {
                 let load = self.load_saved(&target, cx);
                 cx.spawn(async move |this, cx| {
@@ -1078,7 +1104,7 @@ impl Shell {
                                 this.mobile_older_page(request, &target, cursor, None, limit, cx)
                             });
                         }
-                        Err(error) => request.reply(Err(error)),
+                        Err(error) => request.reply(Err(error.into())),
                     }
                 })
                 .detach();
@@ -1499,7 +1525,7 @@ impl Shell {
             Receipt::Pending(signature.clone()),
         );
         let command = request.command_id.clone();
-        let finish = move |this: &mut Shell, request: Request, result: Result<Value, String>| {
+        let finish = move |this: &mut Shell, request: Request, result: Result<Value, Failure>| {
             // A failed command may be retried with the same ID.
             match &result {
                 Ok(_) => {
@@ -1532,7 +1558,8 @@ impl Shell {
                 finish(self, request, result);
             }
             method if method.starts_with("cloud.") => {
-                let result = cloud::dispatch(self, &request.device, method, &request.params, cx);
+                let result = cloud::dispatch(self, &request.device, method, &request.params, cx)
+                    .map_err(Failure::from);
                 finish(self, request, result);
             }
             _ => {
@@ -1555,7 +1582,7 @@ impl Shell {
         params: &Value,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Failure> {
         let conversation = string(params, "conversationId").unwrap_or_default();
         let target = self.mobile_target(&conversation, device, cx)?;
         let reply = json!({"sessionId": conversation});
@@ -1686,7 +1713,7 @@ impl Shell {
     fn mobile_send(
         &mut self,
         request: Request,
-        finish: impl FnOnce(&mut Shell, Request, Result<Value, String>) + 'static,
+        finish: impl FnOnce(&mut Shell, Request, Result<Value, Failure>) + 'static,
         cx: &mut Context<Self>,
     ) {
         let conversation = string(&request.params, "conversationId").unwrap_or_default();
@@ -1700,7 +1727,7 @@ impl Shell {
             };
             cloud::before_send(self, &request.device, session, &request.params, cx)?;
             let text = message_text(&request.params)?;
-            Ok::<_, String>((target, text))
+            Ok::<_, Failure>((target, text))
         })();
         let (target, text) = match staged {
             Ok(staged) => staged,
@@ -1735,7 +1762,9 @@ impl Shell {
                             )
                         }),
                 });
-                let result = result.map(|()| json!({"sessionId": conversation}));
+                let result = result
+                    .map(|()| json!({"sessionId": conversation}))
+                    .map_err(Failure::from);
                 this.schedule_mobile_push(cx);
                 finish(this, request, result);
             });
@@ -1748,7 +1777,7 @@ impl Shell {
     fn mobile_start(
         &mut self,
         request: Request,
-        finish: impl FnOnce(&mut Shell, Request, Result<Value, String>) + 'static,
+        finish: impl FnOnce(&mut Shell, Request, Result<Value, Failure>) + 'static,
         cx: &mut Context<Self>,
     ) {
         let params = request.params.clone();
@@ -1775,7 +1804,7 @@ impl Shell {
             );
             let access = requested.unwrap_or(default_access);
             let account = self.mobile_account(kind, &cwd, &params, cx)?;
-            Ok::<_, String>((text, cwd, kind, model, access, account))
+            Ok::<_, Failure>((text, cwd, kind, model, access, account))
         })();
         let (text, cwd, kind, model, access, account) = match prepared {
             Ok(prepared) => prepared,
@@ -1821,7 +1850,7 @@ impl Shell {
             // A new worktree off HEAD is made on the first send, as automations do.
             settings.new_worktree = params["workspaceMode"] == "worktree";
             store.save_agent_settings(summary.id, &settings)?;
-            Ok::<_, String>((summary, settings, attachments))
+            Ok::<_, Failure>((summary, settings, attachments))
         });
         cx.spawn(async move |this, cx| {
             let result = work.await;
@@ -2316,11 +2345,15 @@ impl Shell {
             .background_executor()
             .spawn(async move { locked(&store)?.mono_document(&id) });
         cx.spawn(async move |_, _| {
-            request.reply(work.await.and_then(|document| {
-                document
-                    .map(reply)
-                    .ok_or_else(|| "This document is no longer available".into())
-            }))
+            request.reply(
+                work.await
+                    .and_then(|document| {
+                        document
+                            .map(reply)
+                            .ok_or_else(|| "This document is no longer available".into())
+                    })
+                    .map_err(Failure::from),
+            )
         })
         .detach();
     }
@@ -2381,7 +2414,7 @@ impl Shell {
             let views = self.mono_session_views(cx);
             monos.update(cx, |monos, cx| monos.mobile_profile(&id, &views, cx))
         };
-        request.reply(result);
+        request.reply(result.map_err(Failure::from));
     }
 
     /// The phone's Reset conversation. It answers once the reset is over, as a
@@ -2389,7 +2422,7 @@ impl Shell {
     fn mobile_mono_reset(
         &mut self,
         request: Request,
-        finish: impl FnOnce(&mut Shell, Request, Result<Value, String>) + 'static,
+        finish: impl FnOnce(&mut Shell, Request, Result<Value, Failure>) + 'static,
         cx: &mut Context<Self>,
     ) {
         let id = string(&request.params, "monoId").unwrap_or_default();
@@ -2410,7 +2443,7 @@ impl Shell {
                     this.publish_mobile_catalog(cx);
                     this.push_mobile_watches(cx);
                 }
-                finish(this, request, result);
+                finish(this, request, result.map_err(Failure::from));
             });
         })
         .detach();
@@ -2440,7 +2473,7 @@ impl Shell {
             return request.reply(Err("Mono is no longer available".into()));
         };
         let work = monos.update(cx, |monos, cx| monos.mobile_file(&id, &request.params, cx));
-        cx.spawn(async move |_, _| request.reply(work.await))
+        cx.spawn(async move |_, _| request.reply(work.await.map_err(Failure::from)))
             .detach();
     }
 
@@ -2584,7 +2617,7 @@ fn older_page(
     before: Option<usize>,
     limit: usize,
     mut look: PageLook,
-) -> Result<Value, String> {
+) -> Result<Value, Failure> {
     if look.harness.is_empty()
         && let Some(saved) = store.sessions()?.into_iter().find(|s| s.id == session)
     {
@@ -2836,7 +2869,7 @@ mod tests {
                     .map(|p| project_id(p))
                     .expect("the session lives in a rail project");
                 let conversation = shell.mobile_session_id(id);
-                let denied = Some(policy::Code::NotSelected.message());
+                let denied = Some(policy::Code::NotSelected.failure());
                 let other = web(Some(vec!["other".into()]), None);
                 let own_only = web(Some(vec![own.clone()]), None);
                 let none = web(Some(vec![]), None);
@@ -2849,25 +2882,15 @@ mod tests {
                 assert!(shell.mobile_project_path(&own, &phone(), cx).is_ok());
                 // Read, older, watch start and send all resolve through the target.
                 for device in [&other, &none] {
-                    assert_eq!(
-                        shell
-                            .mobile_target(&conversation, device, cx)
-                            .err()
-                            .as_deref(),
-                        denied
-                    );
-                    assert_eq!(
-                        shell.mobile_project_path(&own, device, cx).err().as_deref(),
-                        denied
-                    );
+                    assert_eq!(shell.mobile_target(&conversation, device, cx).err(), denied);
+                    assert_eq!(shell.mobile_project_path(&own, device, cx).err(), denied);
                     // Every session.* command goes through the same check.
                     for method in ["session.cancel", "session.rename", "session.configure"] {
                         let params = json!({"conversationId": conversation, "title": "t"});
                         assert_eq!(
                             shell
                                 .mobile_session_command(device, method, &params, window, cx)
-                                .err()
-                                .as_deref(),
+                                .err(),
                             denied,
                             "{method}"
                         );
@@ -2883,26 +2906,14 @@ mod tests {
                 );
                 // A mono outside the selection is refused before it is looked up.
                 let narrowed = web(None, Some(vec!["m1".into()]));
+                assert_eq!(shell.mobile_target("mono:m2", &narrowed, cx).err(), denied);
                 assert_eq!(
-                    shell
-                        .mobile_target("mono:m2", &narrowed, cx)
-                        .err()
-                        .as_deref(),
-                    denied
+                    shell.mobile_target("mono:m1", &narrowed, cx).err(),
+                    Some(Failure::from("Mono is no longer available"))
                 );
                 assert_eq!(
-                    shell
-                        .mobile_target("mono:m1", &narrowed, cx)
-                        .err()
-                        .as_deref(),
-                    Some("Mono is no longer available")
-                );
-                assert_eq!(
-                    shell
-                        .mobile_target("mono:m2", &phone(), cx)
-                        .err()
-                        .as_deref(),
-                    Some("Mono is no longer available")
+                    shell.mobile_target("mono:m2", &phone(), cx).err(),
+                    Some(Failure::from("Mono is no longer available"))
                 );
             })
             .unwrap();
@@ -2913,7 +2924,7 @@ mod tests {
         let (window, id, _) = super::super::tests::window(cx);
         window
             .update(cx, |shell, window, cx| {
-                let forbidden = Err(policy::Code::Forbidden.message().to_owned());
+                let forbidden = Err(policy::Code::Forbidden.failure());
                 let conversation = shell.mobile_session_id(id);
                 let params = json!({"conversationId": conversation, "runtimeMode": "full-access"});
                 for device in [phone(), web(None, None)] {
@@ -2930,7 +2941,7 @@ mod tests {
                 }
                 assert_eq!(
                     remote_access(&params),
-                    Err(policy::Code::Forbidden.message().to_owned())
+                    Err(policy::Code::Forbidden.failure())
                 );
                 assert_eq!(
                     remote_access(&json!({"runtimeMode": "auto"})),
@@ -3017,7 +3028,7 @@ mod tests {
                 });
                 assert_eq!(
                     approvals::dispatch_with(shell, &phone(), &params("r1", "allow"), false, cx),
-                    Err(policy::Code::Disabled.message().to_owned())
+                    Err(policy::Code::Disabled.failure())
                 );
                 assert_eq!(pending(cx), 1);
                 const { assert!(!policy::REMOTE_APPROVALS_ENABLED) };
@@ -3047,7 +3058,7 @@ mod tests {
                     Err(not_selected())
                 );
                 // Extra keys are forbidden, a bad decision is invalid.
-                let forbidden = Err(policy::Code::Forbidden.message().to_owned());
+                let forbidden = Err(policy::Code::Forbidden.failure());
                 for key in ["scope", "always", "remember", "other"] {
                     let mut extra = params("r1", "allow");
                     extra[key] = json!(true);
@@ -3068,7 +3079,7 @@ mod tests {
                 assert!(receive.try_recv().is_err());
 
                 // A stale request is refused.
-                let stale = Err("Approval is no longer pending".to_string());
+                let stale = Err(Failure::from("Approval is no longer pending"));
                 assert_eq!(ask(shell, &phone(), params("nope", "allow"), cx), stale);
 
                 // Allow resolves once; a second answer is refused.
@@ -3077,6 +3088,20 @@ mod tests {
                 assert_eq!(pending(cx), 0);
                 assert_eq!(ask(shell, &phone(), params("r1", "deny"), cx), stale);
                 assert!(receive.try_recv().is_err());
+
+                // One answer per request, even when the desktop shows the same
+                // id pending again (a replay or a race with the desktop's UI):
+                // the pair was recorded, so the decision is applied once.
+                let replay = view.update(cx, |v, _| {
+                    v.mobile_test_wait_on(&[("r1", "Run ls", "ls -la")], AccessMode::Supervised)
+                });
+                assert_eq!(pending(cx), 1);
+                assert_eq!(ask(shell, &phone(), params("r1", "allow"), cx), stale);
+                assert_eq!(pending(cx), 1);
+                assert!(replay.try_recv().is_err());
+                // The record is per session and request: another id is answered.
+                assert!(!shell.mobile_claim_answer(id, "r1"));
+                assert!(shell.mobile_claim_answer(id + 1_000_000, "r1"));
 
                 // Deny resolves once too.
                 let receive = view.update(cx, |v, _| {
@@ -3093,6 +3118,26 @@ mod tests {
                 assert_eq!(ask(shell, &phone(), params("r3", "allow"), cx), forbidden);
                 assert_eq!(pending(cx), 1);
                 assert!(receive.try_recv().is_err());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_answered_set_is_bounded_and_forgets_the_oldest(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.mobile_claim_answer(1, "first"));
+                assert!(!shell.mobile_claim_answer(1, "first"));
+                for number in 0..MAX_ANSWERED {
+                    assert!(shell.mobile_claim_answer(2, &number.to_string()));
+                }
+                // 1 + MAX_ANSWERED pairs were recorded: the oldest is forgotten.
+                assert_eq!(shell.mobile.answered.len(), MAX_ANSWERED);
+                assert_eq!(shell.mobile.answered_set.len(), MAX_ANSWERED);
+                assert!(shell.mobile_claim_answer(1, "first"));
+                // A recent one is still refused.
+                assert!(!shell.mobile_claim_answer(2, &(MAX_ANSWERED - 1).to_string()));
             })
             .unwrap();
     }
@@ -3200,7 +3245,7 @@ mod tests {
                 }
                 assert_eq!(
                     approvals::dispatch(shell, &phone(), "session.answerApproval", &json!({}), cx),
-                    Err(policy::Code::Disabled.message().to_owned())
+                    Err(policy::Code::Disabled.failure())
                 );
                 // Archive, delete, send and start are never refused by the stubs.
                 assert_eq!(
@@ -3265,7 +3310,7 @@ mod tests {
             let params = json!({"conversationId":conversation, "token":from_disk["token"], "enabled":false});
             shell.mobile_session_command(&phone(), "session.resumeUsageAtReset", &params, window, cx).unwrap();
             assert!(!shell.sessions[&id].read(cx).settings.usage_limit.as_ref().unwrap().resume_at_reset);
-            assert!(shell.mobile_session_command(&phone(), "session.resumeUsageAtReset", &params, window, cx).unwrap_err().contains("changed"));
+            assert!(shell.mobile_session_command(&phone(), "session.resumeUsageAtReset", &params, window, cx).unwrap_err().error.contains("changed"));
             shell.sessions[&id].update(cx, |v, _| {
                 v.settings.usage_limit.as_mut().unwrap().resets_at = None;
                 v.settings.mono = Some(monocode_core::agent::MonoContext { mono: Default::default(), root: "/fixture".into(), executable: "/fixture/binary".into() });
@@ -3274,9 +3319,9 @@ mod tests {
             let params = json!({"conversationId":conversation, "token":token});
             shell.mobile_session_command(&phone(), "session.resumeUsage", &params, window, cx).unwrap();
             assert!(shell.sessions[&id].read(cx).settings.usage_limit.is_none());
-            assert!(shell.mobile_session_command(&phone(), "session.resumeUsage", &params, window, cx).unwrap_err().contains("no longer paused"));
+            assert!(shell.mobile_session_command(&phone(), "session.resumeUsage", &params, window, cx).unwrap_err().error.contains("no longer paused"));
             shell.session_summaries.remove(&id);
-            assert!(shell.mobile_session_command(&phone(), "session.resumeUsage", &params, window, cx).unwrap_err().contains("no longer available"));
+            assert!(shell.mobile_session_command(&phone(), "session.resumeUsage", &params, window, cx).unwrap_err().error.contains("no longer available"));
         }).unwrap();
     }
 

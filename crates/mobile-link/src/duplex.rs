@@ -5,7 +5,7 @@
 //! heartbeats, the gate recheck before the request and before every frame, the
 //! handler timeout) live here once.
 use crate::transport::{WatchSink, WATCH_HEARTBEAT};
-use crate::{LinkResult, REQUEST_LIMIT, RESPONSE_LIMIT};
+use crate::{Failure, LinkResult, REQUEST_LIMIT, RESPONSE_LIMIT};
 use serde_json::{json, Value};
 use std::{future::Future, pin::Pin, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
@@ -60,10 +60,14 @@ impl ServeOptions {
     };
 }
 
-fn frame(result: LinkResult<Value>) -> Value {
+fn frame(result: Result<Value, Failure>) -> Value {
     match result {
         Ok(value) => json!({"ok":true,"result":value}),
-        Err(error) => json!({"ok":false,"error":error}),
+        Err(Failure { error, code: None }) => json!({"ok":false,"error":error}),
+        Err(Failure {
+            error,
+            code: Some(code),
+        }) => json!({"ok":false,"error":error,"code":code}),
     }
 }
 
@@ -71,7 +75,7 @@ fn frame(result: LinkResult<Value>) -> Value {
 /// keeps the stream open until its sink is dropped, the peer closes, or the
 /// device is no longer admitted. `admits` is asked about `peer` before the
 /// request is handled and before every frame of a watch.
-pub async fn serve_stream<S, A, F, Fut, W, WFut>(
+pub async fn serve_stream<S, A, F, Fut, E, W, WFut, WE>(
     stream: S,
     peer: &str,
     admits: A,
@@ -82,9 +86,11 @@ pub async fn serve_stream<S, A, F, Fut, W, WFut>(
     S: Duplex,
     A: Fn(&str) -> bool + Send + 'static,
     F: Fn(String, Value) -> Fut + Send + Sync,
-    Fut: Future<Output = LinkResult<Value>> + Send,
+    Fut: Future<Output = Result<Value, E>> + Send,
+    E: Into<Failure>,
     W: Fn(String, Value, WatchSink) -> WFut + Send + Sync,
-    WFut: Future<Output = LinkResult<()>> + Send,
+    WFut: Future<Output = Result<(), WE>> + Send,
+    WE: Into<Failure>,
 {
     if let Accepted::Watch(run) = accept(stream, peer, admits, &handler, &watcher, options).await {
         run.run().await;
@@ -101,7 +107,7 @@ pub(crate) enum Accepted<S, A, WFut> {
 
 /// Reads the request and, unless it is a watch, answers it before returning:
 /// a caller that awaits this serves its requests in order.
-pub(crate) async fn accept<S, A, F, Fut, W, WFut>(
+pub(crate) async fn accept<S, A, F, Fut, E, W, WFut, WE>(
     mut stream: S,
     peer: &str,
     admits: A,
@@ -113,9 +119,11 @@ where
     S: Duplex,
     A: Fn(&str) -> bool + Send + 'static,
     F: Fn(String, Value) -> Fut + Send + Sync,
-    Fut: Future<Output = LinkResult<Value>> + Send,
+    Fut: Future<Output = Result<Value, E>> + Send,
+    E: Into<Failure>,
     W: Fn(String, Value, WatchSink) -> WFut + Send + Sync,
-    WFut: Future<Output = LinkResult<()>> + Send,
+    WFut: Future<Output = Result<(), WE>> + Send,
+    WE: Into<Failure>,
 {
     let request = stream
         .read_request(REQUEST_LIMIT)
@@ -146,8 +154,11 @@ where
     let response = match request {
         Ok(request) => timeout(options.handler_timeout, handler(peer.to_string(), request))
             .await
-            .unwrap_or_else(|_| Err("Desktop request timed out".into())),
-        Err(error) => Err(error),
+            .map_or_else(
+                |_| Err("Desktop request timed out".into()),
+                |result| result.map_err(Into::into),
+            ),
+        Err(error) => Err(error.into()),
     };
     let _ = timeout(
         options.write_timeout,
@@ -166,11 +177,12 @@ pub(crate) struct WatchRun<S, A, WFut> {
     peer: String,
     options: ServeOptions,
 }
-impl<S, A, WFut> WatchRun<S, A, WFut>
+impl<S, A, WFut, WE> WatchRun<S, A, WFut>
 where
     S: Duplex,
     A: Fn(&str) -> bool + Send + 'static,
-    WFut: Future<Output = LinkResult<()>> + Send,
+    WFut: Future<Output = Result<(), WE>> + Send,
+    WE: Into<Failure>,
 {
     pub(crate) async fn run(self) {
         let Self {
@@ -184,7 +196,10 @@ where
         // The watcher answers first, as a request would: refused, or watching.
         if let Err(error) = timeout(options.handler_timeout, watching)
             .await
-            .unwrap_or_else(|_| Err("Desktop request timed out".into()))
+            .map_or_else(
+                |_| Err("Desktop request timed out".into()),
+                |result: Result<(), WE>| result.map_err(Into::into),
+            )
         {
             let _ = timeout(
                 options.write_timeout,
@@ -313,7 +328,9 @@ mod tests {
             stream,
             "peer",
             |_| true,
-            |peer, request| async move { Ok(json!({"peer":peer,"echo":request["method"]})) },
+            |peer, request| async move {
+                Ok::<_, String>(json!({"peer":peer,"echo":request["method"]}))
+            },
             no_watch,
             FAST,
         )
@@ -336,7 +353,7 @@ mod tests {
             |_| false,
             move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
-                async { Ok(Value::Null) }
+                async { Ok::<_, String>(Value::Null) }
             },
             no_watch,
             FAST,
@@ -358,7 +375,7 @@ mod tests {
             |_| true,
             |_, _| async {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                Ok(Value::Null)
+                Ok::<_, String>(Value::Null)
             },
             no_watch,
             FAST,
@@ -370,6 +387,56 @@ mod tests {
         );
     }
 
+    /// A text error writes today's exact bytes; a coded failure adds `code`.
+    #[tokio::test]
+    async fn a_failure_writes_code_only_when_it_has_one() {
+        let (stream, rig) = memory(Ok(json!({})));
+        serve_stream(
+            stream,
+            "peer",
+            |_| true,
+            |_, _| async { Err::<Value, String>("Plain".into()) },
+            no_watch,
+            FAST,
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_string(&rig.written.lock().unwrap()[0]).unwrap(),
+            serde_json::to_string(&json!({"ok":false,"error":"Plain"})).unwrap()
+        );
+        assert!(rig.written.lock().unwrap()[0].get("code").is_none());
+
+        let (stream, rig) = memory(Ok(json!({})));
+        serve_stream(
+            stream,
+            "peer",
+            |_| true,
+            |_, _| async { Err::<Value, Failure>(Failure::coded("busy", "Later")) },
+            no_watch,
+            FAST,
+        )
+        .await;
+        assert_eq!(
+            rig.written.lock().unwrap()[0],
+            json!({"ok":false,"error":"Later","code":"busy"})
+        );
+
+        let (stream, rig) = memory(Ok(json!({"watch":true})));
+        serve_stream(
+            stream,
+            "peer",
+            |_| true,
+            |_, _| async { Ok::<_, String>(Value::Null) },
+            |_, _, _| async { Err::<(), Failure>(Failure::coded("unsupported", "No")) },
+            FAST,
+        )
+        .await;
+        assert_eq!(
+            rig.written.lock().unwrap()[0],
+            json!({"ok":false,"error":"No","code":"unsupported"})
+        );
+    }
+
     #[tokio::test]
     async fn a_watch_accepts_updates_beats_and_stops_when_the_peer_closes() {
         let (stream, rig) = memory(Ok(json!({"watch":true})));
@@ -378,12 +445,12 @@ mod tests {
             stream,
             "peer",
             |_| true,
-            |_, _| async { Ok(Value::Null) },
+            |_, _| async { Ok::<_, String>(Value::Null) },
             move |_, _, sink| {
                 let sinks = sinks.clone();
                 async move {
                     sinks.send(sink).await.unwrap();
-                    Ok(())
+                    Ok::<_, String>(())
                 }
             },
             FAST,
@@ -427,10 +494,10 @@ mod tests {
             stream,
             "peer",
             |_| true,
-            |_, _| async { Ok(Value::Null) },
+            |_, _| async { Ok::<_, String>(Value::Null) },
             |_, _, sink: WatchSink| async move {
                 tokio::spawn(async move { sink.send(json!({"n":1})).await.unwrap() });
-                Ok(())
+                Ok::<_, String>(())
             },
             FAST,
         )
@@ -445,7 +512,7 @@ mod tests {
             stream,
             "peer",
             move |_| !flag.load(Ordering::SeqCst),
-            |_, _| async { Ok(Value::Null) },
+            |_, _| async { Ok::<_, String>(Value::Null) },
             move |_, _, sink: WatchSink| {
                 let revoked = revoked.clone();
                 async move {
@@ -453,7 +520,7 @@ mod tests {
                         revoked.store(true, Ordering::SeqCst);
                         let _ = sink.send(json!({"n":1})).await;
                     });
-                    Ok(())
+                    Ok::<_, String>(())
                 }
             },
             FAST,
