@@ -52,6 +52,7 @@ fn tag(event: &SettingsEvent) -> Option<String> {
         SettingsEvent::WebAnswerRequest { device_id, approve } => {
             format!("answer:{device_id}:{approve}")
         }
+        SettingsEvent::WebSetPolicyFlag { flag, on } => format!("policy:{flag:?}:{on}"),
         SettingsEvent::WebConfirmDevice {
             fingerprint,
             permission,
@@ -693,4 +694,28 @@ fn ticking_every_project_again_goes_back_to_none(cx: &mut TestAppContext) {
     click(visual, "mobile-projects-ph1");
     click(visual, "mobile-project-ph1-p1");
     assert_eq!(events(&window, visual), ["phone-projects:ph1:None"]);
+}
+
+#[gpui::test]
+fn the_remote_action_toggles_render_off_and_disabled(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    assert!(visual.debug_bounds("web-policy-rows").is_none());
+    set_web(&window, visual, |ctx| ctx.web = Some(paired()));
+    assert!(visual.debug_bounds("web-policy-rows").is_some());
+    for selector in [
+        "settings-toggle-web-policy-git-push",
+        "settings-toggle-web-policy-cloud-start",
+    ] {
+        click(visual, selector);
+    }
+    // Disabled: clicking changes nothing and sends no event.
+    assert!(events(&window, visual).is_empty());
+    window
+        .update(visual, |preview, _, cx| {
+            let ctx = &preview.settings.read(cx).ctx;
+            assert!(!ctx.web_policy.remote_git_push);
+            assert!(!ctx.web_policy.remote_cloud_start);
+        })
+        .unwrap();
 }

@@ -8,7 +8,7 @@ use super::mobile::Qr;
 use crate::{
     input::{self, Input},
     settings::{
-        SettingsEvent, SettingsView,
+        SettingsEvent, SettingsView, WebPolicyFlag,
         widgets::{note, red, secondary_button},
     },
     theme::*,
@@ -259,9 +259,58 @@ impl SettingsView {
             page.push(banner("web-notice", notice));
         }
         if status.paired {
+            page.push(self.web_app_remote_actions(cx));
             page.extend(self.web_app_devices(&status, cx));
         }
         page
+    }
+
+    /// "Remote push in Git" and "Remote cloud start": off by default. The
+    /// flags have no storage yet, so both rows stay disabled with a caption.
+    fn web_app_remote_actions(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        const CAPTION: &str = "Available once remote Git push / remote cloud start lands";
+        let flags = self.ctx.web_policy;
+        let rows = [
+            (
+                "web-policy-git-push",
+                "Remote push in Git",
+                flags.remote_git_push,
+                WebPolicyFlag::GitPush,
+            ),
+            (
+                "web-policy-cloud-start",
+                "Remote cloud start",
+                flags.remote_cloud_start,
+                WebPolicyFlag::CloudStart,
+            ),
+        ];
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, label, on, flag))| {
+                let toggle = self.toggle(id, label, on, true, cx, move |_, on, cx| {
+                    cx.emit(SettingsEvent::WebSetPolicyFlag { flag, on });
+                });
+                self.row(
+                    Some(id),
+                    index == 0,
+                    label,
+                    Some(CAPTION.into()),
+                    vec![toggle],
+                )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .debug_selector(|| "web-policy-rows".into())
+            .mt_5()
+            .rounded_xl()
+            .border_1()
+            .border_color(content(0.1))
+            .bg(content(0.03))
+            .flex()
+            .flex_col()
+            .children(rows)
+            .into_any_element()
     }
 
     fn web_app_header(&self) -> AnyElement {

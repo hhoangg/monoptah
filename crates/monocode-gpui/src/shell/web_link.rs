@@ -218,6 +218,16 @@ impl Shell {
                 let device_id = device_id.clone();
                 self.web_action("Revoke", cx, move |host| host.web_revoke(&device_id));
             }
+            SettingsEvent::WebSetPolicyFlag { flag, on } => {
+                let _ = (flag, on);
+                // No flag storage yet (WS-D2 and WS-D4): the page renders the
+                // toggles disabled, so this only guards a stray event. Once a
+                // setter exists, save the flag and call `web_link::resend_state()`.
+                self.web_set_notice(
+                    Some("Remote Git push and cloud start are not available yet.".into()),
+                    cx,
+                );
+            }
             SettingsEvent::WebAnswerRequest { device_id, approve } => {
                 let (device_id, approve) = (device_id.clone(), *approve);
                 self.web_action("Request", cx, move |host| {

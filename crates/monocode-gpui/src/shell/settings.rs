@@ -86,6 +86,7 @@ impl Shell {
             web_notice: self.web_notice(cx),
             web_projects: web_choices.0,
             web_monos: web_choices.1,
+            web_policy: Default::default(),
             quick_error: self.quick.error.clone(),
             inbox_connections: self
                 .inbox
@@ -310,6 +311,7 @@ impl Shell {
                 | SettingsEvent::WebRevokeDevice(_)
                 | SettingsEvent::WebConfirmDevice { .. }
                 | SettingsEvent::PhoneSetProjects { .. }
+                | SettingsEvent::WebSetPolicyFlag { .. }
                 | SettingsEvent::WebAnswerRequest { .. } => this.web_settings_event(event, cx),
             },
         ));

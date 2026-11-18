@@ -86,6 +86,9 @@ pub(crate) struct SettingsContext {
     /// catalog order: what a device can be given access to.
     pub web_projects: Vec<(String, String)>,
     pub web_monos: Vec<(String, String)>,
+    /// The desktop toggles that gate remote Git push and cloud start. They
+    /// have no storage yet, so the page shows them off and disabled.
+    pub web_policy: monocode_core::mobile::policy::PolicyFlags,
     /// Minutes after midnight when the Today work day starts; `None` until Today has loaded it.
     pub today_rollover_minutes: Option<u32>,
     /// The native store, for the Cloud page's Docker accounts. `None` without one.
@@ -119,6 +122,7 @@ impl PartialEq for SettingsContext {
             && self.web_notice == other.web_notice
             && self.web_projects == other.web_projects
             && self.web_monos == other.web_monos
+            && self.web_policy == other.web_policy
             && self.today_rollover_minutes == other.today_rollover_minutes
             && self.store == other.store
     }
@@ -198,11 +202,25 @@ pub(crate) enum SettingsEvent {
         device_id: String,
         projects: Option<Vec<String>>,
     },
+    /// Switch a remote-action toggle (H-06, H-11) on or off.
+    WebSetPolicyFlag {
+        flag: WebPolicyFlag,
+        on: bool,
+    },
     /// Approve or refuse a confirmed device's request for more permission.
     WebAnswerRequest {
         device_id: String,
         approve: bool,
     },
+}
+
+/// The desktop toggles that gate a remote capability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebPolicyFlag {
+    /// "Remote push in Git" (capability `gitPush`).
+    GitPush,
+    /// "Remote cloud start" (capability `cloudStart`).
+    CloudStart,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
