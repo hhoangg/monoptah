@@ -457,7 +457,27 @@ export class DesktopRoom extends DurableObject<Env> {
       }
       await this.#writeLastSeen(TOUCH_DESKTOP_SEEN_SQL, att.desktopId);
     } else {
+      this.#byeAbandonedChannels(att);
       await this.#deviceLeft(att);
+    }
+  }
+
+  /**
+   * A device socket that closes without sending BYE (a page reload or navigation drops the socket silently) would
+   * leave its Noise sessions open on the desktop, which caps channels per device. Send the desktop a BYE for each
+   * channel this socket used that no other live socket of the same device uses, so a tab that already took the
+   * channel over keeps its session. Synchronous.
+   */
+  #byeAbandonedChannels(att: Attachment): void {
+    const id = att.deviceId;
+    if (!id || att.channels.length === 0) return;
+    const desktop = this.#desktop();
+    if (!desktop) return;
+    const stillUsed = new Set<number>();
+    for (const other of this.#live(`device:${id}`)) for (const channel of this.#att(other)?.channels ?? []) stillUsed.add(channel);
+    for (const channel of att.channels) {
+      if (stillUsed.has(channel)) continue;
+      this.#send(desktop, encodeFrame({ type: FrameType.BYE, channel, deviceId: id }));
     }
   }
 

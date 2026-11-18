@@ -172,3 +172,45 @@ describe("CTRL frames, presence and last_seen_at", () => {
     expect(await lastSeen("desktops", f.desktopId)).toBe(nowSec - 100);
   });
 });
+
+describe("a device socket that closes without BYE", () => {
+  it("sends the desktop a BYE for each channel it used, so a reload cannot leak desktop sessions", async () => {
+    const f = await seedRoom();
+    const desktop = await connectDesktop(f);
+    const tab = await connectDevice(f, f.deviceId);
+    tab.send(hs1(f.deviceId, 3));
+    tab.send(hs1(f.deviceId, 4));
+    await desktop.until(() => desktop.ofType(FrameType.HS1).length === 2);
+
+    tab.ws.close(1001);
+    await desktop.until(() => desktop.ofType(FrameType.BYE).length === 2);
+    expect(desktop.ofType(FrameType.BYE).map((fr) => [fr.deviceId, fr.channel]).sort()).toEqual([
+      [f.deviceId, 3],
+      [f.deviceId, 4],
+    ]);
+    await desktop.until(() => desktop.ctrl().some((c) => (c as { event?: string }).event === "left"));
+    await closeAll(desktop);
+  });
+
+  it("keeps a channel that a newer socket of the same device already took over", async () => {
+    const f = await seedRoom();
+    const desktop = await connectDesktop(f);
+    const oldTab = await connectDevice(f, f.deviceId);
+    oldTab.send(hs1(f.deviceId, 1));
+    oldTab.send(hs1(f.deviceId, 2));
+    await desktop.until(() => desktop.ofType(FrameType.HS1).length === 2);
+    // The reloaded page connects before the old socket is noticed gone and reuses channel 1.
+    const newTab = await connectDevice(f, f.deviceId);
+    newTab.send(hs1(f.deviceId, 1));
+    await desktop.until(() => desktop.ofType(FrameType.HS1).length === 3);
+
+    oldTab.ws.close(1001);
+    await desktop.until(() => desktop.ofType(FrameType.BYE).length === 1);
+    // Only channel 2 is abandoned; channel 1 belongs to the new socket. No `left`: the device is still there.
+    desktop.send("ping");
+    await desktop.until(() => desktop.texts.includes("pong"));
+    expect(desktop.ofType(FrameType.BYE).map((fr) => [fr.deviceId, fr.channel])).toEqual([[f.deviceId, 2]]);
+    expect(desktop.ctrl().some((c) => (c as { event?: string }).event === "left")).toBe(false);
+    await closeAll(desktop, newTab);
+  });
+});

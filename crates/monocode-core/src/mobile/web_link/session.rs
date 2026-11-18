@@ -21,7 +21,8 @@ use super::noise::{fingerprint, is_low_order, Responder, Transport};
 use crate::mobile::host::Device;
 use crate::mobile::policy::{self, DeviceKind, PolicyFlags};
 
-/// Channels one device may hold at once (architecture 4.4).
+/// Channels one device may hold at once (architecture 4.4). A successful HS1
+/// from a device at the limit evicts its least recently active session.
 pub const MAX_CHANNELS_PER_DEVICE: usize = 4;
 /// Sessions held at once across all devices.
 pub const MAX_SESSIONS: usize = 64;
@@ -337,21 +338,41 @@ impl SessionTable {
             .filter(|k| k.device_id == key.device_id && **k != key)
             .count();
         let total = self.sessions.len() - usize::from(self.sessions.contains_key(&key));
-        if on_device >= MAX_CHANNELS_PER_DEVICE || total >= MAX_SESSIONS {
+        if total >= MAX_SESSIONS {
             return vec![Action::Send(bye(key))];
         }
+        // A device at its channel limit does not lock itself out. A browser
+        // reload drops its socket without a BYE, so the old channel can only
+        // be told apart from a live one by its silence. The device's least
+        // recently active session makes room, but only after this handshake
+        // proved the device key: a failed HS1 evicts nothing.
+        let victim = (on_device >= MAX_CHANNELS_PER_DEVICE)
+            .then(|| {
+                self.sessions
+                    .iter()
+                    .filter(|(k, _)| k.device_id == key.device_id && **k != key)
+                    .min_by_key(|(k, s)| (s.last_activity, **k))
+                    .map(|(k, _)| *k)
+            })
+            .flatten();
         let live = self.sessions.contains_key(&key);
-        self.handshake(key, body, now).unwrap_or_else(|| {
+        match self.handshake(key, body, now) {
+            Some(mut out) => {
+                if let Some(victim) = victim {
+                    if self.remove_session(&victim) {
+                        out.push(Action::Send(bye(victim)));
+                        out.push(Action::Closed { key: victim });
+                    }
+                }
+                out
+            }
             // BYE answers an unknown pair. A pair with a live session sends
             // nothing on a failed HS1: whoever sent it (the relay, or a thief
             // of the device id) must not be able to end that session, on the
             // desktop or, through the BYE, in the browser.
-            if live {
-                Vec::new()
-            } else {
-                vec![Action::Send(bye(key))]
-            }
-        })
+            None if live => Vec::new(),
+            None => vec![Action::Send(bye(key))],
+        }
     }
 
     /// Runs the responder and the directory check. `None` means BYE with no
@@ -780,8 +801,10 @@ mod tests {
                 serde_json::from_slice::<Value>(&payload).unwrap(),
                 json!({"proto": 1})
             );
+            // Only this channel's frames: an eviction adds a BYE for another.
             let msgs = frames[1..]
                 .iter()
+                .filter(|f| f.kind == FrameType::Transport && f.channel == channel)
                 .map(|f| {
                     let plain = it.decrypt(&f.body).unwrap();
                     let Plaintext::Msg(m) = Plaintext::decode(&plain).unwrap() else {
@@ -1371,20 +1394,69 @@ mod tests {
     }
 
     #[test]
-    fn per_device_channel_cap() {
+    fn a_device_at_the_channel_cap_evicts_its_least_recently_active_session() {
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.confirmed(&dev);
+        // Channel 2 is the quietest: opened first among the late ones, and 0
+        // and 1 were used since.
+        for (ch, at) in [(0u16, 1u64), (1, 2), (2, 3), (3, 4)] {
+            let _ = h.connect(&dev, ch, at);
+        }
+        h.table.sessions.get_mut(&dev.key(2)).unwrap().last_activity = 0;
+        let (_it, _msgs, actions) = h.connect(&dev, 9, 10);
+        assert_eq!(h.table.len(), MAX_CHANNELS_PER_DEVICE);
+        assert!(!h.table.sessions.contains_key(&dev.key(2)));
+        assert!(h.table.sessions.contains_key(&dev.key(9)));
+        // The evicted channel is told and reported closed.
+        assert!(
+            actions.contains(&Action::Send(bye(dev.key(2)))),
+            "{actions:?}"
+        );
+        assert!(
+            actions.contains(&Action::Closed { key: dev.key(2) }),
+            "{actions:?}"
+        );
+        // Re-handshaking an existing channel evicts nothing.
+        let _ = h.connect(&dev, 0, 11);
+        assert_eq!(h.table.len(), MAX_CHANNELS_PER_DEVICE);
+    }
+
+    #[test]
+    fn repeated_reloads_never_lock_a_device_out() {
+        let mut h = h();
+        let dev = Dev::new(1);
+        h.confirmed(&dev);
+        // Every reload opens a new channel and never sends a BYE.
+        for ch in 0..(MAX_CHANNELS_PER_DEVICE as u16 * 3) {
+            let _ = h.connect(&dev, ch, u64::from(ch));
+        }
+        assert_eq!(h.table.len(), MAX_CHANNELS_PER_DEVICE);
+    }
+
+    #[test]
+    fn a_failed_hs1_at_the_channel_cap_evicts_nothing() {
         let mut h = h();
         let dev = Dev::new(1);
         h.confirmed(&dev);
         for ch in 0..MAX_CHANNELS_PER_DEVICE as u16 {
             let _ = h.connect(&dev, ch, 0);
         }
-        let mut init = Initiator::new(&dev.private, &h.desktop_pub, &DESKTOP, &dev.id, 9).unwrap();
-        let hs1 = init.write_hs1(br#"{"name":"x"}"#).unwrap();
-        let a = h.table.on_frame(frame(FrameType::Hs1, dev.key(9), hs1), 0);
+        // Garbage that is no handshake, and a handshake of a key the desktop
+        // does not know under the same relay id.
+        let a = h
+            .table
+            .on_frame(frame(FrameType::Hs1, dev.key(9), vec![7u8; 48]), 5);
         assert!(is_single_bye(&a, dev.key(9)), "{a:?}");
+        let thief = same_key_other_id(&Dev::new(2), 1);
+        let a = h
+            .table
+            .on_frame(hs1_for(&thief, &h, 9, br#"{"name":"x"}"#), 5);
+        assert!(is_single_bye(&a, thief.key(9)), "{a:?}");
         assert_eq!(h.table.len(), MAX_CHANNELS_PER_DEVICE);
-        // Re-handshaking an existing channel is still allowed.
-        let _ = h.connect(&dev, 0, 1);
+        for ch in 0..MAX_CHANNELS_PER_DEVICE as u16 {
+            assert!(h.table.sessions.contains_key(&dev.key(ch)));
+        }
     }
 
     #[test]
