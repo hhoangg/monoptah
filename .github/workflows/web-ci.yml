@@ -1,0 +1,62 @@
+name: web-ci
+
+# Fork-local (Monoptah). Builds and tests the web app (web/). Holds no Cloudflare
+# credentials and never deploys: the official deploy runs only from the maintainer's
+# Mac (web/docs/deploy-runbook.md).
+on:
+  push:
+    branches: [main, feat/web-app-impl]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-ci.yml"
+  pull_request:
+    branches: [main, feat/web-app-impl]
+    paths:
+      - "web/**"
+      - ".github/workflows/web-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  web:
+    name: Build and check web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # pnpm comes from the `packageManager` field of web/package.json through corepack.
+      # A current corepack knows the signing keys of recent pnpm releases.
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+      - name: pnpm store path
+        id: pnpm-store
+        working-directory: web
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - name: Build the app
+        run: pnpm --filter @monoptah/app build
+        working-directory: web
+      # Runs after the build on purpose: the Worker header tests must hold with a real
+      # app/dist on disk (W-13 W13-1), not only with the placeholder page.
+      - run: pnpm check
+        working-directory: web

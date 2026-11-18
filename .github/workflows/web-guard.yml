@@ -1,0 +1,80 @@
+name: web-guard
+
+# Fork-local (Monoptah). W-20: web/ must not reference the old Tauri app (src/,
+# src-tauri/) or reintroduce upstream identity. The guard script is the fast check;
+# the isolated build deletes src/ and src-tauri/ and is the real backstop for paths
+# the script cannot see.
+on:
+  push:
+    branches: [main, feat/web-app-impl]
+    paths:
+      - "web/**"
+      - "scripts/check-web-isolation.mjs"
+      - "scripts/check-web-isolation.test.mjs"
+      - "scripts/check-fork-branding.sh"
+      - ".github/workflows/web-guard.yml"
+  pull_request:
+    branches: [main, feat/web-app-impl]
+    paths:
+      - "web/**"
+      - "scripts/check-web-isolation.mjs"
+      - "scripts/check-web-isolation.test.mjs"
+      - "scripts/check-fork-branding.sh"
+      - ".github/workflows/web-guard.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-guard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  guard:
+    name: Web isolation guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Guard
+        run: node scripts/check-web-isolation.mjs
+      - name: Guard self-test (red on each seeded violation)
+        run: node --test scripts/check-web-isolation.test.mjs
+
+  isolated-build:
+    name: Web build without src/ and src-tauri/
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+      - name: Delete the Tauri app sources
+        run: rm -rf src src-tauri
+      - name: pnpm store path
+        id: pnpm-store
+        working-directory: web
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm --filter @monoptah/app build
+        working-directory: web
+      - run: pnpm check
+        working-directory: web

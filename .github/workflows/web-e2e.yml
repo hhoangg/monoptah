@@ -1,0 +1,84 @@
+name: web-e2e
+
+# Fork-local (Monoptah). E-01 harness: Playwright (Chromium, CDP virtual WebAuthn)
+# against local wrangler dev (Miniflare) and the headless desktop core
+# (web_link_headless). Nothing leaves the runner and no credentials are used.
+on:
+  push:
+    branches: [main, feat/web-app-impl]
+    paths:
+      - "web/**"
+      - "crates/monocode-core/**"
+      - "scripts/e2e-web.sh"
+      - ".github/workflows/web-e2e.yml"
+  pull_request:
+    branches: [main, feat/web-app-impl]
+    paths:
+      - "web/**"
+      - "crates/monocode-core/**"
+      - "scripts/e2e-web.sh"
+      - ".github/workflows/web-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-e2e-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+jobs:
+  e2e:
+    name: Web E2E (R-12, W-14, E-01)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Enable corepack
+        run: |
+          npm install --global corepack@latest
+          corepack enable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/monocode-gpui
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/web-app-impl' }}
+      - name: Install Linux core dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libdbus-1-dev pkg-config
+      - name: pnpm store path
+        id: pnpm-store
+        working-directory: web
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+      # The browser build is cached; the OS libraries are installed on every run by
+      # `playwright install --with-deps chromium` (scripts/e2e-web.sh with CI=true).
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+      - name: E2E
+        env:
+          CI: "true"
+          E2E_OUTPUT_DIR: ${{ runner.temp }}/e2e
+        run: scripts/e2e-web.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e
+          path: ${{ runner.temp }}/e2e
+          retention-days: 7
+          if-no-files-found: ignore
