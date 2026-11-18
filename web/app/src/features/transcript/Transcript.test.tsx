@@ -208,6 +208,9 @@ describe("older turns (F-32, N-16)", () => {
     rerender(<Transcript turns={turns(40, 60)} hasOlder olderError="timeout" loadOlder={loadOlder} />);
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent("Could not load earlier messages.");
+    // The list reveals itself one animation frame after the first render, and nothing loads before that. Wait for
+    // it, or a click that lands first (on a busy machine) is ignored and the test fails by timing alone.
+    await waitFor(() => expect(document.querySelector(".opacity-100")).not.toBeNull());
     await user.click(within(alert).getByRole("button", { name: "Retry" }));
     expect(loadOlder).toHaveBeenCalledTimes(1);
   });
