@@ -3,9 +3,22 @@
 // parsed again only when the stored text changed, so clearing storage (tests, another tab of the browser signing out)
 // starts from an empty workspace. A blocked or full storage keeps the workspace in memory for this page. Another
 // browser tab writing the same desktop's workspace fires a `storage` event here: this page adopts that state at once,
-// so two tabs of one desktop do not overwrite each other at some later render.
+// so two tabs of one desktop do not overwrite each other at some later render. What it adopts is the tab sets and the
+// pane tree: which pane is focused and which tab is active stay what this page had, because they follow this page's URL
+// (another browser tab opening a session must not change the chat shown here). A merge writes nothing, so two browser
+// tabs cannot ping-pong.
 import { useSyncExternalStore } from "react";
 import { parseWorkspace, serializeWorkspace, type Workspace } from "./paneTree";
+
+/** `incoming` (written by another browser tab) with the focused pane and the active tabs of `current` where they are still valid. */
+function keepLocalView(current: Workspace, incoming: Workspace): Workspace {
+  const panes = { ...incoming.panes };
+  for (const [id, pane] of Object.entries(incoming.panes)) {
+    const mine = current.panes[id]?.active;
+    if (mine && pane.tabs.includes(mine)) panes[id] = { ...pane, active: mine };
+  }
+  return { ...incoming, panes, focused: incoming.panes[current.focused] ? current.focused : incoming.focused };
+}
 
 export const tabsKey = (desktopId: string) => `monoptah.layout.tabs.${desktopId}`;
 
@@ -60,6 +73,11 @@ if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
     // `key` is null when the whole storage was cleared.
     if (event.key !== null && !event.key.startsWith(tabsKey(""))) return;
+    for (const [desktopId, entry] of [...cache]) {
+      const raw = readRaw(desktopId);
+      if (raw === entry.raw || raw === null) continue;
+      cache.set(desktopId, { raw, ws: keepLocalView(entry.ws, parseWorkspace(raw)), persisted: true });
+    }
     for (const listener of [...listeners]) listener();
   });
 }
