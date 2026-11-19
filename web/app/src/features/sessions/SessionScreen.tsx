@@ -6,6 +6,7 @@ import { useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
 import { useGuardedReplies } from "@/features/composer/useSendGuard";
 import { SessionComposer, SessionQuestionCard, SessionUsageCard } from "@/features/composer/SessionComposer";
+import { useMentionPreview } from "@/features/filePreview/useMentionPreview";
 import { DocumentDialog } from "@/features/transcript/DocumentDialog";
 import { Transcript } from "@/features/transcript/Transcript";
 import { TranscriptOfflineNote } from "@/features/transcript/TranscriptOfflineNote";
@@ -40,14 +41,12 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
 
   const { send, retry: retryTurn } = conversation;
   const projectId = session?.projectId;
+  const mentions = useMentionPreview({ desktopId, conversationId: sessionId, projectId });
   // Retry and a tapped choice go through the send-guard like a typed message.
   const replies = useGuardedReplies({ desktopId, sessionId, target: session?.target ?? null, send, retry: retryTurn });
   const actions = useMemo<TranscriptActions>(
     () => ({
-      onOpenFile: (path) => {
-        if (!projectId) return;
-        void navigate({ to: "/d/$desktopId/p/$projectId/files/$", params: { desktopId, projectId, _splat: path } });
-      },
+      onOpenFile: mentions.onOpenFile,
       onNavigate: (href) => void navigate({ to: href as never }),
       onOpenDocument: setDocument,
       onOpenSession: (otherProject, otherSession) => {
@@ -61,7 +60,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
             onChoose: replies.onChoose,
           }),
     }),
-    [catalog, desktopId, navigate, projectId, readOnly, replies.onChoose],
+    [catalog, desktopId, mentions.onOpenFile, navigate, readOnly, replies.onChoose],
   );
 
   const title = session?.title ?? "Session";
@@ -119,6 +118,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
         />
       </ModelNamesProvider>
       <DocumentDialog document={document} onClose={() => setDocument(null)} />
+      {mentions.dialog}
       <ComposerRegion
         desktopId={desktopId}
         sessionId={sessionId}

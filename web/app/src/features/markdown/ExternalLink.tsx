@@ -10,6 +10,7 @@ export function inlineText(nodes: readonly Inline[]): string {
   let out = "";
   for (const node of nodes) {
     if (node.type === "text" || node.type === "code") out += node.text;
+    else if (node.type === "image") out += node.alt;
     else out += inlineText(node.children);
   }
   return out;

@@ -13,6 +13,7 @@ import { Composer } from "@/features/composer/Composer";
 import { SessionQuestionCard, SessionUsageCard, useLinkReady } from "@/features/composer/SessionComposer";
 import { useGuardedReplies, useSendGuard } from "@/features/composer/useSendGuard";
 import { ComposerRegion } from "@/features/sessions/ComposerRegion";
+import { useMentionPreview } from "@/features/filePreview/useMentionPreview";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
@@ -68,8 +69,11 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const { send, retry: retryTurn } = conversation;
   // Retry and a tapped choice go through the send-guard like a typed message.
   const replies = useGuardedReplies({ desktopId, sessionId: conversationId, target: null, send, retry: retryTurn });
+  // A Mono chat has no project: every file mention opens the preview.
+  const mentions = useMentionPreview({ desktopId, conversationId });
   const actions = useMemo<TranscriptActions>(
     () => ({
+      onOpenFile: mentions.onOpenFile,
       onNavigate: (href) => void navigate({ to: href as never }),
       // A document card opens the profile's document page: it reads the document's own body and visual tree.
       onOpenDocument: (item) => {
@@ -85,7 +89,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             onChoose: replies.onChoose,
           }),
     }),
-    [catalog, desktopId, monoId, navigate, readOnly, replies.onChoose],
+    [catalog, desktopId, mentions.onOpenFile, monoId, navigate, readOnly, replies.onChoose],
   );
 
 
@@ -242,6 +246,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
         {guard.dialog}
         {replies.dialog}
       </ComposerRegion>
+      {mentions.dialog}
     </div>
   );
 }

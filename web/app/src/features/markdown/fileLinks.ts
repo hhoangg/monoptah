@@ -11,7 +11,7 @@ export interface FileReference {
 const LINE_SUFFIX = /(?::(\d{1,9})(?::(\d{1,9}))?|#L(\d{1,9})(?:C(\d{1,9}))?(?:-L?\d{1,9}(?:C\d{1,9})?)?)$/;
 const KNOWN_NAMES = /^(dockerfile|makefile|gemfile|license|readme)$/i;
 
-function hasControl(text: string): boolean {
+export function hasControl(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) < 32) return true;
   }

@@ -8,7 +8,7 @@ import { ProjectToolFrame } from "@/features/sessions/ProjectToolFrame";
 import { FilesBrowser } from "./FilesBrowser";
 import { useEntryKind } from "./useEntryKind";
 
-export function FilesScreen({ desktopId, projectId, path }: { desktopId: string; projectId: string; path: string }) {
+export function FilesScreen({ desktopId, projectId, path, line }: { desktopId: string; projectId: string; path: string; line?: number }) {
   const navigate = useNavigate();
   const capabilities = useLinkState((state) => state.capabilities);
   const allowed = sessionCan("files", { target: null, desktopCapabilities: capabilities });
@@ -27,6 +27,7 @@ export function FilesScreen({ desktopId, projectId, path }: { desktopId: string;
             projectId={projectId}
             path={path}
             isFile={kind === "file"}
+            {...(line !== undefined ? { line } : {})}
             layout="auto"
             onNavigate={(next) => void navigate({ to: "/d/$desktopId/p/$projectId/files/$", params: { desktopId, projectId, _splat: next } })}
           />

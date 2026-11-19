@@ -21,13 +21,15 @@ export interface FilesBrowserProps {
   /** Whether `path` is a file (otherwise a folder, shown as an opened folder in the tree). */
   isFile: boolean;
   onNavigate: (path: string) => void;
+  /** A line of the open file to jump to (from a chat mention). */
+  line?: number;
   layout: "split" | "stack" | "auto";
 }
 
 /** Pane width (CSS px) from which "auto" shows the tree beside the viewer. */
 export const SPLIT_MIN_WIDTH = 700;
 
-export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, layout: requested }: FilesBrowserProps) {
+export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, line, layout: requested }: FilesBrowserProps) {
   const root = useRef<HTMLDivElement>(null);
   const width = useElementWidth(root);
   const layout = requested === "auto" ? (width >= SPLIT_MIN_WIDTH ? "split" : "stack") : requested;
@@ -43,7 +45,7 @@ export function FilesBrowser({ desktopId, projectId, path, isFile, onNavigate, l
       <FileTree projectId={projectId} selected={path} onOpenFile={open} className="h-full" />
     </FileSearchPane>
   );
-  const viewer = isFile ? <FileViewer key={path} projectId={projectId} path={path} onOpenPath={open} /> : null;
+  const viewer = isFile ? <FileViewer key={path} projectId={projectId} path={path} onOpenPath={open} {...(line !== undefined ? { line } : {})} /> : null;
 
   return (
     <div ref={root} className="flex h-full min-h-0 flex-1 flex-col" data-testid="files-browser" data-layout={layout}>

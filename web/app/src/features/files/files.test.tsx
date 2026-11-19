@@ -196,6 +196,29 @@ describe("file viewer (F-60)", () => {
     expect(lines.querySelectorAll("span.md-token").length).toBeGreaterThan(1);
   });
 
+  it("jumps to the line of ?line= and marks it", async () => {
+    TEXT["src/many.ts"] = Array.from({ length: 30 }, (_, i) => `const line${i + 1} = ${i + 1};`).join("\n") + "\n";
+    (TREE["src"] as Entry[]).push(file("many.ts"));
+    try {
+      mount("src/many.ts?line=7");
+      const lines = await screen.findByTestId("file-lines");
+      await waitFor(() => expect(within(lines).getAllByTestId("file-line").some((row) => row.getAttribute("data-highlighted") === "true")).toBe(true));
+      const marked = within(lines).getAllByTestId("file-line").filter((row) => row.getAttribute("data-highlighted") === "true");
+      expect(marked).toHaveLength(1);
+      expect(marked[0]).toHaveTextContent("const line7 = 7;");
+    } finally {
+      delete TEXT["src/many.ts"];
+      (TREE["src"] as Entry[]).pop();
+    }
+  });
+
+  it("marks no line without ?line=, and ignores a line that is not a positive number", async () => {
+    mount("src/main.ts?line=abc");
+    const lines = await screen.findByTestId("file-lines");
+    await waitFor(() => expect(lines.textContent).toContain("const answer"));
+    expect(within(lines).getAllByTestId("file-line").some((row) => row.hasAttribute("data-highlighted"))).toBe(false);
+  });
+
   it("renders agent-controlled text as text, with no element created from it", async () => {
     mount("src/evil.txt");
     const lines = await screen.findByTestId("file-lines");

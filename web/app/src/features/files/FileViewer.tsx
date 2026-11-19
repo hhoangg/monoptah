@@ -44,7 +44,8 @@ function useTokens(text: string, language: string | null): CodeToken[][] | undef
   return done?.key === key ? done.tokens : undefined;
 }
 
-function CodeLines({ text, language, wrap }: { text: string; language: string | null; wrap: boolean }) {
+/** The scrollable, highlighted line list of a text file. `line` (1-based) is scrolled to and marked. */
+export function CodeLines({ text, language, wrap, line, testId = "file-lines", label = "File contents" }: { text: string; language: string | null; wrap: boolean; line?: number; testId?: string; label?: string }) {
   const lines = useMemo(() => splitLines(text), [text]);
   const tokens = useTokens(text, language);
   const parent = useRef<HTMLDivElement>(null);
@@ -61,13 +62,17 @@ function CodeLines({ text, language, wrap }: { text: string; language: string | 
   useEffect(() => {
     virtualizer.measure();
   }, [virtualizer, wrap]);
+  const target = line !== undefined && line >= 1 && line <= lines.length ? line - 1 : undefined;
+  useEffect(() => {
+    if (target !== undefined) virtualizer.scrollToIndex(target, { align: "center" });
+  }, [virtualizer, target, lines]);
 
   return (
     <div
       ref={parent}
       role="region"
-      aria-label="File contents"
-      data-testid="file-lines"
+      aria-label={label}
+      data-testid={testId}
       data-wrap={wrap}
       tabIndex={0}
       className="min-h-0 flex-1 overflow-auto font-mono text-small"
@@ -82,7 +87,8 @@ function CodeLines({ text, language, wrap }: { text: string; language: string | 
             ref={wrap ? virtualizer.measureElement : undefined}
             data-index={item.index}
             data-testid="file-line"
-            className={cn("absolute top-0 left-0 flex w-full gap-3 px-2", wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre")}
+            data-highlighted={item.index === target ? "true" : undefined}
+            className={cn("absolute top-0 left-0 flex w-full gap-3 px-2", item.index === target && "bg-selection", wrap ? "whitespace-pre-wrap break-words" : "whitespace-pre")}
             style={{ transform: `translateY(${item.start}px)`, ...(wrap ? { minHeight: LINE_HEIGHT } : { height: LINE_HEIGHT }), lineHeight: `${LINE_HEIGHT}px` }}
           >
             <span aria-hidden="true" className="shrink-0 text-right text-faint select-none" style={{ width: `${gutter}ch` }}>
@@ -103,9 +109,11 @@ export interface FileViewerProps {
   path: string;
   /** Opens another project file (markdown links). */
   onOpenPath?: (path: string) => void;
+  /** A line (1-based) to scroll to and mark, from a `:12` or `#L12` mention. */
+  line?: number;
 }
 
-export function FileViewer({ projectId, path, onOpenPath }: FileViewerProps) {
+export function FileViewer({ projectId, path, onOpenPath, line }: FileViewerProps) {
   const file = useLinkQuery("project.file", { projectId, path });
   const wrap = useFilePrefs((state) => state.wrap);
   const setWrap = useFilePrefs((state) => state.setWrap);
@@ -140,7 +148,7 @@ export function FileViewer({ projectId, path, onOpenPath }: FileViewerProps) {
       </div>
     );
   } else {
-    body = <CodeLines text={file.data.text} language={language} wrap={wrap} />;
+    body = <CodeLines text={file.data.text} language={language} wrap={wrap} {...(line !== undefined ? { line } : {})} />;
   }
 
   return (
