@@ -10,6 +10,7 @@ import { installSessionExpiryHandler } from "@/features/accounts/sessionExpiry";
 import { startAppearanceSync } from "@/lib/appearance";
 import { queryClient } from "@/lib/queryClient";
 import { Toaster } from "@/ui/sonner";
+import { viewportDebugEnabled } from "@/ui/viewportDebugFlag";
 import { router } from "./router";
 import "./styles/index.css";
 
@@ -23,6 +24,8 @@ import "./features/push/register";
 import "./features/settings/register";
 
 startAppearanceSync();
+// TEMPORARY: read `?debug=viewport` before the router can redirect it away (`/` redirects to the last place).
+viewportDebugEnabled();
 installSessionExpiryHandler(queryClient, router);
 
 async function start() {
