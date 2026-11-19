@@ -8,7 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
 import { SessionStartTargetSchema, type ParamsOf } from "@monoptah/protocol";
 import { catalogKey, useCatalog, useLinkMutation } from "@/data";
-import { BACKGROUND_CONTAINER_CLASS, EmptySessionBackground } from "@/features/backgrounds";
+import { BACKGROUND_CONTAINER_CLASS, ChatBackground } from "@/features/backgrounds";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
 import { Composer } from "@/features/composer/Composer";
@@ -156,7 +156,7 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
       data-embedded={embedded ? "true" : undefined}
       className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col ${embedded ? "overflow-hidden" : ""}`}
     >
-      <EmptySessionBackground projectId={projectId} />
+      <ChatBackground projectId={projectId} />
       {embedded ? null : (
       <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link

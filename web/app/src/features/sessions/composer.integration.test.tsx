@@ -369,10 +369,53 @@ describe("new session page (F-30, F-31)", () => {
     globalThis.indexedDB = new IDBFactory();
     await putBackground({ projectId: "proj-alpha", projectName: "Example Alpha", image: new Blob(["x"], { type: "image/png" }), opacity: 0.3, updatedAt: 1 });
     mount(NEW);
-    const image = await screen.findByTestId("empty-session-background");
+    const image = await screen.findByTestId("chat-background");
     expect(image).toHaveStyle({ opacity: "0.3" });
     expect(screen.getByTestId("new-session-screen")).toContainElement(image);
     expect(screen.getByTestId("new-session-screen")).toHaveClass("isolate");
+  });
+
+  it("shows the same background behind an existing session, under a theme-aware scrim", async () => {
+    globalThis.indexedDB = new IDBFactory();
+    await putBackground({ projectId: "proj-alpha", projectName: "Example Alpha", image: new Blob(["x"], { type: "image/png" }), opacity: 0.3, updatedAt: 1 });
+    mount(`/s/${SESSION}`);
+    expect(await screen.findByText("Done. This is canned example output.")).toBeInTheDocument();
+    const image = await screen.findByTestId("chat-background");
+    expect(image).toHaveStyle({ opacity: "0.3" });
+    const chat = screen.getByTestId("route-stub");
+    expect(chat).toContainElement(image);
+    expect(chat).toHaveClass("isolate");
+    // The scrim is the page background colour (light in light mode, dark in dark mode), drawn over the photo and under the text.
+    const scrim = screen.getByTestId("chat-background-scrim");
+    expect(scrim.className).toContain("bg-background/");
+    expect(chat).toContainElement(scrim);
+    expect(image.compareDocumentPosition(scrim) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("shows no background behind a session whose project has none", async () => {
+    globalThis.indexedDB = new IDBFactory();
+    await putBackground({ projectId: "proj-beta", projectName: "Example Beta", image: new Blob(["x"], { type: "image/png" }), opacity: 0.3, updatedAt: 1 });
+    mount(`/s/${SESSION}`);
+    expect(await screen.findByText("Done. This is canned example output.")).toBeInTheDocument();
+    expect(screen.queryByTestId("chat-background")).toBeNull();
+  });
+
+  it("shows a Mono chat the background of the first of its projects that has one", async () => {
+    globalThis.indexedDB = new IDBFactory();
+    for (const [projectId, opacity] of [["proj-alpha", 0.3], ["proj-beta", 0.5]] as const) {
+      await putBackground({ projectId, projectName: projectId, image: new Blob(["x"], { type: "image/png" }), opacity, updatedAt: 1 });
+    }
+    mount("/monos/mono-example", {
+      seed: (desktop) => {
+        const monos = desktop.world.monos() as unknown as Array<Record<string, unknown>>;
+        monos[0] = { ...monos[0], projectIds: ["proj-gamma", "proj-alpha", "proj-beta"] };
+      },
+    });
+    const image = await screen.findByTestId("chat-background");
+    // proj-gamma has none, so proj-alpha (0.3) wins over proj-beta (0.5).
+    expect(image).toHaveStyle({ opacity: "0.3" });
+    expect(screen.getByTestId("route-stub")).toContainElement(image);
+    expect(screen.getByTestId("chat-background-scrim")).toBeInTheDocument();
   });
 
   it("goes back to the project when Open after starting is off", async () => {

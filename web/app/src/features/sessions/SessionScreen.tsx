@@ -1,5 +1,6 @@
 // `/d/:desktopId/s/:sessionId` (W-07): the header (back, title, the `session-header-chip` slot host), the
 // transcript of the conversation and the composer region (Task 5 mounts the composer there).
+import { BACKGROUND_CONTAINER_CLASS, ChatBackground } from "@/features/backgrounds";
 import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
@@ -72,8 +73,10 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
     <div
       data-testid="route-stub"
       data-route="/d/:desktopId/s/:sessionId"
-      className="flex h-full min-h-0 flex-1 flex-col"
+      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col`}
     >
+      {/* The project's background sits behind the whole chat, like on the New session page. */}
+      <ChatBackground projectId={projectId} />
       {/* The header spans the chat pane; the transcript and composer keep their own 768 px column. */}
       <header className="flex w-full shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link

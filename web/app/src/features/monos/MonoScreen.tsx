@@ -3,6 +3,7 @@
 // composer (no model controls: a Mono's model is edited on its profile) and the Mono's empty state. Opening the
 // chat marks the Mono seen (F-17). The Mono's own header cards, chips and documents render through the WS-T
 // transcript components (F-43, F-72).
+import { BACKGROUND_CONTAINER_CLASS, ChatBackground, useFirstBackgroundProject } from "@/features/backgrounds";
 import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
@@ -56,6 +57,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const older = useOlderTurns(conversationId, state?.turns ?? [], state?.older ?? false);
   const cancel = useLinkMutation("session.cancel");
   const accentStyle = useMonoAccentStyle(desktopId, monoId);
+  const monoBackgroundProject = useFirstBackgroundProject(mono?.projectIds);
   const requestControl = useRequestControl(desktopId);
   // F-71: the message being replied to; the reply is sent with it quoted.
   const [replyTo, setReplyTo] = useState<HeldMessage | null>(null);
@@ -111,8 +113,10 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
       data-testid="route-stub"
       data-route="/d/:desktopId/monos/:monoId"
       style={accentStyle}
-      className="flex h-full min-h-0 flex-1 flex-col"
+      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col`}
     >
+      {/* A Mono works across projects (`projectIds`) and has no background of its own: its chat shows the background of the first of its projects that has one. */}
+      <ChatBackground projectId={monoBackgroundProject} />
       <header className="flex w-full shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
           to="/d/$desktopId"
