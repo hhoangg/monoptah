@@ -8,7 +8,7 @@ import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { SessionListBody } from "./SessionListBody";
-import { useReadOnly } from "./WorkspaceFrame";
+import { useActivityTracking, useReadOnly } from "./WorkspaceFrame";
 
 export interface SessionListPaneProps {
   desktopId: string;
@@ -20,11 +20,16 @@ export interface SessionListPaneProps {
    * chat shows its own h1 (a session, a project tool page).
    */
   heading: "h1" | "h2";
+  /** The chat already shows the New session page (the project URL and `/new`): no button that points at the page already open. */
+  newSessionOpen?: boolean;
 }
 
-export function SessionListPane({ desktopId, projectId, width, heading }: SessionListPaneProps) {
+export function SessionListPane({ desktopId, projectId, width, heading, newSessionOpen = false }: SessionListPaneProps) {
   const catalog = useCatalog();
   const readOnly = useReadOnly();
+  // The classic layout shows no WorkspaceFrame on project and session routes, so the list that holds the now-working
+  // pill feeds the activity tracker (it is mounted from 1024px only, where the frame is not: no double tracking).
+  useActivityTracking(desktopId);
   const project = catalog.data?.projects.find((candidate) => candidate.id === projectId);
   const missing = !!catalog.data && !project;
   const Heading = heading;
@@ -40,7 +45,7 @@ export function SessionListPane({ desktopId, projectId, width, heading }: Sessio
             </p>
           ) : null}
         </div>
-        {missing ? null : readOnly ? (
+        {missing || newSessionOpen ? null : readOnly ? (
           <Button type="button" size="circle" variant="secondary" disabled aria-label="New session" title="This device is read-only">
             <Icon name="compose" size={18} />
           </Button>

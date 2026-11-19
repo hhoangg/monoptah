@@ -172,7 +172,7 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
         {wide ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
         {listShown ? (
           <>
-            <SessionListPane desktopId={desktopId} projectId={projectId} width={listWidth} heading={projectRoute ? "h1" : "h2"} />
+            <SessionListPane desktopId={desktopId} projectId={projectId} width={listWidth} heading={projectRoute ? "h1" : "h2"} newSessionOpen={projectRoute} />
             <Splitter label="Resize session list" value={listWidth} min={SESSION_LIST_WIDTH.min} max={listMax} onChange={setListWidth} onCommit={persistListWidth} grow={1} />
           </>
         ) : null}

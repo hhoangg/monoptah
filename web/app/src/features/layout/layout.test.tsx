@@ -243,9 +243,24 @@ describe("classic layout: session list sidebar and chat pane (>= 1024)", () => {
     expect(await within(list).findByRole("heading", { level: 1, name: "Example Alpha" })).toBeInTheDocument();
     expect(within(list).getByRole("searchbox", { name: "Search sessions" })).toBeInTheDocument();
     expect(await within(list).findByTestId("sessions-list")).toBeInTheDocument();
-    expect(within(list).getByRole("link", { name: "New session" })).toHaveAttribute("href", expect.stringContaining("/p/proj-alpha/new"));
+    // The chat already shows the New session page: no button that points at the page already open.
+    expect(within(list).queryByRole("link", { name: "New session" })).toBeNull();
     // No project route heading twice: the chat pane (the New session page) has no title of its own.
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
+  it("feeds the activity tracker from the session list, so the now-working pill shows where no workspace frame is mounted", async () => {
+    mount(1280, "/s/sess-local-1");
+    const list = await screen.findByTestId("session-list-pane");
+    expect(await within(list).findByTestId("now-working")).toBeInTheDocument();
+    expect(screen.queryByTestId("workspace-frame")).toBeNull();
+  });
+
+  it("shows no New session button on /new either: that page is already open", async () => {
+    mount(1280, `${ALPHA}/new`);
+    const list = await screen.findByTestId("session-list-pane");
+    await within(list).findByRole("heading", { level: 1, name: "Example Alpha" });
+    expect(within(list).queryByRole("link", { name: "New session" })).toBeNull();
   });
 
   it("fills the chat pane edge to edge with the New session page, with no card", async () => {
@@ -264,6 +279,8 @@ describe("classic layout: session list sidebar and chat pane (>= 1024)", () => {
     mount(1280, "/s/sess-local-1");
     const list = await screen.findByTestId("session-list-pane");
     expect(await within(list).findByRole("heading", { level: 2, name: "Example Alpha" })).toBeInTheDocument();
+    // On a session the New session page is not open, so the list offers it.
+    expect(within(list).getByRole("link", { name: "New session" })).toHaveAttribute("href", expect.stringContaining("/p/proj-alpha/new"));
     const pane = screen.getByTestId("chat-pane");
     expect(await within(pane).findByRole("heading", { level: 1 })).toBeInTheDocument();
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
