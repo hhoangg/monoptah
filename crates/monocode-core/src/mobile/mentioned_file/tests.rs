@@ -52,9 +52,33 @@ fn asset(path: &str, asset: &str) -> Params {
     }
 }
 
+/// A tool row of a file tool (`Write`) that was given `path`.
+fn write_row(path: &str) -> String {
+    let mut call = crate::tool::ToolCall::new("1", "Write");
+    call.input = json!({ "file_path": path, "content": "x" }).to_string();
+    serde_json::to_string(&call).unwrap()
+}
+
+/// A tool row of `name` with `input` and `output`.
+fn tool_row_of(name: &str, input: &str, output: &str) -> String {
+    let mut call = crate::tool::ToolCall::new("1", name);
+    call.input = input.to_owned();
+    call.output = output.to_owned();
+    serde_json::to_string(&call).unwrap()
+}
+
+/// `Write` rows for everything `texts` mention.
+fn write_rows_for(texts: &[String]) -> Vec<String> {
+    texts
+        .iter()
+        .flat_map(|text| mentions::extract_mentions(text))
+        .map(|mention| write_row(&mention))
+        .collect()
+}
+
 /// One call with `texts` as the assistant's messages and `cwd` as the session folder. The agent
-/// is taken to have run a tool on everything it names (the same texts are the tool rows), so a
-/// file outside a project is judged on the mention alone; [`run_evidence`] says otherwise.
+/// is taken to have run a file tool on everything it names, so a file outside a project is
+/// judged on the mention alone; [`run_evidence`] says otherwise.
 fn run(texts: &[&str], cwd: &Path, params: &Params) -> Result<Reply, Failure> {
     run_with(texts, cwd, &[], params, |_| {})
 }
@@ -68,8 +92,9 @@ fn run_with(
 ) -> Result<Reply, Failure> {
     let texts: Vec<String> = texts.iter().map(|t| (*t).to_owned()).collect();
     let cwd = cwd.to_string_lossy().into_owned();
+    let tool = write_rows_for(&texts);
     let mut ctx = Context::new(&texts, &cwd, &[], projects);
-    ctx.tool_texts = &texts;
+    ctx.tool_texts = &tool;
     ctx.home = None;
     tune(&mut ctx);
     serve(params, &ctx)
@@ -136,13 +161,13 @@ fn only_assistant_rows_make_mentions() {
         },
         Row {
             role: "tool".into(),
-            text: "`c.md`".into(),
+            text: write_row("c.md"),
             first: true,
             sent_at: None,
         },
     ];
     assert_eq!(assistant_texts(&rows), ["ok `a.md`"]);
-    assert_eq!(tool_texts(&rows), ["`c.md`"]);
+    assert_eq!(tool_texts(&rows), [write_row("c.md")]);
     // A mention in a user message does not authorize: only the assistant text is handed over.
     let fx = Fx::new();
     fx.write("a.md", "# a");
@@ -161,10 +186,10 @@ fn only_assistant_rows_make_mentions() {
     // not enough (see the tool evidence tests).
     assert_eq!(code(&serve(&params("a.md"), &ctx)), Some(Code::Forbidden));
     // A tool row that names another file called `a.md` is not that file.
-    let other = vec!["Write /nowhere/a.md".to_owned()];
+    let other = vec![write_row("/nowhere/a.md")];
     ctx.tool_texts = &other;
     assert_eq!(code(&serve(&params("a.md"), &ctx)), Some(Code::Forbidden));
-    let named = vec!["Write a.md".to_owned()];
+    let named = vec![write_row("a.md")];
     ctx.tool_texts = &named;
     assert!(serve(&params("a.md"), &ctx).is_ok());
 }
@@ -220,8 +245,9 @@ fn a_mono_mention_is_found_under_its_project_roots() {
     let texts = vec!["see `docs/a.md`".to_owned()];
     let roots = vec![project.to_string_lossy().into_owned()];
     let cwd = home.to_string_lossy().into_owned();
+    let tool = write_rows_for(&texts);
     let mut ctx = Context::new(&texts, &cwd, &roots, &[]);
-    ctx.tool_texts = &texts;
+    ctx.tool_texts = &tool;
     ctx.home = None;
     let reply = serve(&params("docs/a.md"), &ctx).unwrap();
     assert_eq!(reply.path, project.join("docs/a.md").to_string_lossy());
@@ -774,8 +800,9 @@ fn handle_counts_calls_budgets_bytes_and_reports_what_the_audit_needs() {
     fx.write("a.md", "# hello");
     let texts = vec!["`a.md`".to_owned()];
     let cwd = fx.text("");
+    let tool = write_rows_for(&texts);
     let mut ctx = Context::new(&texts, &cwd, &[], &[]);
-    ctx.tool_texts = &texts;
+    ctx.tool_texts = &tool;
     ctx.home = None;
     let device = format!("handle-test-{}", fx.root.display());
     let call = handle(&device, &json!({"path": "a.md"}), &ctx);
@@ -819,11 +846,31 @@ fn outside_a_project_the_assistant_alone_does_not_authorize_a_file() {
     let result = run_evidence(&said, &[], &fx.root, &[], &params(&path));
     assert_eq!(code(&result), Some(Code::Forbidden));
     // A tool row that is not about this file does not help either.
-    let other = format!("{{\"command\":\"cat {}\"}}", fx.text("home/other.txt"));
+    let other = tool_row_of(
+        "Bash",
+        &json!({ "command": format!("cat {}", fx.text("home/other.txt")) }).to_string(),
+        "",
+    );
     let result = run_evidence(&said, &[&other], &fx.root, &[], &params(&path));
     assert_eq!(code(&result), Some(Code::Forbidden));
     // A tool row that wrote it does.
-    let write = format!("{{\"file_path\":\"{path}\",\"content\":\"x\"}}");
+    let write = write_row(&path);
+    // Echoing the path in a command, or in the output of a tool, is not a tool run on it.
+    let echo = tool_row_of(
+        "Bash",
+        &json!({ "command": format!("echo {path}") }).to_string(),
+        &path,
+    );
+    let result = run_evidence(&said, &[&echo], &fx.root, &[], &params(&path));
+    assert_eq!(code(&result), Some(Code::Forbidden));
+    // Neither is the answer a control device typed to a question.
+    let answer = tool_row_of(
+        "AskUserQuestion",
+        &json!({ "path": &path }).to_string(),
+        &path,
+    );
+    let result = run_evidence(&said, &[&answer], &fx.root, &[], &params(&path));
+    assert_eq!(code(&result), Some(Code::Forbidden));
     assert!(run_evidence(&said, &[&write], &fx.root, &[], &params(&path)).is_ok());
     // A tool row alone (no assistant mention) does not authorize.
     let result = run_evidence(&["nothing"], &[&write], &fx.root, &[], &params(&path));
@@ -839,7 +886,7 @@ fn a_tool_row_names_a_file_relative_to_the_session_folder_or_through_a_link() {
     // A relative tool path is the same file as the relative mention.
     assert!(run_evidence(
         &said,
-        &["wrote out/report.html"],
+        &[&write_row("out/report.html")],
         &work,
         &[],
         &params("out/report.html")
@@ -847,7 +894,7 @@ fn a_tool_row_names_a_file_relative_to_the_session_folder_or_through_a_link() {
     .is_ok());
     assert!(run_evidence(
         &said,
-        &["wrote ./out/report.html"],
+        &[&write_row("./out/report.html")],
         &work,
         &[],
         &params("out/report.html")
@@ -856,7 +903,7 @@ fn a_tool_row_names_a_file_relative_to_the_session_folder_or_through_a_link() {
     // The same name in another folder is another file.
     let result = run_evidence(
         &said,
-        &["wrote other/report.html"],
+        &[&write_row("other/report.html")],
         &work,
         &[],
         &params("out/report.html"),
@@ -900,7 +947,7 @@ fn sufficient_evidence_stops_the_history_scan_only_when_the_call_is_decided() {
     ctx.home = None;
     // Mentioned, outside a project, no tool row yet: keep reading older turns.
     assert!(!sufficient(&ctx, &params("a.md")));
-    let tool = vec!["wrote a.md".to_owned()];
+    let tool = vec![write_row("a.md")];
     ctx.tool_texts = &tool;
     assert!(sufficient(&ctx, &params("a.md")));
     // Not mentioned at all: older turns may still mention it.
@@ -924,8 +971,9 @@ fn a_relative_mention_authorizes_the_one_file_it_resolves_to_not_the_name_under_
         two.to_string_lossy().into_owned(),
     ];
     let cwd = fx.text("home");
+    let tool = write_rows_for(&texts);
     let mut ctx = Context::new(&texts, &cwd, &roots, &[]);
-    ctx.tool_texts = &texts;
+    ctx.tool_texts = &tool;
     ctx.home = None;
     // The mention re-roots to the first root that has it.
     let reply = serve(&params("a.md"), &ctx).unwrap();
@@ -1044,7 +1092,32 @@ fn many_elements_times_many_rules_is_too_large() {
     fx.write("heavy.html", format!("<style>{rules}</style>{elements}"));
     let result = run(&["`heavy.html`"], &fx.root, &params("heavy.html"));
     assert_eq!(code(&result), Some(Code::TooLarge));
-    assert_eq!(weight("<a><b/>{ {"), (2, 2));
+    assert_eq!(weight("<a><b/>{ {"), (2, 0));
+    assert_eq!(
+        weight("<p><STYLE media=x>a{color:red}@media x{b{c:d}}</style><i>"),
+        (3, 13)
+    );
+}
+
+#[test]
+fn one_rule_with_a_huge_declaration_block_is_too_large() {
+    let fx = Fx::new();
+    // One rule: the old rule count saw 1. 1 MB of declarations times 20k elements would inline
+    // far past the output cap, so it is refused before css-inline runs.
+    let declarations = "color:red;".repeat(100_000);
+    let elements = "<i>x</i>".repeat(20_000);
+    fx.write(
+        "wide.html",
+        format!("<style>i{{{declarations}}}</style>{elements}"),
+    );
+    let result = run(&["`wide.html`"], &fx.root, &params("wide.html"));
+    assert_eq!(code(&result), Some(Code::TooLarge));
+    // The same block on a few elements is fine.
+    fx.write(
+        "ok.html",
+        format!("<style>i{{{declarations}}}</style><i>x</i>"),
+    );
+    assert!(run(&["`ok.html`"], &fx.root, &params("ok.html")).is_ok());
 }
 
 #[test]
@@ -1202,4 +1275,88 @@ fn source_true_serves_html_and_markdown_as_raw_text() {
         run(&["`c.rs`"], &fx.root, &request).unwrap().kind,
         Kind::Text
     );
+}
+
+// ---- N6b: not_found must not reveal whether an unauthorized name exists ----
+
+#[test]
+fn a_missing_file_is_forbidden_unless_it_is_the_authorized_mention_itself() {
+    let fx = Fx::new();
+    let (one, two) = (fx.root.join("one"), fx.root.join("two"));
+    fx.write("one/a.md", "# one");
+    fs::create_dir_all(&two).unwrap();
+    fx.write("home/.keep", "");
+    let said = vec!["see `a.md`".to_owned()];
+    let tool = write_rows_for(&said);
+    let roots = vec![
+        one.to_string_lossy().into_owned(),
+        two.to_string_lossy().into_owned(),
+    ];
+    let cwd = fx.text("home");
+    let mut ctx = Context::new(&said, &cwd, &roots, &[]);
+    ctx.tool_texts = &tool;
+    ctx.home = None;
+    // The same name under the other root: lexically a candidate, but not the mention's target.
+    // It is missing here and present there; either way the answer is the same.
+    let missing_elsewhere = two.join("a.md").to_string_lossy().into_owned();
+    let existing_elsewhere = fx.text("one/a.md");
+    assert_eq!(
+        code(&serve(&params(&missing_elsewhere), &ctx)),
+        Some(Code::Forbidden)
+    );
+    assert!(serve(&params(&existing_elsewhere), &ctx).is_ok());
+    // An unmentioned name is forbidden whether or not it exists.
+    fx.write("one/b.md", "# b");
+    for name in ["b.md", "zz-missing.md"] {
+        assert_eq!(code(&serve(&params(name), &ctx)), Some(Code::Forbidden));
+    }
+    // Outside a project a mentioned but never tool-touched path is forbidden missing or not.
+    let outside = fx.text("home/gone.md");
+    let said = vec![format!("see `{outside}`")];
+    let mut ctx = Context::new(&said, &cwd, &[], &[]);
+    ctx.home = None;
+    assert_eq!(code(&serve(&params(&outside), &ctx)), Some(Code::Forbidden));
+    fx.write("home/gone.md", "x");
+    assert_eq!(code(&serve(&params(&outside), &ctx)), Some(Code::Forbidden));
+    fs::remove_file(fx.path("home/gone.md")).unwrap();
+    // With the tool row it is the authorized target itself: the disk's answer.
+    let tool = vec![write_row(&outside)];
+    ctx.tool_texts = &tool;
+    assert_eq!(code(&serve(&params(&outside), &ctx)), Some(Code::NotFound));
+}
+
+#[test]
+fn sufficiency_over_pages_looks_only_at_what_each_page_added() {
+    let fx = Fx::new();
+    fx.write("a.md", "# a");
+    let cwd = fx.text("");
+    let none: Vec<String> = Vec::new();
+    let ctx = Context::new(&none, &cwd, &[], &[]);
+    let mut enough = Sufficiency::new(&ctx, &params("a.md"));
+    let mut evidence = Evidence::default();
+    assert!(!enough.check(&ctx, &evidence));
+    // A page with other files only.
+    evidence = Evidence::from_texts(&["`b.md`".to_owned()], &[write_row("b.md")]);
+    assert!(!enough.check(&ctx, &evidence));
+    // A page that mentions it: outside a project a tool row is still missing.
+    let mut grown = evidence.clone();
+    grown.absorb_rows(&[Row {
+        role: "assistant".into(),
+        text: "see `a.md`".into(),
+        first: true,
+        sent_at: None,
+    }]);
+    assert!(!enough.check(&ctx, &grown));
+    // The tool row arrives on a later page, the mention was seen earlier and is remembered.
+    grown.absorb_rows(&[Row {
+        role: "tool".into(),
+        text: write_row("a.md"),
+        first: true,
+        sent_at: None,
+    }]);
+    assert!(enough.check(&ctx, &grown));
+    // The same answer as the one-shot check.
+    let mut one_shot = Context::new(&grown.assistant, &cwd, &[], &[]);
+    one_shot.evidence = Some(&grown);
+    assert!(sufficient(&one_shot, &params("a.md")));
 }

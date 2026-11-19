@@ -1290,10 +1290,15 @@ impl Shell {
                         // A long Mono keeps its older turns in the store: read them newest
                         // first, and only until the file is accounted for.
                         let no_texts: [String; 0] = [];
+                        // The request's candidates are worked out once, and each page is
+                        // checked only for what it added.
+                        let mut enough = {
+                            let ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+                            mention::Sufficiency::new(&ctx, &parsed)
+                        };
                         for _ in 0..100_000 {
-                            let mut ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
-                            ctx.evidence = Some(&evidence);
-                            if mention::sufficient(&ctx, &parsed) {
+                            let ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+                            if enough.check(&ctx, &evidence) {
                                 break;
                             }
                             let (Some(session), Some(before)) = (session, cursor) else {

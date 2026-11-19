@@ -4,11 +4,14 @@
 //!
 //! * **Mentions**: the file mentions of the ASSISTANT's messages (see [`super::mentions`]). A
 //!   user message never counts, a control device can type any path into one.
-//! * **Tool paths**: the path-like tokens of the TOOL rows (the input and the output of what the
-//!   agent ran: Write, Edit, Read, `apply_patch`, shell command lines, created files). A remote
-//!   device cannot write a tool row: only the agent running a tool produces one. A file outside
-//!   every project the device selected needs both (see [`super::serve`]), so asking the
-//!   assistant to "reply with `~/x`" no longer makes `~/x` readable.
+//! * **Tool paths**: the STRUCTURED path parameters of the TOOL rows of tools that operate on
+//!   files (`file_path`, `path`, `notebook_path`, `filename`, `output_path`, `paths[]`, the
+//!   headers of a patch). Outputs, free-text command lines and question tools never count: a
+//!   control device can make a shell command echo a path or type one as the answer to a
+//!   question. A file outside every project the device selected needs both kinds (see
+//!   [`super::serve`]), so asking the assistant to "reply with `~/x`" does not make `~/x`
+//!   readable. Residual: an agent prompted (or prompt-injected) into reading or writing a file
+//!   with a file tool makes that file readable.
 //!
 //! Extraction is the expensive part of a call on a long conversation, so [`Evidence`] is built
 //! once and kept for a short time per conversation ([`cached`] and [`remember`]).
@@ -26,10 +29,7 @@ use crate::transcript::Row;
 /// Mentions or tool paths kept at most, so one huge conversation cannot grow the set unbounded.
 const MAX_ENTRIES: usize = 100_000;
 /// Longest tool row text read for paths, in bytes.
-const MAX_TOOL_TEXT: usize = 128 * 1024;
-/// Strings of one tool input taken, and how deep.
-const MAX_JSON_STRINGS: usize = 2_000;
-const MAX_JSON_DEPTH: usize = 8;
+const MAX_TOOL_TEXT: usize = 4 * 1024 * 1024;
 /// Longest token kept, in characters.
 const MAX_TOKEN_CHARS: usize = 1024;
 
@@ -93,41 +93,88 @@ impl Evidence {
     }
 }
 
-/// The path-like tokens of one tool row: of its input (command lines, `file_path` and `path`
-/// arguments, patches) and its output. A row that is not a tool call is read as plain text.
+/// The file paths one tool row names through STRUCTURED parameters: the `file_path`, `path`,
+/// `notebook_path`, `filename`, `output_path` and `paths[]` fields of the tool input, and the
+/// `*** Add File:` / `*** Update File:` headers of a patch tool. Never free text (a shell
+/// command line, a tool output, a question's answer) and never a question tool: a control
+/// device can make the agent echo or be answered with any text, but it cannot choose which
+/// parameter of a file tool the agent fills in. A row that is not a tool call gives nothing.
 pub fn tool_paths(row_text: &str) -> Vec<String> {
     let row_text = cut(row_text, MAX_TOOL_TEXT);
-    let mut whole: Vec<String> = Vec::new();
-    let mut fragments: Vec<String> = Vec::new();
-    match serde_json::from_str::<crate::tool::ToolCall>(row_text) {
-        Ok(call) => {
-            strings_of(&call.input, &mut whole, &mut fragments);
-            if let Some(display) = &call.display {
-                json_strings(display, 0, &mut whole, &mut fragments);
-            }
-            fragments.push(call.output);
-        }
-        Err(_) => fragments.push(row_text.to_owned()),
+    let Ok(call) = serde_json::from_str::<crate::tool::ToolCall>(row_text) else {
+        return Vec::new();
+    };
+    if is_question_tool(&call.name) {
+        return Vec::new();
     }
+    let patch_tool = call.name.to_ascii_lowercase().contains("patch");
     let mut out: Vec<String> = Vec::new();
-    // A whole JSON string value that is a path may hold spaces (`/Users/me/My Docs/a.html`).
-    for value in whole {
+    let mut push = |value: &str| {
         if let Some(path) = argument_token(value.trim()) {
-            if !out.contains(&path) {
+            if out.len() < MAX_ENTRIES && !out.contains(&path) {
                 out.push(path);
             }
         }
-    }
-    for fragment in &fragments {
-        for token in fragment.split(is_separator) {
-            if let Some(path) = path_token(token) {
-                if !out.contains(&path) {
-                    out.push(path);
+    };
+    match serde_json::from_str::<Value>(&call.input) {
+        Ok(Value::Object(map)) => {
+            for key in PATH_KEYS {
+                if let Some(Value::String(value)) = map.get(*key) {
+                    push(value);
+                }
+            }
+            if let Some(Value::Array(items)) = map.get("paths") {
+                for item in items.iter().take(MAX_PATHS) {
+                    if let Value::String(value) = item {
+                        push(value);
+                    }
+                }
+            }
+            if patch_tool {
+                for value in map.values() {
+                    if let Value::String(text) = value {
+                        patch_headers(text, &mut push);
+                    }
                 }
             }
         }
+        // A patch tool may take the patch itself as its whole input.
+        _ if patch_tool => patch_headers(&call.input, &mut push),
+        _ => {}
     }
     out
+}
+
+/// Input fields that hold one file path.
+const PATH_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "notebook_path",
+    "filename",
+    "output_path",
+];
+/// Entries of a `paths` array read.
+const MAX_PATHS: usize = 1_000;
+
+/// Tools that ask the user a question: their input and answer carry text the user typed.
+fn is_question_tool(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("question")
+        || name.contains("user_input")
+        || name.contains("userinput")
+        || name.starts_with("ask")
+}
+
+/// The files a patch adds, updates or moves to.
+fn patch_headers(text: &str, push: &mut impl FnMut(&str)) {
+    for line in text.lines() {
+        let line = line.trim();
+        for header in ["*** Add File:", "*** Update File:", "*** Move to:"] {
+            if let Some(path) = line.strip_prefix(header) {
+                push(path);
+            }
+        }
+    }
 }
 
 fn cut(text: &str, max: usize) -> &str {
@@ -141,90 +188,14 @@ fn cut(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// The strings of a JSON text (every string value is a candidate path, and a fragment to
-/// tokenize), or the text itself when it is not JSON.
-fn strings_of(text: &str, whole: &mut Vec<String>, fragments: &mut Vec<String>) {
-    match serde_json::from_str::<Value>(text) {
-        Ok(value) => json_strings(&value, 0, whole, fragments),
-        Err(_) => fragments.push(text.to_owned()),
-    }
-}
-
-fn json_strings(value: &Value, depth: usize, whole: &mut Vec<String>, fragments: &mut Vec<String>) {
-    if depth > MAX_JSON_DEPTH || whole.len() + fragments.len() > MAX_JSON_STRINGS {
-        return;
-    }
-    match value {
-        Value::String(text) => {
-            whole.push(text.clone());
-            fragments.push(text.clone());
-        }
-        Value::Array(items) => {
-            for item in items {
-                json_strings(item, depth + 1, whole, fragments);
-            }
-        }
-        Value::Object(map) => {
-            for item in map.values() {
-                json_strings(item, depth + 1, whole, fragments);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_separator(c: char) -> bool {
-    c.is_whitespace()
-        || matches!(
-            c,
-            '"' | '\''
-                | '`'
-                | '='
-                | '('
-                | ')'
-                | ','
-                | ';'
-                | '<'
-                | '>'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '|'
-                | '&'
-        )
-}
-
-/// A whole argument of a tool call (a JSON string value): any single-line text without a URL
-/// scheme may be the file the tool was given (`Makefile`, `NOTES`, `/Users/me/My Docs/a.html`).
-/// It is only ever compared with the file that was requested, so being loose costs nothing.
+/// A whole parameter value of a tool call: any single-line text without a URL scheme may be the
+/// file the tool was given (`Makefile`, `NOTES`, `/Users/me/My Docs/a.html`). It is only ever
+/// compared with the file that was requested, so being loose costs nothing.
 fn argument_token(value: &str) -> Option<String> {
     if value.is_empty() || value.contains("://") && !value.starts_with("file://") {
         return None;
     }
     mentions::clean_path(value).filter(|path| path.chars().count() <= MAX_TOKEN_CHARS)
-}
-
-/// A token that names a path: it starts like one (`/`, `~/`, `./`, `../`, `file://`), has a
-/// separator, or ends in a file name with an extension. Trailing punctuation and `:12` are cut.
-fn path_token(token: &str) -> Option<String> {
-    let token = token.trim_start_matches(['*', '@', '+', '-']);
-    if token.is_empty() || token.contains("://") && !token.starts_with("file://") {
-        return None;
-    }
-    let cleaned = mentions::clean_path(token)?;
-    let name = cleaned.rsplit('/').next().unwrap_or(&cleaned);
-    let looks = mentions::is_known_name(name)
-        || cleaned.starts_with('/')
-        || cleaned.starts_with("~/")
-        || cleaned.starts_with("./")
-        || cleaned.starts_with("../")
-        || cleaned.starts_with("file://")
-        || cleaned.contains('/')
-        || name.rsplit_once('.').is_some_and(|(stem, ext)| {
-            !stem.is_empty() && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric())
-        });
-    (looks && cleaned.chars().count() <= MAX_TOKEN_CHARS).then_some(cleaned)
 }
 
 struct Entry {
@@ -316,33 +287,34 @@ mod tests {
     }
 
     #[test]
-    fn tool_paths_come_from_arguments_command_lines_and_output() {
+    fn tool_paths_come_only_from_structured_path_parameters() {
         let evidence = Evidence::from_rows(&[
             tool_row(
                 "Write",
                 r#"{"file_path":"/Users/me/My Docs/report.html","content":"x"}"#,
                 "",
             ),
+            tool_row("Read", r#"{"path":"docs/a.md"}"#, ""),
+            tool_row("NotebookEdit", r#"{"notebook_path":"~/n.ipynb"}"#, ""),
             tool_row(
-                "Bash",
-                r#"{"command":"cat docs/a.md > ./out/b.txt && open ~/x/c.html"}"#,
+                "Save",
+                r#"{"filename":"Makefile","output_path":"./out/b.txt"}"#,
                 "",
             ),
             tool_row(
-                "Bash",
-                "{}",
-                "wrote /tmp/shot.png (12 KB)\nsee notes.md:12\n",
+                "fileChange",
+                r#"{"path":"a/x.rs","paths":["a/x.rs","b/y.rs"]}"#,
+                "",
             ),
         ]);
         for expected in [
             "/Users/me/My Docs/report.html",
             "docs/a.md",
-            "./out/b.txt",
-            "~/x/c.html",
-            "/tmp/shot.png",
-            "notes.md",
+            "~/n.ipynb",
             "Makefile",
-            "LICENSE",
+            "./out/b.txt",
+            "a/x.rs",
+            "b/y.rs",
         ] {
             assert!(
                 evidence.tool.iter().any(|t| t == expected),
@@ -353,10 +325,74 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_row_that_is_not_json_is_read_as_text() {
-        assert_eq!(tool_paths("created /tmp/x/y.md"), ["/tmp/x/y.md"]);
+    fn command_lines_outputs_and_other_free_text_do_not_count() {
+        let evidence = Evidence::from_rows(&[
+            tool_row(
+                "Bash",
+                r#"{"command":"echo ~/x/c.html && cat docs/a.md"}"#,
+                "",
+            ),
+            tool_row(
+                "Bash",
+                "{}",
+                "wrote /tmp/shot.png (12 KB)\nsee notes.md:12\nupdated Makefile and LICENSE\n",
+            ),
+            tool_row(
+                "WebFetch",
+                r#"{"url":"https://example.com/a.html","prompt":"~/y.md"}"#,
+                "read ~/z.md",
+            ),
+            tool_row(
+                "Write",
+                r#"{"content":"/etc/hosts","description":"~/w.md"}"#,
+                "",
+            ),
+        ]);
+        assert!(evidence.tool.is_empty(), "{:?}", evidence.tool);
+    }
+
+    #[test]
+    fn a_question_tool_never_counts_even_with_a_path_field() {
+        for name in [
+            "AskUserQuestion",
+            "item/tool/requestUserInput",
+            "cursor/ask_question",
+            "_x.ai/ask_user_question",
+        ] {
+            let evidence = Evidence::from_rows(&[tool_row(
+                name,
+                r#"{"path":"~/x","questions":[{"question":"~/x"}]}"#,
+                "~/x",
+            )]);
+            assert!(evidence.tool.is_empty(), "{name}: {:?}", evidence.tool);
+        }
+    }
+
+    #[test]
+    fn patch_headers_count_for_a_patch_tool_only() {
+        let patch = "*** Begin Patch\n*** Add File: new/a.md\n+x\n*** Update File: src/b.rs\n@@\n*** End Patch";
+        let evidence = Evidence::from_rows(&[
+            tool_row(
+                "apply_patch",
+                &serde_json::json!({ "input": patch }).to_string(),
+                "",
+            ),
+            tool_row("apply_patch", patch, ""),
+        ]);
+        assert_eq!(evidence.tool, ["new/a.md", "src/b.rs"]);
+        // The same text in a shell command is only text.
+        let evidence = Evidence::from_rows(&[tool_row(
+            "Bash",
+            &serde_json::json!({ "command": patch }).to_string(),
+            patch,
+        )]);
+        assert!(evidence.tool.is_empty());
+    }
+
+    #[test]
+    fn a_row_that_is_not_a_tool_call_gives_nothing() {
+        assert!(tool_paths("created /tmp/x/y.md").is_empty());
         assert!(tool_paths("nothing here").is_empty());
-        assert!(tool_paths("see https://example.com/a.html now").is_empty());
     }
 
     #[test]

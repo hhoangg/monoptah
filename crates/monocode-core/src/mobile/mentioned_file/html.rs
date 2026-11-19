@@ -20,11 +20,12 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use ammonia::{Builder, UrlRelative};
 use css_inline::{CSSInliner, StylesheetResolver};
+use regex::Regex;
 
 /// The most distinct assets one document may name; later references are removed.
 pub const MAX_ASSETS: usize = 256;
@@ -73,7 +74,14 @@ pub fn transform(source: &str, sheets: Arc<dyn Sheets>) -> Document {
     // Without inlining the styles are lost, never passed on.
     .unwrap_or_else(|| source.to_owned());
     let assets = Arc::new(Mutex::new(Vec::<String>::new()));
+    // The sanitizer drops the `<body>` tag, and with it the styles inlined onto it (the page's
+    // background, text color and font): they go on a wrapper div, through the same style filter.
+    let body_style = body_style(&inlined, &assets);
     let body = sanitizer(assets.clone()).clean(&inlined).to_string();
+    let body = match body_style {
+        Some(style) => format!("<div style=\"{style}\">{body}</div>"),
+        None => body,
+    };
     let assets = std::mem::take(&mut *assets.lock().unwrap_or_else(|e| e.into_inner()));
     Document {
         html: format!(
@@ -81,6 +89,31 @@ pub fn transform(source: &str, sheets: Arc<dyn Sheets>) -> Document {
         ),
         assets,
     }
+}
+
+/// The safe declarations of the first `<body>`'s `style` attribute, ready for a double-quoted
+/// attribute, or `None`.
+fn body_style(inlined: &str, assets: &Mutex<Vec<String>>) -> Option<String> {
+    static BODY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<body(?:\s(?:"[^"]*"|'[^']*'|[^>"'])*)?>"#).expect("body tag pattern")
+    });
+    static STYLE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)(?:^|\s)style\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("style pattern")
+    });
+    let tag = BODY.find(inlined)?.as_str();
+    let captures = STYLE.captures(tag)?;
+    let value = captures.get(1).or_else(|| captures.get(2))?.as_str();
+    // The raw text is not entity-decoded here (ammonia decodes before its filter): an entity
+    // could spell `url(` past the style filter, so such a value is dropped.
+    if value.contains('&') {
+        return None;
+    }
+    let kept = sanitize_style(value, assets)?;
+    Some(
+        kept.replace('"', "&quot;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;"),
+    )
 }
 
 /// Attributes that can carry a URL or load something; each is rebuilt or removed.
@@ -516,6 +549,33 @@ mod tests {
         let doc = transform("<link rel=stylesheet href=a.css><p>x</p>", Arc::new(sheets));
         assert!(!doc.html.contains("e.test"), "{}", doc.html);
         assert!(doc.html.contains("color: green"), "{}", doc.html);
+    }
+
+    #[test]
+    fn the_body_style_moves_to_a_wrapper_div_through_the_style_filter() {
+        let doc = run(concat!(
+            "<style>body{background:#123456;color:white}</style>",
+            "<body><p>hi</p></body>"
+        ));
+        assert!(
+            doc.html.contains("<div style=\"") && doc.html.contains("background: #123456"),
+            "{}",
+            doc.html
+        );
+        assert!(doc.html.contains("<p>hi</p>"));
+        // The same rules as any style attribute: no remote URL, no entity that spells one.
+        for style in [
+            "background:url(https://e.test/a.png);color:red",
+            "background:&#117;rl(https://e.test/a.png)",
+        ] {
+            let doc = run(&format!("<body style=\"{style}\"><p>x</p></body>"));
+            assert!(!doc.html.contains("e.test"), "{style}: {}", doc.html);
+        }
+        let doc = run("<body style=\"background:url(a.png)\"><p>x</p></body>");
+        assert!(doc.html.contains("url(monoptah-asset:0)"), "{}", doc.html);
+        assert_eq!(doc.assets, ["a.png"]);
+        // A page without body styles gets no wrapper.
+        assert!(!run("<p>x</p>").html.contains("<div"));
     }
 
     #[test]

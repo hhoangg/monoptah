@@ -950,8 +950,7 @@ impl MobileHost {
         let result = self.call_from(via, peer, &request, &mut audited).await;
         // Recorded with no lock held: the log may write a file.
         if let Some((context, mut event)) = audited {
-            // Still Ok here: no core refusal, so the app answered.
-            event.from_app = event.outcome == Outcome::Ok;
+            // `from_app` was set by `call_from` only when the app really replied.
             event.outcome = outcome_of(event.outcome, &result);
             audit::record(&context, &event);
         }
@@ -1127,6 +1126,14 @@ impl MobileHost {
             Err(Failure::from("Desktop is unavailable"))
         };
         self.pending.fetch_sub(1, Ordering::SeqCst);
+        // The app wrote its own audit line for the calls it audits, and only a reply proves it
+        // got this one: a request that was never delivered, or whose reply channel was dropped,
+        // leaves the host's line as the only record.
+        if response.is_ok() {
+            if let Some((_, event)) = audited.as_mut() {
+                event.from_app = true;
+            }
+        }
         let response = response?;
         let admitted = match via {
             DeviceKind::Phone => self.gate.admits(peer),
@@ -3077,6 +3084,57 @@ mod tests {
         assert_eq!(event.command_id.as_deref(), Some("c"));
         // Admitted, so Ok until the call has ended.
         assert_eq!(event.outcome, Outcome::Ok);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_undelivered_call_is_not_marked_as_audited_by_the_app() {
+        // The receiver is gone: the app never saw the request, so nobody wrote its line.
+        let (host, events, peer) = paired();
+        drop(events);
+        let mut audited = None;
+        let request = json!({"version":VERSION,"id":"c","method":"session.cancel","params":{"projectId":"p"}});
+        assert!(host
+            .handle_call(&peer, &request, &mut audited)
+            .await
+            .is_err());
+        assert!(!audited.unwrap().1.from_app);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+        // The app took the request and dropped its reply channel: still no line from it.
+        let (host, events, peer) = paired();
+        let dropping = tokio::spawn(async move {
+            let Ok(Event::Request(request)) = events.recv().await else {
+                panic!("expected a request");
+            };
+            drop(request);
+        });
+        let mut audited = None;
+        assert!(host
+            .handle_call(&peer, &request, &mut audited)
+            .await
+            .is_err());
+        dropping.await.unwrap();
+        assert!(!audited.unwrap().1.from_app);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_call_the_app_answered_is_marked_as_audited_by_the_app() {
+        let (host, events, peer) = paired();
+        let answering = tokio::spawn(async move {
+            let Ok(Event::Request(request)) = events.recv().await else {
+                panic!("expected a request");
+            };
+            request.reply(Ok(json!({})));
+        });
+        let mut audited = None;
+        let request = json!({"version":VERSION,"id":"c","method":"session.cancel","params":{"projectId":"p"}});
+        assert!(host
+            .handle_call(&peer, &request, &mut audited)
+            .await
+            .is_ok());
+        answering.await.unwrap();
+        assert!(audited.unwrap().1.from_app);
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

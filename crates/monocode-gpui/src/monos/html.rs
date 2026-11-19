@@ -105,6 +105,32 @@ struct Hosted {
     web: Retained<WKWebView>,
     _guard: Retained<NavigationGuard>,
     markup: Arc<str>,
+    gate: Rc<RefCell<LoadGate>>,
+}
+#[cfg(target_os = "macos")]
+impl Rules {
+    /// A page may load only when it needs no rules or they are installed.
+    fn allows_load(self) -> bool {
+        matches!(self, Rules::NotNeeded | Rules::Ready)
+    }
+}
+/// Whether the remote-load rules stand in the way of loading a page, and the markup to load
+/// once they are installed (the latest one, whatever was asked for earlier).
+#[cfg(target_os = "macos")]
+struct LoadGate {
+    rules: Rules,
+    latest: Arc<str>,
+}
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rules {
+    /// The page needs no remote-load rules.
+    NotNeeded,
+    /// Being compiled: nothing may load yet.
+    Pending,
+    Ready,
+    /// They could not be had: the page stays blank rather than load without them.
+    Failed,
 }
 #[cfg(target_os = "macos")]
 struct Markup {
@@ -267,23 +293,42 @@ fn load_page(web: &WKWebView, markup: &str, file: Option<&FilePage>) {
 const BLOCK_REMOTE_RULES: &str =
     r#"[{"trigger":{"url-filter":"^(https?|wss?|ftp)://"},"action":{"type":"block"}}]"#;
 
-/// [`load_page`] once the remote-load rules are installed in `web`. Compiling a rule list is
-/// asynchronous, so the page is loaded from its completion; when the rules cannot be had, the
-/// page stays blank rather than load without them.
+/// Loads `markup` unless the remote-load rules are still pending or failed. While pending, the
+/// markup is only remembered: the completion of [`load_page_without_remote`] loads the latest.
+#[cfg(target_os = "macos")]
+fn request_load(
+    web: &WKWebView,
+    gate: &RefCell<LoadGate>,
+    markup: &Arc<str>,
+    file: Option<&FilePage>,
+) {
+    let mut gate = gate.borrow_mut();
+    gate.latest = markup.clone();
+    if gate.rules.allows_load() {
+        load_page(web, markup, file);
+    }
+}
+
+/// Installs the remote-load rules in `web`, then loads the gate's latest markup. Compiling a
+/// rule list is asynchronous, so nothing loads before its completion (see [`request_load`]);
+/// when the rules cannot be had, the page stays blank rather than load without them.
 #[cfg(target_os = "macos")]
 fn load_page_without_remote(
     web: &Retained<WKWebView>,
     mtm: MainThreadMarker,
-    markup: Arc<str>,
+    gate: Rc<RefCell<LoadGate>>,
     file: Option<Rc<FilePage>>,
 ) {
     let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+        gate.borrow_mut().rules = Rules::Failed;
         return;
     };
+    gate.borrow_mut().rules = Rules::Pending;
     let web = web.clone();
     let done = block2::RcBlock::new(move |list: *mut WKContentRuleList, _: *mut NSError| {
         // SAFETY: WebKit passes a live list, or null with an error.
         let Some(list) = (unsafe { list.as_ref() }) else {
+            gate.borrow_mut().rules = Rules::Failed;
             return;
         };
         unsafe {
@@ -291,7 +336,12 @@ fn load_page_without_remote(
                 .userContentController()
                 .addContentRuleList(list)
         };
-        load_page(&web, &markup, file.as_deref());
+        let latest = {
+            let mut gate = gate.borrow_mut();
+            gate.rules = Rules::Ready;
+            gate.latest.clone()
+        };
+        load_page(&web, &latest, file.as_deref());
     });
     unsafe {
         store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
@@ -395,8 +445,17 @@ impl gpui::Render for Html {
                             });
                             let guard: Retained<NavigationGuard> = msg_send![super(guard), init];
                             web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*guard)));
-                            if file.as_ref().is_some_and(|file| !file.scripts) {
-                                load_page_without_remote(&web, mtm, html.clone(), file.clone());
+                            let remote_blocked = file.as_ref().is_some_and(|file| !file.scripts);
+                            let gate = Rc::new(RefCell::new(LoadGate {
+                                rules: if remote_blocked {
+                                    Rules::Pending
+                                } else {
+                                    Rules::NotNeeded
+                                },
+                                latest: html.clone(),
+                            }));
+                            if remote_blocked {
+                                load_page_without_remote(&web, mtm, gate.clone(), file.clone());
                             } else {
                                 load_page(&web, &html, file.as_deref());
                             }
@@ -406,13 +465,14 @@ impl gpui::Render for Html {
                                 web,
                                 _guard: guard,
                                 markup: html.clone(),
+                                gate,
                             }
                         };
                         *view = Some(hosted);
                     }
                     if let Some(view) = view.as_mut() {
                         if !Arc::ptr_eq(&view.markup, &html) {
-                            load_page(&view.web, &html, file.as_deref());
+                            request_load(&view.web, &view.gate, &html, file.as_deref());
                             view.markup = html.clone();
                         }
                         parent.addSubview_positioned_relativeTo(
@@ -450,6 +510,15 @@ impl Drop for Html {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_page_loads_while_the_remote_load_rules_are_pending_or_failed() {
+        assert!(Rules::NotNeeded.allows_load());
+        assert!(Rules::Ready.allows_load());
+        assert!(!Rules::Pending.allows_load());
+        assert!(!Rules::Failed.allows_load());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_file_page_runs_scripts_only_until_it_is_made_a_preview() {
