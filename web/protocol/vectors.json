@@ -853,7 +853,6 @@
       "not_pending",
       "not_selected",
       "path_denied",
-      "rate_limited",
       "read_only",
       "revoked",
       "starting",

@@ -10,7 +10,6 @@ use super::policy::{requested, Code, DeviceContext, Failure, Requested, Selectio
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 const INVALID: &str = "Invalid mobile parameters";
 /// Most refs one call may carry, and the longest one.
@@ -21,10 +20,6 @@ pub(crate) const MAX_TICKET_CHARS: usize = 256;
 const NAME_CHARS: usize = 200;
 /// Longest text of an access change.
 const CHANGE_CHARS: usize = 400;
-/// Most widening attempts per device and hour, and the least gap between them.
-const MAX_ATTEMPTS: usize = 5;
-const WINDOW: Duration = Duration::from_secs(3600);
-const MIN_GAP: Duration = Duration::from_secs(10);
 
 /// Which list of the catalog an id belongs to. Part of the ref, so a project
 /// and a Mono with the same id get different refs.
@@ -335,59 +330,9 @@ pub(crate) fn change_text(device: &str, summary: &str) -> String {
         .collect()
 }
 
-/// Per device: at most five widening attempts in a rolling hour and ten
-/// seconds between two. In memory, so a restart starts clean.
-#[derive(Default)]
-pub(crate) struct AttemptLimit {
-    attempts: HashMap<String, Vec<Instant>>,
-}
-
-impl AttemptLimit {
-    /// Counts an attempt at `now`, or refuses it.
-    pub(crate) fn admit(&mut self, device_id: &str, now: Instant) -> Result<(), Failure> {
-        let list = self.attempts.entry(device_id.to_owned()).or_default();
-        list.retain(|at| now.saturating_duration_since(*at) < WINDOW);
-        let too_soon = list
-            .last()
-            .is_some_and(|at| now.saturating_duration_since(*at) < MIN_GAP);
-        if too_soon || list.len() >= MAX_ATTEMPTS {
-            return Err(Code::RateLimited.failure());
-        }
-        list.push(now);
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn at_most_five_attempts_an_hour_and_ten_seconds_apart() {
-        let mut limit = AttemptLimit::default();
-        let start = Instant::now();
-        assert!(limit.admit("d", start).is_ok());
-        let too_soon = limit
-            .admit("d", start + Duration::from_secs(9))
-            .unwrap_err();
-        assert_eq!(too_soon.code.as_deref(), Some("rate_limited"));
-        for n in 1..5 {
-            assert!(limit
-                .admit("d", start + Duration::from_secs(11 * n))
-                .is_ok());
-        }
-        // A sixth within the hour is refused, however far apart.
-        let sixth = limit
-            .admit("d", start + Duration::from_secs(600))
-            .unwrap_err();
-        assert_eq!(sixth.code.as_deref(), Some("rate_limited"));
-        // Another device has its own count.
-        assert!(limit
-            .admit("other", start + Duration::from_secs(600))
-            .is_ok());
-        // The first attempt leaves the rolling hour.
-        assert!(limit.admit("d", start + Duration::from_secs(3601)).is_ok());
-    }
 
     #[test]
     fn names_are_cleaned_and_never_fall_back_to_the_id() {

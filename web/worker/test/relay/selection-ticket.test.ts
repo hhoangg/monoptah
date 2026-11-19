@@ -1,5 +1,5 @@
 // Selection tickets: a Control web device proves a fresh passkey re-auth to its desktop with a single-use ticket
-// (security.md decision "Selection widening from the web"). Both routes, the rate limit, the audit rows and the cleanup.
+// (security.md decision "Selection widening from the web"). Both routes, the audit rows and the cleanup.
 import { describe, expect, it } from "vitest";
 import { cleanup as grantsCleanup } from "../../src/modules/grants/cleanup.ts";
 import { sha256Hex } from "../../src/lib/crypto.ts";
@@ -95,17 +95,12 @@ describe("POST /api/desktops/:id/grants/:deviceId/selection-ticket", () => {
     expect((await env.DB.prepare("SELECT count(*) AS n FROM selection_tickets WHERE user_id IN (?, ?)").bind(s.mine.user.id, other.user.id).first<{ n: number }>())?.n).toBe(0);
   });
 
-  it("allows 10 tickets per user per hour, then 429 with Retry-After, and audits the breach once", async () => {
+  it("is not rate limited: 12 tickets in a row for one user all succeed", async () => {
     const s = await setup();
-    for (let i = 0; i < 10; i++) await mint(s);
-    const res = await authedCall(s.mine.session, ticketPath(s.desktop.desktopId, s.device.deviceId), json({}), s.roomEnv);
-    expect(res.status).toBe(429);
-    expect(res.headers.get("Retry-After")).not.toBeNull();
-    expect(((await res.json()) as { code: string }).code).toBe("rate_limited");
-    await authedCall(s.mine.session, ticketPath(s.desktop.desktopId, s.device.deviceId), json({}), s.roomEnv);
+    for (let i = 0; i < 12; i++) await mint(s);
+    expect((await env.DB.prepare("SELECT count(*) AS n FROM selection_tickets WHERE desktop_id = ?").bind(s.desktop.desktopId).first<{ n: number }>())?.n).toBe(12);
     const breaches = await env.DB.prepare("SELECT 1 FROM audit_log WHERE actor_user_id = ? AND action = 'ratelimit.breach'").bind(s.mine.user.id).all();
-    expect(breaches.results).toHaveLength(1);
-    expect((await env.DB.prepare("SELECT count(*) AS n FROM selection_tickets WHERE desktop_id = ?").bind(s.desktop.desktopId).first<{ n: number }>())?.n).toBe(10);
+    expect(breaches.results).toHaveLength(0);
   });
 });
 

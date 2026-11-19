@@ -340,7 +340,6 @@ describe("projects picker", () => {
 
   it.each([
     ["fresh_required", "could not confirm your passkey"],
-    ["rate_limited", "Too many attempts to add projects on this desktop"],
     ["read_only", "Only a browser with Control access can add projects"],
     ["not_found", "The desktop's list changed. Refresh and try again."],
     ["forbidden", "The desktop did not allow this change"],
@@ -361,7 +360,7 @@ describe("projects picker", () => {
     expect(screen.getByRole("dialog", { name: "Projects on this device" })).toBeInTheDocument();
   });
 
-  it("shows clear copy when the Worker refuses the ticket (429 and 403)", async () => {
+  it("shows clear copy when the Worker refuses the ticket (403)", async () => {
     const user = userEvent.setup();
     const link = provideMockLink();
     const device = [...link.desktop.devices.values()][0];
@@ -369,9 +368,6 @@ describe("projects picker", () => {
     mount(SETTINGS);
     const dialog = await openPicker(user);
     await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
-    ticketAnswer = { status: 429, code: "rate_limited" };
-    await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
-    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Too many attempts to add projects. Wait a while");
     ticketAnswer = { status: 403, code: "forbidden" };
     await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
     await waitFor(() => expect(within(dialog).getByRole("alert")).toHaveTextContent("does not have Control access"));

@@ -98,7 +98,7 @@ pub enum Lifecycle {
     SelectionWiden,
     /// A web device narrowed its own project or Mono selection.
     SelectionNarrow,
-    /// A web device asked to widen and was refused for its ticket or the rate.
+    /// A web device asked to widen and was refused for its ticket.
     SelectionWidenRefused,
 }
 

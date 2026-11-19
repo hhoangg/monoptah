@@ -43,8 +43,6 @@ export const LIMITS = {
   "push-notify": { limit: 30, windowSeconds: 60 },
   /** `push/test`: per signed-in user, counted in the handler (the user is known only after auth). */
   "push-test": { limit: 3, windowSeconds: 600 },
-  /** `selection-ticket`: widening tickets per signed-in user, counted in the handler (security.md decision "Selection widening from the web"). */
-  "selection-ticket": { limit: 10, windowSeconds: 3600 },
   /**
    * Attempts per invite code across register/options and register/verify. The table gives no window; an
    * hour matches the other registration limit, and the invite code is hashed in the key.
