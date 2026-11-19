@@ -81,6 +81,11 @@ hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/(remote/proto
 # preference importer reads back and asserts, so "Monocode" is data, not product copy.
 hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/desktop_preferences\.rs:[0-9]+: *(\("production", "tauri", "Monocode 🦀"\),|assert_eq!\(preferences\.get\("monocode\.test"\), Some\("Monocode 🦀"\)\);|json!\(\{"/code/agent-terminal":"Monocode"\}\),|"Monocode")$' || true)
 
+# credential_guard.rs APP_DATA_NAMES entry: "MonoCode" is the legacy upstream app data folder
+# name (Application Support/MonoCode). The remote-file deny-list must keep blocking it so a
+# remote file preview cannot read the old app's data, so it is a path, not product copy.
+hits=$(printf '%s\n' "$hits" | grep -vE '^crates/monocode-core/src/credential_guard\.rs:[0-9]+: *"MonoCode",$' || true)
+
 hits=$(printf '%s\n' "$hits" | grep -v '^[[:space:]]*$' || true)
 
 if [ -n "$hits" ]; then
