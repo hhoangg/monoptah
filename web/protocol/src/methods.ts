@@ -128,10 +128,35 @@ export const MonoCardSchema = z.looseObject({
   subsessions: z.looseObject({ harness: z.string().optional(), model: z.string().optional(), effort: z.string().optional() }).nullable().optional(),
 });
 
+/** The most characters of a folder name (`folder.create`, `folder.rename`). */
+export const FOLDER_NAME_MAX = 100;
+/** The most sessions one `folder.create` takes. */
+export const FOLDER_CREATE_MAX = 50;
+
+/**
+ * A session folder of one project, as the desktop's sidebar keeps it (web devices only; a phone's catalog has
+ * none). `sessionIds` are the sessions this device sees, in the desktop's order; a folder with none is not sent.
+ * `collapsed` is the desktop's own state: the web starts from it and keeps its own toggle.
+ */
+export const FolderCardSchema = z.looseObject({
+  id: z.string(),
+  projectId: z.string(),
+  name: z.string(),
+  sessionIds: z.array(z.string()),
+  collapsed: z.boolean().optional(),
+  /** Index into the desktop's folder palette (1 to 8); absent for the default wash. */
+  colorIndex: z.number().int().positive().optional(),
+  /** A custom `#rrggbb` color. */
+  customColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+});
+export type FolderCard = z.infer<typeof FolderCardSchema>;
+
 export const WorkspaceListResultSchema = z.looseObject({
   projects: z.array(ProjectCardSchema),
   monos: z.array(MonoCardSchema),
   sessions: z.array(SessionCardSchema),
+  /** Session folders, in the desktop's order, per project (absent on older desktops). */
+  folders: z.array(FolderCardSchema).optional(),
   /** Capability flags the catalog has always carried (absent on older desktops). */
   monoTools: z.boolean().optional(),
   monoFiles: z.boolean().optional(),
@@ -425,6 +450,39 @@ export const METHODS = {
     result: SessionAck,
   }),
   "session.delete": method({ class: "control", transport: "app", params: z.object({ conversationId: ConversationId }), result: SessionAck }),
+
+  // Session folders (control): the sidebar's own folder edits, for sessions of one shared project.
+  "folder.create": method({
+    class: "control",
+    transport: "app",
+    params: z.object({
+      projectId: ProjectId,
+      /** The sessions to put in the new folder; they leave their old folders. */
+      conversationIds: z.array(ConversationId).min(1).max(FOLDER_CREATE_MAX),
+      name: z.string().trim().min(1).max(FOLDER_NAME_MAX).optional(),
+    }),
+    result: z.looseObject({ folderId: z.string() }),
+  }),
+  "folder.rename": method({
+    class: "control",
+    transport: "app",
+    params: z.object({ projectId: ProjectId, folderId: z.string().min(1).max(256), name: z.string().trim().min(1).max(FOLDER_NAME_MAX) }),
+    result: z.looseObject({ folderId: z.string() }),
+  }),
+  "folder.move": method({
+    class: "control",
+    transport: "app",
+    /** `folderId: null` takes the session out of its folder. */
+    params: z.object({ projectId: ProjectId, conversationId: ConversationId, folderId: z.string().min(1).max(256).nullable() }),
+    result: z.looseObject({ folderId: z.string().nullable() }),
+  }),
+  "folder.delete": method({
+    class: "control",
+    transport: "app",
+    /** Ungroups: the folder goes and its sessions return to the list. */
+    params: z.object({ projectId: ProjectId, folderId: z.string().min(1).max(256) }),
+    result: z.looseObject({ folderId: z.string() }),
+  }),
 
   // Projects
   "project.changes": method({

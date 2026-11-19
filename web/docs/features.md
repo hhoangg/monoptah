@@ -89,6 +89,7 @@ Global rules that apply to every row:
 | F-23 | Filter menu: working only, by agent (11 providers) | `mobile/src/features/sessions/SessionFilterMenu.tsx:56` | none | DropdownMenu with the same groups. | P1 |
 | F-24 | Session card: title, relative time or "Working..." spinner, branch, model, provider logo | `mobile/src/features/sessions/SessionCard.tsx:35` | none | Same card; terminal braille spinner (`mobile/src/features/sessions/TerminalSpinner.tsx:33`) as CSS/JS; provider SVGs ported (`mobile/src/features/sessions/ProviderLogo.tsx:19`). | MVP |
 | F-25 | Row actions: rename, delete (swipe left or long press, confirm) | `mobile/src/features/sessions/useSessionActions.ts:21` | `session.rename`, `session.delete` | Kebab/context menu + AlertDialog (rename is a Dialog). Optional swipe on touch. Hidden for read-only devices. Gap: no `Alert.prompt`; use Dialog. | P1 |
+| F-25b | Session folders: the desktop's folders (name, order, members, collapse, color) group a project's sessions, on phone, tablet and desktop layouts; a control device adds a session to a folder, creates, renames or ungroups one | desktop `crates/monocode-core/src/session_groups.rs` | `workspace.list` (`folders`), `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | Folder headers above the loose sessions (`FolderHeader.tsx`); the list follows the catalog poll. Collapse is the desktop's UI state: the web starts from it and keeps its own toggle per device until the desktop changes it. Read-only devices see the folders and none of the edit items. Web only: a phone's catalog has no folders. | P1 |
 | F-26 | New-arrival animation | `mobile/src/features/sessions/useArrivals.ts:21` | none | `motion` layout animation, honours `prefers-reduced-motion`. | P2 |
 
 ### 2.4 Live and finished surfaces
@@ -304,6 +305,7 @@ Permission: R = read-only device allowed; C = control device only. The desktop e
 | `session.rename` | F-25, F-40 | mutate | C | P1 | |
 | `session.delete` | F-25, F-40 | mutate (R4) | C | P1 | Confirm dialog; consider desktop-side confirm for web devices later. Answers `code: unsupported_target` for a cloud session (X-19). |
 | `session.archive` | F-40, X-19 | mutate | C | P1 | For a cloud session `cloud: "keep"` or `"stop"` is required (X-19). |
+| `folder.create`, `folder.rename`, `folder.move`, `folder.delete` | F-25b | mutate | C | P1 | Of a project the device shares; sessions must belong to it. `folder.move` with `folderId: null` takes the session out. |
 | `mono.document` | F-63, F-72 | read | R | P2 | |
 | `mono.profile` | F-74, F-76, F-77 | read | R | P2 | |
 | `mono.update` | F-75, F-78 | mutate | C | P2 | |

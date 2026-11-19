@@ -79,6 +79,16 @@ interface SessionRecord {
   script: (() => void)[];
 }
 
+/** A session folder as the desktop keeps it: `sessionIds` in order, newest folder first in `MockWorld.folders`. */
+export interface FolderRecord {
+  id: string;
+  projectId: string;
+  name: string;
+  sessionIds: string[];
+  collapsed: boolean;
+  colorIndex?: number;
+}
+
 interface CloudInstanceRecord {
   kind: "codespace" | "sandbox";
   instance: string;
@@ -116,6 +126,9 @@ export class MockWorld {
   capabilities: WorldCapabilities;
   readonly sessions = new Map<string, SessionRecord>();
   readonly instances = new Map<string, CloudInstanceRecord>();
+  /** Session folders of every project, in the desktop's order. */
+  folders: FolderRecord[] = [];
+  #nextFolder = 1;
   readonly #listeners = new Map<string, Set<() => void>>();
   #nextTurn = 100;
   #nextSession = 1;
@@ -146,6 +159,7 @@ export class MockWorld {
     this.#addSession({ id: "sess-sandbox-stopped", projectId: "proj-beta", title: "Stopped sandbox work", target: { kind: "sandbox", instance: "fake-sandbox-one" }, cloudState: "stopped" });
     const starting = this.#addSession({ id: "sess-codespace-starting", projectId: "proj-beta", title: "Starting codespace work", target: { kind: "codespace", instance: "fake-codespace-two" }, cloudState: "starting" });
     this.#beginStartup(starting, 1);
+    this.folders.push({ id: "folder-parser", projectId: "proj-alpha", name: "Parser work", sessionIds: ["sess-local-1", "sess-local-approval"], collapsed: false });
     this.#addSession({ id: "sess-remote-1", projectId: "proj-beta", title: "Work on a remote machine", target: { kind: "remote", instance: "example-remote" }, cloudState: "available" });
   }
 
@@ -209,6 +223,66 @@ export class MockWorld {
           }
         : {}),
     };
+  }
+
+  // --- Folders (the desktop's Groups: a new folder goes first; a folder left empty goes) ---
+
+  folderCard(folder: FolderRecord, visible: (session: SessionRecord) => boolean): { id: string; projectId: string; name: string; sessionIds: string[]; collapsed: boolean; colorIndex?: number } | null {
+    const sessionIds = folder.sessionIds.filter((id) => {
+      const s = this.sessions.get(id);
+      return !!s && s.projectId === folder.projectId && this.visibleSessions().includes(s) && visible(s);
+    });
+    if (sessionIds.length === 0) return null;
+    return { id: folder.id, projectId: folder.projectId, name: folder.name, sessionIds, collapsed: folder.collapsed, ...(folder.colorIndex ? { colorIndex: folder.colorIndex } : {}) };
+  }
+
+  #leaveFolders(sessionIds: string[]): void {
+    for (const f of this.folders) f.sessionIds = f.sessionIds.filter((id) => !sessionIds.includes(id));
+    this.folders = this.folders.filter((f) => f.sessionIds.length > 0);
+  }
+
+  #folder(projectId: string, folderId: string): FolderRecord {
+    const folder = this.folders.find((f) => f.id === folderId && f.projectId === projectId);
+    if (!folder) throw new FixtureError("Folder not found");
+    return folder;
+  }
+
+  #folderSession(projectId: string, conversationId: string): SessionRecord {
+    const s = this.session(conversationId);
+    if (s.projectId !== projectId) throw new FixtureError("Session is not in this project");
+    return s;
+  }
+
+  createFolder(projectId: string, conversationIds: string[], name: string | undefined): string {
+    const ids = [...new Set(conversationIds)];
+    for (const id of ids) this.#folderSession(projectId, id);
+    this.#leaveFolders(ids);
+    const id = `folder-new-${this.#nextFolder++}`;
+    // Like the desktop's Groups: an unnamed folder is "New folder", then "New folder 2" and so on within the project.
+    const taken = (candidate: string) => this.folders.some((f) => f.projectId === projectId && f.name === candidate);
+    let fallback = "New folder";
+    for (let n = 2; taken(fallback); n++) fallback = `New folder ${n}`;
+    this.folders.unshift({ id, projectId, name: name ?? fallback, sessionIds: ids, collapsed: false });
+    return id;
+  }
+
+  renameFolder(projectId: string, folderId: string, name: string): void {
+    this.#folder(projectId, folderId).name = name;
+  }
+
+  moveToFolder(projectId: string, conversationId: string, folderId: string | null): void {
+    this.#folderSession(projectId, conversationId);
+    if (folderId === null) return this.#leaveFolders([conversationId]);
+    const folder = this.#folder(projectId, folderId);
+    for (const f of this.folders) f.sessionIds = f.sessionIds.filter((id) => id !== conversationId);
+    folder.sessionIds.push(conversationId);
+    folder.collapsed = false;
+    this.folders = this.folders.filter((f) => f.sessionIds.length > 0);
+  }
+
+  deleteFolder(projectId: string, folderId: string): void {
+    this.#folder(projectId, folderId);
+    this.folders = this.folders.filter((f) => f.id !== folderId);
   }
 
   session(conversationId: string): SessionRecord {
@@ -543,6 +617,12 @@ function project(world: MockWorld, projectId: string): void {
   if (!world.projectIds().includes(projectId)) throw new FixtureError(`Unknown project ${projectId}`, "not_selected");
 }
 
+/** A folder call names a project the device shares, as the desktop checks it. */
+function folderProject(ctx: HandlerContext, projectId: string): void {
+  project(ctx.world, projectId);
+  if (!selected(ctx, projectId)) throw new FixtureError("This project is not shared with this device", "not_selected");
+}
+
 function selected(ctx: HandlerContext, projectId: string): boolean {
   return ctx.device.selection.projects === null || ctx.device.selection.projects.includes(projectId);
 }
@@ -631,6 +711,26 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
     return ACK(p.conversationId);
   },
 
+  "folder.create": (p, ctx) => {
+    folderProject(ctx, p.projectId);
+    return { folderId: ctx.world.createFolder(p.projectId, p.conversationIds, p.name) };
+  },
+  "folder.rename": (p, ctx) => {
+    folderProject(ctx, p.projectId);
+    ctx.world.renameFolder(p.projectId, p.folderId, p.name);
+    return { folderId: p.folderId };
+  },
+  "folder.move": (p, ctx) => {
+    folderProject(ctx, p.projectId);
+    ctx.world.moveToFolder(p.projectId, p.conversationId, p.folderId);
+    return { folderId: p.folderId };
+  },
+  "folder.delete": (p, ctx) => {
+    folderProject(ctx, p.projectId);
+    ctx.world.deleteFolder(p.projectId, p.folderId);
+    return { folderId: p.folderId };
+  },
+
   "project.changes": (p, { world }) => {
     project(world, p.projectId);
     return {
@@ -708,6 +808,7 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
       projects: world.projects().filter((p) => visible(p.id)).map((p) => ({ ...p })),
       monos: world.monos().map((m) => ({ ...m, projectIds: [...m.projectIds] })),
       sessions: world.visibleSessions().filter((s) => visible(s.projectId)).map((s) => world.card(s)),
+      folders: world.folders.flatMap((f) => (visible(f.projectId) ? [world.folderCard(f, () => true)] : [])).filter((f) => f !== null),
       monoTools: true,
       monoFiles: true,
       push: true,

@@ -11,7 +11,7 @@ import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import type { SessionCard as SessionCardData } from "@monoptah/protocol";
 import { useCloseSessionTab } from "@/features/layout/tabs/useCloseSessionTab";
-import { useLinkMutation } from "@/data";
+import { useCatalog, useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
@@ -20,8 +20,10 @@ import { HarnessIcon } from "@/ui/HarnessIcon";
 import { Icon } from "@/ui/Icon";
 import { sessionCan } from "@/ui/hooks";
 import { TerminalSpinner } from "@/features/transcript/TerminalSpinner";
+import { canEditFolders, folderOf, projectFolders } from "./folders";
 import { relativeTime } from "./relativeTime";
 import { ArchiveSessionDialog, RenameSessionDialog, useRefreshSessions } from "./SessionActionDialogs";
+import { AddToFolderDialog, FolderErrorDialog } from "./SessionFolderDialogs";
 import { SessionCardBadgeSlot, SessionMenuItemsSlot } from "./slots";
 
 /** Every card is the same height, which is what lets the list be virtualized (the card is 68 plus 4 padding each side). */
@@ -102,7 +104,10 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
   const [confirming, setConfirming] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [archiving, setArchiving] = useState(false);
+  const [filing, setFiling] = useState(false);
   const remove = useLinkMutation("session.delete");
+  // Kept here, not in the menu items, which unmount when the menu closes.
+  const unfile = useLinkMutation("folder.move");
   const refresh = useRefreshSessions(desktopId);
   const closeTab = useCloseSessionTab(desktopId);
   const afterDelete = () => {
@@ -164,6 +169,11 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
                 <Icon name="edit" size={18} />
                 Rename
               </DropdownMenuItem>
+              <FolderMenuItems
+                session={session}
+                onAdd={() => setFiling(true)}
+                onRemove={() => unfile.mutate({ projectId: session.projectId, conversationId: session.id, folderId: null }, { onSuccess: refresh })}
+              />
               <DropdownMenuItem onSelect={() => setArchiving(true)}>
                 <Icon name="archive" size={18} />
                 Archive
@@ -179,6 +189,8 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
         </DropdownMenuContent>
       </DropdownMenu>
       <RenameSessionDialog desktopId={desktopId} session={session} open={renaming} onOpenChange={setRenaming} />
+      <FolderErrorDialog open={unfile.isError} onClose={unfile.reset} />
+      {readOnly ? null : <AddToFolderDialog desktopId={desktopId} session={session} open={filing} onOpenChange={setFiling} />}
       {archiving ? <ArchiveSessionDialog desktopId={desktopId} session={session} open onOpenChange={setArchiving} /> : null}
       <ConfirmDialog
         open={confirming}
@@ -191,6 +203,28 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
         error={remove.isError ? "Could not delete the session." : null}
         onConfirm={() => remove.mutate({ conversationId: session.id }, { onSuccess: afterDelete })}
       />
+    </>
+  );
+}
+
+/** "Add to folder" and, for a session in one, "Remove from folder". Only rendered while the menu is open. */
+function FolderMenuItems({ session, onAdd, onRemove }: { session: SessionCardData; onAdd: () => void; onRemove: () => void }) {
+  const catalog = useCatalog();
+  // An older desktop sends no folders, and a remote-machine project's are refused: no folder items for those.
+  if (!canEditFolders(catalog.data?.folders, session.projectId)) return null;
+  const current = folderOf(projectFolders(catalog.data?.folders, session.projectId), session.id);
+  return (
+    <>
+      <DropdownMenuItem onSelect={onAdd}>
+        <Icon name="folder" size={18} />
+        {current ? "Move to folder" : "Add to folder"}
+      </DropdownMenuItem>
+      {current ? (
+        <DropdownMenuItem onSelect={onRemove}>
+          <Icon name="minus" size={18} />
+          Remove from folder
+        </DropdownMenuItem>
+      ) : null}
     </>
   );
 }

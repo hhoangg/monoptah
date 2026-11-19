@@ -2,8 +2,8 @@ import { act, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { findScrollParent, useWindowedList } from "./useWindowedList";
 
-function List({ count, onRange }: { count: number; onRange: (range: { start: number; end: number }) => void }) {
-  const [ref, range] = useWindowedList(count, 100, 0);
+function List({ count, onRange, layoutKey }: { count: number; onRange: (range: { start: number; end: number }) => void; layoutKey?: string }) {
+  const [ref, range] = useWindowedList(count, 100, 0, layoutKey);
   onRange(range);
   return <ul ref={ref} />;
 }
@@ -68,5 +68,15 @@ describe("useWindowedList", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("measures again when the layout key changes, without a scroll", () => {
+    const ranges: { start: number; end: number }[] = [];
+    const view = render(<List count={100} onRange={(range) => ranges.push(range)} layoutKey="a" />);
+    const list = view.container.querySelector("ul") as HTMLElement;
+    // Content above the list grew: the list now starts 5000 px above the viewport top.
+    list.getBoundingClientRect = () => ({ top: -5000 }) as DOMRect;
+    view.rerender(<List count={100} onRange={(range) => ranges.push(range)} layoutKey="b" />);
+    expect(ranges[ranges.length - 1]!.start).toBe(50);
   });
 });

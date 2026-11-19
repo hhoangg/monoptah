@@ -4,6 +4,7 @@
 use super::audit::{self, AuditEvent, Outcome, Transport};
 use super::catalog::{recent_sessions, session_page};
 use super::cloud_policy;
+use super::folders;
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
 use super::policy::{self, DeviceContext, DeviceKind, Permission};
 use super::web_link::{desktop_api, LinkCommand, PairPoll, PairTicket, PermissionRequest};
@@ -62,6 +63,10 @@ pub(super) const APP_METHODS: &[&str] = &[
     "session.rename",
     "session.delete",
     "session.archive",
+    "folder.create",
+    "folder.rename",
+    "folder.move",
+    "folder.delete",
     "mono.document",
     "mono.profile",
     "mono.update",
@@ -1058,7 +1063,10 @@ impl MobileHost {
                     // Before the lists are cut to a recent few, so web-only
                     // sessions never take a phone's place in them.
                     cloud_policy::scope_catalog(&context, &mut catalog);
-                    catalog["sessions"] = json!(recent_sessions(&catalog["sessions"]));
+                    // A web device's folders list their sessions however old
+                    // they are, so those are kept with the recent ones.
+                    let foldered = folders::foldered_session_ids(&catalog);
+                    catalog["sessions"] = json!(recent_sessions(&catalog["sessions"], &foldered));
                     // The desktop's network addresses are for phones; a browser
                     // reaches it through the relay and never needs them.
                     if context.kind != DeviceKind::Web {
@@ -1075,6 +1083,10 @@ impl MobileHost {
                     let mut page = session_page(&scoped["sessions"], &params);
                     policy::filter_reply(&context, method, &mut page);
                     return Ok(page);
+                }
+                // Session folders are for web devices; a phone's catalog has none.
+                folder if folders::METHODS.contains(&folder) && via != DeviceKind::Web => {
+                    return Err(unsupported());
                 }
                 // Push tokens are for the phones' Expo path; the web transport
                 // answers `unsupported`, before any config write.
@@ -3254,6 +3266,146 @@ mod tests {
         assert_eq!(page["hasMore"], true);
         assert!(!page.to_string().contains("webOnly"));
         assert!(!page.to_string().contains("target"));
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn folders_reach_web_devices_only_and_only_with_sessions_they_see() {
+        let (host, events, phone) = paired();
+        host.set_flags_for_test(true, true);
+        let mut control = web_row("wc", "web-control");
+        control.permission = Permission::Control;
+        host.add_device_for_test(web_row("wr", "web-read"));
+        host.add_device_for_test(control);
+        let mut narrowed = web_row("wn", "web-narrowed");
+        narrowed.permission = Permission::Control;
+        narrowed.projects = Some(vec!["a".into()]);
+        host.add_device_for_test(narrowed);
+        // 30 sessions of project "a"; the oldest are in a folder, so a poll
+        // must keep them although they are past the recent 20.
+        let mut sessions: Vec<Value> = (0..30)
+            .map(|i| json!({"id": format!("s{i}"), "projectId": "a", "title": "t"}))
+            .collect();
+        sessions.push(json!({"id": "b0", "projectId": "b", "title": "t"}));
+        host.publish(json!({
+            "projects": [{"id":"a"}, {"id":"b"}],
+            "monos": [],
+            "sessions": sessions,
+            "folders": [
+                {"id":"f1","projectId":"a","name":"Old","sessionIds":["s29","s28","gone"],"collapsed":true},
+                {"id":"f2","projectId":"b","name":"Other","sessionIds":["b0"],"collapsed":false},
+                {"id":"f3","projectId":"a","name":"Ghost","sessionIds":["gone"],"collapsed":false},
+            ],
+        }))
+        .unwrap();
+        let call = |method: &str, params: Value| json!({"version":VERSION,"id":"x","method":method,"params":params});
+        let poll = host
+            .handle_web("web-control", call("workspace.list", json!({})))
+            .await
+            .unwrap();
+        let folders = poll["folders"].as_array().unwrap();
+        assert_eq!(
+            folders
+                .iter()
+                .map(|f| f["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["f1", "f2"],
+            "a folder with no visible session is dropped, order kept"
+        );
+        assert_eq!(folders[0]["sessionIds"], json!(["s29", "s28"]));
+        assert_eq!(folders[0]["collapsed"], true);
+        let listed = |poll: &Value, id: &str| {
+            poll["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["id"] == id)
+        };
+        assert!(
+            listed(&poll, "s29") && listed(&poll, "s28"),
+            "foldered sessions are kept"
+        );
+        assert!(!listed(&poll, "s25"), "other old sessions stay paged");
+
+        // A device narrowed to project "a" never learns of project "b"'s folder.
+        let narrow = host
+            .handle_web("web-narrowed", call("workspace.list", json!({})))
+            .await
+            .unwrap();
+        assert_eq!(narrow["folders"].as_array().unwrap().len(), 1);
+        assert_eq!(narrow["folders"][0]["id"], "f1");
+        assert!(!narrow.to_string().contains("Other"));
+
+        // A phone's catalog has no folders and no extra sessions.
+        let poll = host
+            .handle(&phone, call("workspace.list", json!({})))
+            .await
+            .unwrap();
+        assert!(poll.get("folders").is_none());
+        assert!(!listed(&poll, "s29"));
+
+        // Paging never carries folders, and an unshared project's page is refused.
+        let failure = host
+            .handle_web(
+                "web-narrowed",
+                call("sessions.list", json!({"projectId":"b"})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("not_selected"));
+        let page = host
+            .handle_web(
+                "web-narrowed",
+                call("sessions.list", json!({"projectId":"a"})),
+            )
+            .await
+            .unwrap();
+        assert!(page.get("folders").is_none());
+        assert!(!page.to_string().contains("b0"));
+
+        // A phone may not call the folder methods at all.
+        let refused = host
+            .handle(
+                &phone,
+                call("folder.delete", json!({"projectId":"a","folderId":"f1"})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused, "Unsupported mobile operation");
+        assert!(events.try_recv().is_err());
+
+        // Control devices reach the app; read-only and unselected ones do not.
+        let create = call(
+            "folder.create",
+            json!({"projectId":"a","conversationIds":["s1"],"name":"New"}),
+        );
+        let failure = host
+            .handle_web("web-read", create.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("read_only"));
+        let failure = host
+            .handle_web(
+                "web-narrowed",
+                call("folder.delete", json!({"projectId":"b","folderId":"f2"})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("not_selected"));
+        assert!(
+            events.try_recv().is_err(),
+            "refused calls never reach the app"
+        );
+        let pending = host.handle_web("web-control", create);
+        let reached = tokio::time::timeout(std::time::Duration::from_millis(200), pending).await;
+        assert!(
+            reached.is_err(),
+            "a control device's call waits for the app"
+        );
+        match events.try_recv() {
+            Ok(Event::Request(request)) => assert_eq!(request.method, "folder.create"),
+            _ => panic!("the app got the request"),
+        }
         std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
     }
 

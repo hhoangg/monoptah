@@ -23,7 +23,11 @@ export function findScrollParent(element: HTMLElement | null): HTMLElement | nul
 }
 
 /** Returns the ref to attach to the element that holds the rows (the `ul`), and the range to render. */
-export function useWindowedList(count: number, rowHeight: number, overscan = 6): [RefObject<HTMLUListElement | null>, WindowedRange] {
+/**
+ * `layoutKey` changes whenever content above the list changes height (a folder section folding, appearing or going),
+ * so the range is measured again at once instead of after the next scroll.
+ */
+export function useWindowedList(count: number, rowHeight: number, overscan = 6, layoutKey = ""): [RefObject<HTMLUListElement | null>, WindowedRange] {
   const ref = useRef<HTMLUListElement | null>(null);
   const [range, setRange] = useState({ first: 0, last: Math.min(count, 24) });
 
@@ -39,7 +43,7 @@ export function useWindowedList(count: number, rowHeight: number, overscan = 6):
     setRange((previous) => (previous.first === first && previous.last === last ? previous : { first, last }));
   }, [count, rowHeight, overscan]);
 
-  useLayoutEffect(measure, [measure]);
+  useLayoutEffect(measure, [measure, layoutKey]);
   useEffect(() => {
     let frame = 0;
     const onChange = () => {

@@ -1,6 +1,6 @@
 //! The workspace catalog a phone polls, and the session pages it browses.
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How many of a project's sessions the workspace poll carries; the sessions
 /// sheet pages through the rest with `sessions.list`.
@@ -8,8 +8,8 @@ const RECENT_SESSIONS: usize = 20;
 const SESSION_PAGE_MAX: usize = 100;
 
 /// The workspace poll's sessions: each project's most recent, every busy one,
-/// and every Mono's. `sessions` is newest first, as the catalog is sorted.
-pub fn recent_sessions(sessions: &Value) -> Vec<Value> {
+/// every Mono's and those in `keep` (a web device's folders). `sessions` is newest first, as the catalog is sorted.
+pub fn recent_sessions(sessions: &Value, keep: &HashSet<String>) -> Vec<Value> {
     let mut per_project: HashMap<&str, usize> = HashMap::new();
     sessions
         .as_array()
@@ -20,7 +20,10 @@ pub fn recent_sessions(sessions: &Value) -> Vec<Value> {
                 .entry(session["projectId"].as_str().unwrap_or(""))
                 .or_default();
             *count += 1;
-            *count <= RECENT_SESSIONS || session["busy"] == true || session["monoId"].is_string()
+            *count <= RECENT_SESSIONS
+                || session["busy"] == true
+                || session["monoId"].is_string()
+                || session["id"].as_str().is_some_and(|id| keep.contains(id))
         })
         .cloned()
         .collect()
@@ -78,10 +81,16 @@ mod tests {
             .chain([json!({"id":"m","projectId":"p","monoId":"mono"})])
             .collect();
         let sessions = json!(sessions);
-        let recent = recent_sessions(&sessions);
+        let recent = recent_sessions(&sessions, &HashSet::new());
         assert_eq!(recent.len(), RECENT_SESSIONS + 2);
         assert!(recent.iter().any(|s| s["id"] == "s25"));
 
+        // Sessions named by the caller (a web device's folders) are kept too.
+        let keep: HashSet<String> = ["s27".to_owned()].into();
+        let kept = recent_sessions(&sessions, &keep);
+        assert_eq!(kept.len(), RECENT_SESSIONS + 3);
+        assert!(kept.iter().any(|s| s["id"] == "s27"));
+        assert!(!kept.iter().any(|s| s["id"] == "s28"));
         let page = session_page(&sessions, &json!({"projectId":"p","offset":28,"limit":10}));
         assert_eq!(page["sessions"].as_array().unwrap().len(), 3);
         assert_eq!(page["hasMore"], false);

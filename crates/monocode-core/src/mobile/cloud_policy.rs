@@ -40,6 +40,12 @@ pub const WEB_CARD_FIELDS: [&str; 3] = ["target", "cloudState", "startup"];
 /// `projectId`) and project cards are touched, so other replies pass through.
 pub fn scope_catalog(device: &DeviceContext, catalog: &mut Value) {
     let phone = device.kind == DeviceKind::Phone;
+    // Session folders are for web devices; a phone's catalog stays as it was.
+    if phone {
+        if let Some(catalog) = catalog.as_object_mut() {
+            catalog.remove("folders");
+        }
+    }
     if let Some(list) = catalog.get_mut("sessions").and_then(Value::as_array_mut) {
         if phone {
             list.retain(|card| card.get(WEB_ONLY).is_none());
