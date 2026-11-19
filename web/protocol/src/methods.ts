@@ -484,7 +484,10 @@ export const METHODS = {
   }),
   /**
    * A file an assistant message of the conversation mentions (chat.mentionedFile, capability `mentionedFiles`). The
-   * desktop serves it only when the path is mentioned in an assistant message and is not on the deny list. Large
+   * desktop serves it only when the path is mentioned in an assistant message and is not on the deny list; outside the
+   * device's projects it also needs a completed tool call that names it (a file tool; since capability
+   * `mentionedFiles2` also a shell command or its output, or a subagent's output) or, for a session and not a Mono, a
+   * file changed after the conversation began inside the session's own folder. Large
    * files come in pages (`nextOffset`); `asset` asks for an image an html or markdown file refers to.
    */
   "chat.mentionedFile": method({

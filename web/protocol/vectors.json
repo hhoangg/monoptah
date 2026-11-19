@@ -805,7 +805,8 @@
       "gitPush",
       "monoTools",
       "monoFiles",
-      "mentionedFiles"
+      "mentionedFiles",
+      "mentionedFiles2"
     ],
     "messages": [
       {
@@ -825,7 +826,8 @@
           "gitPush",
           "monoTools",
           "monoFiles",
-          "mentionedFiles"
+          "mentionedFiles",
+          "mentionedFiles2"
         ],
         "desktop": {
           "name": "Example Desktop",

@@ -143,6 +143,17 @@ pub struct Settings {
     pub pending_provider_switch: Option<ProviderSwitch>,
     pub turns: std::collections::HashMap<usize, TurnInfo>,
 }
+
+impl Settings {
+    /// The folder a session with this configuration runs in: its worktree unless that is gone,
+    /// else `cwd` (the session's own folder).
+    pub fn execution_cwd<'a>(&'a self, cwd: &'a str) -> &'a str {
+        if self.worktree_removed {
+            return cwd;
+        }
+        self.worktree_cwd.as_deref().unwrap_or(cwd)
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderSwitch {

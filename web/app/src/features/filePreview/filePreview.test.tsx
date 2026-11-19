@@ -267,7 +267,7 @@ describe("mentions in a session chat", () => {
     [".env", "path_denied", "This file is hidden by Monoptah"],
     ["big.log", "too_large", "This file is too large to preview"],
     ["missing.txt", "not_found", "This file could not be found"],
-    ["private/unmentioned-by-desktop.txt", "forbidden", "This file is not mentioned in this conversation"],
+    ["private/unmentioned-by-desktop.txt", "forbidden", "This file is outside this conversation"],
   ])("explains %s (%s) in a Mono chat, where every file opens the preview", async (mention, _code, message) => {
     const user = userEvent.setup();
     mount(`/monos/${MONO}`);
@@ -300,6 +300,16 @@ describe("mentions in a session chat", () => {
     busy = false;
     await user.click(within(problem).getByRole("button", { name: "Try again" }));
     expect(await within(await dialog()).findByTestId("preview-binary")).toBeInTheDocument();
+  });
+
+  it("tells an old desktop's refusal apart: forbidden without mentionedFiles2 says to update the desktop", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}`, { capabilities: ["cloud", "mentionedFiles"] });
+    await user.click(await mentionChip("private/unmentioned-by-desktop.txt"));
+    const problem = await within(await dialog()).findByTestId("file-preview-error");
+    expect(problem).toHaveAttribute("data-problem", "update_desktop");
+    expect(problem).toHaveTextContent("Update Monoptah on your desktop");
+    expect(within(problem).queryByRole("button", { name: "Try again" })).toBeNull();
   });
 
   it("shows an update hint for a file outside the project, and asks nothing, when the desktop does not advertise mentionedFiles", async () => {

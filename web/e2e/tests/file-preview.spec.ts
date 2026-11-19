@@ -83,6 +83,13 @@ test.describe("file mention previews on the web app", () => {
   test.skip(!probe.run, probe.reason);
 
   let fixtureDir = "";
+  /** A Mono project folder holding the reports a script wrote: a root for relative mentions, not a project of the device. */
+  let rootDir = "";
+  let legacyFlag = "";
+  /** The device grants of one desktop of the account (for the second, old desktop). */
+  let grantsOf: (desktopId: string) => Promise<{ deviceId: string; state: string }[]>;
+  let oldDesktop: HeadlessDesktop | null = null;
+  let oldPending: PendingPairing | null = null;
   let pending: PendingPairing | null = null;
   let desktop: HeadlessDesktop | null = null;
   let page: Page;
@@ -92,8 +99,11 @@ test.describe("file mention previews on the web app", () => {
 
   test.afterAll(() => {
     desktop?.kill();
+    oldDesktop?.kill();
     pending?.dispose();
+    oldPending?.dispose();
     if (fixtureDir) rmSync(fixtureDir, { recursive: true, force: true });
+    if (rootDir) rmSync(rootDir, { recursive: true, force: true });
   });
 
   /** Waits until every finite animation of the page (the dialog fades in) has ended and two frames were painted. */
@@ -163,15 +173,30 @@ test.describe("file mention previews on the web app", () => {
     writeFileSync(join(fixtureDir, ".env"), "FAKE=not-a-secret\n");
     writeFileSync(join(fixtureDir, "unmentioned-secret.txt"), "not mentioned anywhere\n");
     canonicalDir = realpathSync(fixtureDir);
+    // Two reports a script wrote, outside the selected project: no Write or Edit tool ever touched them.
+    rootDir = mkdtempSync(join(tmpdir(), "monoptah-e2e-preview-root-"));
+    mkdirSync(join(rootDir, "casium", "reports"), { recursive: true });
+    for (const name of ["made-by-script", "made-twice"]) {
+      writeFileSync(join(rootDir, "casium", "reports", `${name}.html`), `<!doctype html><html><body><h1 id="title">Report ${name}</h1></body></html>\n`);
+    }
+    legacyFlag = join(rootDir, "legacy-desktop.flag");
 
     const text = [
       "Here are the files:",
       "`{dir}/report.html`, `{dir}/img/chart.png`, `{dir}/notes.md`, `{dir}/diagram.svg`,",
       "`{dir}/code.ts:12`, `{dir}/data.bin` and `{dir}/.env`.",
-    ].join(" ");
+    ].join(" ") + [
+      "",
+      "",
+      "| Report | File |",
+      "|---|---|",
+      "| Made by a script | [made-by-script.html](casium/reports/made-by-script.html) |",
+      "| Made twice | `casium/reports/made-twice.html` |",
+    ].join("\n");
 
     const actor = await newSharedActor();
     page = actor.page;
+    grantsOf = async (id) => (await actor.call("GET", `/api/desktops/${id}/grants`)).json["grants"] as { deviceId: string; state: string }[];
     await registerThroughUi(page, namedInvite("filepreview"), HANDLE, "File Preview");
 
     pending = await startPairing(MACHINE);
@@ -184,11 +209,20 @@ test.describe("file mention previews on the web app", () => {
     // The mention seeding is read from the environment of the `serve` process.
     process.env["WEB_LINK_HEADLESS_MENTION_DIR"] = fixtureDir;
     process.env["WEB_LINK_HEADLESS_MENTION_TEXT"] = text;
+    // No structured tool row at all: the reports are named only by the command that wrote them.
+    process.env["WEB_LINK_HEADLESS_MENTION_TOOL_TEXT"] = "";
+    process.env["WEB_LINK_HEADLESS_MENTION_ROOT"] = rootDir;
+    process.env["WEB_LINK_HEADLESS_MENTION_BASH_TEXT"] = "python3 gen.py > casium/reports/made-by-script.html && cp casium/reports/made-by-script.html casium/reports/made-twice.html";
+    process.env["WEB_LINK_HEADLESS_MENTION_LEGACY_FLAG"] = legacyFlag;
     try {
       desktop = new HeadlessDesktop(["serve", "--data-dir", join(pending.dataDir, "data")]);
     } finally {
       delete process.env["WEB_LINK_HEADLESS_MENTION_DIR"];
       delete process.env["WEB_LINK_HEADLESS_MENTION_TEXT"];
+      delete process.env["WEB_LINK_HEADLESS_MENTION_TOOL_TEXT"];
+      delete process.env["WEB_LINK_HEADLESS_MENTION_ROOT"];
+      delete process.env["WEB_LINK_HEADLESS_MENTION_BASH_TEXT"];
+      delete process.env["WEB_LINK_HEADLESS_MENTION_LEGACY_FLAG"];
     }
     const online = await desktop.waitFor("online", {}, 60_000);
     const desktopId = String(online["desktopId"]);
@@ -202,7 +236,7 @@ test.describe("file mention previews on the web app", () => {
     let deviceId = "";
     await expect
       .poll(async () => {
-        const grants = (await actor.call("GET", `/api/desktops/${desktopId}/grants`)).json["grants"] as { deviceId: string; state: string }[];
+        const grants = await grantsOf(desktopId);
         deviceId = grants.find((g) => g.state === "pending")?.deviceId ?? "";
         return deviceId !== "";
       })
@@ -324,6 +358,28 @@ test.describe("file mention previews on the web app", () => {
     await shot("web-denied");
   });
 
+  test("a relative link in a table, to a report a script wrote outside the project, opens", async () => {
+    await open("made-by-script.html");
+    await expect(page.getByTestId("file-preview-name")).toHaveText("made-by-script.html");
+    const inner = page.frameLocator('[data-testid="preview-html"]');
+    await expect(inner.locator("h1")).toHaveText("Report made-by-script");
+    await shot("web-script-report");
+  });
+
+  test("a desktop that does not know the method shows the update notice, not a mention error", async () => {
+    // An older desktop: the flag file makes the headless desktop answer `unsupported`, like one without the method.
+    writeFileSync(legacyFlag, "");
+    try {
+      await open("made-twice.html");
+      const error = page.getByTestId("file-preview-error");
+      await expect(error).toBeVisible();
+      await expect(error).toHaveAttribute("data-problem", "update_desktop");
+      await expect(error).toContainText("Update Monoptah on your desktop");
+    } finally {
+      rmSync(legacyFlag, { force: true });
+    }
+  });
+
   test("a file no assistant message mentions is refused as not mentioned", async () => {
     // A user message does not authorize a path: the echo turn that quotes it is an assistant message of the fake
     // desktop, which the real mention check ignores, so the chip shows up but the desktop answers `forbidden`.
@@ -343,5 +399,76 @@ test.describe("file mention previews on the web app", () => {
     await expect(error).toBeVisible();
     await expect(error).toHaveAttribute("data-problem", "not_mentioned");
     await expect(page.getByText("not mentioned anywhere")).toHaveCount(0);
+  });
+
+  test("a 0.54.1 desktop (answers forbidden, no mentionedFiles2) shows the update notice, not a mention error", async () => {
+    test.setTimeout(240_000);
+    // A second desktop of the same account that behaves like release 0.54.1: only structured evidence counts, so the
+    // script's report is refused with `forbidden`, and it does not advertise `mentionedFiles2`.
+    oldPending = await startPairing("old-headless");
+    const { userCode, fingerprint } = oldPending.started;
+    await page.goto(`/pair/${userCode}#fp=${fingerprint}`);
+    await page.getByRole("button", { name: "Approve" }).click();
+    await expect(page.getByRole("heading", { name: "Desktop approved" })).toBeVisible();
+    expect(await oldPending.process.exited, oldPending.process.stderr()).toBe(0);
+
+    const text = ["Reports:", "", "| Report | File |", "|---|---|", "| Made by a script | [made-by-script.html](casium/reports/made-by-script.html) |"].join("\n");
+    const env = {
+      WEB_LINK_HEADLESS_MENTION_DIR: fixtureDir,
+      WEB_LINK_HEADLESS_MENTION_TEXT: text,
+      WEB_LINK_HEADLESS_MENTION_TOOL_TEXT: "",
+      WEB_LINK_HEADLESS_MENTION_ROOT: rootDir,
+      WEB_LINK_HEADLESS_MENTION_BASH_TEXT: "python3 gen.py > casium/reports/made-by-script.html",
+      WEB_LINK_HEADLESS_MENTION_OLD_RULES: "1",
+      WEB_LINK_HEADLESS_HIDE_CAPABILITIES: "mentionedFiles2",
+    };
+    Object.assign(process.env, env);
+    try {
+      oldDesktop = new HeadlessDesktop(["serve", "--data-dir", join(oldPending.dataDir, "data")]);
+    } finally {
+      for (const name of Object.keys(env)) delete process.env[name];
+    }
+    const online = await oldDesktop.waitFor("online", {}, 60_000);
+    const desktopId = String(online["desktopId"]);
+    await page.evaluate((id) => window.localStorage.setItem(`monoptah.pickerSeen.${id}`, "1"), desktopId);
+    await page.goto("/desktops");
+    await page.getByRole("link", { name: "Open old-headless" }).click();
+    await expect(page).toHaveURL(new RegExp(`/d/${desktopId}$`));
+    const pendingScreen = page.getByRole("alertdialog", { name: "Confirm this device on your desktop" });
+    await expect(pendingScreen).toBeVisible({ timeout: 30_000 });
+    let deviceId = "";
+    await expect
+      .poll(async () => {
+        deviceId = (await grantsOf(desktopId)).find((g) => g.state === "pending")?.deviceId ?? "";
+        return deviceId !== "";
+      })
+      .toBe(true);
+    const confirmed = oldDesktop;
+    await expect
+      .poll(
+        async () => {
+          if (confirmed.matching("confirmed", { deviceId }).length > 0) return true;
+          confirmed.command({ cmd: "approve", deviceId, permission: "control" });
+          await new Promise((resolve) => setTimeout(resolve, 1_500));
+          return confirmed.matching("confirmed", { deviceId }).length > 0;
+        },
+        { timeout: 45_000, intervals: [100] },
+      )
+      .toBe(true);
+    await expect(pendingScreen).toHaveCount(0, { timeout: 30_000 });
+    await page.goto(`/d/${desktopId}/s/${E2E_CATALOG.sessionId}`);
+    await expect(page.getByRole("heading", { level: 1, name: E2E_CATALOG.sessionTitle })).toBeVisible();
+    await page.getByRole("textbox", { name: "Message" }).fill(text);
+    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(mention("made-by-script.html")).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+    await clickWhenStable(mention("made-by-script.html"));
+    await expect(dialog()).toBeVisible();
+    const error = page.getByTestId("file-preview-error");
+    await expect(error).toBeVisible();
+    await expect(error).toHaveAttribute("data-problem", "update_desktop");
+    await expect(error).toContainText("Update Monoptah on your desktop");
+    // The desktop answered with the same `forbidden` an unmentioned file gets: only the missing capability tells.
+    await expect(page.getByText("outside this conversation")).toHaveCount(0);
   });
 });

@@ -218,7 +218,7 @@ export function formatSize(bytes: number): string {
   return `${value >= 10 ? Math.round(value) : Math.round(value * 10) / 10} ${units[unit]}`;
 }
 
-export type PreviewProblemKind = "denied" | "not_mentioned" | "too_large" | "not_found" | "busy" | "not_selected" | "failed";
+export type PreviewProblemKind = "denied" | "not_mentioned" | "too_large" | "not_found" | "busy" | "not_selected" | "update_desktop" | "failed";
 
 export interface PreviewProblem {
   kind: PreviewProblemKind;
@@ -230,7 +230,21 @@ export interface PreviewProblem {
 
 export const HIDDEN_PREVIEW_MESSAGE = "This file is hidden by Monoptah";
 
-export function previewProblem(error: unknown): PreviewProblem {
+function updateDesktop(): PreviewProblem {
+  return { kind: "update_desktop", title: "Update Monoptah on your desktop", detail: "Your desktop is too old to open this file from the web. Update it, then try again.", retry: false };
+}
+
+export interface PreviewProblemOptions {
+  /**
+   * Whether the desktop advertises `mentionedFiles2` (a shell command or its output counts as evidence, a file made during
+   * the conversation too). An older desktop refuses such a file with the same `forbidden` as an unmentioned one, so there
+   * the refusal reads as "update the desktop", not as "not in this conversation". Defaults to true.
+   */
+  desktopCurrent?: boolean;
+}
+
+/** The short reason shown for a failed preview: not found, outside the conversation, blocked, or the desktop needs an update. */
+export function previewProblem(error: unknown, options: PreviewProblemOptions = {}): PreviewProblem {
   if (error instanceof PreviewLimitError) {
     return { kind: "too_large", title: "This file is too large to preview", detail: "It is more than the preview can load here. Open it on your desktop instead.", retry: false };
   }
@@ -239,7 +253,10 @@ export function previewProblem(error: unknown): PreviewProblem {
     case "path_denied":
       return { kind: "denied", title: HIDDEN_PREVIEW_MESSAGE, detail: "Monoptah keeps this kind of file (for example secrets) off your devices.", retry: false };
     case "forbidden":
-      return { kind: "not_mentioned", title: "This file is not mentioned in this conversation", detail: "Only files an assistant message names can be opened here.", retry: false };
+      if (options.desktopCurrent === false) return updateDesktop();
+      return { kind: "not_mentioned", title: "This file is outside this conversation", detail: "Only files the assistant named, and that its work in this conversation touched, can be opened here.", retry: false };
+    case "unsupported":
+      return updateDesktop();
     case "too_large":
       return { kind: "too_large", title: "This file is too large to preview", detail: "Open it on your desktop instead.", retry: false };
     case "not_found":

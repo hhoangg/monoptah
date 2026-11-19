@@ -510,6 +510,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "monoTools",
     "monoFiles",
     "mentionedFiles",
+    "mentionedFiles2",
 ];
 
 /// Codes in the ERROR relay frame body.

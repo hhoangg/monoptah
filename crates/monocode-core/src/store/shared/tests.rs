@@ -104,6 +104,22 @@ fn streamed_indexed_mono_load_preserves_projection_and_revision_guards() {
 }
 
 fn indexed_mono(store: &mut Store, turns: usize) -> (i64, String, Vec<Value>) {
+    let blocks = (0..turns)
+        .flat_map(|turn| {
+            [
+                json!({"id":format!("prompt-{turn}"),"role":"user","text":format!("Question {turn}"),
+                       "sentAt":turn,"startedAt":turn,"durationMs":5,
+                       "turnModel":{"harness":"codex","id":"codex:model","name":"Model"}}),
+                json!({"id":format!("answer-{turn}"),"role":"assistant","text":format!("Answer {turn}")}),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let (id, original) = indexed_blocks(store, &blocks);
+    (id, original, blocks)
+}
+
+/// A long indexed Mono holding `blocks`, as a newly opened store sees it.
+fn indexed_blocks(store: &mut Store, blocks: &[Value]) -> (i64, String) {
     let legacy = include_str!("../../../../../src-tauri/src/mono_transcript.rs");
     let schema = legacy
         .split("CREATE TABLE IF NOT EXISTS mono_transcripts (")
@@ -118,23 +134,13 @@ fn indexed_mono(store: &mut Store, turns: usize) -> (i64, String, Vec<Value>) {
             "CREATE TABLE IF NOT EXISTS mono_transcripts ({schema}"
         ))
         .unwrap();
-    let blocks = (0..turns)
-        .flat_map(|turn| {
-            [
-                json!({"id":format!("prompt-{turn}"),"role":"user","text":format!("Question {turn}"),
-                       "sentAt":turn,"startedAt":turn,"durationMs":5,
-                       "turnModel":{"harness":"codex","id":"codex:model","name":"Model"}}),
-                json!({"id":format!("answer-{turn}"),"role":"assistant","text":format!("Answer {turn}")}),
-            ]
-        })
-        .collect::<Vec<_>>();
     let id = store.create("codex", "/project").unwrap().id;
     let original = store.persisted_session_id(id).unwrap();
     store
         .conn
         .execute("INSERT INTO mono_transcripts VALUES(?1)", [&original])
         .unwrap();
-    store.shared_store_blocks(id, &blocks).unwrap();
+    store.shared_store_blocks(id, blocks).unwrap();
     // As a newly opened store would: no window or revision chosen yet.
     store.shared.as_ref().unwrap().windows.borrow_mut().clear();
     store
@@ -144,7 +150,7 @@ fn indexed_mono(store: &mut Store, turns: usize) -> (i64, String, Vec<Value>) {
         .snapshots
         .borrow_mut()
         .clear();
-    (id, original, blocks)
+    (id, original)
 }
 
 #[test]
@@ -1880,4 +1886,52 @@ mod transcript_index {
         fixture(&store);
         assert!(!run(&store, "zebra").is_empty());
     }
+}
+
+#[test]
+fn a_monos_older_pages_feed_the_mentioned_file_evidence() {
+    use crate::mobile::mentioned_file::Evidence;
+    let mut blocks = vec![
+        json!({"id":"q","role":"user","text":"Make a report","sentAt":1_700_000_001_000u64}),
+        json!({"id":"run","role":"tool","text":"Run","tool":{"callId":"c","kind":"execute","title":"Run","status":"completed",
+               "rawInput":{"command":"python gen.py > casium/reports/old.html"},"detail":"wrote casium/reports/other.html"}}),
+        json!({"id":"a","role":"assistant","text":"| Report | File |\n|---|---|\n| Old | [old](casium/reports/old.html) |\n| Other | `casium/reports/other.html` |"}),
+    ];
+    blocks.extend((0..25).flat_map(|turn| {
+        [
+            json!({"id":format!("p{turn}"),"role":"user","text":format!("Question {turn}"),"sentAt":1_700_000_002_000u64 + turn}),
+            json!({"id":format!("r{turn}"),"role":"assistant","text":format!("Answer {turn}")}),
+        ]
+    }));
+    let mut store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let (id, _) = indexed_blocks(&mut store, &blocks);
+    // The newest window holds neither the table nor the command.
+    let mut evidence = Evidence::from_rows(&store.load(id).unwrap().rows);
+    assert!(evidence.assistant.is_empty() && evidence.loose.is_empty());
+    let mut cursor = store.history_before(id).unwrap();
+    while let Some(before) = cursor {
+        let page = store.load_before(id, before, false).unwrap();
+        evidence.absorb_rows(&page.rows);
+        cursor = page.before.filter(|next| *next != before);
+    }
+    assert_eq!(
+        evidence.assistant,
+        ["casium/reports/old.html", "casium/reports/other.html"]
+    );
+    for token in ["casium/reports/old.html", "casium/reports/other.html"] {
+        assert!(evidence.loose.iter().any(|t| t == token), "{token}");
+    }
+    // The conversation began at its first prompt.
+    assert_eq!(evidence.started_ms, Some(1_700_000_001_000));
+}
+
+#[test]
+fn a_shared_session_records_when_it_was_created() {
+    let store = Store::open_monocode(Path::new(":memory:")).unwrap();
+    let before = crate::time::now_ms();
+    let id = store.create("codex", "/project").unwrap().id;
+    let created = store.session_created_at(id).unwrap().unwrap();
+    assert!(created >= before && created <= crate::time::now_ms());
+    // A remote session (negative id) has none here.
+    assert_eq!(store.session_created_at(-1).unwrap(), None);
 }

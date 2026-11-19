@@ -14,6 +14,7 @@ export const KNOWN_CAPABILITIES = [
   "monoTools",
   "monoFiles",
   "mentionedFiles",
+  "mentionedFiles2",
 ] as const;
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 

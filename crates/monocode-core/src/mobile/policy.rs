@@ -721,7 +721,23 @@ pub fn device_selection(
 /// The capabilities the desktop advertises.
 #[allow(dead_code)]
 pub fn capabilities(flags: &PolicyFlags) -> Vec<String> {
-    capabilities_with(flags, REMOTE_APPROVALS_ENABLED)
+    let mut list = capabilities_with(flags, REMOTE_APPROVALS_ENABLED);
+    let hidden = HIDDEN_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    list.retain(|name| !hidden.contains(name));
+    list
+}
+
+static HIDDEN_CAPABILITIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Stops advertising `names`. Only the headless E2E desktop calls this, to behave like an older
+/// release that lacks them; the app never does.
+#[doc(hidden)]
+pub fn hide_capabilities(names: &[String]) {
+    *HIDDEN_CAPABILITIES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = names.to_vec();
 }
 
 fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
@@ -741,6 +757,9 @@ fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
     }
     // The app answers `chat.mentionedFile` (a read, always on).
     list.push("mentionedFiles".to_owned());
+    // The widened evidence of rule 2 (a shell command or its output naming the file, or a file
+    // made after the conversation began): a web that sees this knows a refusal is final.
+    list.push("mentionedFiles2".to_owned());
     list
 }
 
@@ -1357,7 +1376,7 @@ mod tests {
     fn capabilities_follow_flags_and_the_approvals_gate() {
         assert_eq!(
             capabilities_with(&PolicyFlags::default(), false),
-            ["cloud", "mentionedFiles"]
+            ["cloud", "mentionedFiles", "mentionedFiles2"]
         );
         assert_eq!(
             capabilities_with(&ON, false),
@@ -1366,13 +1385,14 @@ mod tests {
                 "gitPush",
                 "cloudStart",
                 "cloudMove",
-                "mentionedFiles"
+                "mentionedFiles",
+                "mentionedFiles2"
             ]
         );
         // The gate alone does not list approvals: the desktop toggle is needed too.
         assert_eq!(
             capabilities_with(&PolicyFlags::default(), true),
-            ["cloud", "mentionedFiles"]
+            ["cloud", "mentionedFiles", "mentionedFiles2"]
         );
         let toggle = PolicyFlags {
             remote_approvals: true,
@@ -1380,11 +1400,11 @@ mod tests {
         };
         assert_eq!(
             capabilities_with(&toggle, false),
-            ["cloud", "mentionedFiles"]
+            ["cloud", "mentionedFiles", "mentionedFiles2"]
         );
         assert_eq!(
             capabilities_with(&toggle, true),
-            ["cloud", "approvals", "mentionedFiles"]
+            ["cloud", "approvals", "mentionedFiles", "mentionedFiles2"]
         );
         assert_eq!(
             capabilities_with(&ON, true),
@@ -1394,7 +1414,8 @@ mod tests {
                 "cloudStart",
                 "cloudMove",
                 "approvals",
-                "mentionedFiles"
+                "mentionedFiles",
+                "mentionedFiles2"
             ]
         );
     }
@@ -1410,11 +1431,11 @@ mod tests {
         };
         assert_eq!(
             capabilities_with(&flags(false, true), false),
-            ["cloud", "cloudStart", "mentionedFiles"]
+            ["cloud", "cloudStart", "mentionedFiles", "mentionedFiles2"]
         );
         assert_eq!(
             capabilities_with(&flags(true, false), false),
-            ["cloud", "gitPush", "mentionedFiles"]
+            ["cloud", "gitPush", "mentionedFiles", "mentionedFiles2"]
         );
         assert_eq!(
             capabilities_with(&flags(true, true), false),
@@ -1423,12 +1444,13 @@ mod tests {
                 "gitPush",
                 "cloudStart",
                 "cloudMove",
-                "mentionedFiles"
+                "mentionedFiles",
+                "mentionedFiles2"
             ]
         );
         assert_eq!(
             capabilities_with(&flags(false, false), false),
-            ["cloud", "mentionedFiles"]
+            ["cloud", "mentionedFiles", "mentionedFiles2"]
         );
     }
 
@@ -1503,11 +1525,11 @@ mod tests {
         }
         assert_eq!(
             capabilities_with(&off, REMOTE_APPROVALS_ENABLED),
-            ["cloud", "mentionedFiles"]
+            ["cloud", "mentionedFiles", "mentionedFiles2"]
         );
         assert_eq!(
             capabilities_with(&on, REMOTE_APPROVALS_ENABLED),
-            ["cloud", "approvals", "mentionedFiles"]
+            ["cloud", "approvals", "mentionedFiles", "mentionedFiles2"]
         );
     }
 

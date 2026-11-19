@@ -770,6 +770,14 @@ impl Store {
         }
         self.local_create_as(provider, cwd, surface)
     }
+    /// When the session was created (Unix milliseconds), when the database records it: the
+    /// shared database does, the native one does not (then `None`).
+    pub fn session_created_at(&self, id: i64) -> Result<Option<u64>, String> {
+        if id < 0 || self.shared.is_none() {
+            return Ok(None);
+        }
+        self.shared_created_at(id)
+    }
     /// A session's surface. Sessions without a stored one, and sessions on
     /// another machine, are chats.
     pub fn session_surface(&self, id: i64) -> Result<Surface, String> {

@@ -10,7 +10,7 @@ import { useFilePrefs } from "@/features/files/filePrefs";
 import { languageId, leafName } from "@/lib/fileKind";
 import { safeClipboardText } from "@/lib/clipboardText";
 import { useLinkDesktopId } from "@/link";
-import { RequireCapability } from "@/version";
+import { RequireCapability, useCapability } from "@/version";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/ui/dialog";
@@ -102,8 +102,9 @@ function wantsSource(target: PreviewTarget): boolean {
 
 function PreviewContent({ conversationId, target }: { conversationId: string; target: PreviewTarget }) {
   const query = useMentionedFile(conversationId, target.path, wantsSource(target));
+  const desktopCurrent = useCapability("mentionedFiles2");
   if (query.isError) {
-    const problem = previewProblem(query.error);
+    const problem = previewProblem(query.error, { desktopCurrent });
     return (
       <div data-testid="file-preview-error" data-problem={problem.kind} className="min-h-0 flex-1 overflow-auto">
         <FileProblem

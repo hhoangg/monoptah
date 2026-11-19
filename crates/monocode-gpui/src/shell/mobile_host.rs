@@ -159,6 +159,9 @@ struct Snapshot<'a> {
     rows: &'a [Row],
     turns: &'a HashMap<usize, TurnInfo>,
     cwd: &'a str,
+    /// The folder the session runs in: its worktree when it has a live one, else `cwd`. A
+    /// relative file link is read against it, as the desktop's own click does.
+    exec_cwd: &'a str,
     harness: &'a str,
     model: Option<String>,
     busy: bool,
@@ -276,7 +279,7 @@ struct MentionAudit {
 }
 
 impl MentionAudit {
-    fn record(&self, result: &Result<Value, Failure>, path: &str, bytes: u64) {
+    fn record(&self, result: &Result<Value, Failure>, path: &str, bytes: u64, rule: Option<&str>) {
         let outcome = match result {
             Ok(_) => audit::Outcome::Ok,
             Err(error) => {
@@ -291,6 +294,7 @@ impl MentionAudit {
                 path,
                 asset: self.asset.as_deref(),
                 bytes,
+                rule,
                 command_id: Some(&self.command_id),
                 transport: self.device.kind.into(),
                 outcome,
@@ -299,8 +303,45 @@ impl MentionAudit {
     }
 
     fn record_call(&self, call: &monocode_core::mobile::mentioned_file::Call) {
-        self.record(&call.result, &call.path, call.bytes);
+        self.record(&call.result, &call.path, call.bytes, call.rule);
     }
+}
+
+/// What a `chat.mentionedFile` call knows of the session beyond its rows.
+struct Scene<'a> {
+    /// When the session was created, when the database records it (Unix milliseconds).
+    created: Option<u64>,
+    /// The folder it runs in (its worktree when it has a live one).
+    exec_cwd: &'a str,
+    /// The session's own folder, the project a worktree belongs to.
+    project_cwd: &'a str,
+    /// The conversation is a Mono's: no freshness rule for it.
+    mono: bool,
+}
+
+/// The context of a call: the base folder for a relative mention, the Mono's roots, the
+/// projects, and the session's start and worktree for the freshness rule.
+fn mention_context<'a>(
+    no_texts: &'a [String],
+    cwd: &'a str,
+    roots: &'a [String],
+    projects: &'a [monocode_core::mobile::mentioned_file::Project],
+    scene: &Scene<'a>,
+) -> monocode_core::mobile::mentioned_file::Context<'a> {
+    use monocode_core::mobile::mentioned_file as mention;
+    let mut ctx = mention::Context::new(no_texts, cwd, roots, projects);
+    ctx.started = scene
+        .created
+        .filter(|ms| *ms >= mention::evidence::MIN_PLAUSIBLE_MS)
+        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms));
+    ctx.mono = scene.mono;
+    if scene.exec_cwd != scene.project_cwd {
+        ctx.worktree = Some(mention::Worktree {
+            path: scene.exec_cwd,
+            project: scene.project_cwd,
+        });
+    }
+    ctx
 }
 
 /// What the conversation says, before the older pages are added.
@@ -308,13 +349,22 @@ struct Gathered {
     source: EvidenceSource,
     /// Which state of the conversation `source` covers, for the evidence cache.
     key: (usize, usize),
-    cwd: String,
+    /// The session's own folder (the project it was started in).
+    project_cwd: String,
+    /// The folder it runs in: its worktree when it has a live one, else `project_cwd`.
+    exec_cwd: String,
+    /// The earliest send time of the rows read (Unix milliseconds), the fallback start of the
+    /// conversation for the freshness rule.
+    started: Option<u64>,
 }
 
 enum EvidenceSource {
     /// Evidence kept from an earlier call on the same state, and where the scan of the older
     /// pages stopped.
-    Cached(monocode_core::mobile::mentioned_file::Evidence, Option<i64>),
+    Cached(
+        Box<monocode_core::mobile::mentioned_file::Evidence>,
+        Option<i64>,
+    ),
     /// The assistant and tool rows to extract it from, and the store cursor of the turns above.
     Rows(Vec<Row>, Option<i64>),
 }
@@ -322,11 +372,17 @@ enum EvidenceSource {
 impl Gathered {
     /// The evidence of `conversation` at `rows`: the kept one when the conversation did not move
     /// (same row count and last row length), else a copy of the rows that matter.
-    fn of(conversation: &str, rows: &[Row], cwd: &str, cursor: Option<i64>) -> Self {
+    fn of(
+        conversation: &str,
+        rows: &[Row],
+        project_cwd: &str,
+        exec_cwd: &str,
+        cursor: Option<i64>,
+    ) -> Self {
         use monocode_core::mobile::mentioned_file::evidence;
         let key = (rows.len(), rows.last().map_or(0, |row| row.text.len()));
         let source = match evidence::cached(conversation, key) {
-            Some((kept, scanned_to)) => EvidenceSource::Cached(kept, scanned_to),
+            Some((kept, scanned_to)) => EvidenceSource::Cached(Box::new(kept), scanned_to),
             None => EvidenceSource::Rows(
                 rows.iter()
                     .filter(|row| matches!(row.role.as_str(), "assistant" | "tool"))
@@ -338,7 +394,15 @@ impl Gathered {
         Self {
             source,
             key,
-            cwd: cwd.to_owned(),
+            project_cwd: project_cwd.to_owned(),
+            exec_cwd: exec_cwd.to_owned(),
+            started: rows
+                .iter()
+                .filter_map(|row| row.sent_at)
+                .filter(|at| {
+                    *at >= monocode_core::mobile::mentioned_file::evidence::MIN_PLAUSIBLE_MS
+                })
+                .min(),
         }
     }
 }
@@ -1196,23 +1260,34 @@ impl Shell {
         let target = match self.mobile_target(&conversation, &request.device, cx) {
             Ok(target) => target,
             Err(error) => {
-                audited.record(&Err(error.clone()), &audited.path, 0);
+                audited.record(&Err(error.clone()), &audited.path, 0, None);
                 return request.reply(Err(error));
             }
         };
         // Budget and shape first: a device over budget, or a malformed request, gathers nothing.
         if let Err(code) = mention::budget::admit(&request.device.id) {
             let error = code.failure();
-            audited.record(&Err(error.clone()), &audited.path, 0);
+            audited.record(
+                &Err(error.clone()),
+                &audited.path,
+                0,
+                Some(mention::rule::BUDGET),
+            );
             return request.reply(Err(error));
         }
         let parsed = match mention::Params::from_json(&request.params) {
             Ok(parsed) => parsed,
             Err(error) => {
-                audited.record(&Err(error.clone()), &audited.path, 0);
+                audited.record(
+                    &Err(error.clone()),
+                    &audited.path,
+                    0,
+                    Some(mention::rule::BAD_REQUEST),
+                );
                 return request.reply(Err(error));
             }
         };
+        let is_mono = matches!(target, Target::Mono(_));
         let (session, mono_projects) = match &target {
             Target::Session(id) => (Some(*id), Vec::new()),
             Target::Mono(id) => {
@@ -1249,6 +1324,7 @@ impl Shell {
                 &key_conversation,
                 snapshot.rows,
                 snapshot.cwd,
+                snapshot.exec_cwd,
                 snapshot.history,
             ))
         });
@@ -1262,7 +1338,13 @@ impl Shell {
             let gathered = match (live, saved) {
                 (Some(live), _) => live,
                 (None, Some(load)) => load.await.map(|saved| {
-                    Gathered::of(&key_conversation, &saved.rows, &saved.cwd, saved.history)
+                    Gathered::of(
+                        &key_conversation,
+                        &saved.rows,
+                        &saved.cwd,
+                        saved.settings.execution_cwd(&saved.cwd),
+                        saved.history,
+                    )
                 }),
                 (None, None) => Err("Conversation is no longer available".to_owned()),
             };
@@ -1280,24 +1362,46 @@ impl Shell {
                                 )
                             })
                             .collect();
-                        let Gathered { source, key, cwd } = gathered;
+                        let Gathered {
+                            source,
+                            key,
+                            project_cwd,
+                            exec_cwd,
+                            started,
+                        } = gathered;
+                        // A relative mention is read against what the desktop's click binds
+                        // it to: a Mono's first local project, else the session's folder.
+                        let cwd = roots.first().cloned().unwrap_or_else(|| exec_cwd.clone());
+                        // The session's creation time, when the database records it.
+                        let created = session.and_then(|id| {
+                            locked(&store).ok()?.session_created_at(id).ok().flatten()
+                        });
+                        let scene = Scene {
+                            created,
+                            exec_cwd: &exec_cwd,
+                            project_cwd: &project_cwd,
+                            mono: is_mono,
+                        };
                         let (mut evidence, mut cursor) = match source {
-                            EvidenceSource::Cached(evidence, cursor) => (evidence, cursor),
+                            EvidenceSource::Cached(evidence, cursor) => (*evidence, cursor),
                             EvidenceSource::Rows(rows, cursor) => {
                                 (mention::Evidence::from_rows(&rows), cursor)
                             }
                         };
+                        if let Some(started) = started {
+                            evidence.note_started(started);
+                        }
                         // A long Mono keeps its older turns in the store: read them newest
                         // first, and only until the file is accounted for.
                         let no_texts: [String; 0] = [];
                         // The request's candidates are worked out once, and each page is
                         // checked only for what it added.
                         let mut enough = {
-                            let ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+                            let ctx = mention_context(&no_texts, &cwd, &roots, &projects, &scene);
                             mention::Sufficiency::new(&ctx, &parsed)
                         };
                         for _ in 0..100_000 {
-                            let ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+                            let ctx = mention_context(&no_texts, &cwd, &roots, &projects, &scene);
                             if enough.check(&ctx, &evidence) {
                                 break;
                             }
@@ -1313,7 +1417,7 @@ impl Shell {
                             cursor = page.before.filter(|next| *next != before);
                         }
                         mention::evidence::remember(&key_conversation, key, &evidence, cursor);
-                        let mut ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+                        let mut ctx = mention_context(&no_texts, &cwd, &roots, &projects, &scene);
                         ctx.evidence = Some(&evidence);
                         ctx.private_dirs = private.into_iter().collect();
                         mention::handle_admitted(&device.id, &params, &ctx)
@@ -1322,6 +1426,7 @@ impl Shell {
                 }
                 Err(error) => mention::Call {
                     result: Err(error.into()),
+                    rule: Some(mention::rule::FAILED),
                     path: audited.path.clone(),
                     asset: audited.asset.clone(),
                     bytes: 0,
@@ -1663,6 +1768,7 @@ impl Shell {
             rows: chat.transcript.read(cx).source_rows(),
             turns: &chat.settings.turns,
             cwd: &chat.summary.cwd,
+            exec_cwd: chat.execution_cwd(),
             harness: &chat.summary.provider,
             model: chat.mobile_model().map(str::to_owned),
             busy: chat.busy,
@@ -3200,6 +3306,7 @@ fn older_page(
                 rows: &page.rows,
                 turns: &page.turns,
                 cwd: &look.cwd,
+                exec_cwd: &look.cwd,
                 harness: &look.harness,
                 model: look.model.clone(),
                 busy: false,
@@ -3257,6 +3364,7 @@ fn saved_snapshot(saved: &Saved) -> Snapshot<'_> {
         rows: &saved.rows,
         turns: &saved.settings.turns,
         cwd: &saved.cwd,
+        exec_cwd: saved.settings.execution_cwd(&saved.cwd),
         harness: &saved.harness,
         model: saved.settings.model.clone(),
         busy: false,
