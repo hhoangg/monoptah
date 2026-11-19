@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { test as base, expect, type Page } from "@playwright/test";
 import { E2E_CATALOG } from "../lib/catalog.ts";
 import { clearRateLimits, namedInvite, origin } from "../lib/env.ts";
+import { startCookieProxy, type CookieProxy } from "../lib/cookie-proxy.ts";
 import { probePair } from "../lib/probes.ts";
 import { testIp } from "../lib/pure.ts";
 import { HeadlessDesktop } from "../lib/r12.ts";
@@ -83,6 +84,7 @@ test.describe("html preview on the web app", () => {
   let fixtureDir = "";
   let pending: PendingPairing | null = null;
   let desktop: HeadlessDesktop | null = null;
+  let proxy: CookieProxy | null = null;
   let page: Page;
 
   test.beforeAll(clearRateLimits);
@@ -123,6 +125,7 @@ test.describe("html preview on the web app", () => {
 
   test.afterAll(async () => {
     await page?.context().close();
+    await proxy?.close();
   });
 
   test("setup: account, paired desktop, open the session", async ({ browser }, testInfo) => {
@@ -167,13 +170,16 @@ test.describe("html preview on the web app", () => {
     const desktopId = String(online["desktopId"]);
 
     // A fresh context of the project's own profile (iPhone for WebKit), signed in with the session of the owner.
-    const context = await browser.newContext({ ...testInfo.project.use, baseURL: origin(), serviceWorkers: "block" });
+    // WebKit goes through a proxy that adds the session cookie to the relay websocket handshake (see lib/cookie-proxy.ts).
+    if (webkit) proxy = await startCookieProxy(origin(), `${session!.name}=${session!.value}`);
+    const site = proxy?.origin ?? origin();
+    const context = await browser.newContext({ ...testInfo.project.use, baseURL: site, serviceWorkers: "block" });
     if (webkit) {
       // The app CSP carries `upgrade-insecure-requests`. Chromium leaves localhost alone, WebKit upgrades every
       // http://localhost sub-resource and websocket to https and the local run (plain http) never loads. Only that one
       // directive is dropped from the local response; every other directive stays in force.
       await context.route(
-        (url) => url.protocol === "http:" && url.origin === origin(),
+        (url) => url.protocol === "http:" && url.origin === site,
         async (route) => {
           const response = await route.fetch();
           const headers = response.headers();
@@ -183,12 +189,7 @@ test.describe("html preview on the web app", () => {
         },
       );
     }
-    // The session cookie is `__Host-` + Secure. WebKit on Linux sends a Secure cookie on http://localhost fetches but
-    // not on the ws:// relay handshake (CI trace: every GET /relay/device had no Cookie header and got 401, so the
-    // page sat on "Reconnecting..."). The browser's own cookie rules cannot be changed here, so for WebKit the cookie
-    // is stored without the Secure flag (set through the test API, which skips the prefix check) and rides on ws://
-    // too. Chromium keeps the real flags: it rejects a non-Secure cookie and sends it on ws://localhost.
-    await context.addCookies([{ name: session!.name, value: session!.value, domain: new URL(origin()).hostname, path: "/", httpOnly: true, secure: !webkit }]);
+    await context.addCookies([{ name: session!.name, value: session!.value, domain: new URL(origin()).hostname, path: "/", httpOnly: true, secure: true }]);
     page = await context.newPage();
     await page.goto("/");
     await page.evaluate((id) => window.localStorage.setItem(`monoptah.pickerSeen.${id}`, "1"), desktopId);
