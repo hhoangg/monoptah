@@ -35,6 +35,18 @@ async function armedStop() {
   return stop;
 }
 
+function renderWithOutside(onOutside: () => void) {
+  render(
+    <>
+      <button type="button" onClick={onOutside}>
+        Outside
+      </button>
+      <Composer onSubmit={() => Promise.resolve()} />
+    </>,
+  );
+  return { field: screen.getByRole("textbox") };
+}
+
 function setup(props: Partial<ComposerProps> = {}) {
   const onSubmit = vi.fn<ComposerProps["onSubmit"]>(() => Promise.resolve());
   render(<Composer onSubmit={onSubmit} {...props} />);
@@ -210,6 +222,23 @@ describe("send", () => {
     expect(stop).not.toHaveFocus();
     await user.pointer({ keys: "[/MouseLeft]", target: stop });
     expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the card until a press elsewhere ends, so the content under the pointer does not shift before its click", async () => {
+    const user = userEvent.setup();
+    const onOutside = vi.fn();
+    const { field } = renderWithOutside(onOutside);
+    const shape = () => field.closest("[data-shape]");
+    act(() => field.focus());
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    const outside = screen.getByRole("button", { name: "Outside" });
+    await user.pointer({ keys: "[MouseLeft>]", target: outside });
+    // The press blurred the field, yet the layout must still be the card the pointer went down on.
+    expect(field).not.toHaveFocus();
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    await user.pointer({ keys: "[/MouseLeft]", target: outside });
+    expect(onOutside).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"));
   });
 
   it("keeps the card when Stop is pressed while the empty field has focus", async () => {
