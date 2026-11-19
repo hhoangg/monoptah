@@ -4,9 +4,9 @@
 // session; its menu offers the actions the `session-capabilities` predicate allows for its target.
 //
 // The card adapts to its own width with a container query (the session list sidebar is 240-560px, the phone page is
-// the full width): under 20rem the model name and the "Working..." text give way to the harness mark and the spinner
-// (both stay available to assistive tech), so the title, the branch and the target chip keep their room and truncate
-// with an ellipsis. From 20rem the card looks as before.
+// the full width): under 18rem (a list under 320px) the model name gives way to the harness mark and "Working..." loses its dots,
+// so the title, the branch and the target chip keep their room and truncate with an ellipsis. From 18rem, which
+// includes the default 320px list, the phone page and tablet, the card shows the model and the status.
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import type { SessionCard as SessionCardData } from "@monoptah/protocol";
@@ -66,7 +66,8 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
           ) : working ? (
             <span className="flex shrink-0 items-center gap-1 text-meta text-brand-text">
               <TerminalSpinner />
-              <span className="@max-[20rem]:sr-only">Working...</span>
+              <span className="@max-[18rem]:hidden">Working...</span>
+              <span className="hidden @max-[18rem]:inline">Working</span>
             </span>
           ) : (
             <span className="shrink-0 text-meta tabular text-muted-text">{relativeTime(session.updatedAt, now)}</span>
@@ -80,8 +81,8 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
               <SessionCardBadgeSlot desktopId={desktopId} session={session} />
             </span>
           </span>
-          <span className="flex max-w-[50%] shrink items-center gap-1.5 @max-[20rem]:max-w-none" title={model || undefined}>
-            {model ? <span className="truncate @max-[20rem]:hidden">{model}</span> : null}
+          <span className="flex max-w-[50%] shrink items-center gap-1.5 @max-[18rem]:max-w-none" title={model || undefined}>
+            {model ? <span className="truncate @max-[18rem]:hidden">{model}</span> : null}
             <HarnessIcon harness={session.harness} className="size-3.5 shrink-0" />
           </span>
         </span>

@@ -90,7 +90,8 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
           <Icon name="chevronDown" size={20} className="rotate-90" />
         </Link>
         <PaneHeading className="min-w-0 flex-1 truncate text-h font-semibold">{title}</PaneHeading>
-        <div className="flex shrink-0 items-center gap-2">
+        {/* The chip gives way (ellipsis) before the title does: the group never takes more than 55% of the header. */}
+        <div className="flex max-w-[55%] min-w-0 shrink items-center gap-2">
           {readOnly ? (
             <Glass className="flex min-h-9 items-center rounded-pill px-3">
               <Badge variant="outline" className="border-0 px-0 text-meta" data-testid="read-only-chip">

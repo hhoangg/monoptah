@@ -288,6 +288,8 @@ describe("now working pill (F-28)", () => {
     const user = userEvent.setup();
     mount("/p/proj-alpha");
     const pill = await screen.findByTestId("now-working");
+    // A container: in the 320px session list the pill drops its artwork and shortens "1 of 3" (container query).
+    expect(pill).toHaveClass("@container");
     // sess-seed-0 works; sess-seed-1 works and has a question; sess-local-approval works and waits.
     expect(within(pill).getByRole("button", { name: /working sessions/ })).toBeInTheDocument();
     const before = [...link.desktop.world.sessions.values()].filter((s) => s.busy && s.projectId === "proj-alpha").length;

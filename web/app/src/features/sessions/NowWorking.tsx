@@ -61,9 +61,9 @@ function StopButton({ onClick, disabled, label }: { onClick: () => void; disable
   );
 }
 
-function Artwork({ session }: { session: SessionCard }) {
+function Artwork({ session, compact = false }: { session: SessionCard; compact?: boolean }) {
   return (
-    <span aria-hidden="true" className="relative flex size-10 shrink-0 items-center justify-center rounded-pill bg-fill">
+    <span aria-hidden="true" className={cn("relative flex size-10 shrink-0 items-center justify-center rounded-pill bg-fill", compact && "@max-[20rem]:hidden")}>
       <HarnessIcon harness={session.harness} className="size-5" />
       {session.waiting ? null : <span className="absolute inset-0 rounded-pill border border-brand opacity-50 motion-safe:animate-pulse" />}
     </span>
@@ -106,7 +106,12 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
       <span className={cn("truncate", current.waiting && "text-caution")}>{detailOf(current, current.id in arrivals)}</span>
       {many ? (
         <span className="ml-auto shrink-0 tabular text-muted-text" aria-label={`${index + 1} of ${live.length}`}>
-          {index + 1} of {live.length}
+          <span className="@max-[20rem]:hidden">
+            {index + 1} of {live.length}
+          </span>
+          <span aria-hidden="true" className="hidden @max-[20rem]:inline">
+            {index + 1}/{live.length}
+          </span>
         </span>
       ) : null}
     </span>
@@ -115,7 +120,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
   return (
     <div
       data-testid="now-working"
-      className="pointer-events-none sticky mt-auto bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3 pt-3"
+      className="@container pointer-events-none sticky mt-auto bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3 pt-3"
     >
       <FinishedDeck desktopId={desktopId} entries={finished} />
       {expanded ? (
@@ -138,8 +143,8 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
           ))}
         </ul>
       ) : null}
-      <Glass className="pointer-events-auto flex w-full max-w-[560px] items-center gap-3 rounded-pill py-2 pr-2 pl-2.5 motion-safe:animate-[fade-in_180ms_var(--ease-out-cubic)]">
-        <Artwork session={current} />
+      <Glass className="pointer-events-auto flex w-full max-w-[560px] items-center gap-3 rounded-pill py-2 pr-2 pl-2.5 @max-[20rem]:gap-2 @max-[20rem]:pl-3.5 motion-safe:animate-[fade-in_180ms_var(--ease-out-cubic)]">
+        <Artwork session={current} compact />
         {many ? (
           <button
             type="button"

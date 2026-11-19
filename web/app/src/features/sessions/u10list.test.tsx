@@ -214,7 +214,7 @@ describe("session cards and open tabs", () => {
     const first = card("sess-local-1");
     expect(first).toHaveClass("@container");
     // Above 20rem the card is unchanged; under it only the model text hides (the harness mark stays).
-    expect(first.querySelector("[class*=\"@max-[20rem]:max-w-none\"]")).not.toBeNull();
+    expect(first.querySelector("[class*=\"@max-[18rem]:max-w-none\"]")).not.toBeNull();
   });
 });
 
