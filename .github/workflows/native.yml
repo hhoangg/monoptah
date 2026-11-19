@@ -53,24 +53,39 @@ jobs:
     steps:
       - id: filter
         if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        # v3.0.4, pinned by commit.
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad
         with:
+          # Everything the native jobs compile, include_str!/include_bytes!, read in
+          # tests or run as node tests. When in doubt a path belongs here: a missing
+          # one lets a breaking change merge with CI skipped.
           filters: |
             native:
-              - 'crates/monocode-core/**'
-              - 'crates/monocode-gpui/**'
-              - 'crates/mobile-link/**'
-              - 'web/protocol/methods.json'
-              - 'web/protocol/vectors.json'
-              - 'vendor/gpui-pre*/**'
+              - 'crates/**'
+              - 'vendor/**'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '**/rust-toolchain*'
+              - '**/.cargo/**'
+              - 'src-tauri/**'
+              - 'src/app/App.tsx'
+              - 'src/integrations/harness/core/register.ts'
+              - 'src/integrations/harness/core/availability.ts'
+              - 'web/protocol/**'
+              - 'docs/native/**'
+              - 'CHANGELOG.md'
               - 'scripts/*native*'
               - 'scripts/native-editor/**'
               - 'scripts/native-settings/**'
+              - 'scripts/pin-host-release*'
+              - 'scripts/sandbox-scripts*'
+              - 'scripts/sandbox/**'
+              - 'scripts/worktrees-clean*'
+              - 'scripts/perf/**'
               - 'package.json'
               - 'package-lock.json'
-              - '.github/workflows/native.yml'
-              - '.github/workflows/native-release.yml'
-              - '.github/workflows/native-release-monoptah.yml'
+              - '.github/workflows/native*.yml'
+              - '.github/actions/**'
       - id: decide
         env:
           EVENT: ${{ github.event_name }}
