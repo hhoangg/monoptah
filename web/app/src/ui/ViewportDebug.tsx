@@ -1,7 +1,7 @@
 // TEMPORARY diagnostic overlay: live viewport and layout numbers for a real iPhone (screenshot them).
 // Numbers and enums only: no URLs, ids, names or text. Loaded lazily by ViewportDebugGate, so it never runs by default.
 import { useCallback, useEffect, useRef, useState } from "react";
-import { keyboardInset, textFieldFocused } from "@/features/composer/useKeyboardInset";
+import { readKeyboardLift, textFieldFocused } from "@/features/composer/useKeyboardInset";
 
 const MAIN_ID = "main-content";
 const n = (value: number | undefined | null): string => (typeof value === "number" && Number.isFinite(value) ? String(Math.round(value * 10) / 10) : "n/a");
@@ -51,19 +51,24 @@ function snapshot(probe: HTMLElement | null): string[] {
     const env = ENV_SIDES.map((side, i) => `${side.slice(0, 1)}${n(probeNumber(probe.children[i], (el) => parseFloat(getComputedStyle(el)[PADDING_KEY[side]])))}`).join(" ");
     const units = HEIGHT_PROBES.map((u, i) => `${u.slice(3)} ${n(probeNumber(probe.children[ENV_SIDES.length + i], (el) => rectOf(el).height))}`).join(" ");
     out.push(`env ${env}`);
+    const frame = document.querySelector("[data-app-frame]");
+    const frameRect = frame ? rectOf(frame) : null;
+    out.push(`frame ${frameRect ? `t${n(frameRect.top)} b${n(frameRect.bottom)} h${n(frameRect.height)}` : "none"}`);
     out.push(`units ${units}`);
   }
   const nav = navigator as Navigator & { standalone?: boolean };
-  out.push(`mode ${media("(display-mode: standalone)") ? "standalone" : "browser"} nav.standalone ${String(nav.standalone)} dark ${String(media("(prefers-color-scheme: dark)"))}`);
+  const statusBar = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')?.getAttribute("content") ?? "none";
+  out.push(`mode ${media("(display-mode: standalone)") ? "standalone" : "browser"} nav.standalone ${String(nav.standalone)} statusbar ${statusBar} dark ${String(media("(prefers-color-scheme: dark)"))}`);
   out.push(`ua ${(/OS [\d_]+/.exec(navigator.userAgent)?.[0] ?? "?")}`);
   const typing = textFieldFocused();
-  const raw = vv ? keyboardInset(window.innerHeight, vv) : 0;
+  const raw = vv ? readKeyboardLift(vv) : 0;
   out.push(`kbd typing ${String(typing)} inset ${raw} effective ${typing ? raw : 0}`);
   const composer = document.querySelector('[data-testid="composer"]');
   if (composer) {
     const rect = rectOf(composer);
     const style = getComputedStyle(composer);
-    const vvGap = vv ? vv.height + vv.offsetTop - rect.bottom : NaN;
+    // Client coordinates: pageTop - scrollY is the visual viewport top (offsetTop would count the scroll twice on iOS).
+    const vvGap = vv ? vv.pageTop - window.scrollY + vv.height - rect.bottom : NaN;
     out.push(`composer b${n(rect.bottom)} h${n(rect.height)} pb ${style.paddingBottom} mb ${style.marginBottom} gap(inner) ${n(window.innerHeight - rect.bottom)} gap(vv) ${n(vvGap)}`);
   } else out.push("composer none");
   const region = document.querySelector('[data-testid="composer-region"]');

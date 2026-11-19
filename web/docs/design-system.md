@@ -697,13 +697,13 @@ Rules:
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="mobile-web-app-capable" content="yes" />
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
 <meta name="theme-color" content="#131313" />
 ```
 
 - `viewport-fit=cover` extends the app under the notch and home indicator; pad with `env(safe-area-inset-top|right|bottom|left)`: header top, composer and sheets bottom (`max(env(safe-area-inset-bottom), 0px) + 16px`), page bottom `inset + 40px`, landscape left/right on the sidebar and transcript gutters.
 - Use `100dvh` (not `100vh`) for the app shell; the keyboard on iOS shrinks the visual viewport, so size the composer from `window.visualViewport` (resize and scroll events) and keep it above the keyboard; scroll the transcript with an internal scroller, `overscroll-behavior: none` on `body`, and never let the body scroll (avoids rubber-band exposing the background).
-- `black-translucent` status bar lets the page background show behind the status bar in standalone mode; set `background` on `html` to the active scheme so no white strip shows.
+- Status bar style is `default`, not `black-translucent`: on iOS 26 black-translucent paints from y=0 but makes the layout viewport 48pt (the status bar) shorter than the screen, so the bottom 48pt are never painted and a bottom-pinned composer is cut off. With `default` the web view starts below the status bar and the status bar takes the page background; set `background` on `html` to the active scheme. iOS reads the tag only when the app is added to the Home Screen, so existing installs must be removed and added again.
 - Standalone iOS PWA: no browser back button, so every screen needs an in-app back control; keep edge-swipe-back off native (the pager uses pointer events); no reload gesture, so provide a pull-free "Reconnect" action; opening external links leaves the app, so mark them clearly. The WebSocket drops about 10s in background; resync on `visibilitychange` (see architecture doc).
 - Inputs at 16px or larger (the composer is 17px) so iOS does not zoom on focus.
 - `touch-action: pan-y` on pager scenes, `manipulation` on buttons, `-webkit-tap-highlight-color: transparent`, `user-select: none` on chrome, `text` on transcript content.

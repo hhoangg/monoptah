@@ -283,6 +283,126 @@ test.describe("mobile chat layout", () => {
     }
   }
 
+  /**
+   * Everything that could dim or fade the top of a /d screen: each element that intersects the top zone (from the screen
+   * top to the bottom of the switcher row and of the screen header), is `fixed` or `absolute` or has such an ancestor
+   * (so a static child of a transparent fixed layer counts), is not inside either of them and does not contain them,
+   * and paints something itself: a background color or image, a backdrop filter, a mask, a box shadow or a filter.
+   * `pointer-events: none` layers count, which `elementFromPoint` cannot see. Opacity is not scanned: it only matters
+   * on a painted layer, which is already reported. Boxes of 1px or less paint nothing visible. Returns one line per
+   * element found.
+   */
+  async function topOverlays(target: Page): Promise<string[]> {
+    return target.evaluate(() => {
+      const row = document.querySelector('button[aria-label^="Switch desktop"]')?.closest(".border-b") ?? null;
+      const heading = document.querySelector("h1")?.closest("header, div") ?? null;
+      const guarded = [row, heading].filter((el): el is Element => el !== null);
+      if (!row) return ["the switcher row is missing"];
+      const zoneBottom = Math.max(...guarded.map((el) => el.getBoundingClientRect().bottom));
+      const isLayer = (el: Element) => /^(fixed|absolute)$/.test(getComputedStyle(el).position);
+      const underLayer = (el: Element) => {
+        for (let a: Element | null = el; a && a !== document.body; a = a.parentElement) if (isLayer(a)) return true;
+        return false;
+      };
+      const found: string[] = [];
+      for (const el of Array.from(document.querySelectorAll("body *"))) {
+        const style = getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden") continue;
+        // Allow-listed: the skip link is `sr-only` (clipped to nothing) until it is focused.
+        if (/^rect\(0(px)?,? 0(px)?,? 0(px)?,? 0(px)?\)$/.test(style.clip) || style.clipPath === "inset(50%)") continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width <= 1 || rect.height <= 1 || rect.bottom <= 0 || rect.top >= zoneBottom) continue;
+        if (guarded.some((g) => g.contains(el) || el.contains(g))) continue;
+        if (!underLayer(el)) continue;
+        const color = style.backgroundColor;
+        const paints: string[] = [];
+        if (color !== "rgba(0, 0, 0, 0)" && color !== "transparent") paints.push(`background-color ${color}`);
+        if (style.backgroundImage !== "none") paints.push("background-image");
+        const backdrop = style.getPropertyValue("backdrop-filter") || style.getPropertyValue("-webkit-backdrop-filter");
+        if (backdrop && backdrop !== "none") paints.push("backdrop-filter");
+        const mask = style.getPropertyValue("mask-image") || style.getPropertyValue("-webkit-mask-image");
+        if (mask && mask !== "none") paints.push("mask");
+        if (style.boxShadow !== "none") paints.push("box-shadow");
+        if (style.filter !== "none") paints.push("filter");
+        if (paints.length > 0) found.push(`${el.tagName.toLowerCase()}.${String(el.className).slice(0, 80)} [${paints.join(", ")}] top=${Math.round(rect.top)} bottom=${Math.round(rect.bottom)}`);
+      }
+      return found;
+    });
+  }
+
+  test("negative control: the overlay scan reports a pointer-events none gradient, and a painted child of a transparent fixed layer", async () => {
+    await page.setViewportSize({ width: 390, height: HEIGHT });
+    await openChat(`/s/${E2E_CATALOG.sessionId}`);
+    expect(await topOverlays(page)).toEqual([]);
+    // DOM APIs, not innerHTML: the page enforces Trusted Types.
+    const inject = (child: boolean) =>
+      page.evaluate((withChild) => {
+        const layer = document.createElement("div");
+        layer.id = "negative-control";
+        layer.style.cssText = "position:fixed;left:0;right:0;top:0;height:180px;pointer-events:none;z-index:40";
+        if (withChild) {
+          const pre = document.createElement("pre");
+          pre.style.cssText = "margin:0;height:100px;background:rgba(19,19,19,0.7)";
+          layer.append(pre);
+        } else layer.style.background = "linear-gradient(rgba(19,19,19,0.7),rgba(19,19,19,0))";
+        document.body.append(layer);
+      }, child);
+    const remove = () => page.evaluate(() => document.getElementById("negative-control")?.remove());
+    try {
+      await inject(false);
+      expect((await topOverlays(page)).some((line) => line.includes("background-image"))).toBe(true);
+      await remove();
+      expect(await topOverlays(page)).toEqual([]);
+      await inject(true);
+      expect((await topOverlays(page)).some((line) => line.startsWith("pre") && line.includes("background-color"))).toBe(true);
+    } finally {
+      await remove();
+    }
+  });
+
+  /** Types a message and sends it; resolves once the textarea is read. */
+  async function typeAndSend(target: Page, how: "button" | "enter"): Promise<void> {
+    const field = target.getByRole("textbox", { name: "Message" });
+    await field.fill("hello after send");
+    await expect(field).toBeFocused();
+    if (how === "enter") await field.press("Enter");
+    else await target.getByRole("button", { name: "Send", exact: true }).click();
+    await expect(field).toHaveValue("");
+  }
+
+  test("a phone-sized composer closes the keyboard after a send (the field loses focus)", async () => {
+    await page.setViewportSize({ width: 390, height: HEIGHT });
+    await openChat(`/s/${E2E_CATALOG.sessionId}`);
+    await typeAndSend(page, "button");
+    await expect(page.getByRole("textbox", { name: "Message" })).not.toBeFocused();
+    expect(await page.evaluate(() => document.activeElement instanceof HTMLTextAreaElement)).toBe(false);
+  });
+
+  test("a desktop-sized composer (fine pointer, 640px and wider) keeps the focus after a send", async () => {
+    await page.setViewportSize({ width: 1100, height: HEIGHT });
+    await openChat(`/s/${E2E_CATALOG.sessionId}`);
+    await typeAndSend(page, "enter");
+    await expect(page.getByRole("textbox", { name: "Message" })).toBeFocused();
+  });
+
+  test("a tablet with a coarse pointer (820px wide) closes the keyboard after a send", async () => {
+    // A second browser context has no desktop link (its keys are in IndexedDB), so touch is emulated on this page: the
+    // touch emulation of the protocol turns the primary pointer coarse, as on an iPad.
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      await page.setViewportSize({ width: 820, height: 1180 });
+      await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+      await openChat(`/s/${E2E_CATALOG.sessionId}`);
+      // Wide enough for the desktop width, but the pointer is coarse: the touch layout applies.
+      expect(await page.evaluate(() => [window.matchMedia("(min-width: 640px)").matches, window.matchMedia("(pointer: coarse)").matches])).toEqual([true, true]);
+      await typeAndSend(page, "button");
+      await expect(page.getByRole("textbox", { name: "Message" })).not.toBeFocused();
+    } finally {
+      await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+      await cdp.detach();
+    }
+  });
+
   // Chromium has no on-screen keyboard, so a visual viewport that is shorter than the layout is simulated. It runs
   // last: the init script stays on the page. iOS reports such a viewport after the keyboard closed in a standalone
   // app (and, with browser chrome, even without a keyboard); with no field focused it must not lift the composer,

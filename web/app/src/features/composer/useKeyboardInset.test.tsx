@@ -1,15 +1,32 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { keyboardInset, textFieldFocused, useKeyboardInset } from "./useKeyboardInset";
+import { keyboardLift, layoutBottom, textFieldFocused, useKeyboardInset } from "./useKeyboardInset";
 
-describe("keyboardInset", () => {
-  it("is the part of the layout the visual viewport no longer covers", () => {
-    expect(keyboardInset(800, { height: 480, offsetTop: 0, scale: 1 })).toBe(320);
-    expect(keyboardInset(800, { height: 460, offsetTop: 20, scale: 1 })).toBe(320);
+describe("keyboardLift", () => {
+  const vv = (height: number, offsetTop: number, pageTop: number, scale = 1) => ({ height, offsetTop, pageTop, scale });
+  it("a frame that ends below the visual viewport bottom is lifted by exactly the difference, even when it is small", () => {
+    // iOS scrolled the document by 365 for the keyboard; the frame spans -365..531 in client coordinates, the visual viewport ends at 483.
+    expect(keyboardLift({ frameBottom: 531, clientHeight: 848, viewport: vv(483, 365, 365), scrollY: 365 })).toBe(48);
   });
-  it("ignores browser chrome, and pinch zoom", () => {
-    expect(keyboardInset(800, { height: 750, offsetTop: 0, scale: 1 })).toBe(0);
-    expect(keyboardInset(800, { height: 400, offsetTop: 0, scale: 2 })).toBe(0);
+  it("in-flow frame in a home-screen app (default status bar): the frame bottom is the visual viewport bottom, no lift", () => {
+    expect(keyboardLift({ frameBottom: 483, clientHeight: 848, viewport: vv(483, 365, 365), scrollY: 365 })).toBe(0);
+  });
+  it("Safari tab with the keyboard open: no lift, the frame ends at the visual viewport bottom", () => {
+    expect(keyboardLift({ frameBottom: 403, clientHeight: 750, viewport: vv(403, 347, 347), scrollY: 347 })).toBe(0);
+  });
+  it("at rest (no keyboard): no lift", () => {
+    expect(keyboardLift({ frameBottom: 848, clientHeight: 848, viewport: vv(848, 0, 0), scrollY: 0 })).toBe(0);
+  });
+  it("matches the plain offsetTop formula where pageTop = scrollY + offsetTop (Chromium)", () => {
+    expect(keyboardLift({ frameBottom: 800, clientHeight: 800, viewport: vv(480, 0, 0), scrollY: 0 })).toBe(320);
+    expect(keyboardLift({ frameBottom: 800, clientHeight: 800, viewport: vv(460, 20, 20), scrollY: 0 })).toBe(320);
+  });
+  it("is 0 while pinch-zoomed, and for browser chrome that is shorter than a keyboard", () => {
+    expect(keyboardLift({ frameBottom: 800, clientHeight: 800, viewport: vv(400, 0, 0, 2), scrollY: 0 })).toBe(0);
+    expect(keyboardLift({ frameBottom: 800, clientHeight: 800, viewport: vv(750, 0, 0), scrollY: 0 })).toBe(0);
+  });
+  it("never lifts by a negative amount", () => {
+    expect(keyboardLift({ frameBottom: 400, clientHeight: 800, viewport: vv(500, 0, 0), scrollY: 0 })).toBe(0);
   });
 });
 
@@ -166,5 +183,50 @@ describe("textFieldFocused", () => {
     expect(textFieldFocused()).toBe(false);
     button.focus();
     expect(textFieldFocused()).toBe(false);
+  });
+});
+
+describe("useKeyboardInset: the layout height is the bottom of the app frame", () => {
+  afterEach(() => {
+    Object.defineProperty(window, "visualViewport", { value: null, configurable: true });
+    document.body.replaceChildren();
+  });
+  const stub = (height: number) => {
+    const viewport = Object.assign(new EventTarget(), { height, offsetTop: 0, scale: 1 });
+    Object.defineProperty(window, "visualViewport", { value: viewport, configurable: true });
+    Object.defineProperty(window, "innerHeight", { value: 800, configurable: true });
+    return viewport;
+  };
+  const frame = (bottom: number) => {
+    const el = document.createElement("div");
+    el.setAttribute("data-app-frame", "");
+    el.getBoundingClientRect = () => ({ bottom }) as DOMRect;
+    document.body.append(el);
+    return el;
+  };
+  it("measures the keyboard against the frame bottom, not window.innerHeight", () => {
+    expect(layoutBottom()).toBe(800);
+    frame(780);
+    expect(layoutBottom()).toBe(780);
+    const viewport = stub(500);
+    const input = document.createElement("textarea");
+    document.body.append(input);
+    input.focus();
+    const { result } = renderHook(() => useKeyboardInset());
+    // 780 - 500, not 800 - 500.
+    expect(result.current).toBe(280);
+    act(() => {
+      viewport.height = 800;
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    expect(result.current).toBe(0);
+  });
+  it("falls back to window.innerHeight when there is no frame", () => {
+    stub(500);
+    const input = document.createElement("textarea");
+    document.body.append(input);
+    input.focus();
+    const { result } = renderHook(() => useKeyboardInset());
+    expect(result.current).toBe(300);
   });
 });
