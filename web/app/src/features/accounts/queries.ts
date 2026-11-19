@@ -8,6 +8,7 @@ import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
 import { releaseDevice } from "./deviceBinding";
 import { clearLowCodes } from "./lowCodes";
+import { resetChatDrafts } from "@/features/composer/chatDraft";
 import { resetNewSessionDrafts } from "@/features/sessions/newSessionDraft";
 import { getRecoveryBatch, setRecoveryBatch } from "./pendingRecoveryCodes";
 import { unsubscribeFromPush } from "@/features/push/subscribe";
@@ -104,8 +105,9 @@ export async function withFreshAuth<T>(fn: () => Promise<T>, reauthFn: typeof re
  */
 export function clearAccountCache(queryClient: QueryClient): void {
   queryClient.clear();
-  // A New session draft belongs to the account that typed it.
+  // A New session draft and the text typed in a chat belong to the account that typed it.
   resetNewSessionDrafts();
+  resetChatDrafts();
   // The offline snapshots of the previous session must not outlive it (features/offline/accountCache.ts).
   void forgetAccountSnapshots();
 }
@@ -161,6 +163,7 @@ export async function signOut(queryClient: QueryClient, options: { keepLowCodes?
   } finally {
     queryClient.clear();
     resetNewSessionDrafts();
+    resetChatDrafts();
     // The encrypted content cache, the snapshots and any push subscription left behind go with the session.
     await releaseDevice();
   }

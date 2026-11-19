@@ -6,6 +6,7 @@ import "@/features/models/register";
 import { onForgetDesktop } from "@/features/settings/desktopLink";
 import { forgetDesktop, readLastPlace } from "./lastPlace";
 import { forgetMonoSeen } from "./monoSeen";
+import { forgetChatDrafts } from "@/features/composer/chatDraft";
 import { forgetNewSessionDrafts } from "./newSessionDraft";
 
 registerLastPlaceResolver(readLastPlace);
@@ -13,5 +14,6 @@ registerLastPlaceResolver(readLastPlace);
 onForgetDesktop((desktopId) => {
   forgetDesktop(desktopId);
   forgetNewSessionDrafts(desktopId);
+  forgetChatDrafts(desktopId);
   return forgetMonoSeen(desktopId);
 });

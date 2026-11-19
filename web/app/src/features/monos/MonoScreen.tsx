@@ -6,10 +6,11 @@
 import { BACKGROUND_CONTAINER_CLASS, ChatBackground, useFirstBackgroundProject } from "@/features/backgrounds";
 import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
+import { readChatDraft, writeChatDraft } from "@/features/composer/chatDraft";
 import { Composer } from "@/features/composer/Composer";
 import { SessionQuestionCard, SessionUsageCard, useLinkReady } from "@/features/composer/SessionComposer";
 import { useGuardedReplies, useSendGuard } from "@/features/composer/useSendGuard";
@@ -55,6 +56,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const conversationId = monoConversationId(monoId);
   const conversation = useConversation(conversationId);
   const state = conversation.state;
+  const [initialText] = useState(() => readChatDraft(desktopId, conversationId));
+  const rememberText = useCallback((text: string) => writeChatDraft(desktopId, conversationId, text), [desktopId, conversationId]);
   const older = useOlderTurns(conversationId, state?.turns ?? [], state?.older ?? false);
   const cancel = useLinkMutation("session.cancel");
   const accentStyle = useMonoAccentStyle(desktopId, monoId);
@@ -223,6 +226,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
         }
       >
         <Composer
+          initialText={initialText}
+          onTextChange={rememberText}
           onSubmit={submit}
           busy={state?.busy ?? false}
           onStop={async () => {
