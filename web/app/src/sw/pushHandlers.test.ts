@@ -49,6 +49,16 @@ describe("push", () => {
     expect(shown).toEqual([{ title: "Studio Mac", options: { body: "api: Needs your input", icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", tag: "s9", data: { url: "/d/dk1/s/s9" } } }]);
   });
 
+  it("shows the session or Mono name as the title and the message preview as the body", async () => {
+    const { handlers, shown } = setup();
+    const { event, settle } = pushEvent({ v: 1, t: "Bach Tieu Thuan", b: "Fixed the login bug. All tests pass.", url: "/d/dk1/s/s9", tag: "s9" });
+    handlers.push(event);
+    await settle();
+    expect(shown[0]?.title).toBe("Bach Tieu Thuan");
+    expect(shown[0]?.options.body).toBe("Fixed the login bug. All tests pass.");
+    expect(shown[0]?.options.data).toEqual({ url: "/d/dk1/s/s9" });
+  });
+
   it("passes the Mono chat URL of a Mono message through (the URL rule lives in the Worker)", async () => {
     const { handlers, shown } = setup();
     const { event, settle } = pushEvent({ v: 1, t: "Studio Mac", b: "Atlas: New message", url: "/d/dk1/monos/m7", tag: "s9" });

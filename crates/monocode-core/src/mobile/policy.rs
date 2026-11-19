@@ -54,8 +54,9 @@ impl DeviceContext {
     }
 }
 
-/// Desktop toggles that gate parts of the policy. All default to off.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Desktop toggles that gate parts of the policy. All default to off, except
+/// `show_push_content`, which only picks what a web notification says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PolicyFlags {
     /// "Remote push in Git".
@@ -65,6 +66,20 @@ pub struct PolicyFlags {
     /// "Answer approvals from remote devices" (H-08). Effective together with
     /// [`REMOTE_APPROVALS_ENABLED`].
     pub remote_approvals: bool,
+    /// "Show message content in notifications": web pushes carry the session
+    /// or Mono name and a short preview. Off sends the generic text. Default on.
+    pub show_push_content: bool,
+}
+
+impl Default for PolicyFlags {
+    fn default() -> Self {
+        Self {
+            remote_git_push: false,
+            remote_cloud_start: false,
+            remote_approvals: false,
+            show_push_content: true,
+        }
+    }
 }
 
 /// The file name of the saved policy settings, next to the mobile config.
@@ -102,6 +117,7 @@ static SETTINGS: RwLock<PolicySettings> = RwLock::new(PolicySettings {
         remote_git_push: false,
         remote_cloud_start: false,
         remote_approvals: false,
+        show_push_content: true,
     },
     deny_patterns: BTreeMap::new(),
 });
@@ -942,6 +958,7 @@ mod tests {
         remote_git_push: true,
         remote_cloud_start: true,
         remote_approvals: true,
+        show_push_content: true,
     };
 
     fn code(result: Result<(), Denial>) -> Option<Code> {
@@ -1447,6 +1464,7 @@ mod tests {
             remote_git_push: push,
             remote_cloud_start: cloud,
             remote_approvals: false,
+            show_push_content: true,
         };
         assert_eq!(
             capabilities_with(&flags(false, true), false),
@@ -1603,8 +1621,13 @@ mod tests {
         let empty = serde_json::to_string(&PolicySettings::default()).unwrap();
         assert_eq!(
             empty,
-            r#"{"remoteGitPush":false,"remoteCloudStart":false,"remoteApprovals":false,"denyPatterns":{}}"#
+            r#"{"remoteGitPush":false,"remoteCloudStart":false,"remoteApprovals":false,"showPushContent":true,"denyPatterns":{}}"#
         );
+        // A file saved before the setting existed keeps it on.
+        std::fs::write(&path, br#"{"remoteGitPush":true,"denyPatterns":{}}"#).unwrap();
+        assert!(load_settings(&path).flags.show_push_content);
+        std::fs::write(&path, br#"{"showPushContent":false}"#).unwrap();
+        assert!(!load_settings(&path).flags.show_push_content);
         let partial: PolicySettings = serde_json::from_str("{}").unwrap();
         assert_eq!(partial, PolicySettings::default());
     }

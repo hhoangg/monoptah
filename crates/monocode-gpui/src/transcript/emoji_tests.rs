@@ -746,3 +746,55 @@ fn the_preview_stays_clear_of_an_emoji_near_the_window_bottom(cx: &mut TestAppCo
     }
     assert!(seen_below && seen_flipped, "both placements were exercised");
 }
+
+fn reply_text_of(rows: Vec<(&'static str, &'static str)>, cx: &mut TestAppContext) -> String {
+    let fx = fixture(false);
+    let window = open_view(cx, Some(fx.emoji.clone()), false);
+    window
+        .update(cx, |view, _, cx| {
+            view.patch(0, rows.into_iter().map(|(r, t)| row(r, t)).collect(), cx);
+            view.notification_reply_text()
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn the_reply_text_keeps_its_lines_for_the_web_preview(cx: &mut TestAppContext) {
+    let text = reply_text_of(
+        vec![
+            ("user", "hi"),
+            ("assistant", "Run:\n```sh\ncargo test\n```"),
+        ],
+        cx,
+    );
+    assert_eq!(text, "Run:\n```sh\ncargo test\n```");
+}
+
+#[gpui::test]
+fn a_turn_that_ends_in_an_error_reports_the_error(cx: &mut TestAppContext) {
+    let text = reply_text_of(
+        vec![
+            ("user", "hi"),
+            ("assistant", "Working"),
+            ("error", "Rate limit reached"),
+        ],
+        cx,
+    );
+    assert_eq!(text, "Error: Rate limit reached");
+    // A stop is not an error, and an error followed by a later reply is over.
+    let stopped = reply_text_of(
+        vec![("user", "hi"), ("assistant", "Part"), ("error", "Stopped")],
+        cx,
+    );
+    assert_eq!(stopped, "Part");
+    let recovered = reply_text_of(
+        vec![
+            ("user", "hi"),
+            ("error", "Oops"),
+            ("user", "again"),
+            ("assistant", "Done"),
+        ],
+        cx,
+    );
+    assert_eq!(recovered, "Done");
+}

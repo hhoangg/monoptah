@@ -279,6 +279,8 @@ export async function runNotify(env: Env, principal: DesktopPrincipal, rawBody: 
     sessionId,
     monoId: body.monoId,
     habitRun: body.habitRun,
+    title: body.title,
+    preview: body.preview,
   });
   const topic = await topicFor(target);
   const urgency = body.category === "agentInput" ? "high" : "normal";

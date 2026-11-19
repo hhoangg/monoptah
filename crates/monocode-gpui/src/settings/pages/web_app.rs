@@ -329,7 +329,8 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// "Remote push in Git", "Remote cloud start" and "Remote approvals": off by default. The
+    /// "Remote push in Git", "Remote cloud start" and "Remote approvals" (off by
+    /// default), and "Show message content in notifications" (on by default). The
     /// shell saves a change and tells the connected web devices.
     fn web_app_remote_actions(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let flags = self.ctx.web_policy;
@@ -354,6 +355,13 @@ impl SettingsView {
                 "Lets control devices answer a tool approval with Allow once or Deny. Never grants full access. Off by default",
                 flags.remote_approvals,
                 WebPolicyFlag::Approvals,
+            ),
+            (
+                "web-policy-push-content",
+                "Show message content in notifications",
+                "Web notifications show the session or Mono name and a short preview. Off shows only a generic line. On by default",
+                flags.show_push_content,
+                WebPolicyFlag::PushContent,
             ),
         ];
         let rows = rows

@@ -2664,6 +2664,8 @@ impl Shell {
             notify::log_suppressed(category, reason);
             return;
         }
+        // The web preview strips markdown itself, so it gets the text before it is clipped to one paragraph.
+        let raw = body;
         let body = delivery::clip_body(body);
         let web_mono = mono
             .as_ref()
@@ -2729,6 +2731,8 @@ impl Shell {
             session_id: notice.data["sessionId"].as_str(),
             mono_id: web_mono.as_ref().map(|(id, _)| id.as_str()),
             project,
+            title: &notice.title,
+            preview: Some(raw),
         });
         // A phone is never pushed about a session only web devices see: it
         // cannot open it, and its path or instance name stays off the wire.

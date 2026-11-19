@@ -31,8 +31,9 @@ impl Conversation {
         self.input.focus_handle(cx).is_focused(window)
     }
 
-    pub(crate) fn notification_reply_body(&self, cx: &gpui::App) -> String {
-        self.transcript.read(cx).notification_reply_body()
+    /// The reply before any clipping (`Error: ...` when the turn failed).
+    pub(crate) fn notification_reply_text(&self, cx: &gpui::App) -> String {
+        self.transcript.read(cx).notification_reply_text()
     }
 
     /// Resolve the exact approval represented by the card, even if a newer

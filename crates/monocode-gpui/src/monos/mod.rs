@@ -1268,7 +1268,7 @@ impl Monos {
         let completion =
             (finished && self.inflight.contains_key(id)).then(|| NotificationFinished {
                 summary: view.summary.clone(),
-                body: view.notification_reply_body(cx),
+                body: view.notification_reply_text(cx),
                 habit: false,
                 was_cancelled: view.notification_was_cancelled(),
             });

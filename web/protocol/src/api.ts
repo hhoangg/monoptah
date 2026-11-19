@@ -333,7 +333,7 @@ export const PushTestResponse = z.object({
   results: z.array(z.object({ outcome: z.enum(PUSH_TEST_OUTCOMES), status: z.number().int().nonnegative() })),
 });
 
-/** Desktop -> Worker (architecture.md 8). No title, no assistant text, no transcript. */
+/** Desktop -> Worker (architecture.md 8). Content (`title`, `preview`) only when the desktop setting is on. */
 export const PushNotifyBody = z.object({
   category: PushCategory,
   /** Display name of the project (the Mono name for Mono notices). */
@@ -350,15 +350,23 @@ export const PushNotifyBody = z.object({
   /** Server ids of confirmed web devices whose selection includes the project or Mono. */
   deviceIds: z.array(Id),
   desktopName: z.string().optional(),
+  /**
+   * Message content for the notification, set by the desktop only while its "Show message content in
+   * notifications" setting is on and only for devices that selected the project or Mono: the session or Mono name
+   * (`title`) and a one-line plain preview (`preview`, about 180 characters). The Worker puts them into the
+   * encrypted payload and never logs or stores them. Both or neither; without them the generic text is sent.
+   */
+  title: z.string().max(512).optional(),
+  preview: z.string().max(2048).optional(),
 });
 export const PushNotifyResponse = z.object({ sent: z.number().int().nonnegative() });
 
-/** The encrypted payload the service worker receives (architecture.md 8, under 1 KiB). */
+/** The encrypted payload the service worker receives (architecture.md 8, under 3 KiB). */
 export const PushPayloadSchema = z.object({
   v: z.literal(1),
-  /** Desktop name. */
+  /** The session or Mono name when the desktop sent content, otherwise the desktop name. */
   t: z.string(),
-  /** `<project>: Finished`, `: Needs your input` or `: New message`. */
+  /** A one-line preview when the desktop sent content, otherwise `<project>: Finished`, `: Needs your input` or `: New message`. */
   b: z.string(),
   url: z.string(),
   /** The session id, or `mono:<monoId>` for a Mono's own chat; repeated notices for one target collapse. */
