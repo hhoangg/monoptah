@@ -7,6 +7,7 @@ import { cn } from "@/lib/utils";
 import { Glass } from "./Glass";
 import { AppNav } from "./AppNav";
 import { TooltipProvider } from "./tooltip";
+import { ViewportDebugGate } from "./ViewportDebugGate";
 
 /** The one `main` landmark of the app: the skip link points at it. Screens never render their own `main`. */
 export const MAIN_ID = "main-content";
@@ -66,6 +67,7 @@ export function Shell() {
         <Outlet />
       </main>
     </div>
+    <ViewportDebugGate />
     </TooltipProvider>
   );
 }

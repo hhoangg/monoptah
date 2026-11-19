@@ -13,6 +13,7 @@ import { Icon, type IconName } from "@/ui/Icon";
 import { Input } from "@/ui/input";
 import { MatchText } from "@/ui/MatchText";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
+import { setViewportDebug, viewportDebugCommand } from "@/ui/viewportDebugFlag";
 import { closeCommandPalette, openCommandPalette, useCommandPalette } from "./palette";
 import { PANEL_LABELS, useProjectTools } from "./projectTools";
 import type { PanelKind } from "./panels";
@@ -162,6 +163,15 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
       const step = event.key === "ArrowDown" ? 1 : -1;
       setActive((current + step + items.length) % items.length);
     } else if (event.key === "Enter") {
+      // TEMPORARY: Enter on exactly "debug viewport" / "debug off" toggles the viewport debug overlay (the installed
+      // app has no URL bar). Only on Enter, so typing a search that starts with these words never reloads.
+      const debug = viewportDebugCommand(query);
+      if (debug !== null) {
+        event.preventDefault();
+        setViewportDebug(debug);
+        window.location.reload();
+        return;
+      }
       const item = items[current];
       if (item) {
         event.preventDefault();
