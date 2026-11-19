@@ -64,6 +64,44 @@ describe("send", () => {
     expect(onSubmit).toHaveBeenCalledWith("hello", []);
   });
 
+  it("closes the on-screen keyboard as soon as Send is pressed on a touch layout, before the send resolves", async () => {
+    const user = userEvent.setup();
+    setMedia(false);
+    let resolve!: () => void;
+    const onSubmit = vi.fn<ComposerProps["onSubmit"]>(() => new Promise<void>((done) => (resolve = done)));
+    render(<Composer onSubmit={onSubmit} />);
+    const field = screen.getByRole("textbox", { name: "Message" });
+    await user.type(field, "hi");
+    expect(field).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSubmit).toHaveBeenCalled();
+    expect(field).not.toHaveFocus();
+    await act(async () => resolve());
+    await waitFor(() => expect((field as HTMLTextAreaElement).value).toBe(""));
+    expect(field).not.toHaveFocus();
+  });
+
+  it("keeps the text of a refused send on a touch layout (the field stays unfocused)", async () => {
+    const user = userEvent.setup();
+    setMedia(false);
+    const onSubmit = vi.fn<ComposerProps["onSubmit"]>(() => Promise.reject(new Error("Refused")));
+    render(<Composer onSubmit={onSubmit} />);
+    const field = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+    await user.type(field, "hi");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByText("Refused")).toBeTruthy();
+    expect(field.value).toBe("hi");
+  });
+
+  it("keeps the focus after a send on a desktop layout", async () => {
+    const user = userEvent.setup();
+    const { onSubmit, field } = setup();
+    await user.type(field, "hi");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(field).toHaveFocus();
+  });
+
   it("sends on Enter on a desktop layout and keeps Shift+Enter for a newline", async () => {
     const user = userEvent.setup();
     const { onSubmit, field } = setup();

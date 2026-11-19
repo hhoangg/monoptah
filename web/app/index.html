@@ -7,7 +7,14 @@
     <meta name="theme-color" content="#131313" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <!-- Keep this "default", not "black-translucent". On iOS 26 a home-screen app with black-translucent paints from y=0
+         under the status bar, but its layout viewport (100dvh, innerHeight) is 48pt (the status bar) shorter than the
+         screen. The bottom 48pt are never painted, so a composer pinned to the bottom is cut off or floats above a gap, and
+         no CSS can draw into that band. With "default" the web view starts below the status bar (env top 0) and runs to
+         the screen bottom, so 100dvh frames fit exactly. The status bar takes the page background (#131313 dark, light in
+         light). iOS reads this tag only when the app is added to the Home Screen: an existing install must be removed and
+         added again. -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <title>Monoptah</title>
     <!-- Blocking, same-origin, no async or defer: sets data-scheme, data-theme, data-accent and the

@@ -261,6 +261,12 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
     if (!canSend) return;
     const message = text.trim();
     const files = attachments;
+    // Phones, tablets and touch: close the on-screen keyboard right away, before anything is awaited. Doing it after the
+    // send resolves could close it while the user already types the next message, and a send-guard dialog would hand the
+    // focus back to the field when it closes (it restores to the element focused when it opened: with the field blurred
+    // that is the page body). A refused or cancelled send keeps the draft but leaves the field unfocused, which is fine.
+    // A desktop layout keeps the focus to type the next message.
+    if (!desktopLayout) area.current?.blur();
     setSubmitting(true);
     setError(null);
     try {

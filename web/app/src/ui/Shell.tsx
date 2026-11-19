@@ -29,7 +29,7 @@ export function Shell() {
   return (
     <TooltipProvider delayDuration={300}>
     {/* /d routes: a fixed-height flex column (header, switcher and banner shrink-0, main fills the rest) so no screen needs 100dvh math and the body never scrolls. */}
-    <div className={cn("flex flex-col bg-background text-content", inDesktop ? "relative h-dvh overflow-hidden" : "min-h-dvh")}>
+    <div className={cn("flex flex-col bg-background text-content", inDesktop ? "relative h-dvh overflow-hidden" : "min-h-dvh")} data-app-frame={inDesktop ? "" : undefined}>
       {/* First focusable element (design-system.md 9): visible on focus only; moves focus to the main content. */}
       <a
         href={`#${MAIN_ID}`}
