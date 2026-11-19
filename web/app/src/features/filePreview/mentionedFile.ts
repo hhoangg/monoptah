@@ -157,8 +157,8 @@ export function buildPreviewDocument(html: string, dataUris: ReadonlyMap<number,
 
 /** The html and its images: every `assets[i]` fetched (4 at a time) and inlined. */
 export async function loadHtmlDocument(request: MentionRequester, path: string, content: MentionContent, signal?: AbortSignal): Promise<{ document: string; limited: boolean }> {
-  const budget = new PreviewBudget();
-  budget.reserve(content.length);
+  // The document counts by its UTF-8 bytes (what the frame holds), not its UTF-16 length.
+  const budget = budgetForText(content.text);
   const assets = content.meta.assets ?? [];
   const uris = new Map<number, string>();
   const used = [...new Set([...content.text.matchAll(PLACEHOLDER)].map((match) => Number(match[1])))].filter((index) => index < assets.length);

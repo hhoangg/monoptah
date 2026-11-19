@@ -74,33 +74,45 @@ pub fn transform(source: &str, sheets: Arc<dyn Sheets>) -> Document {
     // Without inlining the styles are lost, never passed on.
     .unwrap_or_else(|| source.to_owned());
     let assets = Arc::new(Mutex::new(Vec::<String>::new()));
-    // The sanitizer drops the `<body>` tag, and with it the styles inlined onto it (the page's
-    // background, text color and font): they go on a wrapper div, through the same style filter.
-    let body_style = body_style(&inlined, &assets);
+    // The sanitizer drops the `<html>` and `<body>` tags, and with them the styles inlined onto
+    // them (the page's background, text color, font, padding): they go on a wrapper div, through
+    // the same style filter, `<html>` first so `<body>` wins like in a browser. The wrapper
+    // fills the frame (a dark page paints all of it) and has no margin of its own, like the
+    // outer body, so the page's own `margin` and `padding` keep their meaning.
+    let html_style = element_style(&inlined, "html", &assets);
+    let body_style = element_style(&inlined, "body", &assets);
     let body = sanitizer(assets.clone()).clean(&inlined).to_string();
-    let body = match body_style {
-        Some(style) => format!("<div style=\"{style}\">{body}</div>"),
-        None => body,
-    };
+    let style: String = ["margin:0;min-height:100vh", &html_style, &body_style]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim_end_matches(';'))
+        .collect::<Vec<_>>()
+        .join(";");
+    let body = format!("<div style=\"{style}\">{body}</div>");
     let assets = std::mem::take(&mut *assets.lock().unwrap_or_else(|e| e.into_inner()));
     Document {
         html: format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>{body}</body></html>"
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0\">{body}</body></html>"
         ),
         assets,
     }
 }
 
-/// The safe declarations of the first `<body>`'s `style` attribute, ready for a double-quoted
-/// attribute, or `None`.
-fn body_style(inlined: &str, assets: &Mutex<Vec<String>>) -> Option<String> {
-    static BODY: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?is)<body(?:\s(?:"[^"]*"|'[^']*'|[^>"'])*)?>"#).expect("body tag pattern")
-    });
+/// The safe declarations of the first `<html>` or `<body>` tag's `style` attribute (`name` says
+/// which), ready for a double-quoted attribute, or an empty string.
+fn element_style(inlined: &str, name: &str, assets: &Mutex<Vec<String>>) -> String {
+    element_style_of(inlined, name, assets).unwrap_or_default()
+}
+
+fn element_style_of(inlined: &str, name: &str, assets: &Mutex<Vec<String>>) -> Option<String> {
+    let body = Regex::new(&format!(
+        r#"(?is)<{name}(?:\s(?:"[^"]*"|'[^']*'|[^>"'])*)?>"#
+    ))
+    .ok()?;
     static STYLE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?is)(?:^|\s)style\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("style pattern")
     });
-    let tag = BODY.find(inlined)?.as_str();
+    let tag = body.find(inlined)?.as_str();
     let captures = STYLE.captures(tag)?;
     let value = captures.get(1).or_else(|| captures.get(2))?.as_str();
     // The raw text is not entity-decoded here (ammonia decodes before its filter): an entity
@@ -574,8 +586,31 @@ mod tests {
         let doc = run("<body style=\"background:url(a.png)\"><p>x</p></body>");
         assert!(doc.html.contains("url(monoptah-asset:0)"), "{}", doc.html);
         assert_eq!(doc.assets, ["a.png"]);
-        // A page without body styles gets no wrapper.
-        assert!(!run("<p>x</p>").html.contains("<div"));
+        // Every page gets the wrapper that fills the frame, with its own margin removed.
+        let plain = run("<p>x</p>").html;
+        assert!(
+            plain.contains("<div style=\"margin:0;min-height:100vh\"><p>x</p></div>"),
+            "{plain}"
+        );
+        assert!(plain.contains("<body style=\"margin:0\">"), "{plain}");
+    }
+
+    #[test]
+    fn the_html_background_goes_on_the_wrapper_and_the_body_wins() {
+        let doc = run(concat!(
+            "<style>html{background:#111111;color:white}body{background:#222222;padding:12px}</style>",
+            "<p>x</p>"
+        ));
+        let wrapper = doc.html.split("<div style=\"").nth(1).unwrap();
+        let wrapper = wrapper.split('"').next().unwrap();
+        let html = wrapper.find("#111111").expect(wrapper);
+        let body = wrapper.find("#222222").expect(wrapper);
+        assert!(html < body, "{wrapper}");
+        assert!(wrapper.contains("padding: 12px"), "{wrapper}");
+        assert!(
+            wrapper.starts_with("margin:0;min-height:100vh;"),
+            "{wrapper}"
+        );
     }
 
     #[test]

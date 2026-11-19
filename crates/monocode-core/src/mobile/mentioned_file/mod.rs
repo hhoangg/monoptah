@@ -30,6 +30,7 @@
 //!
 //! The caller audits (rule 5 of the contract) with [`Call`], which carries what the line needs.
 pub mod budget;
+pub mod cost;
 pub mod evidence;
 pub mod html;
 pub mod mentions;
@@ -78,10 +79,13 @@ pub const MAX_DATA_JSON_BYTES: usize = 6 * 1024 * 1024;
 pub const MENTIONED_FILE_MAX_BYTES: u64 = 20 * 1024 * 1024;
 /// Largest HTML or markdown source that is transformed or searched for references.
 pub const MAX_REFERENCING_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
-/// Elements times declaration bytes (inline `<style>` plus linked sheets) an HTML document may
-/// have: inlining writes at most every declaration into every element, so this bounds the work
-/// and keeps the worst-case output near [`MENTIONED_FILE_MAX_BYTES`].
-pub const MAX_TRANSFORM_WORK: u64 = MENTIONED_FILE_MAX_BYTES;
+/// Elements times style bytes (inline `<style>` plus linked sheets) an HTML document may have:
+/// what matching the selectors costs. 5000 elements with 200 KB of CSS is accepted.
+pub const MAX_SCAN_WORK: u64 = 1_000_000_000;
+/// Declaration bytes times the elements they can reach (see [`cost`]) an HTML document may have:
+/// inlining copies a declaration into every element it matches, so this bounds the time and
+/// memory of the worst case (measured: about 30 bytes of memory per unit, so about 200 MB).
+pub const MAX_COPY_WORK: u64 = 6_000_000;
 /// Longest `path` or `asset`, in characters.
 pub const MAX_PATH_CHARS: usize = 1024;
 /// One linked stylesheet, and all of them together, in bytes.
@@ -653,7 +657,7 @@ fn authorize(
 
 /// Whether `written` (which does not exist) is itself the file one of the `hits` mentions, and
 /// the rest of the rules (a selected project, or a tool row naming it) would have let it through.
-/// Compared lexically: nothing here touches the disk.
+/// The names are compared lexically; the disk is only asked for the nearest existing ancestor.
 fn missing_but_authorized(
     ctx: &Context,
     evidence: &Evidence,
@@ -667,16 +671,31 @@ fn missing_but_authorized(
     if !mentioned {
         return false;
     }
-    let inside = ctx
-        .projects
-        .iter()
-        .any(|p| p.selected && (written.starts_with(&p.canonical) || written.starts_with(&p.root)));
-    inside
-        || evidence.tool.iter().any(|token| {
-            link_candidates(token, ctx.cwd, ctx.roots)
-                .into_iter()
-                .any(|path| path_key(&lossy(&path)) == wanted)
-        })
+    inside_by_ancestor(ctx, written) || tool_names_missing(ctx, evidence, written)
+}
+
+/// Whether some tool token spells `written` (compared lexically).
+fn tool_names_missing(ctx: &Context, evidence: &Evidence, written: &Path) -> bool {
+    let wanted = path_key(&lossy(written));
+    evidence.tool.iter().any(|token| {
+        link_candidates(token, ctx.cwd, ctx.roots)
+            .into_iter()
+            .any(|path| path_key(&lossy(&path)) == wanted)
+    })
+}
+
+/// Whether the missing `written` would lie in a selected project: its nearest existing ancestor,
+/// with symlinks resolved, is inside the project's canonical root (a link in the way cannot
+/// carry it out of the project by spelling).
+fn inside_by_ancestor(ctx: &Context, written: &Path) -> bool {
+    let Some(real) = written
+        .ancestors()
+        .skip(1)
+        .find_map(|dir| dir.canonicalize().ok())
+    else {
+        return false;
+    };
+    in_selected_project(ctx, &real)
 }
 
 /// Whether the evidence gathered so far is enough to decide the call, so a long history need not
@@ -689,14 +708,19 @@ pub fn sufficient(ctx: &Context, params: &Params) -> bool {
 
 /// [`sufficient`] for a history read page by page: the requested path's candidates are worked
 /// out once, and each check looks only at the mentions and tool paths added since the last one
-/// (the lists of [`Evidence`] only grow), so the whole scan costs no more than one pass.
+/// (the lists of [`Evidence`] only grow), so the whole scan costs no more than one pass. A
+/// mention counts only when it is the requested file itself (the exact check of [`authorize`]),
+/// so a first lexical hit that names another file does not end the scan.
 pub struct Sufficiency {
+    path: String,
     wanted: HashSet<String>,
-    inside: bool,
     assistant_seen: usize,
     tool_seen: usize,
     mentioned: bool,
     tooled: bool,
+    /// The requested path as written and what it canonicalizes to (`None` when missing), worked
+    /// out at the first lexical hit, never before.
+    target: Option<Option<(PathBuf, Option<PathBuf>)>>,
 }
 
 impl Sufficiency {
@@ -705,13 +729,8 @@ impl Sufficiency {
             .into_iter()
             .filter(|path| path.is_absolute() && !is_remote(path))
             .collect();
-        let inside = |path: &Path| {
-            ctx.projects.iter().any(|p| {
-                p.selected && (path.starts_with(&p.canonical) || path.starts_with(&p.root))
-            })
-        };
         Self {
-            inside: candidates.iter().all(|path| inside(path)),
+            path: params.path.clone(),
             wanted: candidates
                 .iter()
                 .map(|path| path_key(&lossy(path)))
@@ -720,33 +739,66 @@ impl Sufficiency {
             tool_seen: 0,
             mentioned: false,
             tooled: false,
+            target: None,
         }
     }
 
     /// Whether `evidence` (the same, grown, as at the last call) is enough.
     pub fn check(&mut self, ctx: &Context, evidence: &Evidence) -> bool {
-        let names_it = |text: &String| {
+        let names_it = |wanted: &HashSet<String>, text: &String| {
             link_candidates(text, ctx.cwd, ctx.roots)
                 .into_iter()
-                .any(|path| self.wanted.contains(&path_key(&lossy(&path))))
+                .any(|path| wanted.contains(&path_key(&lossy(&path))))
         };
         if !self.mentioned && !self.wanted.is_empty() {
-            self.mentioned = evidence.assistant
-                [self.assistant_seen.min(evidence.assistant.len())..]
+            let from = self.assistant_seen.min(evidence.assistant.len());
+            let hits: Vec<&String> = evidence.assistant[from..]
                 .iter()
-                .any(names_it);
+                .filter(|text| names_it(&self.wanted, text))
+                .collect();
+            if !hits.is_empty() {
+                let path = self.path.clone();
+                let target = self.target.get_or_insert_with(|| {
+                    let written = literal(ctx, &path)?;
+                    let canonical = written.canonicalize().ok();
+                    Some((written, canonical))
+                });
+                self.mentioned = target.as_ref().is_some_and(|(written, canonical)| {
+                    hits.iter().any(|mention| {
+                        resolved(ctx, mention).is_some_and(|found| match canonical {
+                            Some(real) => found.canonicalize().is_ok_and(|f| f == *real),
+                            None => path_key(&lossy(&found)) == path_key(&lossy(written)),
+                        })
+                    })
+                });
+            }
         }
         self.assistant_seen = evidence.assistant.len();
         if !self.mentioned {
             return false;
         }
-        if self.inside {
+        let inside = match &self.target {
+            Some(Some((_, Some(real)))) => in_selected_project(ctx, real),
+            Some(Some((written, None))) => inside_by_ancestor(ctx, written),
+            _ => false,
+        };
+        if inside {
             return true;
         }
         if !self.tooled {
-            self.tooled = evidence.tool[self.tool_seen.min(evidence.tool.len())..]
+            let from = self.tool_seen.min(evidence.tool.len());
+            let named = evidence.tool[from..]
                 .iter()
-                .any(names_it);
+                .any(|text| names_it(&self.wanted, text));
+            if named {
+                // A lexical hit is final only when the real rule agrees.
+                if let Some(Some((written, canonical))) = &self.target {
+                    self.tooled = match canonical {
+                        Some(real) => tool_evidence(ctx, evidence, real, written),
+                        None => tool_names_missing(ctx, evidence, written),
+                    };
+                }
+            }
         }
         self.tool_seen = evidence.tool.len();
         self.tooled
@@ -1229,53 +1281,6 @@ impl Drop for Flight {
     }
 }
 
-/// Elements of an HTML source, and the bytes of its `<style>` declaration blocks, counted
-/// cheaply from the text.
-fn weight(source: &str) -> (u64, u64) {
-    let bytes = source.as_bytes();
-    let mut elements = 0u64;
-    let mut declarations = 0u64;
-    let mut at = 0;
-    while at < bytes.len() {
-        if bytes[at] == b'<' && bytes.get(at + 1).is_some_and(u8::is_ascii_alphabetic) {
-            elements += 1;
-            if bytes[at + 1..].len() >= 5 && bytes[at + 1..at + 6].eq_ignore_ascii_case(b"style") {
-                let start = (at + 6).min(bytes.len());
-                let end = find_ignore_case(&bytes[start..], b"</style")
-                    .map_or(bytes.len(), |end| start + end);
-                if let Some(open) = bytes[start..end].iter().position(|b| *b == b'>') {
-                    declarations += declaration_bytes(&bytes[start + open + 1..end]);
-                }
-                at = end;
-                continue;
-            }
-        }
-        at += 1;
-    }
-    (elements, declarations)
-}
-
-fn find_ignore_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle))
-}
-
-/// Bytes between braces of a stylesheet: what inlining can copy into an element.
-fn declaration_bytes(css: &[u8]) -> u64 {
-    let mut depth = 0u32;
-    let mut total = 0u64;
-    for byte in css {
-        match byte {
-            b'{' => depth += 1,
-            b'}' => depth = depth.saturating_sub(1),
-            _ if depth > 0 => total += 1,
-            _ => {}
-        }
-    }
-    total
-}
-
 /// The sanitized document of a mentioned HTML file, from the cache or built now (one build at a
 /// time per device, bounded in source size, work and output size).
 fn html_document(
@@ -1297,8 +1302,9 @@ fn html_document(
     }
     let raw = read_at(file, 0, metadata.len() as usize)?;
     let source = String::from_utf8_lossy(&raw).into_owned();
-    let (elements, declarations) = weight(&source);
-    if elements.saturating_mul(declarations) > MAX_TRANSFORM_WORK {
+    let census = Arc::new(cost::Census::of(&source));
+    let (style, copy) = cost::inline_styles(&source, &census);
+    if census.elements.saturating_mul(style) > MAX_SCAN_WORK || copy > MAX_COPY_WORK {
         return Err(Code::TooLarge.failure());
     }
     let folder = canonical.parent().unwrap_or(canonical).to_path_buf();
@@ -1306,8 +1312,9 @@ fn html_document(
         folder,
         guard: env.guard.clone(),
         used: AtomicU64::new(0),
-        elements,
-        declarations: AtomicU64::new(declarations),
+        census,
+        style: AtomicU64::new(style),
+        copy: AtomicU64::new(copy),
     });
     let document = html::transform(&source, sheets);
     if document.html.len() as u64 > MENTIONED_FILE_MAX_BYTES {
@@ -1450,10 +1457,11 @@ struct FolderSheets {
     folder: PathBuf,
     guard: Guard,
     used: AtomicU64,
-    /// Elements of the document and declaration bytes so far (its own plus the sheets taken),
-    /// whose product the inliner's work and output grow with.
-    elements: u64,
-    declarations: AtomicU64,
+    /// The document's census, and the style bytes and copy cost so far (its own plus the sheets
+    /// taken), which the inliner's work and output grow with (see [`cost`]).
+    census: Arc<cost::Census>,
+    style: AtomicU64,
+    copy: AtomicU64,
 }
 
 impl html::Sheets for FolderSheets {
@@ -1482,9 +1490,13 @@ impl html::Sheets for FolderSheets {
         let mut text = Vec::new();
         file.read_to_end(&mut text).ok()?;
         let text = String::from_utf8_lossy(&text).into_owned();
-        let added = declaration_bytes(text.as_bytes());
-        let declarations = self.declarations.fetch_add(added, Ordering::SeqCst) + added;
-        if self.elements.saturating_mul(declarations) > MAX_TRANSFORM_WORK {
+        let style = self.style.fetch_add(text.len() as u64, Ordering::SeqCst) + text.len() as u64;
+        let added = cost::copy_cost(&text, &self.census);
+        let copy = self
+            .copy
+            .fetch_add(added, Ordering::SeqCst)
+            .saturating_add(added);
+        if self.census.elements.saturating_mul(style) > MAX_SCAN_WORK || copy > MAX_COPY_WORK {
             return None;
         }
         Some(text)

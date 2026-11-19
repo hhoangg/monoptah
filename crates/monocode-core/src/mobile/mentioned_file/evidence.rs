@@ -5,7 +5,7 @@
 //! * **Mentions**: the file mentions of the ASSISTANT's messages (see [`super::mentions`]). A
 //!   user message never counts, a control device can type any path into one.
 //! * **Tool paths**: the STRUCTURED path parameters of the TOOL rows of tools that operate on
-//!   files (`file_path`, `path`, `notebook_path`, `filename`, `output_path`, `paths[]`, the
+//!   files that COMPLETED (`file_path`, `path`, `notebook_path`, `filename`, `output_path`, `paths[]`, the
 //!   headers of a patch). Outputs, free-text command lines and question tools never count: a
 //!   control device can make a shell command echo a path or type one as the answer to a
 //!   question. A file outside every project the device selected needs both kinds (see
@@ -28,8 +28,6 @@ use crate::transcript::Row;
 
 /// Mentions or tool paths kept at most, so one huge conversation cannot grow the set unbounded.
 const MAX_ENTRIES: usize = 100_000;
-/// Longest tool row text read for paths, in bytes.
-const MAX_TOOL_TEXT: usize = 4 * 1024 * 1024;
 /// Longest token kept, in characters.
 const MAX_TOKEN_CHARS: usize = 1024;
 
@@ -100,11 +98,13 @@ impl Evidence {
 /// device can make the agent echo or be answered with any text, but it cannot choose which
 /// parameter of a file tool the agent fills in. A row that is not a tool call gives nothing.
 pub fn tool_paths(row_text: &str) -> Vec<String> {
-    let row_text = cut(row_text, MAX_TOOL_TEXT);
+    // The whole row is parsed: a cut would lose the `file_path` of a big Write that is stored
+    // before its content.
     let Ok(call) = serde_json::from_str::<crate::tool::ToolCall>(row_text) else {
         return Vec::new();
     };
-    if is_question_tool(&call.name) {
+    // A call the user denied, that failed, was cancelled or still runs did not touch the file.
+    if call.state != crate::tool::ToolState::Completed || !is_file_tool(&call.name) {
         return Vec::new();
     }
     let patch_tool = call.name.to_ascii_lowercase().contains("patch");
@@ -156,13 +156,36 @@ const PATH_KEYS: &[&str] = &[
 /// Entries of a `paths` array read.
 const MAX_PATHS: usize = 1_000;
 
-/// Tools that ask the user a question: their input and answer carry text the user typed.
-fn is_question_tool(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("question")
-        || name.contains("user_input")
-        || name.contains("userinput")
-        || name.starts_with("ask")
+/// The tools that read or change one file by path, by the names the providers use (Claude,
+/// Codex, OpenCode, editor tools). An allow-list: a search tool (`Glob`, `Grep`, `LS`,
+/// `list_dir`) takes a root folder, a question tool carries text the user typed, and an MCP
+/// tool (`server:tool`) is anything; none of them proves a file was opened.
+fn is_file_tool(name: &str) -> bool {
+    const FILE_TOOLS: &[&str] = &[
+        "read",
+        "write",
+        "edit",
+        "multiedit",
+        "notebookedit",
+        "notebookread",
+        "filechange",
+        "apply_patch",
+        "applypatch",
+        "patch",
+        "str_replace_editor",
+        "str_replace_based_edit_tool",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "create_file",
+        "read_text_file",
+        "write_text_file",
+        "readfile",
+        "writefile",
+        "editfile",
+        "view",
+    ];
+    FILE_TOOLS.contains(&name.to_ascii_lowercase().as_str())
 }
 
 /// The files a patch adds, updates or moves to.
@@ -175,17 +198,6 @@ fn patch_headers(text: &str, push: &mut impl FnMut(&str)) {
             }
         }
     }
-}
-
-fn cut(text: &str, max: usize) -> &str {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 /// A whole parameter value of a tool call: any single-line text without a URL scheme may be the
@@ -268,6 +280,7 @@ mod tests {
 
     fn tool_row(name: &str, input: &str, output: &str) -> Row {
         let mut call = ToolCall::new("1", name);
+        call.state = crate::tool::ToolState::Completed;
         call.input = input.into();
         call.output = output.into();
         row("tool", &serde_json::to_string(&call).unwrap())
@@ -297,7 +310,7 @@ mod tests {
             tool_row("Read", r#"{"path":"docs/a.md"}"#, ""),
             tool_row("NotebookEdit", r#"{"notebook_path":"~/n.ipynb"}"#, ""),
             tool_row(
-                "Save",
+                "write_file",
                 r#"{"filename":"Makefile","output_path":"./out/b.txt"}"#,
                 "",
             ),
@@ -387,6 +400,65 @@ mod tests {
             patch,
         )]);
         assert!(evidence.tool.is_empty());
+    }
+
+    #[test]
+    fn a_call_that_did_not_complete_gives_nothing() {
+        for state in [
+            crate::tool::ToolState::Running,
+            crate::tool::ToolState::Failed,
+            crate::tool::ToolState::Cancelled,
+        ] {
+            let mut call = ToolCall::new("1", "Read");
+            call.input = r#"{"file_path":"/tmp/x/a.md"}"#.into();
+            call.state = state.clone();
+            let text = serde_json::to_string(&call).unwrap();
+            assert!(tool_paths(&text).is_empty(), "{state:?}");
+        }
+        assert_eq!(
+            tool_paths(&tool_row("Read", r#"{"file_path":"/tmp/x/a.md"}"#, "").text),
+            ["/tmp/x/a.md"]
+        );
+    }
+
+    #[test]
+    fn only_file_tools_count_not_search_roots_or_mcp_tools() {
+        for name in [
+            "Glob",
+            "Grep",
+            "LS",
+            "list_dir",
+            "mcp__srv__read",
+            "srv:read_file",
+            "WebFetch",
+            "Bash",
+        ] {
+            let row = tool_row(name, r#"{"path":"/tmp/x","file_path":"/tmp/x/a.md"}"#, "");
+            assert!(tool_paths(&row.text).is_empty(), "{name}");
+        }
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+            "fileChange",
+            "apply_patch",
+            "str_replace_editor",
+            "read",
+            "patch",
+        ] {
+            let row = tool_row(name, r#"{"file_path":"/tmp/x/a.md"}"#, "");
+            assert_eq!(tool_paths(&row.text), ["/tmp/x/a.md"], "{name}");
+        }
+    }
+
+    #[test]
+    fn the_path_of_a_huge_write_is_not_lost() {
+        let content = "x".repeat(5 * 1024 * 1024);
+        let input = serde_json::json!({ "file_path": "/tmp/x/big.md", "content": content });
+        let row = tool_row("Write", &input.to_string(), "");
+        assert_eq!(tool_paths(&row.text), ["/tmp/x/big.md"]);
     }
 
     #[test]

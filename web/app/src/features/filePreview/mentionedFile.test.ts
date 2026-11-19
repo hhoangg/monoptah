@@ -148,6 +148,16 @@ describe("loadHtmlDocument", () => {
     expect(limited).toBe(false);
   });
 
+  it("counts the document by its UTF-8 bytes, so a multibyte page leaves its images less room", async () => {
+    // Under the cap in UTF-16 units, 2 bytes below it in UTF-8: the 4-byte image no longer fits.
+    const text = `${"é".repeat((MAX_PREVIEW_BYTES - 30) / 2)}<img src="monoptah-asset:0">`;
+    const request: MentionRequester = async (params) =>
+      params.asset ? page({ kind: "image", mime: "image/png", encoding: "base64", data: png, total: 4 }) : htmlPage(["a.png"], text);
+    const content = await readMention(async () => htmlPage(["a.png"], text), { path: "r.html" });
+    const { limited } = await loadHtmlDocument(request, "r.html", content);
+    expect(limited).toBe(true);
+  });
+
   it("leaves an empty image for an asset that fails or is not an image, without failing the page", async () => {
     const request: MentionRequester = async (params) => {
       if (params.asset === "gone.png") throw Object.assign(new Error("x"), { code: "not_found" });

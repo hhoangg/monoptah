@@ -55,6 +55,7 @@ fn asset(path: &str, asset: &str) -> Params {
 /// A tool row of a file tool (`Write`) that was given `path`.
 fn write_row(path: &str) -> String {
     let mut call = crate::tool::ToolCall::new("1", "Write");
+    call.state = crate::tool::ToolState::Completed;
     call.input = json!({ "file_path": path, "content": "x" }).to_string();
     serde_json::to_string(&call).unwrap()
 }
@@ -62,6 +63,7 @@ fn write_row(path: &str) -> String {
 /// A tool row of `name` with `input` and `output`.
 fn tool_row_of(name: &str, input: &str, output: &str) -> String {
     let mut call = crate::tool::ToolCall::new("1", name);
+    call.state = crate::tool::ToolState::Completed;
     call.input = input.to_owned();
     call.output = output.to_owned();
     serde_json::to_string(&call).unwrap()
@@ -640,7 +642,7 @@ fn html_pages_cut_on_character_boundaries() {
     let replies = pages(&["`p.html`"], &fx.root, "p.html", 7);
     assert!(replies.len() > 3);
     let joined: String = replies.iter().map(|r| r.data.as_str()).collect();
-    assert!(joined.ends_with("</p></body></html>"));
+    assert!(joined.ends_with("</p></div></body></html>"));
     assert!(!joined.contains('\u{fffd}'));
     assert_eq!(joined.len() as u64, replies[0].total);
 }
@@ -1092,11 +1094,6 @@ fn many_elements_times_many_rules_is_too_large() {
     fx.write("heavy.html", format!("<style>{rules}</style>{elements}"));
     let result = run(&["`heavy.html`"], &fx.root, &params("heavy.html"));
     assert_eq!(code(&result), Some(Code::TooLarge));
-    assert_eq!(weight("<a><b/>{ {"), (2, 0));
-    assert_eq!(
-        weight("<p><STYLE media=x>a{color:red}@media x{b{c:d}}</style><i>"),
-        (3, 13)
-    );
 }
 
 #[test]
@@ -1359,4 +1356,91 @@ fn sufficiency_over_pages_looks_only_at_what_each_page_added() {
     let mut one_shot = Context::new(&grown.assistant, &cwd, &[], &[]);
     one_shot.evidence = Some(&grown);
     assert!(sufficient(&one_shot, &params("a.md")));
+}
+
+#[test]
+fn a_realistic_report_with_framework_css_is_served() {
+    let fx = Fx::new();
+    // 3000 elements and about 200 KB of class-based CSS, each class used by a few elements.
+    let css: String = (0..8_000)
+        .map(|n| format!(".c{n}{{margin:0;padding:1px}}"))
+        .collect();
+    let body: String = (0..1_000)
+        .map(|n| format!("<div class=c{}><span>x</span><b>y</b></div>", n % 8_000))
+        .collect();
+    let page = format!("<style>body{{margin:0}}{css}</style>{body}");
+    assert!(page.len() > 200_000);
+    fx.write("report.html", page);
+    let result = run(&["`report.html`"], &fx.root, &params("report.html"));
+    assert!(result.is_ok(), "{:?}", code(&result));
+}
+
+#[test]
+fn decoy_style_openers_do_not_hide_the_elements_from_the_budget() {
+    let fx = Fx::new();
+    let rules: String = (0..6_000).map(|n| format!("i{{p{n:05}:1}}")).collect();
+    let elements = "<i>x</i>".repeat(4_000);
+    for (name, decoy) in [
+        ("comment.html", "<!--<style>-->"),
+        ("tag.html", "<styled>"),
+        ("attr.html", "<p title=\"<style\">"),
+    ] {
+        fx.write(name, format!("{decoy}{elements}<style>{rules}</style>"));
+        let result = run(&[&format!("`{name}`")], &fx.root, &params(name));
+        assert_eq!(code(&result), Some(Code::TooLarge), "{name}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_missing_file_behind_a_link_out_of_the_project_is_not_inside_the_project() {
+    use std::os::unix::fs::symlink;
+    let fx = Fx::new();
+    fx.write("proj/.keep", "");
+    fx.write("elsewhere/.keep", "");
+    symlink(fx.path("elsewhere"), fx.path("proj/out")).unwrap();
+    let project = Project::new("p1", &fx.path("proj"), true, DenyList::default());
+    let inside = fx.text("proj/gone.md");
+    let through_link = fx.text("proj/out/gone.md");
+    for (path, expected) in [(inside, Code::NotFound), (through_link, Code::Forbidden)] {
+        let said = [format!("`{path}`")];
+        let said: Vec<&str> = said.iter().map(String::as_str).collect();
+        let result = run_evidence(
+            &said,
+            &[],
+            &fx.root,
+            std::slice::from_ref(&project),
+            &params(&path),
+        );
+        assert_eq!(code(&result), Some(expected), "{path}");
+    }
+}
+
+#[test]
+fn a_first_hit_that_names_another_file_does_not_end_the_history_scan() {
+    let fx = Fx::new();
+    let (one, two) = (fx.root.join("one"), fx.root.join("two"));
+    fx.write("one/a.md", "# one");
+    fx.write("two/a.md", "# two");
+    let roots = vec![
+        one.to_string_lossy().into_owned(),
+        two.to_string_lossy().into_owned(),
+    ];
+    let cwd = fx.text("home");
+    let project = Project::new("p1", &two, true, DenyList::default());
+    let wanted = fx.text("two/a.md");
+    let none: Vec<String> = Vec::new();
+    let ctx = Context::new(&none, &cwd, &roots, std::slice::from_ref(&project));
+    let mut enough = Sufficiency::new(&ctx, &params(&wanted));
+    // The newest turn says `a.md`, which is the file under the first root: not this one.
+    let mut evidence = Evidence::from_texts(&["`a.md`".to_owned()], &[]);
+    assert!(!enough.check(&ctx, &evidence));
+    // An older page names the file itself: now the call is decided.
+    evidence.absorb_rows(&[Row {
+        role: "assistant".into(),
+        text: format!("`{wanted}`"),
+        first: true,
+        sent_at: None,
+    }]);
+    assert!(enough.check(&ctx, &evidence));
 }

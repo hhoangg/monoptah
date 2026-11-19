@@ -44,12 +44,13 @@
 //!                                          the canonical folder. Default: a message that mentions, as an absolute path in
 //!                                          backticks, every top-level regular file of the folder whose name does not start
 //!                                          with `unmentioned`
-//! WEB_LINK_HEADLESS_MENTION_TOOL_TEXT=<text>  optional: the one tool row of the conversation (plain text), the evidence a
-//!                                          file OUTSIDE the device's projects needs besides the assistant message; `{dir}`
-//!                                          is replaced as above. Default: the same text as the assistant message, as if the
-//!                                          agent ran a tool on every file it names. Set it to the empty string for a
-//!                                          conversation without any tool row (a file outside the projects is then
-//!                                          `forbidden`)
+//! WEB_LINK_HEADLESS_MENTION_TOOL_TEXT=<text>  optional: the files the agent ran a tool on, written like a message: every
+//!                                          file it mentions becomes one COMPLETED `Read` tool call (`{file_path}`), the
+//!                                          evidence a file OUTSIDE the device's projects needs besides the assistant
+//!                                          message (plain text is no evidence); `{dir}` is replaced as above. Default: the
+//!                                          same text as the assistant message, as if the agent read every file it names.
+//!                                          Set it to the empty string for a conversation without any tool row (a file
+//!                                          outside the projects is then `forbidden`)
 //! ```
 //!
 //! The conversation id is `e2e-session`. The seeded assistant message is the only one that authorizes paths (the
@@ -604,7 +605,8 @@ fn app_loop(
 struct MentionSeed {
     dir: std::path::PathBuf,
     text: Option<String>,
-    /// `Some("")` is no tool row at all; `None` is the default (the assistant's text).
+    /// `Some("")` is no tool row at all; `None` is the default (the assistant's text). Every file
+    /// it mentions becomes a completed `Read` call.
     tool_text: Option<String>,
 }
 
@@ -663,9 +665,15 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
     let assistant = mention_text(seed);
     let tool = seed.tool_text.clone().unwrap_or_else(|| assistant.clone());
     let texts = vec![assistant];
-    let tool_texts: Vec<String> = Some(tool)
-        .filter(|text| !text.is_empty())
+    // Structured evidence: one completed `Read` call per file the tool text mentions.
+    let tool_texts: Vec<String> = mention::mentions::extract_mentions(&tool)
         .into_iter()
+        .map(|path| {
+            let mut call = monocode_core::tool::ToolCall::new("e2e-read", "Read");
+            call.state = monocode_core::tool::ToolState::Completed;
+            call.input = json!({ "file_path": path }).to_string();
+            serde_json::to_string(&call).unwrap_or_default()
+        })
         .collect();
     let id = PROJECT_ID.to_owned();
     let selected = request
