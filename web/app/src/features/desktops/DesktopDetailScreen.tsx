@@ -5,7 +5,7 @@
 // desktop reported and what was requested.
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { isApiError } from "@/features/accounts/api";
 import { QueryBoundary } from "@/features/settings/QueryBoundary";
 import { SettingsLayout } from "@/features/settings/SettingsLayout";
@@ -17,13 +17,11 @@ import { Badge } from "@/ui/badge";
 import { Button, buttonVariants } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
-import { Field } from "@/ui/Field";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard } from "@/ui/SettingsCard";
 import {
-  renameDesktop,
   revokeDesktop,
   revokeGrant,
   setDesktopColor,
@@ -37,6 +35,7 @@ import { DESKTOP_COLORS, findDesktopColor } from "./colors";
 import { grantStateLabel, lastSeenLabel, permissionLabel, safeName, versionLabel } from "./format";
 import { useKeyStatus } from "./keyStatus";
 import { ColorDot, desktopErrorMessage, Fingerprint, FingerprintLines, PresenceBadge } from "./parts";
+import { RenameDesktopForm } from "./RenameDesktopForm";
 import { useThisDevice } from "./thisDevice";
 
 export function DesktopDetailScreen({ id }: { id: string }) {
@@ -156,52 +155,9 @@ function Detail({ label, children }: { label: string; children: ReactNode }) {
 // --- Rename ---
 
 function RenameSection({ desktop }: { desktop: DesktopDirectory }) {
-  const queryClient = useQueryClient();
-  const action = useAction(desktopErrorMessage);
-  const [draft, setDraft] = useState(desktop.name);
-  // The name changed elsewhere (another tab or device, the 15 s refetch): follow it unless the field has edits.
-  const [seenName, setSeenName] = useState(desktop.name);
-  if (desktop.name !== seenName) {
-    setSeenName(desktop.name);
-    if (draft === seenName) setDraft(desktop.name);
-  }
-  const [saved, setSaved] = useState(false);
-  const trimmed = draft.trim();
-  const tooLong = [...trimmed].length > 64;
-  const validation = trimmed === "" ? "Enter a name." : tooLong ? "Use 64 characters or fewer." : null;
-  const unchanged = trimmed === desktop.name;
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (validation || unchanged) return;
-    setSaved(false);
-    const ok = await action.run(() => renameDesktop(queryClient, desktop.id, trimmed));
-    if (ok) {
-      setDraft(trimmed);
-      setSaved(true);
-    }
-  }
-
   return (
     <SettingsCard title="Name">
-      <form onSubmit={(event) => void submit(event)} className="flex flex-col gap-3 px-1.5 py-2" noValidate>
-        <Field
-          label="Desktop name"
-          value={draft}
-          maxLength={200}
-          autoComplete="off"
-          onChange={(event) => {
-            setDraft(event.target.value);
-            setSaved(false);
-          }}
-          error={draft !== desktop.name ? validation : null}
-        />
-        {action.error ? <Notice variant="error">{action.error}</Notice> : null}
-        {saved ? <Notice variant="info">Name saved.</Notice> : null}
-        <Button type="submit" variant="outline" className="w-full sm:w-auto sm:self-start" disabled={action.busy || validation !== null || unchanged} aria-busy={action.busy}>
-          Save name
-        </Button>
-      </form>
+      <RenameDesktopForm desktop={desktop} />
     </SettingsCard>
   );
 }

@@ -192,6 +192,8 @@ export class LinkConnection {
   #gen = 0;
   #session: LinkSession | null = null;
   #latestState: StateMessage | null = null;
+  /** The name the server's directory serves: it follows a rename, the name in a state frame does not. */
+  #directoryName: string | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #readyTimer: ReturnType<typeof setTimeout> | null = null;
   #attempting = false;
@@ -419,6 +421,7 @@ export class LinkConnection {
     }
     if (this.#isStale(gen)) return;
     // The fingerprint shown as "this desktop" is the PINNED key's. A first-use key is shown once it is pinned.
+    this.#directoryName = directory.name;
     this.store.setState({
       desktopName: directory.name,
       presence: directory.online ? "online" : "offline",
@@ -570,7 +573,7 @@ export class LinkConnection {
     this.store.setState({
       permission: state.permission ?? this.store.getState().permission,
       capabilities: state.capabilities ?? this.store.getState().capabilities,
-      desktopName: state.desktop?.name ?? this.store.getState().desktopName,
+      desktopName: this.#directoryName ?? state.desktop?.name ?? this.store.getState().desktopName,
       desktopVersion: state.desktop?.version ?? this.store.getState().desktopVersion,
       proto: state.proto ?? this.store.getState().proto,
       lastFrameAt: session.lastFrameAt,

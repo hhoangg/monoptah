@@ -291,8 +291,10 @@ pub fn pair_poll(base: &str, device_code: &str, verifier: &str) -> Result<PollOu
     }
 }
 
-/// `GET /api/desktop/grants`.
-pub fn desktop_grants(base: &str, token: &str) -> Result<Vec<ServerGrant>, String> {
+/// `GET /api/desktop/grants`: the readable grants, and the device ids of the
+/// entries that carried an id but could not be read. A device in the second
+/// list is still listed by the server, so its row must not be dropped.
+pub fn desktop_grants(base: &str, token: &str) -> Result<(Vec<ServerGrant>, Vec<String>), String> {
     let answer = call(
         "GET",
         base,
@@ -303,9 +305,10 @@ pub fn desktop_grants(base: &str, token: &str) -> Result<Vec<ServerGrant>, Strin
     )?;
     let body = ok_body(answer)?;
     let text = |value: &Value| value.as_str().map(str::to_owned);
-    let grants = body["grants"]
+    let entries = body["grants"]
         .as_array()
-        .ok_or("The web server sent an unreadable grant list")?
+        .ok_or("The web server sent an unreadable grant list")?;
+    let grants: Vec<ServerGrant> = entries
         .iter()
         .filter_map(|grant| {
             Some(ServerGrant {
@@ -319,7 +322,21 @@ pub fn desktop_grants(base: &str, token: &str) -> Result<Vec<ServerGrant>, Strin
             })
         })
         .collect();
-    Ok(grants)
+    let unreadable = entries
+        .iter()
+        .filter_map(|grant| text(&grant["deviceId"]))
+        .filter(|id| !grants.iter().any(|g| &g.device_id == id))
+        .collect();
+    Ok((grants, unreadable))
+}
+
+/// How the server took a grant state report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reported {
+    Accepted,
+    /// 404 (the server has no such grant) or 409 (it revoked it): the grant
+    /// is gone on the server and the desktop must not keep a row for it.
+    Gone,
 }
 
 /// `POST /api/desktop/grants/:deviceId/state`: what the desktop applied.
@@ -329,21 +346,17 @@ pub fn report_grant_state(
     device_id: &str,
     state: &str,
     permission: Option<Permission>,
-) -> Result<(), String> {
+) -> Result<Reported, String> {
     let mut body = json!({"state": state});
     if let Some(permission) = permission {
         body["permission"] = json!(permission_name(permission));
     }
     let path = format!("/api/desktop/grants/{}/state", path_id(device_id)?);
-    ok_body(call(
-        "POST",
-        base,
-        &path,
-        Some(token),
-        Some(&body),
-        TIMEOUT,
-    )?)
-    .map(|_| ())
+    let answer = call("POST", base, &path, Some(token), Some(&body), TIMEOUT)?;
+    if matches!(answer.status, 404 | 409) {
+        return Ok(Reported::Gone);
+    }
+    ok_body(answer).map(|_| Reported::Accepted)
 }
 
 /// `DELETE /api/desktop/me`: the desktop unpairs itself.

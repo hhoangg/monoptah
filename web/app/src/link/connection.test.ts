@@ -79,6 +79,8 @@ interface RigOptions {
   directoryOnline?: boolean;
   /** The public key the directory serves (default: the desktop's). */
   directoryKey?: Uint8Array;
+  /** The name the directory serves (default: the desktop's). */
+  directoryName?: string;
   start?: boolean;
 }
 
@@ -95,7 +97,7 @@ function rig(options: RigOptions = {}): Rig {
   const clock = { now: Date.now() };
   const directory = {
     id: DESKTOP_ID,
-    name: "Example Desktop",
+    name: options.directoryName ?? "Example Desktop",
     color: null,
     online: options.directoryOnline ?? true,
     pendingCount: 0,
@@ -177,6 +179,11 @@ async function ready(options: RigOptions = {}): Promise<Rig> {
 }
 
 describe("connect sequence", () => {
+  it("shows the name of the server directory over the name in the desktop's state frame", async () => {
+    const r = await ready({ directoryName: "Renamed on the web" });
+    expect(r.state().desktopName).toBe("Renamed on the web");
+  });
+
   it("goes connecting -> handshaking -> ready and fills the store with public data only", async () => {
     const r = await ready();
     expect(r.statuses).toEqual(["connecting", "handshaking", "ready"]);
