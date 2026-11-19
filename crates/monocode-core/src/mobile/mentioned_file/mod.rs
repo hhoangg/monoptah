@@ -39,7 +39,7 @@ pub mod sandbox;
 
 use std::{
     borrow::Cow,
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::{File, Metadata},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -1255,8 +1255,29 @@ fn keep_doc(key: DocKey, doc: Arc<Doc>) {
 
 /// Transforms in flight, so a device cannot start a second while one runs, and no more than a
 /// few run at all.
-static FLIGHT: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static FLIGHT: LazyLock<Mutex<FlightState>> = LazyLock::new(|| Mutex::new(FlightState::default()));
 const MAX_TRANSFORMS: usize = 4;
+
+#[derive(Default)]
+struct FlightState {
+    devices: HashSet<String>,
+    /// Transforms running, those of an unnamed device included.
+    total: usize,
+}
+
+impl FlightState {
+    /// Admits one more transform for `device`, or says it is busy.
+    fn admit(&mut self, device: &str, max: usize) -> bool {
+        if self.total >= max || (!device.is_empty() && self.devices.contains(device)) {
+            return false;
+        }
+        self.total += 1;
+        if !device.is_empty() {
+            self.devices.insert(device.to_owned());
+        }
+        true
+    }
+}
 
 struct Flight(Option<String>);
 
@@ -1265,24 +1286,21 @@ impl Flight {
     /// per device, only by the global cap).
     fn enter(device: &str) -> Result<Self, Failure> {
         let mut running = FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        if running.len() >= MAX_TRANSFORMS || (!device.is_empty() && running.contains(device)) {
+        // Tests run many transforms at once with no device; the cap itself is tested on `admit`.
+        let max = if cfg!(test) { 4096 } else { MAX_TRANSFORMS };
+        if !running.admit(device, max) {
             return Err(Code::Busy.failure());
         }
-        if device.is_empty() {
-            return Ok(Self(None));
-        }
-        running.insert(device.to_owned());
-        Ok(Self(Some(device.to_owned())))
+        Ok(Self((!device.is_empty()).then(|| device.to_owned())))
     }
 }
 
 impl Drop for Flight {
     fn drop(&mut self) {
+        let mut running = FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        running.total = running.total.saturating_sub(1);
         if let Some(device) = self.0.take() {
-            FLIGHT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&device);
+            running.devices.remove(&device);
         }
     }
 }
@@ -1322,13 +1340,25 @@ fn html_document(
     let mut hrefs = shape.stylesheets.clone();
     hrefs.sort_unstable();
     hrefs.dedup();
-    let sheets: Vec<(String, String)> = hrefs
-        .into_iter()
-        .filter_map(|href| {
-            let text = html::Sheets::load(&folder_sheets, &href)?;
-            Some((href, text))
-        })
-        .collect();
+    // `a.css`, `./a.css` and `././a.css` are one file: it is read, counted and budgeted once, and
+    // every href that names it keeps its own key for the inliner.
+    let mut loaded: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut sheets: Vec<(String, String)> = Vec::new();
+    for href in hrefs {
+        let Some(canonical) = folder_sheets.resolve(&href) else {
+            continue;
+        };
+        if !loaded.contains_key(&canonical) {
+            if loaded.len() >= sandbox::MAX_SHEETS {
+                return Err(Code::TooLarge.failure());
+            }
+            let text = folder_sheets.read(&canonical);
+            loaded.insert(canonical.clone(), text);
+        }
+        if let Some(Some(text)) = loaded.get(&canonical) {
+            sheets.push((href, text.clone()));
+        }
+    }
     // The style the inliner parses: every `<style>`, then the sheets, joined with newlines.
     let css: String = shape
         .styles
@@ -1491,8 +1521,9 @@ struct FolderSheets {
     used: AtomicU64,
 }
 
-impl html::Sheets for FolderSheets {
-    fn load(&self, href: &str) -> Option<String> {
+impl FolderSheets {
+    /// The canonical path of the stylesheet `href` names, when it may be read.
+    fn resolve(&self, href: &str) -> Option<PathBuf> {
         let reference = href.split(['?', '#']).next()?;
         let relative = html::normalize_relative(&html::percent_decode(reference))?;
         if html::extension(&relative).as_deref() != Some("css") {
@@ -1506,7 +1537,11 @@ impl html::Sheets for FolderSheets {
         if !canonical.starts_with(&self.folder) || self.guard.denied(&canonical) {
             return None;
         }
-        let (mut file, metadata) = open_regular(&canonical).ok()?;
+        Some(canonical)
+    }
+
+    fn read(&self, canonical: &Path) -> Option<String> {
+        let (mut file, metadata) = open_regular(canonical).ok()?;
         if metadata.len() > MAX_SHEET_BYTES {
             return None;
         }
@@ -1517,6 +1552,12 @@ impl html::Sheets for FolderSheets {
         let mut text = Vec::new();
         file.read_to_end(&mut text).ok()?;
         Some(String::from_utf8_lossy(&text).into_owned())
+    }
+}
+
+impl html::Sheets for FolderSheets {
+    fn load(&self, href: &str) -> Option<String> {
+        self.read(&self.resolve(href)?)
     }
 }
 

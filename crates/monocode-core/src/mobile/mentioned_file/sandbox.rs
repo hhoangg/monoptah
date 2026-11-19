@@ -46,7 +46,8 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_OUTPUT_BYTES: usize = MENTIONED_FILE_MAX_BYTES as usize + 1024 * 1024;
 /// The most a child reads (a 4 MiB document and up to 8 MiB of stylesheets, with framing).
 const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_SHEETS: usize = 1024;
+/// The most distinct stylesheets a request may carry.
+pub const MAX_SHEETS: usize = 1024;
 const REQUEST_MAGIC: &[u8; 4] = b"MPQ1";
 const REPLY_MAGIC: &[u8; 4] = b"MPR1";
 
@@ -162,15 +163,44 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// The stylesheets by content: each distinct text once, with every `href` that names it (the
+/// inliner asks for the raw `href`, so `a.css` and `./a.css` must both resolve).
+fn sheet_groups(sheets: &[(String, String)]) -> Vec<(&str, Vec<&str>)> {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    for (href, text) in sheets {
+        let at = *index.entry(text.as_str()).or_insert_with(|| {
+            groups.push((text.as_str(), Vec::new()));
+            groups.len() - 1
+        });
+        groups[at].1.push(href.as_str());
+    }
+    groups
+}
+
 pub fn encode_request(input: &Input) -> Vec<u8> {
     let mut out = REQUEST_MAGIC.to_vec();
     put(&mut out, input.html.as_bytes());
-    out.extend_from_slice(&(input.sheets.len() as u32).to_le_bytes());
-    for (href, text) in &input.sheets {
-        put(&mut out, href.as_bytes());
+    let groups = sheet_groups(&input.sheets);
+    out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+    for (text, hrefs) in groups {
         put(&mut out, text.as_bytes());
+        out.extend_from_slice(&(hrefs.len() as u32).to_le_bytes());
+        for href in hrefs {
+            put(&mut out, href.as_bytes());
+        }
     }
     out
+}
+
+/// The encoded request, or `None` when the child would refuse it: too many distinct
+/// stylesheets, or more bytes than it reads.
+pub fn checked_request(input: &Input) -> Option<Vec<u8>> {
+    if sheet_groups(&input.sheets).len() > MAX_SHEETS {
+        return None;
+    }
+    let request = encode_request(input);
+    (request.len() as u64 <= MAX_REQUEST_BYTES).then_some(request)
 }
 
 pub fn decode_request(data: &[u8]) -> Option<Input> {
@@ -182,7 +212,11 @@ pub fn decode_request(data: &[u8]) -> Option<Input> {
     }
     let mut sheets = Vec::new();
     for _ in 0..count {
-        sheets.push((cursor.text()?, cursor.text()?));
+        let text = cursor.text()?;
+        let hrefs = cursor.number()?;
+        for _ in 0..hrefs {
+            sheets.push((cursor.text()?, text.clone()));
+        }
     }
     cursor.done().then_some(Input { html, sheets })
 }
@@ -293,9 +327,11 @@ impl Limits {
 
 /// Transforms `input` in a child process running `exe` (the app's own executable).
 pub fn transform_isolated(exe: &Path, input: &Input) -> Result<html::Document, Failure> {
+    // Refuse before spawning what the child would refuse after reading it.
+    let request = checked_request(input).ok_or_else(too_complex)?;
     let mut command = Command::new(exe);
     command.arg(CHILD_ARG);
-    run_command(command, encode_request(input), &Limits::DEFAULT)
+    run_command(command, request, &Limits::DEFAULT)
 }
 
 struct KillOnDrop(Child);
@@ -319,6 +355,12 @@ pub fn run_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: no console window flashes for the child.
+        command.creation_flags(0x0800_0000);
+    }
     #[cfg(windows)]
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
@@ -381,6 +423,49 @@ mod tests {
             assets: vec!["a/b.png".into(), "c.png".into()],
         };
         assert_eq!(decode_reply(&encode_reply(&document)), Some(document));
+    }
+
+    #[test]
+    fn sheets_with_the_same_content_travel_once_and_keep_every_href() {
+        let input = Input {
+            html: String::new(),
+            sheets: vec![
+                ("a.css".into(), "p{}".into()),
+                ("./a.css".into(), "p{}".into()),
+                ("b.css".into(), "q{}".into()),
+            ],
+        };
+        let decoded = decode_request(&encode_request(&input)).unwrap();
+        let mut keys: Vec<_> = decoded
+            .sheets
+            .iter()
+            .map(|(h, t)| (h.as_str(), t.as_str()))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [("./a.css", "p{}"), ("a.css", "p{}"), ("b.css", "q{}")]
+        );
+        assert_eq!(sheet_groups(&input.sheets).len(), 2);
+    }
+
+    #[test]
+    fn a_request_the_child_would_refuse_is_not_sent() {
+        let many = Input {
+            html: String::new(),
+            sheets: (0..=MAX_SHEETS)
+                .map(|n| (format!("{n}.css"), format!("p{n}{{}}")))
+                .collect(),
+        };
+        assert!(checked_request(&many).is_none());
+        let big = Input {
+            html: "x".repeat(MAX_REQUEST_BYTES as usize),
+            sheets: Vec::new(),
+        };
+        assert!(checked_request(&big).is_none());
+        assert!(checked_request(&input()).is_some());
+        // Not spawned at all: the executable does not exist, yet the refusal is the same.
+        assert!(transform_isolated(Path::new("/nonexistent/exe"), &many).is_err());
     }
 
     #[test]

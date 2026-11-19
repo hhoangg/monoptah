@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 use html5ever::{
@@ -37,7 +38,12 @@ const MAX_WORK: usize = 40_000_000;
 /// Most distinct words kept; past it every rule counts as reaching everything.
 const MAX_WORDS: usize = 200_000;
 /// The source is fed to the parser in slices of this many bytes.
-const SLICE_BYTES: usize = 16 * 1024;
+const SLICE_BYTES: usize = 4 * 1024;
+/// Most attributes one tag may have: the tokenizer compares every new attribute with the
+/// earlier ones of its tag, so a tag with 200 000 of them takes seconds.
+const MAX_ATTRIBUTES: usize = 1024;
+/// Longest the parse may run.
+const DEADLINE: Duration = Duration::from_secs(1);
 const NONE: usize = usize::MAX;
 
 /// What the pre-pass measured.
@@ -348,6 +354,79 @@ impl TreeSink for Sink {
 
 /// Measures `source`, or refuses it when its tree would exceed the limits.
 pub fn scan(source: &str) -> Result<Shape, Refused> {
+    scan_within(source, DEADLINE)
+}
+
+/// Counts the attribute starts of every tag lexically, quoted values skipped. It may count more
+/// than the tokenizer does (a `<` in a script), never fewer; it runs in linear time.
+fn too_many_attributes(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'<' || !bytes.get(at + 1).is_some_and(u8::is_ascii_alphabetic) {
+            at += 1;
+            continue;
+        }
+        at += 1;
+        while at < bytes.len()
+            && !bytes[at].is_ascii_whitespace()
+            && !matches!(bytes[at], b'/' | b'>')
+        {
+            at += 1;
+        }
+        let mut count = 0;
+        while at < bytes.len() && bytes[at] != b'>' {
+            if bytes[at].is_ascii_whitespace() || bytes[at] == b'/' {
+                at += 1;
+                continue;
+            }
+            count += 1;
+            if count > MAX_ATTRIBUTES {
+                return true;
+            }
+            // The name (a leading `=` belongs to it, as in the tokenizer).
+            at += 1;
+            while at < bytes.len()
+                && !bytes[at].is_ascii_whitespace()
+                && !matches!(bytes[at], b'=' | b'/' | b'>')
+            {
+                at += 1;
+            }
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            if bytes.get(at) != Some(&b'=') {
+                continue;
+            }
+            at += 1;
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            match bytes.get(at) {
+                Some(&quote @ (b'"' | b'\'')) => {
+                    at += 1;
+                    while at < bytes.len() && bytes[at] != quote {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                _ => {
+                    while at < bytes.len() && !bytes[at].is_ascii_whitespace() && bytes[at] != b'>'
+                    {
+                        at += 1;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn scan_within(source: &str, deadline: Duration) -> Result<Shape, Refused> {
+    if too_many_attributes(source) {
+        return Err(Refused);
+    }
+    let started = Instant::now();
     let state = Rc::new(RefCell::new(State::default()));
     let document = {
         let mut inner = state.borrow_mut();
@@ -366,6 +445,9 @@ pub fn scan(source: &str) -> Result<Shape, Refused> {
         let mut parser = parse_document(sink, ParseOpts::default());
         let mut rest = source;
         while !rest.is_empty() {
+            if started.elapsed() > deadline {
+                resume_unwind(Box::new(Overflow));
+            }
             let mut cut = SLICE_BYTES.min(rest.len());
             while !rest.is_char_boundary(cut) {
                 cut += 1;
@@ -373,6 +455,9 @@ pub fn scan(source: &str) -> Result<Shape, Refused> {
             let (slice, tail) = rest.split_at(cut);
             parser.process(StrTendril::from_slice(slice));
             rest = tail;
+        }
+        if started.elapsed() > deadline {
+            resume_unwind(Box::new(Overflow));
         }
         parser.finish();
     }));
@@ -447,6 +532,32 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(scan(&bomb).is_err());
         assert!(started.elapsed().as_secs() < 3, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_tag_with_200k_attributes_is_refused_quickly() {
+        let attrs: String = (0..200_000).map(|n| format!(" a{n}")).collect();
+        let page = format!("<p{attrs}>x</p>");
+        let started = Instant::now();
+        assert!(scan(&page).is_err());
+        assert!(started.elapsed().as_secs() < 2, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn attributes_are_counted_per_tag_and_quoted_values_are_skipped() {
+        let many: String = (0..1000).map(|n| format!(" a{n}='x y z'")).collect();
+        let page = format!("<p{many}>x</p>").repeat(20);
+        assert!(scan(&page).is_ok());
+        let over: String = (0..1025).map(|n| format!(" a{n}")).collect();
+        assert!(scan(&format!("<p{over}>")).is_err());
+        assert!(scan("<a href='x > y z w' class=\"a b\" id=i>t</a>").is_ok());
+    }
+
+    #[test]
+    fn a_parse_past_the_deadline_is_refused() {
+        let page = "<p>hello</p>".repeat(1_000);
+        assert!(scan_within(&page, Duration::ZERO).is_err());
+        assert!(scan(&page).is_ok());
     }
 
     #[test]

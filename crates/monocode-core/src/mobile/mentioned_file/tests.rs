@@ -636,6 +636,33 @@ fn html_is_served_as_a_sanitized_document_with_placeholders() {
 }
 
 #[test]
+fn spellings_of_one_stylesheet_path_apply_it_and_count_once() {
+    let fx = Fx::new();
+    fx.write("site/a.css", "h1 { color: red }");
+    fx.write(
+        "site/p.html",
+        concat!(
+            "<html><head><link rel=stylesheet href=a.css>",
+            "<link rel=stylesheet href=./a.css><link rel=stylesheet href=././a.css></head>",
+            "<body><h1>T</h1></body></html>",
+        ),
+    );
+    let site = fx.path("site");
+    let reply = run(&["`p.html`"], &site, &params("p.html")).unwrap();
+    assert!(reply.data.contains("color: red"), "{}", reply.data);
+}
+
+#[test]
+fn a_call_without_a_device_counts_toward_the_global_transform_limit() {
+    let mut state = FlightState::default();
+    for _ in 0..MAX_TRANSFORMS {
+        assert!(state.admit("", MAX_TRANSFORMS));
+    }
+    assert!(!state.admit("", MAX_TRANSFORMS));
+    assert!(!state.admit("phone", MAX_TRANSFORMS));
+}
+
+#[test]
 fn html_pages_cut_on_character_boundaries() {
     let fx = Fx::new();
     fx.write("p.html", format!("<p>{}</p>", "é€😀".repeat(30)));
