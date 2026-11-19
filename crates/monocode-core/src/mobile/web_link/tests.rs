@@ -1072,7 +1072,23 @@ fn a_silent_relay_is_treated_as_lost_after_the_read_deadline() {
         let silent = stub.accept().await;
         status_is(&env.host, WebState::Connected).await;
         let started = std::time::Instant::now();
-        status_is(&env.host, WebState::Offline).await;
+        // Offline lasts only the backoff jitter (0 to 40 ms) before the next
+        // attempt shows Connecting, which then waits on the accept below. So
+        // wait for the link to give the socket up, not for that brief state.
+        let left = within(async {
+            loop {
+                let status = env.host.web_status();
+                if status.state != WebState::Connected {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            matches!(left.state, WebState::Offline | WebState::Connecting),
+            "{left:?}"
+        );
         assert!(started.elapsed() >= Duration::from_millis(200));
         let second = within(stub.accept()).await;
         assert_eq!(second.path, format!("/relay/desktop/{DESKTOP_UUID}"));
