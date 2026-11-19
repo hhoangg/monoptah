@@ -61,6 +61,7 @@ fn write_row(path: &str) -> String {
 }
 
 /// A tool row of `name` with `input` and `output`.
+#[cfg(unix)]
 fn tool_row_of(name: &str, input: &str, output: &str) -> String {
     let mut call = crate::tool::ToolCall::new("1", name);
     call.state = crate::tool::ToolState::Completed;
