@@ -3,6 +3,7 @@ import {
   METHODS,
   METHOD_CLASSES,
   METHOD_LIST,
+  FolderCardSchema,
   SessionStartTargetSchema,
   RuntimeModeSchema,
   classify,
@@ -76,6 +77,10 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
   "session.rename": { params: { conversationId: "s1", title: "New title" }, result: Ok },
   "session.archive": { params: { conversationId: "s1", cloud: "stop" }, result: Ok },
   "session.delete": { params: { conversationId: "s1" }, result: Ok },
+  "folder.create": { params: { projectId: "p1", conversationIds: ["s1", "s2"], name: "Docs" }, result: { folderId: "f1" } },
+  "folder.rename": { params: { projectId: "p1", folderId: "f1", name: "Specs" }, result: { folderId: "f1" } },
+  "folder.move": { params: { projectId: "p1", conversationId: "s1", folderId: null }, result: { folderId: null } },
+  "folder.delete": { params: { projectId: "p1", folderId: "f1" }, result: { folderId: "f1" } },
   "project.changes": {
     params: { projectId: "p1" },
     result: { branch: "main", files: [{ relative: "src/a.ts", status: "modified", additions: 1, deletions: 0, staged: false, unstaged: true, lines: [{ kind: "add", text: "x", oldNumber: null, newNumber: 1 }] }] },
@@ -108,6 +113,7 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
       projects: [{ id: "p1", name: "app", path: "/work/app", branch: "main", additions: 0, deletions: 0 }],
       monos: [{ id: "m1", name: "Ada", mascot: "cat", color: "#aabbcc", projectIds: ["p1"], unread: 0, status: "idle", lastMessage: "", lastActiveAt: 1 }],
       sessions: [session],
+      folders: [{ id: "f1", projectId: "p1", name: "Docs", sessionIds: ["s1"], collapsed: true, colorIndex: 3, customColor: "#aabbcc" }],
       monoTools: true,
       monoFiles: true,
       push: true,
@@ -241,6 +247,36 @@ describe("param validation", () => {
     const archive = METHODS["session.archive"].params;
     expect(archive.safeParse({ conversationId: "s", cloud: "keep" }).success).toBe(true);
     expect(archive.safeParse({ conversationId: "s", cloud: "delete" }).success).toBe(false);
+  });
+  it("the folder methods are control class and validate ids and names", () => {
+    for (const name of ["folder.create", "folder.rename", "folder.move", "folder.delete"] as const) {
+      expect(METHODS[name].class).toBe("control");
+      expect(classify(name, {})).toBe("control");
+    }
+    const create = METHODS["folder.create"].params;
+    expect(create.safeParse({ projectId: "p", conversationIds: ["s"] }).success).toBe(true);
+    expect(create.safeParse({ projectId: "p", conversationIds: [] }).success).toBe(false);
+    expect(create.safeParse({ projectId: "p", conversationIds: Array.from({ length: 51 }, (_, i) => `s${i}`) }).success).toBe(false);
+    expect(create.safeParse({ projectId: "p", conversationIds: ["s"], name: "  " }).success).toBe(false);
+    expect(create.safeParse({ projectId: "p", conversationIds: ["s"], name: "x".repeat(101) }).success).toBe(false);
+    expect(create.safeParse({ conversationIds: ["s"] }).success).toBe(false);
+    const rename = METHODS["folder.rename"].params;
+    expect(rename.safeParse({ projectId: "p", folderId: "f", name: "A" }).success).toBe(true);
+    expect(rename.safeParse({ projectId: "p", folderId: "f", name: "" }).success).toBe(false);
+    const move = METHODS["folder.move"].params;
+    expect(move.safeParse({ projectId: "p", conversationId: "s", folderId: null }).success).toBe(true);
+    expect(move.safeParse({ projectId: "p", conversationId: "s", folderId: "f" }).success).toBe(true);
+    expect(move.safeParse({ projectId: "p", conversationId: "s" }).success).toBe(false);
+    expect(METHODS["folder.delete"].params.safeParse({ projectId: "p", folderId: "" }).success).toBe(false);
+  });
+  it("a folder card needs a hex custom color and keeps unknown fields", () => {
+    const card = { id: "f", projectId: "p", name: "N", sessionIds: ["s"] };
+    expect(FolderCardSchema.safeParse(card).success).toBe(true);
+    expect(FolderCardSchema.safeParse({ ...card, customColor: "red" }).success).toBe(false);
+    expect(FolderCardSchema.parse({ ...card, future: 1 })).toMatchObject({ future: 1 });
+    // A catalog from an older desktop has no folders.
+    const { folders: _folders, ...older } = fixtures["workspace.list"].result as Record<string, unknown>;
+    expect(METHODS["workspace.list"].result.safeParse(older).success).toBe(true);
   });
   it("cloud.stop takes a session or an instance", () => {
     const stop = METHODS["cloud.stop"].params;

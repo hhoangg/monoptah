@@ -97,6 +97,26 @@
       "transport": "host"
     },
     {
+      "name": "folder.create",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "folder.delete",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "folder.move",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "folder.rename",
+      "class": "control",
+      "transport": "app"
+    },
+    {
       "name": "models.list",
       "class": "read",
       "transport": "app"
