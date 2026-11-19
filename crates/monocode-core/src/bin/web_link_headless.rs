@@ -53,6 +53,13 @@
 //!                                          outside the projects is then `forbidden`)
 //! ```
 //!
+//! Seeding a Mono (environment of the `serve` process):
+//!
+//! ```text
+//! WEB_LINK_HEADLESS_MONO=1   publish one Mono `e2e-mono` ("E2E Mono") in the catalog; its chat, the conversation
+//!                            `mono:e2e-mono`, is the same fake conversation as `e2e-session` (shared state)
+//! ```
+//!
 //! The conversation id is `e2e-session`. The seeded assistant message is the only one that authorizes paths (the
 //! fake `Echo:` turns do not). The folder is also the project `e2e-project` (selected when the device selection is
 //! all or lists it), so replies carry `project`. Files and subfolders are read at request time: a spec may create
@@ -262,6 +269,19 @@ const PROJECT_ID: &str = "e2e-project";
 const PROJECT_NAME: &str = "E2E Project";
 const SESSION_ID: &str = "e2e-session";
 const SESSION_TITLE: &str = "E2E session";
+/// The Mono published when `WEB_LINK_HEADLESS_MONO` is set, and its conversation id (`mono:<id>`).
+const MONO_ID: &str = "e2e-mono";
+const MONO_CONVERSATION: &str = "mono:e2e-mono";
+
+/// Whether the environment asks for the Mono (see the module docs).
+fn mono_enabled() -> bool {
+    std::env::var("WEB_LINK_HEADLESS_MONO").is_ok_and(|value| !value.is_empty())
+}
+
+/// The conversations the fake app knows: the session, and the Mono's chat when it is published.
+fn is_known_conversation(id: Option<&str>) -> bool {
+    id == Some(SESSION_ID) || (mono_enabled() && id == Some(MONO_CONVERSATION))
+}
 /// How long the fake assistant "thinks" before its reply; a `conversation.send` whose text holds
 /// [`HOLD_MARKER`] never gets one until `session.cancel` ends it. It is well above the watch pacer interval
 /// (500 ms, `web_link/pacer.rs`), so the busy frame and the reply frame can never be merged into one.
@@ -423,10 +443,16 @@ impl Conversation {
         }));
     }
 
-    /// `conversation.read`.
+    /// `conversation.read` of the session.
+    #[cfg(test)]
     fn read(&self) -> Value {
+        self.read_as(SESSION_ID)
+    }
+
+    /// `conversation.read` of the conversation `id`.
+    fn read_as(&self, id: &str) -> Value {
         json!({
-            "id": SESSION_ID,
+            "id": id,
             "turns": self.turns,
             "busy": self.busy,
             "usageLimit": null,
@@ -481,6 +507,17 @@ impl Conversation {
 
 /// The catalog the fake app publishes (the values of `web/e2e/lib/catalog.ts`).
 fn e2e_catalog() -> Value {
+    let monos = if mono_enabled() {
+        json!([{
+            "id": MONO_ID,
+            "name": "E2E Mono",
+            "projectIds": [PROJECT_ID],
+            "unread": 0,
+            "status": "idle",
+        }])
+    } else {
+        json!([])
+    };
     json!({
         "projects": [{
             "id": PROJECT_ID,
@@ -488,7 +525,7 @@ fn e2e_catalog() -> Value {
             "path": "/e2e/project",
             "branch": "main",
         }],
-        "monos": [],
+        "monos": monos,
         "sessions": [{
             "id": SESSION_ID,
             "projectId": PROJECT_ID,
@@ -558,7 +595,7 @@ fn app_loop(
                     request.reply(result);
                 }
                 Event::Watch(start) => {
-                    if start.conversation_id == SESSION_ID {
+                    if is_known_conversation(Some(start.conversation_id.as_str())) {
                         say(
                             &lines,
                             json!({"event": "watch", "action": "start", "conversationId": start.conversation_id}),
@@ -694,10 +731,14 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
 }
 
 fn answer(conversation: &mut Conversation, request: &Request) -> Result<Value, Failure> {
-    let known = request.params["conversationId"].as_str() == Some(SESSION_ID);
+    let known = is_known_conversation(request.params["conversationId"].as_str());
     match request.method.as_str() {
         "chat.mentionedFile" => answer_mentioned(request),
-        "conversation.read" if known => Ok(conversation.read()),
+        "conversation.read" if known => Ok(conversation.read_as(
+            request.params["conversationId"]
+                .as_str()
+                .unwrap_or(SESSION_ID),
+        )),
         "conversation.send" if known => match request.params["text"].as_str() {
             Some(text) if !text.is_empty() => {
                 conversation.send(text, Instant::now());

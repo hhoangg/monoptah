@@ -241,7 +241,7 @@ function MessageExtras({ root, reactions }: { root: React.RefObject<HTMLDivEleme
             <button
               type="button"
               aria-label="Message actions"
-              className="mt-1 ml-5 sr-only min-h-11 items-center gap-1.5 rounded-pill bg-fill px-3 text-small text-muted-text focus-visible:not-sr-only focus-visible:inline-flex pointer-fine:min-h-9"
+              className="sr-only items-center gap-1.5 rounded-pill bg-fill text-small text-muted-text focus-visible:not-sr-only focus-visible:mt-1 focus-visible:ml-5 focus-visible:inline-flex focus-visible:min-h-11 focus-visible:px-3 pointer-fine:focus-visible:min-h-9"
               onClick={(event) => openMenuAt(event.currentTarget)}
             >
               <Icon name="more" size={16} />
