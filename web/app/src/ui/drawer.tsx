@@ -4,6 +4,7 @@ import type { ComponentProps } from "react";
 import "@/styles/vaul.css";
 import { Drawer as DrawerPrimitive } from "vaul";
 import { cn } from "@/lib/utils";
+import { useOverlayOwnerAttr } from "./overlayOwner";
 
 // Sheet (design-system.md section 8 maps ModalSheet and the touch ChoiceMenu to vaul Drawer):
 // bg sheet, top radius 32, scrim .4, grabber 36x5 radius 2.5 in `faint`, max height 92dvh,
@@ -14,8 +15,10 @@ export const DrawerPortal = DrawerPrimitive.Portal;
 export const DrawerClose = DrawerPrimitive.Close;
 
 export function DrawerOverlay({ className, ...props }: ComponentProps<typeof DrawerPrimitive.Overlay>) {
+  const owner = useOverlayOwnerAttr();
   return (
     <DrawerPrimitive.Overlay
+      {...owner}
       data-slot="drawer-overlay"
       className={cn("fixed inset-0 z-50 bg-[var(--scrim)]", className)}
       {...props}
@@ -24,10 +27,12 @@ export function DrawerOverlay({ className, ...props }: ComponentProps<typeof Dra
 }
 
 export function DrawerContent({ className, children, ...props }: ComponentProps<typeof DrawerPrimitive.Content>) {
+  const owner = useOverlayOwnerAttr();
   return (
     <DrawerPortal>
       <DrawerOverlay />
       <DrawerPrimitive.Content
+        {...owner}
         data-slot="drawer-content"
         className={cn(
           "fixed inset-x-0 bottom-0 z-50 mt-24 flex max-h-[92dvh] flex-col rounded-t-sheet border border-b-0 border-stroke bg-sheet pb-[calc(env(safe-area-inset-bottom)+1rem)] text-content",

@@ -2,6 +2,7 @@ import { Dialog as DialogPrimitive } from "radix-ui";
 import { useRef, type ComponentProps } from "react";
 import { cn } from "@/lib/utils";
 import { Icon } from "./Icon";
+import { useOverlayOwnerAttr } from "./overlayOwner";
 
 // Dialog (design-system.md section 8): bg sheet, radius 20, padding 20, gap 16, scrim .4, no shadow.
 export const Dialog = DialogPrimitive.Root;
@@ -10,8 +11,10 @@ export const DialogPortal = DialogPrimitive.Portal;
 export const DialogClose = DialogPrimitive.Close;
 
 export function DialogOverlay({ className, ...props }: ComponentProps<typeof DialogPrimitive.Overlay>) {
+  const owner = useOverlayOwnerAttr();
   return (
     <DialogPrimitive.Overlay
+      {...owner}
       data-slot="dialog-overlay"
       className={cn(
         "fixed inset-0 z-50 bg-[var(--scrim)] data-[state=open]:animate-[fade-in_180ms_var(--ease-out-cubic)] data-[state=closed]:animate-[fade-out_180ms_var(--ease-out-cubic)]",
@@ -33,10 +36,12 @@ export function DialogContent({
   // Radix returns focus only to a `DialogTrigger`. Dialogs here are mostly controlled (opened from state), so without
   // this focus would fall to the page body when they close and a keyboard user would lose their place.
   const opener = useRef<HTMLElement | null>(null);
+  const owner = useOverlayOwnerAttr();
   return (
     <DialogPortal>
       <DialogOverlay />
       <DialogPrimitive.Content
+        {...owner}
         data-slot="dialog-content"
         onOpenAutoFocus={(event) => {
           opener.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;

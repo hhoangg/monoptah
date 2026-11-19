@@ -18,7 +18,7 @@
 // - F-47 morph (design-system.md section 6.2 and the Composer row): at rest the glass is a one-line pill, 50 px
 //   high with 25 px corners: add, dictation, the field and Send in one row; the workspace row and the model
 //   controls are clipped to nothing (still in the DOM, so a Tab into them focuses and opens the card). It becomes
-//   the card (26 px corners, field min 64, two rows) while the field or a keyboard-focused control has focus, a draft, an attachment, a notice or an
+//   the card (26 px corners, field min 64, two rows) once the field or a keyboard-focused control took focus (it stays until the user interacts outside), a draft, an attachment, a notice or an
 //   error. The size change is a `motion` layout animation of 280 ms out-cubic (`--ease-out-cubic`); motion writes
 //   through the CSSOM, so the CSP needs no inline style attribute. With `prefers-reduced-motion` it is instant.
 //   `data-shape` says which one it is.
@@ -27,6 +27,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type 
 import { DictationButton } from "@/features/dictation";
 import { cn } from "@/lib/utils";
 import { Glass } from "@/ui/Glass";
+import { OverlayOwnerContext } from "@/ui/overlayOwner";
 import { Icon } from "@/ui/Icon";
 import { sessionErrorContent } from "@/features/transcript/sessionError";
 import { SessionErrorDialog } from "@/features/transcript/TurnDialogs";
@@ -56,8 +57,6 @@ export const STOP_ARM_DELAY_MS = 500;
 /** How long after a resolved cancel request Stop may be pressed again while the turn still runs. */
 export const STOP_RETRY_MS = 4000;
 export const UNKNOWN_ERROR_SENTENCE = "Something went wrong. Try again, or check the desktop.";
-/** How long a finger press is held while waiting for its click (the compatibility mouse events and click follow at once). */
-const TOUCH_CLICK_WAIT_MS = 500;
 const INPUT_MIN_PX = 64;
 const INPUT_MAX_PX = 160;
 /** The resting pill: a one-line field with fully round ends. */
@@ -115,6 +114,16 @@ function isKeyboardFocus(target: EventTarget): boolean {
   }
 }
 
+/**
+ * True when `target` is in the composer's card or in an overlay opened from it. The shared `ui` menus, sheets and
+ * dialogs mark their portaled DOM with this composer's `owner` id (`OverlayOwnerContext` crosses portals), so an
+ * unrelated overlay, or the one of another composer, is not inside.
+ */
+function isInsideComposer(field: HTMLElement | null, owner: string, target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  return !!field?.closest("[data-shape]")?.contains(target) || target.closest(`[data-overlay-owner="${owner}"]`) !== null;
+}
+
 export function Composer({ onSubmit, busy = false, onStop, readOnly = false, requestControl, offline = false, notice, toolbar, topRow, configError, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
   const [text, setText] = useState(initialText);
   useEffect(() => {
@@ -140,54 +149,52 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   const [detailsOpen, setDetailsOpen] = useState(false);
   const reducedMotion = useReducedMotion();
   const [focusWithin, setFocusWithin] = useState(false);
-  // A press elsewhere on the page blurs the field, and collapsing the card then shrinks the composer (its chips become
-  // 0x0 in the pill), so the press lands on something else and its click is lost (only the chips that open on click, the
-  // model and the target, lost the tap: the access and workspace menus open on pointerdown). The collapse
-  // waits until the press ends (after the click has been dispatched). With a mouse the blur comes on pointerdown. With
-  // a finger WebKit moves the focus only on the compatibility `mousedown` that follows `pointerup` and `touchend`, so the
-  // press is held until the `click` (or a short timeout when none comes, e.g. the finger moved).
-  const pressed = useRef(false);
-  const collapseTimer = useRef<number | undefined>(undefined);
+  // The card stays open until the user interacts OUTSIDE the composer, presses Escape in the field, or sends on a phone.
+  // It never closes because focus moved between controls inside it: WebKit on iOS blurs the field with an empty value
+  // when a chip is tapped, and collapsing then shrank the chips to 0x0 so the tap was lost. Blur timing plays no part.
+  // The pickers opened from the composer (menus, sheets, dialogs) count as inside, see `isInsideComposer`.
+  //
+  // `press` is the press in progress: where it started. It is state, not a timer.
+  // - An outside press collapses the card when it ENDS (its `click`, or `pointercancel`), not on the way down, so the
+  //   content under the pointer does not shift before the click lands.
+  // - A `focusin` during a press is not the user leaving: a tap on a button inside moves WebKit's focus to the page, and
+  //   a mouse press outside focuses the thing pressed. Only a focus change with no press (the keyboard) collapses.
+  // - `press` is cleared when the press ends (a mouse press inside ends at `pointerup`; its focus moved on `mousedown`; a
+  //   touch press ends at its `click` or `pointercancel`, after the compatibility `mousedown` moved the focus) and by any key.
+  const owner = useId();
+  const press = useRef<"inside" | "outside" | null>(null);
   useEffect(() => {
-    let clickTimer: number | undefined;
-    const stopWaiting = () => {
-      window.clearTimeout(clickTimer);
-      window.removeEventListener("click", settle, true);
-    };
-    const settle = () => {
-      stopWaiting();
-      pressed.current = false;
-      window.clearTimeout(collapseTimer.current);
-      collapseTimer.current = window.setTimeout(() => {
-        if (!area.current?.closest("[data-shape]")?.contains(document.activeElement)) setFocusWithin(false);
-      }, 0);
-    };
-    const down = () => {
-      // A new press ends the wait of the earlier finger tap, so its leftover timer cannot release this press early.
-      stopWaiting();
-      pressed.current = true;
+    const down = (event: Event) => {
+      press.current = isInsideComposer(area.current, owner, event.target) ? "inside" : "outside";
     };
     const up = (event: PointerEvent) => {
-      if (!pressed.current) return;
-      if (event.type === "pointerup" && (event.pointerType === "touch" || event.pointerType === "pen")) {
-        stopWaiting();
-        window.addEventListener("click", settle, true);
-        clickTimer = window.setTimeout(settle, TOUCH_CLICK_WAIT_MS);
-        return;
-      }
-      settle();
+      if (event.pointerType === "mouse" && press.current === "inside") press.current = null;
+    };
+    const end = () => {
+      if (press.current === "outside") setFocusWithin(false);
+      press.current = null;
+    };
+    const focus = (event: Event) => {
+      if (press.current === null && !isInsideComposer(area.current, owner, event.target)) setFocusWithin(false);
+    };
+    const key = () => {
+      press.current = null;
     };
     window.addEventListener("pointerdown", down, true);
     window.addEventListener("pointerup", up, true);
-    window.addEventListener("pointercancel", up, true);
+    window.addEventListener("pointercancel", end, true);
+    window.addEventListener("click", end, true);
+    window.addEventListener("focusin", focus, true);
+    window.addEventListener("keydown", key, true);
     return () => {
       window.removeEventListener("pointerdown", down, true);
       window.removeEventListener("pointerup", up, true);
-      window.removeEventListener("pointercancel", up, true);
-      stopWaiting();
-      window.clearTimeout(collapseTimer.current);
+      window.removeEventListener("pointercancel", end, true);
+      window.removeEventListener("click", end, true);
+      window.removeEventListener("focusin", focus, true);
+      window.removeEventListener("keydown", key, true);
     };
-  }, []);
+  }, [owner]);
 
   const hasDraft = text.trim().length > 0 || attachments.length > 0;
   const card = focusWithin || hasDraft || !!shownNotice || !!error;
@@ -289,7 +296,10 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
     // focus back to the field when it closes (it restores to the element focused when it opened: with the field blurred
     // that is the page body). A refused or cancelled send keeps the draft but leaves the field unfocused, which is fine.
     // A desktop layout keeps the focus to type the next message.
-    if (!desktopLayout) area.current?.blur();
+    if (!desktopLayout) {
+      area.current?.blur();
+      setFocusWithin(false);
+    }
     setSubmitting(true);
     setError(null);
     try {
@@ -348,8 +358,10 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   const describedBy = [readOnly ? reasonId : null, error ? errorId : null].filter(Boolean).join(" ") || undefined;
 
   return (
-    // The space under the pill is applied once, here: 0.75rem above the on-screen keyboard (lifted by `inset`), and
-    // otherwise the home-indicator safe area, never less than 0.75rem (a device without one keeps the small gap).
+    // Context crosses portals: the pickers opened from here mark their overlays as this composer's.
+    <OverlayOwnerContext.Provider value={owner}>
+    {/* The space under the pill is applied once, here: 0.75rem above the on-screen keyboard (lifted by `inset`), and
+        otherwise the home-indicator safe area, never less than 0.75rem (a device without one keeps the small gap). */}
     <div data-testid="composer" className={cn("pt-1", inset ? "pb-3" : "pb-[max(env(safe-area-inset-bottom),0.75rem)]", className)} style={inset ? { marginBottom: inset } : undefined}>
       <Glass
         className={cn("flex", card ? "flex-col gap-1 px-3 pb-2 pt-3" : "min-h-[50px] flex-row items-center gap-1 px-1.5 py-[3px]")}
@@ -368,9 +380,13 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           // collapses the card on pointerdown and moves the button. Keyboard activation is unaffected.
           if (event.target instanceof Element && event.target.closest("button") && !event.target.closest("[data-composer-extra]")) event.preventDefault();
         }}
-        onBlur={(event) => {
-          if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-          if (pressed.current) return;
+        onPointerDown={(event) => {
+          // A press on the resting pill (not on a button) opens the card; the clipped chips cannot be hit until it is open.
+          if (!card && !(event.target instanceof Element && event.target.closest("button"))) setFocusWithin(true);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "Escape" || event.defaultPrevented || event.target !== area.current) return;
+          area.current?.blur();
           setFocusWithin(false);
         }}
         onDragOver={(event) => {
@@ -524,5 +540,6 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
         </p>
       ) : null}
     </div>
+    </OverlayOwnerContext.Provider>
   );
 }
