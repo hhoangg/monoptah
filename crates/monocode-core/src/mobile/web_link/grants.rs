@@ -92,7 +92,19 @@ pub(crate) fn grant_fingerprint(public_key: &str) -> Option<String> {
 
 /// Sorts the server's grants into what to do. `rows` are the desktop's
 /// devices; only web rows count.
+#[cfg(test)]
 pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device], user_revoked: &[String]) -> Plan {
+    plan_listed(grants, &[], rows, user_revoked)
+}
+
+/// `plan`, where `unreadable` holds the ids of server entries that could not
+/// be parsed: they are still listed, so their rows stay.
+pub(crate) fn plan_listed(
+    grants: &[ServerGrant],
+    unreadable: &[String],
+    rows: &[Device],
+    user_revoked: &[String],
+) -> Plan {
     let web = |row: &&Device| row.kind == DeviceKind::Web;
     let by_server_id = |id: &str| {
         rows.iter().filter(web).find(|row| {
@@ -193,7 +205,9 @@ pub(crate) fn plan(grants: &[ServerGrant], rows: &[Device], user_revoked: &[Stri
         };
         let listed = grants
             .iter()
-            .any(|grant| grant.device_id.eq_ignore_ascii_case(id));
+            .map(|grant| grant.device_id.as_str())
+            .chain(unreadable.iter().map(String::as_str))
+            .any(|listed| listed.eq_ignore_ascii_case(id));
         if !listed && !plan.revoked_rows.contains(&row.id) {
             plan.revoked_rows.push(row.id.clone());
         }
@@ -433,6 +447,15 @@ mod tests {
         twin.permission = Some(Permission::Control);
         let plan = plan(&[listed, twin], &rows, &[]);
         assert_eq!(plan.revoked_rows, ["row-s3"]);
+    }
+
+    #[test]
+    fn a_listed_but_unreadable_grant_keeps_its_row() {
+        let rows = [web_row([1; 32], "s1", Permission::Control)];
+        let plan = plan_listed(&[], &["S1".to_owned()], &rows, &[]);
+        assert!(plan.revoked_rows.is_empty(), "{:?}", plan.revoked_rows);
+        let plan = plan_listed(&[], &[], &rows, &[]);
+        assert_eq!(plan.revoked_rows, ["row-s1"]);
     }
 
     #[test]

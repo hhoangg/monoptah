@@ -403,11 +403,12 @@ impl GrantSync {
     }
 
     fn once(&self) {
-        let Ok(grants) = desktop_api::desktop_grants(&self.base, &self.token) else {
+        let Ok((grants, unreadable)) = desktop_api::desktop_grants(&self.base, &self.token) else {
             return;
         };
         for (device_id, state, permission) in
-            self.host.apply_server_grants(&grants, self.generation)
+            self.host
+                .apply_server_grants_listed(&grants, &unreadable, self.generation)
         {
             // Best effort: the next sync repeats what the server still lacks.
             let answer = desktop_api::report_grant_state(

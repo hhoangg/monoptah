@@ -2102,6 +2102,20 @@ mod seam {
     }
 
     #[test]
+    fn a_grant_entry_with_an_id_but_a_missing_field_is_listed_as_unreadable() {
+        let body = r#"{"grants":[
+            {"deviceId":"ok","publicKey":"k","state":"confirmed"},
+            {"deviceId":"broken","state":"confirmed"},
+            {"publicKey":"k","state":"confirmed"}]}"#;
+        let handler: Handler = Arc::new(move |_| (200, body.into()));
+        let stub = world(handler, false);
+        let base = format!("http://127.0.0.1:{}", stub.hub.port);
+        let (grants, unreadable) = desktop_api::desktop_grants(&base, TOKEN).unwrap();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(unreadable, ["broken"]);
+    }
+
+    #[test]
     fn a_report_the_server_answers_404_or_409_is_gone() {
         let report = |status: u16, state: &str| {
             let handler: Handler = Arc::new(move |_| (status, r#"{"ok":true}"#.into()));

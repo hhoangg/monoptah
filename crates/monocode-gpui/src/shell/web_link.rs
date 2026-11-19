@@ -46,12 +46,9 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The name the web server shows for this desktop.
+/// The name the web server shows for this desktop: the same one phone pairing uses.
 fn machine_name() -> String {
-    ["HOSTNAME", "COMPUTERNAME"]
-        .iter()
-        .find_map(|key| std::env::var(key).ok().filter(|v| !v.trim().is_empty()))
-        .unwrap_or_else(|| "Desktop".into())
+    monocode_core::mobile::host::name()
 }
 
 /// The pending devices whose fingerprint was not announced yet.
@@ -351,10 +348,9 @@ impl Shell {
         let bridge = cx.default_global::<WebBridge>();
         bridge.notice = None;
         let generation = bridge.pairing_generation;
-        let name = machine_name();
         let task = cx
             .background_executor()
-            .spawn(async move { host.web_pair_start(&host_url, &name) });
+            .spawn(async move { host.web_pair_start(&host_url, &machine_name()) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| match result {

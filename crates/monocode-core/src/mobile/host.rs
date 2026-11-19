@@ -1482,9 +1482,9 @@ impl MobileHost {
         let mut verifier = Zeroizing::new([0u8; 32]);
         rand::rng().fill_bytes(&mut *verifier);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(*verifier));
-        let machine_name: String = machine_name.trim().chars().take(64).collect();
+        let machine_name = clip_name(machine_name);
         let machine_name = if machine_name.is_empty() {
-            "Desktop".to_owned()
+            clip_name(&name())
         } else {
             machine_name
         };
@@ -2032,9 +2032,21 @@ impl MobileHost {
     /// the pending set, revoked ones lose their row, a lowered permission is
     /// applied and a raised one becomes a request. Live sessions are told
     /// through the link. Returns what to report to the server.
+    #[cfg(test)]
     pub(super) fn apply_server_grants(
         &self,
         grants: &[desktop_api::ServerGrant],
+        generation: u64,
+    ) -> Vec<Report> {
+        self.apply_server_grants_listed(grants, &[], generation)
+    }
+
+    /// `apply_server_grants`, plus the ids of listed entries that could not
+    /// be read (their rows are kept).
+    pub(super) fn apply_server_grants_listed(
+        &self,
+        grants: &[desktop_api::ServerGrant],
+        unreadable: &[String],
         generation: u64,
     ) -> Vec<Report> {
         let mut reports: Vec<Report> = Vec::new();
@@ -2051,8 +2063,9 @@ impl MobileHost {
             if self.web.generation() != generation {
                 return reports;
             }
-            let plan = super::web_link::grants::plan(
+            let plan = super::web_link::grants::plan_listed(
                 grants,
+                unreadable,
                 &inner.config.devices,
                 &inner.config.web_revoked,
             );
@@ -2415,16 +2428,105 @@ fn addresses(inner: &Inner) -> Vec<Address> {
     result
 }
 
-pub(super) fn name() -> String {
+/// The name of this computer as its user knows it: the macOS Computer Name,
+/// else the hostname, else "Desktop". Trimmed and never empty.
+pub fn name() -> String {
+    // Resolved once: the macOS lookup spawns a process, and callers run on
+    // the UI thread and under the host lock.
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| pick_name([user_facing_name(), os_hostname()]))
+        .clone()
+}
+
+/// The first candidate that is not blank, trimmed; "Desktop" when none is.
+fn pick_name(candidates: impl IntoIterator<Item = Option<String>>) -> String {
+    candidates
+        .into_iter()
+        .flatten()
+        .map(|candidate| candidate.trim().to_owned())
+        .find(|candidate| !candidate.is_empty())
+        .unwrap_or_else(|| "Desktop".to_owned())
+}
+
+/// Trims `text` and cuts it to the server's limit of 64 UTF-16 units without
+/// splitting a character, then trims again.
+fn clip_name(text: &str) -> String {
+    let mut units = 0;
+    let clipped: String = text
+        .trim()
+        .chars()
+        .take_while(|c| {
+            units += c.len_utf16();
+            units <= 64
+        })
+        .collect();
+    clipped.trim().to_owned()
+}
+
+fn os_hostname() -> Option<String> {
     hostname::get()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned()
+        .ok()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// The macOS "Computer Name" (System Settings > General > About), which is
+/// what the user chose; the hostname is often a generated `.local` name.
+#[cfg(target_os = "macos")]
+fn user_facing_name() -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn user_facing_name() -> Option<String> {
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_computer_name_is_the_first_non_blank_candidate_trimmed() {
+        let some = |text: &str| Some(text.to_owned());
+        assert_eq!(
+            pick_name([some("  Hoang's Mac "), some("host.local")]),
+            "Hoang's Mac"
+        );
+        assert_eq!(
+            pick_name([None, some("   "), some(" host.local\n")]),
+            "host.local"
+        );
+        assert_eq!(pick_name([some(""), None]), "Desktop");
+        assert_eq!(pick_name([]), "Desktop");
+    }
+
+    #[test]
+    fn a_name_is_cut_to_64_utf16_units_without_splitting_a_character() {
+        let emoji = "\u{1F600}".repeat(40);
+        let clipped = clip_name(&emoji);
+        assert_eq!(clipped.encode_utf16().count(), 64);
+        assert_eq!(clipped.chars().count(), 32);
+        let odd = format!("a{}", "\u{1F600}".repeat(40));
+        assert_eq!(clip_name(&odd).encode_utf16().count(), 63);
+        assert_eq!(
+            clip_name(&format!("  {}  ", "x".repeat(70))),
+            "x".repeat(64)
+        );
+        assert_eq!(clip_name("   "), "");
+    }
+
+    #[test]
+    fn the_local_name_is_never_empty() {
+        let name = name();
+        assert!(!name.is_empty() && name == name.trim());
+    }
 
     fn phone_row() -> Device {
         Device {
