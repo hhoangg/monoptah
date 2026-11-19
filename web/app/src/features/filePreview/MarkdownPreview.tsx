@@ -1,10 +1,10 @@
 // A markdown file, rendered by the app's own renderer (an AST, no HTML sink). Relative images are fetched through
 // `chat.mentionedFile` (`asset`) and shown from data: URIs; a remote image is never loaded (security.md section 8).
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Markdown } from "@/features/markdown/Markdown";
 import { Notice } from "@/ui/Notice";
-import { PreviewBudget, assetPath, concat, imageDataUri, readMention, type MentionRequester } from "./mentionedFile";
+import { type PreviewBudget, assetPath, budgetForText, concat, imageDataUri, readMention, type MentionRequester } from "./mentionedFile";
 
 interface ImageProps {
   src: string;
@@ -42,10 +42,9 @@ function MarkdownImage({ src, alt, path, request, budget, cacheKey, onLimited }:
 }
 
 export function MarkdownPreview({ text, path, request, cacheKey }: { text: string; path: string; request: MentionRequester; cacheKey: readonly unknown[] }) {
-  const budget = useRef<PreviewBudget | null>(null);
-  budget.current ??= new PreviewBudget();
+  // The document itself counts against the budget, so its images get only what is left.
+  const shared = useMemo(() => budgetForText(text), [text]);
   const [limited, setLimited] = useState(false);
-  const shared = budget.current;
   const onLimited = useCallback(() => setLimited(true), []);
   const renderImage = useCallback(
     (src: string, alt: string) => <MarkdownImage src={src} alt={alt} path={path} request={request} budget={shared} cacheKey={cacheKey} onLimited={onLimited} />,

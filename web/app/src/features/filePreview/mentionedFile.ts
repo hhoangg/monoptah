@@ -40,6 +40,13 @@ export class PreviewBudget {
   }
 }
 
+/** A budget that already counts the document `text` itself (its UTF-8 bytes), so its assets only get what is left. */
+export function budgetForText(text: string): PreviewBudget {
+  const budget = new PreviewBudget();
+  budget.reserve(new TextEncoder().encode(text).length);
+  return budget;
+}
+
 /** A cap of the budget was hit: the asset is skipped, not an error of the desktop. */
 export class PreviewLimitError extends Error {
   constructor() {

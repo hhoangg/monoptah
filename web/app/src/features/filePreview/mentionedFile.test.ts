@@ -5,6 +5,7 @@ import {
   MAX_PREVIEW_BYTES,
   PREVIEW_CSP,
   PreviewBudget,
+  budgetForText,
   PreviewLimitError,
   assetPath,
   buildPreviewDocument,
@@ -187,6 +188,16 @@ describe("PreviewBudget", () => {
     const request = vi.fn(async () => page({ kind: "image", encoding: "base64", data: "", total: 100, nextOffset: 50 }));
     await expect(readMention(request, { path: "a.html", asset: "x.png" }, { budget })).rejects.toBeInstanceOf(PreviewLimitError);
     expect(request).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("budgetForText", () => {
+  it("reserves the UTF-8 bytes of the document, so its images get only the rest", () => {
+    const budget = budgetForText("héllo");
+    expect(budget.bytes).toBe(6);
+    expect(budget.reserve(MAX_PREVIEW_BYTES - 6)).toBe(true);
+    expect(budget.reserve(1)).toBe(false);
+    expect(budget.limited).toBe(true);
   });
 });
 

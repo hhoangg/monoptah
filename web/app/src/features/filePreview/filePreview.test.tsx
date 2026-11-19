@@ -140,6 +140,8 @@ describe("mentions in a session chat", () => {
     expect(frame.getAttribute("sandbox")).toBe("");
     expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(frame.hasAttribute("srcdoc")).toBe(false);
+    // An opaque white page: the document inside is transparent unless its own styles say otherwise.
+    expect(frame).toHaveClass("bg-[#fff]", "[color-scheme:light]");
     const src = frame.getAttribute("src") ?? "";
     expect(src).toMatch(/^blob:/);
     const html = await blobText(blobs.get(src)!);

@@ -20,7 +20,7 @@ export function HtmlPreview({ document: html, name, limited }: { document: strin
         src={url}
         sandbox=""
         referrerPolicy="no-referrer"
-        className="min-h-0 w-full flex-1 rounded-row border border-stroke bg-[#fff]"
+        className="min-h-0 w-full flex-1 rounded-row border border-stroke bg-[#fff] [color-scheme:light]"
       />
     </div>
   );
