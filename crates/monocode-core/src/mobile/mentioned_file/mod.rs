@@ -59,7 +59,7 @@ use crate::credential_guard::{
     all_app_data_dirs, file_id, link_count, SecretIndex, INDEXED_HOME_PATHS, MORE_HOME_CREDENTIALS,
 };
 use crate::files::{
-    links::{link_candidates, resolve_link},
+    links::{file_location, link_candidates, resolve_link, written_relative},
     path_key,
     remote::is_remote,
 };
@@ -536,9 +536,23 @@ fn resolved(ctx: &Context, text: &str) -> Option<PathBuf> {
     (path.is_absolute() && !is_remote(&path)).then_some(path)
 }
 
+/// The requested path as written. A plain relative path is resolved like the desktop's click
+/// (the first root that has it, see [`resolved`]). Any other spelling (absolute, `~`, `file://`)
+/// is taken literally: `~` expanded, lexically normalized, never re-rooted among the roots, so a
+/// missing absolute path stays where it was written and cannot be served as another root's file.
+fn literal(ctx: &Context, text: &str) -> Option<PathBuf> {
+    if written_relative(text).is_some() {
+        return resolved(ctx, text);
+    }
+    let (path, _) = file_location(text, ctx.cwd);
+    let path = PathBuf::from(path);
+    (path.is_absolute() && !is_remote(&path)).then_some(path)
+}
+
 /// Whether a tool row of the conversation names `canonical`: some token of the tool evidence is,
-/// or leads through links to, that same file.
-fn tool_evidence(ctx: &Context, evidence: &Evidence, canonical: &Path) -> bool {
+/// or leads through links to, that same file. `written` is the requested path as written: a tool
+/// row that names it (a link) counts when the disk says it leads to `canonical`.
+fn tool_evidence(ctx: &Context, evidence: &Evidence, canonical: &Path, written: &Path) -> bool {
     let wanted = path_key(&lossy(canonical));
     let name = canonical
         .file_name()
@@ -557,7 +571,8 @@ fn tool_evidence(ctx: &Context, evidence: &Evidence, canonical: &Path) -> bool {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
                 == name;
-            if same_name && disk_checks < MAX_TOOL_DISK_CHECKS {
+            let is_written = path_key(&lossy(&candidate)) == path_key(&lossy(written));
+            if (same_name || is_written) && disk_checks < MAX_TOOL_DISK_CHECKS {
                 disk_checks += 1;
                 if candidate.canonicalize().is_ok_and(|real| real == canonical) {
                     return true;
@@ -590,7 +605,7 @@ fn authorize(
         return Err(forbidden());
     }
     // 3. The written path against the deny-list, still without the disk.
-    let written = resolved(ctx, requested).ok_or_else(forbidden)?;
+    let written = literal(ctx, requested).ok_or_else(forbidden)?;
     if guard.denied(&written) {
         return Err(denied());
     }
@@ -615,7 +630,8 @@ fn authorize(
         return Err(forbidden());
     }
     // 2. Outside the device's projects the agent must also have run a tool on it.
-    if !in_selected_project(ctx, &canonical) && !tool_evidence(ctx, evidence, &canonical) {
+    if !in_selected_project(ctx, &canonical) && !tool_evidence(ctx, evidence, &canonical, &written)
+    {
         return Err(forbidden());
     }
     // 3. Authorized: now the deny-list on what the link really leads to.

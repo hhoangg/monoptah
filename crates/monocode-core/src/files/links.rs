@@ -81,7 +81,7 @@ pub fn file_location(raw: &str, cwd: &str) -> (String, Option<(usize, usize)>) {
 
 /// Whether the link names a plain relative path (not `~`, not `file://`, not absolute), and so
 /// belongs to whichever project folder has it.
-fn written_relative(raw: &str) -> Option<String> {
+pub fn written_relative(raw: &str) -> Option<String> {
     let (written, _) = split_location(raw);
     (!written.starts_with('~') && !raw.starts_with("file://") && Path::new(&written).is_relative())
         .then_some(written)
