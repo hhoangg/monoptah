@@ -142,4 +142,46 @@ test.describe("composer pickers on an iPhone", () => {
     await expect(menu).toHaveCount(0);
     await expect(chip).toHaveAccessibleName("Access: Auto-accept edits");
   });
+
+  // The collapse rule: the card opens with the field and closes only on an interaction OUTSIDE the composer, never because
+  // focus moved inside it (iOS WebKit blurs the empty field when a chip is tapped, whatever the timing).
+  const glass = () => page.getByTestId("composer").locator("[data-shape]");
+
+  test("an empty field and a tap on the model chip: the card stays, the sheet opens, a pick works, the chips keep working", async () => {
+    await expect(glass()).toHaveAttribute("data-shape", "card");
+    const chip = page.locator("[data-model-controls] button[aria-label^='Model:']");
+    const before = await chip.getAttribute("aria-label");
+    await chip.tap();
+    const sheet = page.getByRole("dialog", { name: "Model" });
+    await expect(sheet).toBeVisible();
+    await expect(glass()).toHaveAttribute("data-shape", "card");
+    await sheet.getByRole("button", { name: /Codex/ }).first().tap();
+    await sheet.getByRole("list", { name: "Codex models" }).getByRole("button").first().tap();
+    // A tap inside the open sheet (a portaled overlay) does not count as outside.
+    await expect(glass()).toHaveAttribute("data-shape", "card");
+    await page.keyboard.press("Escape");
+    await expect(sheet).toHaveCount(0);
+    await expect(chip).not.toHaveAttribute("aria-label", before ?? "");
+    await expect(glass()).toHaveAttribute("data-shape", "card");
+    // The composer is sane: the next chip opens on its first tap too.
+    await page.getByTestId("target-chip").tap();
+    await expect(page.getByRole("dialog", { name: "Where it runs" })).toBeVisible();
+  });
+
+  test("with the keyboard dismissed (field blurred, empty) the card stays and the chip opens on the first tap", async () => {
+    await page.getByRole("textbox", { name: "Message" }).evaluate((element) => (element as HTMLElement).blur());
+    await expect(glass()).toHaveAttribute("data-shape", "card");
+    await page.locator("[data-model-controls] button[aria-label^='Model:']").tap();
+    await expect(page.getByRole("dialog", { name: "Model" })).toBeVisible();
+  });
+
+  test("a tap outside the composer collapses it, a tap on the pill opens it again, and its chips work on the first tap", async () => {
+    await expect(glass()).toHaveAttribute("data-shape", "card");
+    await page.getByText("What should we work on?").tap();
+    await expect(glass()).toHaveAttribute("data-shape", "pill");
+    await glass().tap();
+    await expect(glass()).toHaveAttribute("data-shape", "card");
+    await page.locator("[data-model-controls] button[aria-label^='Model:']").tap();
+    await expect(page.getByRole("dialog", { name: "Model" })).toBeVisible();
+  });
 });
