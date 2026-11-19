@@ -9,6 +9,7 @@ import { Icon } from "@/ui/Icon";
 import { forgetDevice, useDesktops, useDevices, type DesktopSummary, type DeviceSummary } from "./api";
 import { desktopErrorMessage, ColorDot, Fingerprint, PresenceBadge } from "./parts";
 import { parsePairingInput } from "./pairingLink";
+import { RenameDesktopForm } from "./RenameDesktopForm";
 import { useThisDevice } from "./thisDevice";
 import { SettingsLayout } from "@/features/settings/SettingsLayout";
 import { QueryBoundary } from "@/features/settings/QueryBoundary";
@@ -17,6 +18,7 @@ import { useAction } from "@/features/settings/useAction";
 import { Badge } from "@/ui/badge";
 import { Button, buttonVariants } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { Field } from "@/ui/Field";
 import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard } from "@/ui/SettingsCard";
@@ -71,6 +73,7 @@ function DesktopList({ desktops }: { desktops: DesktopSummary[] }) {
 }
 
 function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
+  const [renaming, setRenaming] = useState(false);
   const name = safeName(desktop.name, "Unnamed desktop");
   const version = versionLabel(desktop.os, desktop.appVersion);
   return (
@@ -99,6 +102,18 @@ function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
       >
         Manage
       </Link>
+      <Button type="button" variant="ghost" size="sm" aria-label={`Rename ${name}`} className="shrink-0 text-muted-text" onClick={() => setRenaming(true)}>
+        Rename
+      </Button>
+      <Dialog open={renaming} onOpenChange={setRenaming}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Rename desktop</DialogTitle>
+            <DialogDescription>Choose the name this account shows for {name}.</DialogDescription>
+          </DialogHeader>
+          <RenameDesktopForm desktop={desktop} onSaved={() => setRenaming(false)} />
+        </DialogContent>
+      </Dialog>
     </li>
   );
 }

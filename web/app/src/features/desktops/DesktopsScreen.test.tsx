@@ -63,6 +63,21 @@ describe("/desktops list", () => {
     expect(within(linux).queryByText(/to confirm/)).toBeNull();
   });
 
+  it("renames a desktop from its row in a dialog", async () => {
+    install({ desktops: [desktop({ id: "d1", name: "Studio Mac" })] });
+    mountApp("/desktops");
+    await userEvent.click(await screen.findByRole("button", { name: "Rename Studio Mac" }));
+    const dialog = await screen.findByRole("dialog");
+    const field = within(dialog).getByLabelText("Desktop name");
+    expect(field).toHaveValue("Studio Mac");
+    await userEvent.clear(field);
+    await userEvent.type(field, "  Office  ");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Save name" }));
+    await waitFor(() => expect(server.calls.find((call) => call.method === "PATCH")).toMatchObject({ body: { name: "Office" } }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByRole("link", { name: /^Open Office/ })).toBeInTheDocument();
+  });
+
   it("explains how to pair when there is no desktop", async () => {
     install();
     mountApp("/desktops");
