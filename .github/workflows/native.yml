@@ -74,6 +74,10 @@ jobs:
               - 'web/protocol/**'
               - 'docs/native/**'
               - 'CHANGELOG.md'
+              - 'LICENSE'
+              - 'NOTICE'
+              - 'public/monocode.png'
+              - '.gitattributes'
               - 'scripts/*native*'
               - 'scripts/native-editor/**'
               - 'scripts/native-settings/**'
@@ -96,6 +100,11 @@ jobs:
           else
             native=true
           fi
+          # Fail closed: an empty or unexpected filter result must not skip the jobs.
+          case "$native" in
+            true|false) ;;
+            *) echo "Unexpected native filter result: '$native'"; exit 1 ;;
+          esac
           echo "native=$native" >> "$GITHUB_OUTPUT"
           echo "native=$native"
 
