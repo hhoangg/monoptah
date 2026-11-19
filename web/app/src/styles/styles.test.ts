@@ -87,7 +87,7 @@ describe("static asset headers (generated at build time, see vite-plugins/header
       "style-src-attr 'unsafe-inline'",
       "connect-src 'self' wss://zptah.app;",
       "worker-src 'self'",
-      "frame-ancestors 'none'",
+      "frame-ancestors 'self'",
       "require-trusted-types-for 'script'",
       "trusted-types default",
     ]) {

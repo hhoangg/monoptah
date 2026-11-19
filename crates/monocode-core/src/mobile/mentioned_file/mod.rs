@@ -47,9 +47,11 @@
 //!    [`MENTIONED_FILE_PAGE_BYTES`] raw bytes (less for text, see [`MENTIONED_FILE_UTF8_PAGE_BYTES`]),
 //!    one file at most [`MENTIONED_FILE_MAX_BYTES`], one HTML transform at a time per device.
 //! 6. **Assets** (images an HTML or markdown file shows) are reached only when that file
-//!    references them, relative to its folder, never through `..`, an absolute path, a scheme, a
-//!    backslash or a symlink out of that folder, and only as images. The file itself qualified
-//!    under rules 1 to 5 by whichever evidence; its assets need nothing more.
+//!    references them (the exact key it lists), relative to its folder or as an absolute or
+//!    `file://` path, and only inside the root the file was authorized under: the selected
+//!    project holding it, else its own folder. Checked by name first and again after the links
+//!    are followed, never through a scheme or a backslash, and only as images. The file itself
+//!    qualified under rules 1 to 5 by whichever evidence; its assets need nothing more.
 //!
 //! The caller audits (rule 5 of the contract) with [`Call`], which carries what the line needs,
 //! including which rule refused ([`rule`]).
@@ -1662,7 +1664,7 @@ fn html_document(
     Ok(doc)
 }
 
-/// The image paths a mentioned markdown file references, normalized like an `asset`.
+/// The image keys a mentioned markdown file references (same rules as the html: [`html::normalize_reference`]).
 fn markdown_assets(source: &str) -> Vec<String> {
     use pulldown_cmark::{Event, Options, Parser, Tag};
     let mut assets: Vec<String> = Vec::new();
@@ -1671,10 +1673,9 @@ fn markdown_assets(source: &str) -> Vec<String> {
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     ) {
         if let Event::Start(Tag::Image { dest_url, .. }) = event {
-            let path = dest_url.split(['?', '#']).next().unwrap_or("");
-            if let Some(path) = html::normalize_asset(&html::percent_decode(path)) {
-                if !assets.contains(&path) && assets.len() < html::MAX_ASSETS {
-                    assets.push(path);
+            if let Some(key) = html::normalize_reference(&dest_url) {
+                if !assets.contains(&key) && assets.len() < html::MAX_ASSETS {
+                    assets.push(key);
                 }
             }
         }
@@ -1711,7 +1712,7 @@ fn references(
     }
 }
 
-/// Rule 6: an image the mentioned HTML or markdown file references, inside its folder.
+/// Rule 6: an image the mentioned HTML or markdown file references, inside the root of its project (else its folder).
 fn serve_asset(
     env: &Env,
     parent_file: &mut File,
@@ -1735,20 +1736,43 @@ fn serve_asset(
     {
         return Err(forbidden().into());
     }
-    let relative = html::normalize_asset(asset).ok_or_else(forbidden)?;
+    let key = html::normalize_key(asset).ok_or_else(forbidden)?;
     // The file must reference it: otherwise the folder's images could be probed one by one.
     // Decided from the mentioned file alone, before the asset's path is looked at.
     let referenced = references(env, parent_file, parent, parent_meta)?;
-    if !referenced.assets.contains(&relative) {
+    if !referenced.assets.contains(&key) {
         return Err(forbidden().into());
     }
     let folder = parent.parent().ok_or_else(forbidden)?;
-    let joined = folder.join(&relative);
+    // The root the document was authorized under: the selected project holding it, else its own
+    // folder. An image may sit anywhere inside that root (`../img/a.png`, an absolute path or a
+    // `file://` URL included), never outside it.
+    let root = asset_root(ctx, parent, folder);
+    let joined = if key.starts_with('/') {
+        PathBuf::from(&key)
+    } else {
+        folder.join(&key)
+    };
+    // Lexically first, so a path outside the root is refused without touching the disk (no
+    // probing of what exists elsewhere), then again after the links are followed.
+    if !lexical_clean(&joined).starts_with(&root) {
+        return Err(forbidden().into());
+    }
     if let Some(by) = guard.denial(&joined) {
         return Err(Refusal::new(denied(), by));
     }
+    // A `..` after a link can leave the root only once the link is followed: the parent folder is
+    // resolved and checked first, so a missing target outside the root answers like any other
+    // refusal and never says whether it exists.
+    if key.split('/').any(|part| part == "..") {
+        let parent_dir = joined.parent().ok_or_else(forbidden)?;
+        let resolved = parent_dir.canonicalize().map_err(|_| forbidden())?;
+        if !resolved.starts_with(&root) {
+            return Err(forbidden().into());
+        }
+    }
     let canonical = joined.canonicalize().map_err(|_| not_found())?;
-    if !canonical.starts_with(folder) {
+    if !canonical.starts_with(&root) {
         return Err(forbidden().into());
     }
     if let Some(by) = guard.denial(&canonical) {
@@ -1784,6 +1808,32 @@ fn serve_asset(
     };
     image_page(&mut file, &mut reply, params.offset, env.page)?;
     Ok(reply)
+}
+
+/// The folder an asset of the document `parent` must stay inside: the selected project that
+/// holds the document (the deepest one), else the document's own folder.
+fn asset_root(ctx: &Context, parent: &Path, folder: &Path) -> PathBuf {
+    ctx.projects
+        .iter()
+        .filter(|p| p.selected && parent.starts_with(&p.canonical))
+        .max_by_key(|p| p.canonical.as_os_str().len())
+        .map_or_else(|| folder.to_path_buf(), |p| p.canonical.clone())
+}
+
+/// `path` with its `.` and `..` parts resolved by name only (no disk access).
+fn lexical_clean(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// The linked stylesheets of a mentioned HTML file: local, inside its folder, not denied.

@@ -3,7 +3,9 @@ import { useRef, type ComponentProps } from "react";
 import { cn } from "@/lib/utils";
 import { Icon } from "./Icon";
 
-// Dialog (design-system.md section 8): bg sheet, radius 20, padding 20, gap 16, scrim .4, no shadow.
+// Dialog (design-system.md section 8): bg sheet, radius 20, padding 20, gap 16, scrim .4, no shadow. One shrinkable grid
+// column (a long unbreakable child must never widen the dialog past the screen) and a header that keeps clear of the
+// 44px close button at the top right.
 export const Dialog = DialogPrimitive.Root;
 export const DialogTrigger = DialogPrimitive.Trigger;
 export const DialogPortal = DialogPrimitive.Portal;
@@ -26,10 +28,11 @@ export function DialogContent({
   className,
   children,
   showClose = true,
+  closeClassName,
   onOpenAutoFocus,
   onCloseAutoFocus,
   ...props
-}: ComponentProps<typeof DialogPrimitive.Content> & { showClose?: boolean }) {
+}: ComponentProps<typeof DialogPrimitive.Content> & { showClose?: boolean; closeClassName?: string }) {
   // Radix returns focus only to a `DialogTrigger`. Dialogs here are mostly controlled (opened from state), so without
   // this focus would fall to the page body when they close and a keyboard user would lose their place.
   const opener = useRef<HTMLElement | null>(null);
@@ -52,7 +55,7 @@ export function DialogContent({
           target.focus();
         }}
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-[calc(100%-2.5rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100dvh-2rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] gap-4 overflow-y-auto overscroll-contain rounded-dialog border border-stroke bg-sheet p-5 text-content data-[state=open]:animate-[dialog-in_280ms_var(--ease-out-cubic)] data-[state=closed]:animate-[fade-out_180ms_var(--ease-out-cubic)]",
+          "fixed top-1/2 left-1/2 z-50 grid w-[calc(100%-2.5rem)] grid-cols-[minmax(0,1fr)] max-w-lg -translate-x-1/2 -translate-y-1/2 max-h-[calc(100dvh-2rem-env(safe-area-inset-top)-env(safe-area-inset-bottom))] gap-4 overflow-y-auto overscroll-contain rounded-dialog border border-stroke bg-sheet p-5 text-content data-[state=open]:animate-[dialog-in_280ms_var(--ease-out-cubic)] data-[state=closed]:animate-[fade-out_180ms_var(--ease-out-cubic)]",
           className,
         )}
         {...props}
@@ -61,7 +64,7 @@ export function DialogContent({
         {showClose && (
           <DialogPrimitive.Close
             aria-label="Close"
-            className="absolute top-3 right-3 inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection pointer-fine:size-9"
+            className={cn("absolute top-3 right-3 inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection pointer-fine:size-9", closeClassName)}
           >
             <Icon name="close" size={20} />
           </DialogPrimitive.Close>
@@ -72,7 +75,7 @@ export function DialogContent({
 }
 
 export function DialogHeader({ className, ...props }: ComponentProps<"div">) {
-  return <div data-slot="dialog-header" className={cn("grid gap-1.5 pr-10", className)} {...props} />;
+  return <div data-slot="dialog-header" className={cn("grid gap-1.5 pr-14 pointer-fine:pr-12", className)} {...props} />;
 }
 
 export function DialogFooter({ className, ...props }: ComponentProps<"div">) {

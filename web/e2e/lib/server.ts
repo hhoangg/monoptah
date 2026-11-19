@@ -16,7 +16,7 @@ export interface RunningServer {
   /** The one-use bootstrap invite. Never print it. */
   invite: string;
   /** More bootstrap invites, one per spec that needs its own account. Never print them. */
-  extraInvites: { pairing: string; devices: string; ui: string; w14: string; w14b: string; r12: string; filepreview: string; mlayout: string; selection: string };
+  extraInvites: { pairing: string; devices: string; ui: string; w14: string; w14b: string; r12: string; filepreview: string; mlayout: string; selection: string; htmlpreview: string; htmlpreviewwk: string };
   /**
    * Kills wrangler and starts it again on the same port with the same local persistence (D1 and DO state survive).
    * With `clearRateLimits` the D1 rate limiter table is emptied while wrangler is down (harness only, see
@@ -126,7 +126,7 @@ export async function startServer(logFile: string): Promise<RunningServer> {
       return code;
     };
     const invite = bootstrap();
-    const extraInvites = { pairing: bootstrap(), devices: bootstrap(), ui: bootstrap(), w14: bootstrap(), w14b: bootstrap(), r12: bootstrap(), filepreview: bootstrap(), mlayout: bootstrap(), selection: bootstrap() };
+    const extraInvites = { pairing: bootstrap(), devices: bootstrap(), ui: bootstrap(), w14: bootstrap(), w14b: bootstrap(), r12: bootstrap(), filepreview: bootstrap(), mlayout: bootstrap(), selection: bootstrap(), htmlpreview: bootstrap(), htmlpreviewwk: bootstrap() };
 
     // Obviously fake secrets, passed with --var so a developer's web/.dev.vars is never read.
     const fake = {

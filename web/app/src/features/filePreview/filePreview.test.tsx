@@ -165,6 +165,61 @@ describe("mentions in a session chat", () => {
     await waitFor(() => expect(revoked).toContain(src));
   });
 
+  it("has a full screen toggle that fills the viewport, restores the dialog, and gives Escape to fullscreen first", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("report.html"));
+    const box = await dialog();
+    await within(box).findByTestId("preview-html");
+    const toggle = within(box).getByTestId("file-preview-fullscreen");
+    expect(toggle).toHaveAccessibleName("Full screen");
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+    expect(box).toHaveAttribute("data-fullscreen", "false");
+    expect(box).not.toHaveClass("h-dvh");
+
+    await user.click(toggle);
+    expect(box).toHaveAttribute("data-fullscreen", "true");
+    expect(box).toHaveClass("h-dvh", "w-full", "max-w-none", "rounded-none", "translate-x-0");
+    expect(box.className).toContain("env(safe-area-inset-top)");
+    expect(box.className).toContain("env(safe-area-inset-bottom)");
+    expect(toggle).toHaveAccessibleName("Exit full screen");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    // The close button follows the safe areas too (a notch must not cover it).
+    expect(within(box).getByRole("button", { name: "Close" }).className).toContain("env(safe-area-inset-top)");
+    expect(within(box).getByRole("button", { name: "Close" }).className).toContain("env(safe-area-inset-right)");
+
+    // The first Escape leaves fullscreen and keeps the dialog; the second closes it.
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(box).toHaveAttribute("data-fullscreen", "false"));
+    expect(screen.getByTestId("file-preview-dialog")).toBe(box);
+    await user.click(toggle);
+    expect(box).toHaveAttribute("data-fullscreen", "true");
+    await user.click(toggle);
+    expect(box).toHaveAttribute("data-fullscreen", "false");
+    expect(box).not.toHaveClass("h-dvh");
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByTestId("file-preview-dialog")).toBeNull());
+
+    // A new open starts as the plain dialog again.
+    await user.click(await mentionChip("report.html"));
+    expect(await dialog()).toHaveAttribute("data-fullscreen", "false");
+  });
+
+  it("keeps the dialog inside a narrow viewport: one shrinkable column, a clear header and a shrinkable frame", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("report.html"));
+    const box = await dialog();
+    const frame = await within(box).findByTestId("preview-html");
+    // A grid column of `auto` grows to the longest unbreakable path line and pushes the frame past the screen edge.
+    expect(box).toHaveClass("grid-cols-[minmax(0,1fr)]");
+    expect(within(box).getByTestId("file-preview-name")).toHaveClass("truncate");
+    expect(within(box).getByTestId("file-preview-path")).toHaveClass("truncate", "min-w-0");
+    expect(box.querySelector('[data-slot="dialog-header"]')).toHaveClass("pr-14");
+    expect(within(box).getByTestId("file-preview-body")).toHaveClass("min-w-0");
+    expect(frame).toHaveClass("min-w-0", "max-w-full");
+  });
+
   it("renders a markdown file with its relative image from the desktop and never loads a remote image", async () => {
     const user = userEvent.setup();
     mount(`/s/${SESSION}`);
