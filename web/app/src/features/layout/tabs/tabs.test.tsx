@@ -29,7 +29,7 @@ import { closeCommandPalette } from "../palette";
 import { clearPanels } from "../panels";
 import { closeBackgroundDialog } from "../projectTools";
 import { clearShortcuts } from "../shortcuts";
-import { emptyWorkspace, openTab, paneOrder, serializeWorkspace, sessionTab } from "./paneTree";
+import { activateTab, emptyWorkspace, moveTab, openTab, paneOrder, serializeWorkspace, sessionTab, splitPane } from "./paneTree";
 import { endTabDrag } from "./tabDrag";
 import { getWorkspace, resetTabsStore, tabsKey } from "./tabsStore";
 
@@ -444,6 +444,29 @@ describe("tab strip structure and keyboard", () => {
     await waitFor(() => expect(screen.getAllByRole("tablist")).toHaveLength(2));
     expect(within(screen.getByTestId("pane-p1")).getByTestId("pane-body").scrollTop).toBe(120);
     expect(box).toHaveFocus();
+  });
+
+  it("shows this page's URL tab in its pane when another browser tab moved that tab to another pane", async () => {
+    await openThree();
+    // The other browser tab put sess-seed-2 in a second pane and left its focus and active tab elsewhere.
+    let other = openTab(openTab(openTab(emptyWorkspace(), sessionTab("sess-seed-0")), sessionTab("sess-seed-1")), sessionTab("sess-seed-2"));
+    other = splitPane(other, "p1", "row");
+    other = moveTab(other, sessionTab("sess-seed-2"), "p2");
+    other = activateTab(other, "p1", sessionTab("sess-seed-0"));
+    expect(other.focused).toBe("p1");
+    localStorage.setItem(tabsKey(DESKTOP_ID), serializeWorkspace(other));
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: tabsKey(DESKTOP_ID) }));
+    });
+    await waitFor(() => expect(getWorkspace(DESKTOP_ID).focused).toBe("p2"));
+    expect(getWorkspace(DESKTOP_ID).panes.p2?.active).toBe(sessionTab("sess-seed-2"));
+    expect(screen.getByTestId("pane-p2")).toHaveAttribute("data-focused", "true");
+    // Once the URL tab shows, a second event writes nothing.
+    const written = localStorage.getItem(tabsKey(DESKTOP_ID));
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: tabsKey(DESKTOP_ID) }));
+    });
+    expect(localStorage.getItem(tabsKey(DESKTOP_ID))).toBe(written);
   });
 
   it("keeps this page's focused pane and active tab when another browser tab changes them (no write back)", async () => {

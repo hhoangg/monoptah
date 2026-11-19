@@ -20,7 +20,7 @@ import { PaneHosts } from "./paneHosts";
 import { PaneContext } from "./PaneContext";
 import { PaneDivider } from "./PaneDivider";
 import { PaneDropZones } from "./PaneDropZones";
-import { canSplit, findTab, fits, openTab, paneOrder, parseTab, type Pane, type PaneNode, type TabKey, type Workspace } from "./paneTree";
+import { canSplit, fits, openTab, paneOrder, parseTab, type Pane, type PaneNode, type TabKey, type Workspace } from "./paneTree";
 import { TabStrip } from "./TabStrip";
 import { tabOfPath } from "./tabRoutes";
 import { useTabShortcuts } from "./tabShortcuts";
@@ -163,11 +163,12 @@ export function TabbedChat({ desktopId, children }: { desktopId: string; childre
     if (urlKey) updateWorkspace(desktopId, (current) => openTab(current, urlKey));
   }, [desktopId, urlKey]);
 
-  // Another browser tab replaced the workspace: the URL's tab must still be in it (it is added once if the other tab did not have it).
+  // Another browser tab replaced the workspace: this page's URL tab must still be in it and shown in its pane. openTab
+  // returns the same workspace when that already holds, so nothing is written then (no ping-pong between browser tabs).
   useLayoutEffect(() => {
     const onStorage = (event: StorageEvent) => {
       if (event.key !== null && event.key !== tabsKey(desktopId)) return;
-      if (urlKey && !findTab(getWorkspace(desktopId), urlKey)) updateWorkspace(desktopId, (current) => openTab(current, urlKey));
+      if (urlKey) updateWorkspace(desktopId, (current) => openTab(current, urlKey));
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
