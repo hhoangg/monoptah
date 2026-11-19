@@ -1586,10 +1586,12 @@ fn why(result: &Result<Reply, Refusal>) -> Option<(Option<Code>, &'static str)> 
         .map(|r| (super::super::policy::code_of_failure(&r.failure), r.rule))
 }
 
+#[cfg(unix)]
 const REPORT: &str = "casium/reports/868mmrmbv-removed-staff-thread-access.html";
 
 /// The table of the report: one file as a link, one as a code span, and prose whose path ends
 /// with a full stop.
+#[cfg(unix)]
 const TABLE: &str = "| Report | File |\n|---|---|\n| Removed staff | [868mmrmbv-removed-staff-thread-access.html](casium/reports/868mmrmbv-removed-staff-thread-access.html) |\n| Other | `casium/reports/other.html` |\n\nAlso see ./casium/reports/third.html.";
 
 #[cfg(unix)]
