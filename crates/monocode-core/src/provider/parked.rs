@@ -44,6 +44,9 @@ pub(super) struct Wire {
     reader: Option<thread::JoinHandle<()>>,
     stderr_reader: Option<thread::JoinHandle<()>>,
     writer: Option<thread::JoinHandle<()>>,
+    /// `process::session_epoch` when the turn took this process; it is parked
+    /// for reuse only while that is unchanged (see `provider::retire_session`).
+    pub epoch: u64,
     // Held until the child is gone, which may be after `Wire` is dropped.
     _registration: Option<process::Registration>,
     _account: Option<crate::accounts::Tracked>,
@@ -140,6 +143,7 @@ impl Wire {
             reader: Some(reader),
             stderr_reader: Some(stderr_reader),
             writer: Some(writer),
+            epoch: process::turn_epoch(),
             _registration: Some(registration),
             _account: Some(account),
         })
@@ -316,12 +320,19 @@ pub(super) fn key(request: &Request) -> String {
     .to_string()
 }
 pub(super) fn take(key: &str) -> Option<Parked> {
+    let epoch = process::turn_epoch();
     if LIMIT.load(Ordering::Relaxed) == 0 {
         return None;
     }
     let mut pool = idle_pool().lock().unwrap();
     let ix = pool.iter().position(|p| p.key == key)?;
     let mut parked = pool.remove(ix);
+    if parked.wire.epoch != epoch {
+        // Parked before its session was retired: never reuse it.
+        drop(pool);
+        thread::spawn(move || drop(parked));
+        return None;
+    }
     if parked.at.elapsed() >= Duration::from_secs(180)
         || parked.wire.child.try_wait().ok().flatten().is_some()
     {
@@ -338,6 +349,9 @@ pub(super) fn put(wire: Wire, mut protocol: Protocol) {
     {
         return;
     }
+    if !process::may_park(wire.epoch) {
+        return;
+    }
     let key = key(&protocol.request);
     protocol.emitted.clear();
     protocol.tools.clear();
@@ -348,6 +362,10 @@ pub(super) fn put(wire: Wire, mut protocol: Protocol) {
     protocol.request.settings.turns.clear();
     process::mark_idle(wire.child.id(), true);
     let mut pool = idle_pool().lock().unwrap();
+    // Checked under the pool lock so `retire_session` cannot miss this entry.
+    if !process::may_park(wire.epoch) {
+        return;
+    }
     pool.push(Parked {
         wire,
         protocol,
@@ -389,10 +407,12 @@ pub(super) fn settle_cancelled(mut wire: Wire, mut protocol: Protocol) {
         || (protocol.request.kind == Kind::Claude && !protocol.claude_prompt_sent)
         // The CLI runs a queued prompt after an interrupt, so end the process.
         || !protocol.claude_unstarted_steers.is_empty()
+        || !process::may_park(wire.epoch)
     {
         return;
     }
     let owner = process::owner();
+    let wire_epoch = wire.epoch;
     let binding = Binding::request(&protocol.request);
     let epoch = *epochs().lock().unwrap().entry(binding.clone()).or_default();
     process::mark_idle(wire.child.id(), true);
@@ -403,6 +423,7 @@ pub(super) fn settle_cancelled(mut wire: Wire, mut protocol: Protocol) {
             // not a deadline on an active provider conversation.
             while started.elapsed() < Duration::from_secs(180)
                 && LIMIT.load(Ordering::Relaxed) > 0
+                && process::may_park(wire_epoch)
                 && epochs()
                     .lock()
                     .unwrap()
@@ -507,6 +528,28 @@ fn park_cancelled(wire: Wire, protocol: Protocol, binding: &Binding, epoch: u64)
     if epochs.get(binding).copied().unwrap_or_default() == epoch {
         put(wire, protocol);
     }
+}
+
+/// Remove and return the warm processes owned by `session`, and the pids of
+/// those entries. Dropping the entries retires them gracefully.
+pub(super) fn retire_session(session: i64) -> Vec<u32> {
+    let mut retired = Vec::new();
+    {
+        let mut pool = idle_pool().lock().unwrap_or_else(|e| e.into_inner());
+        let mut ix = 0;
+        while ix < pool.len() {
+            if pool[ix].owner == Some(session) {
+                retired.push(pool.remove(ix));
+            } else {
+                ix += 1;
+            }
+        }
+    }
+    let pids = retired.iter().map(|p| p.wire.child.id()).collect();
+    if !retired.is_empty() {
+        thread::spawn(move || drop(retired));
+    }
+    pids
 }
 
 pub fn discard_worktree(path: &Path) {
@@ -804,5 +847,184 @@ for line in sys.stdin:
         assert_eq!(output, "FRESH");
         configure(0);
         idle_pool().lock().unwrap().clear();
+    }
+
+    const SESSION: i64 = 4_547_595;
+
+    fn gone(pid: i32) -> bool {
+        unsafe {
+            libc::kill(pid, 0) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
+    /// Re-run `name` in a child test process: the idle pool is process-wide.
+    fn in_child(name: &str, marker: &str) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return true;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(marker, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        false
+    }
+
+    /// A fake Codex that starts a long-lived helper (like Claude's `visual-mcp`)
+    /// on the turn and records both pids. With `finish` it completes the turn.
+    fn fake_agent_with_helper(dir: &Path, finish: bool) -> (PathBuf, PathBuf, PathBuf) {
+        let binary = dir.join("provider");
+        let agent_pid = dir.join("agent.pid");
+        let helper_pid = dir.join("helper.pid");
+        std::fs::write(
+            &binary,
+            format!(
+                r#"#!/usr/bin/env python3
+import json,os,subprocess,sys
+open({agent:?},'w').write(str(os.getpid()))
+def send(v): print(json.dumps(v),flush=True)
+for line in sys.stdin:
+ v=json.loads(line)
+ if v.get('id')==1: send({{'id':1,'result':{{}}}})
+ elif v.get('id')==2: send({{'id':2,'result':{{'thread':{{'id':'archive-thread'}}}}}})
+ elif v.get('id')==3:
+  helper=subprocess.Popen(['sleep','300'])
+  open({helper:?},'w').write(str(helper.pid))
+  if {finish}:
+   send({{'method':'item/agentMessage/delta','params':{{'itemId':'answer','delta':'ok'}}}})
+   send({{'method':'turn/completed','params':{{'turn':{{'status':'completed'}}}}}})
+"#,
+                agent = agent_pid.to_str().unwrap(),
+                helper = helper_pid.to_str().unwrap(),
+                finish = if finish { "True" } else { "False" },
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (binary, agent_pid, helper_pid)
+    }
+
+    fn pid_of(path: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "no pid in {}", path.display());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn assert_both_gone(agent: i32, helper: i32) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !(gone(agent) && gone(helper)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(gone(agent), "agent process {agent} is still running");
+        assert!(gone(helper), "helper process {helper} is still running");
+    }
+
+    fn request(binary: PathBuf, cwd: &Path) -> Request {
+        Request {
+            kind: Kind::Codex,
+            binary,
+            cwd: cwd.into(),
+            prompt: "hello".into(),
+            provider_id: None,
+            model: None,
+            settings: Settings::default(),
+        }
+    }
+
+    #[test]
+    fn archiving_a_session_ends_its_warm_agent_and_the_helpers_in_its_group() {
+        const NAME: &str = "provider::parked::tests::archiving_a_session_ends_its_warm_agent_and_the_helpers_in_its_group";
+        if !in_child(NAME, "MONOCODE_ARCHIVE_WARM_TEST_CHILD") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, agent, helper) = fake_agent_with_helper(dir.path(), true);
+        configure(1);
+        process::owned_by(SESSION, || {
+            run(
+                request(binary, dir.path()),
+                Arc::new(AtomicBool::new(false)),
+                |_| Ok(()),
+            )
+        })
+        .unwrap();
+        assert_eq!(idle_pool().lock().unwrap().len(), 1, "the process is warm");
+        let (agent, helper) = (pid_of(&agent), pid_of(&helper));
+        assert!(!gone(agent) && !gone(helper));
+        crate::provider::retire_session(SESSION);
+        assert_both_gone(agent, helper);
+        assert!(idle_pool().lock().unwrap().is_empty());
+        configure(0);
+    }
+
+    #[test]
+    fn stopping_a_running_session_ends_the_agent_and_its_helpers_without_parking() {
+        const NAME: &str = "provider::parked::tests::stopping_a_running_session_ends_the_agent_and_its_helpers_without_parking";
+        if !in_child(NAME, "MONOCODE_STOP_RUNNING_TEST_CHILD") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, agent, helper) = fake_agent_with_helper(dir.path(), false);
+        configure(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let turn = {
+            let (cancel, request) = (cancel.clone(), request(binary, dir.path()));
+            thread::spawn(move || process::owned_by(SESSION, || run(request, cancel, |_| Ok(()))))
+        };
+        let (agent, helper) = (pid_of(&agent), pid_of(&helper));
+        cancel.store(true, Ordering::Relaxed);
+        crate::provider::retire_session(SESSION);
+        assert!(turn.join().unwrap().is_err(), "the turn ends");
+        assert_both_gone(agent, helper);
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            idle_pool().lock().unwrap().is_empty(),
+            "a stopped session's process must not be parked"
+        );
+        configure(0);
+    }
+
+    #[test]
+    fn a_turn_started_right_after_retiring_a_session_is_not_killed_or_given_the_old_process() {
+        const NAME: &str = "provider::parked::tests::a_turn_started_right_after_retiring_a_session_is_not_killed_or_given_the_old_process";
+        if !in_child(NAME, "MONOCODE_RETIRE_THEN_SEND_TEST_CHILD") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (binary, agent, helper) = fake_agent_with_helper(dir.path(), true);
+        configure(1);
+        let turn = |prompt_id: Option<&str>| {
+            let mut request = request(binary.clone(), dir.path());
+            request.provider_id = prompt_id.map(Into::into);
+            process::owned_by(SESSION, || {
+                run(request, Arc::new(AtomicBool::new(false)), |_| Ok(()))
+            })
+        };
+        turn(None).unwrap();
+        let (old_agent, old_helper) = (pid_of(&agent), pid_of(&helper));
+        std::fs::remove_file(&agent).unwrap();
+        crate::provider::retire_session(SESSION);
+        // The sweep may not have run yet: the warm entry must still not be reused.
+        turn(Some("archive-thread")).unwrap();
+        let new_agent = pid_of(&agent);
+        assert_ne!(new_agent, old_agent, "the retired process was reused");
+        assert_both_gone(old_agent, old_helper);
+        thread::sleep(Duration::from_secs(3));
+        assert!(!gone(new_agent), "the new turn's process was killed");
+        configure(0);
     }
 }

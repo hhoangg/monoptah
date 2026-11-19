@@ -1095,6 +1095,8 @@ impl Shell {
             cx.notify();
             return;
         }
+        // A deleted session leaves no agent process or helper behind.
+        monocode_core::provider::retire_session(id);
         self.invalidate_chrome(cx);
         let store = self.store.clone();
         let cloud = self.cloud.clone();

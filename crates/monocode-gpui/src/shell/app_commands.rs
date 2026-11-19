@@ -822,6 +822,8 @@ impl Shell {
                             return;
                         } else if action == "sessions.stop" {
                             view.update(cx, |v, cx| v.stop_app_session(cx));
+                            // An API stop ends the agent's whole process tree, not only the turn.
+                            monocode_core::provider::retire_session(id);
                             Ok(json!({"sessionId":id,"stopped":true}))
                         } else {
                             view.update(cx, |v, cx| v.load(cx));

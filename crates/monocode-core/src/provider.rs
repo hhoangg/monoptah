@@ -39,6 +39,24 @@ pub fn configure_idle_agents(limit: usize) {
 pub fn keep_idle_agents(ids: Vec<i64>) {
     parked::keep(ids);
 }
+/// End every agent process that belongs to app session `session` (archive,
+/// stop, delete): warm idle processes, a cancelled one still settling, and a
+/// running turn's child, with the whole process tree (MCP helpers). Graceful
+/// first (stdin closed, then SIGTERM), SIGKILL of the group after a short
+/// grace; never blocks the caller. Windows uses `taskkill /T /F`; other
+/// platforms do nothing. Safe to call repeatedly, and for sessions with none.
+pub fn retire_session(session: i64) {
+    // The epoch bump makes running turns drop instead of park.
+    process::bump_epoch(session);
+    // The sweeps lock the pools and a Windows `Wire` drop blocks: never on the caller.
+    // Snapshot now: a turn started after this call must not be signalled.
+    let snapshot = process::session_pids(session);
+    thread::spawn(move || {
+        let mut retiring = parked::retire_session(session);
+        retiring.extend(opencode::retire_session(session));
+        process::retire_session_processes(snapshot, retiring);
+    });
+}
 pub fn discard_worktree(path: &Path) {
     parked::discard_worktree(path);
     opencode::discard_worktree(path);
@@ -1417,6 +1435,8 @@ fn run_operation(
     command_probe: bool,
     mut emit: impl FnMut(Vec<Event>) -> Result<(), String>,
 ) -> Result<Option<Value>, String> {
+    // Before the cancel check and any spawn: see `process::begin_turn`.
+    let _turn = process::begin_turn();
     if cancel.load(Ordering::Relaxed) {
         return Err("Stopped".into());
     }
