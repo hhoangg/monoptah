@@ -73,7 +73,7 @@ jobs:
           key: pnpm-store-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
           restore-keys: pnpm-store-${{ runner.os }}-
       # The browser build is cached; the OS libraries are installed on every run by
-      # `playwright install --with-deps chromium` (scripts/e2e-web.sh with CI=true).
+      # `playwright install --with-deps chromium webkit` (scripts/e2e-web.sh with CI=true).
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright

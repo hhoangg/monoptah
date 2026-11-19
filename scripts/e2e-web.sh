@@ -59,7 +59,8 @@ if [ "${E2E_SKIP_APP_BUILD:-}" != "1" ]; then
   export E2E_ASSETS_DIR="$app_out/client"
 fi
 
-install_args=(chromium)
+# chromium runs the specs; webkit runs web/e2e/tests/mobile-pickers.spec.ts (iPhone touch emulation).
+install_args=(chromium webkit)
 if [ "${CI:-}" = "true" ]; then install_args+=(--with-deps); fi
 pnpm --filter @monoptah/e2e exec playwright install "${install_args[@]}"
 

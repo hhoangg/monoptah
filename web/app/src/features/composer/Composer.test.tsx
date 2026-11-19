@@ -279,6 +279,58 @@ describe("send", () => {
     await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"));
   });
 
+  it("keeps the card through a finger tap elsewhere until its click, because WebKit blurs the field on the mousedown after pointerup", async () => {
+    const onOutside = vi.fn();
+    const { field } = renderWithOutside(onOutside);
+    const shape = () => field.closest("[data-shape]");
+    act(() => field.focus());
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    const outside = screen.getByRole("button", { name: "Outside" });
+    // The order of a tap: pointerdown, pointerup, then the compatibility mousedown (focus moves), mouseup and click.
+    fireEvent.pointerDown(outside, { pointerType: "touch" });
+    fireEvent.pointerUp(outside, { pointerType: "touch" });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+    act(() => field.blur());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+    expect(field).not.toHaveFocus();
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    fireEvent.click(outside);
+    expect(onOutside).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"));
+  });
+
+  it("collapses a card held for a finger tap even when no click follows (a drag)", async () => {
+    const { field } = renderWithOutside(vi.fn());
+    const shape = () => field.closest("[data-shape]");
+    act(() => field.focus());
+    const outside = screen.getByRole("button", { name: "Outside" });
+    fireEvent.pointerDown(outside, { pointerType: "touch" });
+    fireEvent.pointerUp(outside, { pointerType: "touch" });
+    act(() => field.blur());
+    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"), { timeout: 2000 });
+  });
+
+  it("a leftover wait of an earlier finger tap does not release the next press early", async () => {
+    const { field } = renderWithOutside(vi.fn());
+    const shape = () => field.closest("[data-shape]");
+    const outside = screen.getByRole("button", { name: "Outside" });
+    act(() => field.focus());
+    // Tap 1 ends without a click: its 500 ms wait is left running.
+    fireEvent.pointerDown(outside, { pointerType: "touch" });
+    fireEvent.pointerUp(outside, { pointerType: "touch" });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 300)));
+    // Tap 2 starts and ends later; tap 1's timer would fire in the middle of it.
+    act(() => field.focus());
+    fireEvent.pointerDown(outside, { pointerType: "touch" });
+    fireEvent.pointerUp(outside, { pointerType: "touch" });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 300)));
+    act(() => field.blur());
+    // 600 ms after tap 1 (past its timer), 300 ms after tap 2: the card is still held for tap 2's click.
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    fireEvent.click(outside);
+    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"));
+  });
+
   it("keeps the card when Stop is pressed while the empty field has focus", async () => {
     const user = userEvent.setup();
     const { field } = setup({ busy: true, onStop: () => Promise.resolve() });
