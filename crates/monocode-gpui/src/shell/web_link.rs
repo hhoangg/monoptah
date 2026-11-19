@@ -543,6 +543,7 @@ fn with_flag(mut flags: PolicyFlags, flag: WebPolicyFlag, on: bool) -> PolicyFla
         WebPolicyFlag::GitPush => flags.remote_git_push = on,
         WebPolicyFlag::CloudStart => flags.remote_cloud_start = on,
         WebPolicyFlag::Approvals => flags.remote_approvals = on,
+        WebPolicyFlag::PushContent => flags.show_push_content = on,
     }
     flags
 }
@@ -644,6 +645,40 @@ mod tests {
         let saved = policy::load_settings(&dir.join(policy::SETTINGS_FILE));
         assert!(saved.flags.remote_approvals);
         assert!(!saved.flags.remote_git_push && !saved.flags.remote_cloud_start);
+        policy::install_settings(Default::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The content toggle defaults on and its change is saved per desktop.
+    #[gpui::test]
+    fn the_push_content_toggle_defaults_on_and_is_saved(cx: &mut gpui::TestAppContext) {
+        let _serial = POLICY.lock().unwrap_or_else(|e| e.into_inner());
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let dir = scratch_dir("push-content");
+        policy::install_settings(Default::default());
+        assert!(policy::flags().show_push_content, "on by default");
+        assert!(
+            policy::load_settings(&dir.join(policy::SETTINGS_FILE))
+                .flags
+                .show_push_content,
+            "an old or missing file keeps it on"
+        );
+        window
+            .update(cx, |shell, _, cx| {
+                shell.data_dir = Some(dir.clone());
+                shell.web_settings_event(
+                    &SettingsEvent::WebSetPolicyFlag {
+                        flag: WebPolicyFlag::PushContent,
+                        on: false,
+                    },
+                    cx,
+                );
+                assert!(!policy::flags().show_push_content);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let saved = policy::load_settings(&dir.join(policy::SETTINGS_FILE));
+        assert!(!saved.flags.show_push_content);
         policy::install_settings(Default::default());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -142,7 +142,7 @@ impl Shell {
             return;
         }
         let summary = chat.summary.clone();
-        let body = chat.notification_reply_body(cx);
+        let body = chat.notification_reply_text(cx);
         self.deliver_session_notice(
             &summary,
             "agentFinished",
@@ -497,7 +497,7 @@ impl Shell {
                         .as_ref()
                         .is_some_and(|monos| monos.read(cx).is_mono_session(id))
                 {
-                    completed.push((chat.summary.clone(), chat.notification_reply_body(cx)));
+                    completed.push((chat.summary.clone(), chat.notification_reply_text(cx)));
                 } else {
                     // Ended with no finish to send, as when stopped.
                     quiet.push(id);

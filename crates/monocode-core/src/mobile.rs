@@ -11,6 +11,7 @@ pub(crate) mod identity_store;
 pub mod mentioned_file;
 pub mod notify;
 pub mod policy;
+pub mod preview;
 mod router;
 mod selection;
 pub mod watch;

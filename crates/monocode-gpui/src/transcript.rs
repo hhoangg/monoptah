@@ -3083,8 +3083,14 @@ impl TranscriptView {
             info.model = model.into();
         }
     }
-    /// Latest assistant message, including its virtualized continuation rows.
-    pub(crate) fn notification_reply_body(&self) -> String {
+    /// The latest assistant message, not yet reduced to one paragraph: a notice
+    /// clips it for the desktop and the phone, and the web preview strips its
+    /// markdown itself. Only the first ~480 UTF-16 units are kept. When the turn
+    /// ended in an error (not a stop), `Error: <text>` instead.
+    pub(crate) fn notification_reply_text(&self) -> String {
+        if let Some(error) = self.notification_error() {
+            return format!("Error: {error}");
+        }
         let Some(end) = self
             .source
             .iter()
@@ -3110,7 +3116,23 @@ impl TranscriptView {
         if self.mono {
             text = monocode_core::mono::emoji::token::strip(&text);
         }
-        crate::notifications::delivery::clip_body(&text)
+        text
+    }
+
+    /// The error that ended the turn: the last assistant or error row is an
+    /// error with text, and not the "Stopped" notice of a cancel.
+    fn notification_error(&self) -> Option<String> {
+        let row = self.source.iter().rfind(|row| {
+            matches!(row.role.as_str(), "assistant" | "error") && !row.text.trim().is_empty()
+        })?;
+        let text = row.text.trim();
+        (row.role == "error" && text != "Stopped").then(|| text.to_owned())
+    }
+
+    /// The reply as the desktop notice shows it: first paragraph, one line.
+    #[cfg(test)]
+    pub(crate) fn notification_reply_body(&self) -> String {
+        crate::notifications::delivery::clip_body(&self.notification_reply_text())
     }
 
     /// The latest assistant message in full, including its virtualized continuation rows.

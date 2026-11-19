@@ -230,6 +230,9 @@ pub(crate) enum WebPolicyFlag {
     CloudStart,
     /// "Remote approvals" (capability `approvals`).
     Approvals,
+    /// "Show message content in notifications" (not a capability: it only
+    /// picks what a web push says; on by default).
+    PushContent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

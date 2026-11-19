@@ -909,6 +909,20 @@ fn the_approvals_toggle_that_is_on_emits_off(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_content_toggle_defaults_on_and_emits_off(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| ctx.web = Some(paired()));
+    window
+        .update(visual, |preview, _, cx| {
+            assert!(preview.settings.read(cx).ctx.web_policy.show_push_content);
+        })
+        .unwrap();
+    click(visual, "settings-toggle-web-policy-push-content");
+    assert_eq!(events(&window, visual), ["policy:PushContent:false"]);
+}
+
+#[gpui::test]
 fn a_toggle_that_is_on_emits_off(cx: &mut TestAppContext) {
     let window = preview(cx);
     let visual = &mut VisualTestContext::from_window(window.into(), cx);

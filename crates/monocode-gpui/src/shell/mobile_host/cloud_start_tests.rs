@@ -713,6 +713,7 @@ fn the_cloud_methods_are_gated_by_their_toggles_and_the_permission() {
         remote_git_push: push,
         remote_cloud_start: cloud,
         remote_approvals: false,
+        show_push_content: true,
     };
     let control = device("gate-control", DeviceKind::Web, Permission::Control);
     let reader = device("gate-reader", DeviceKind::Web, Permission::Read);

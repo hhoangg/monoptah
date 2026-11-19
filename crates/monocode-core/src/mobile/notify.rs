@@ -20,8 +20,11 @@ pub struct Notice {
     pub data: Value,
 }
 
-/// What a web notice says, with no title or text: only enough for the browser
-/// to build its own line (architecture.md section 8).
+/// What a web notice says. By default it carries the session or Mono name and
+/// a short plain preview, which the Worker encrypts to each browser and never
+/// logs or stores (architecture.md section 8). With the "Show message content
+/// in notifications" setting off (`policy::PolicyFlags::show_push_content`)
+/// it carries neither, only enough for the browser to build a generic line.
 pub struct WebNotice<'a> {
     /// `agentFinished`, `agentInput` or `monoMessages`.
     pub category: &'a str,
@@ -30,6 +33,11 @@ pub struct WebNotice<'a> {
     pub mono_id: Option<&'a str>,
     /// The project's display name, or the Mono's name for a Mono notice.
     pub project: &'a str,
+    /// The session title or the Mono's name: the notification title.
+    pub title: &'a str,
+    /// The raw text to preview (reply excerpt, command asked, question).
+    /// Reduced by [`super::preview`] before it leaves the desktop.
+    pub preview: Option<&'a str>,
 }
 
 /// Tells the paired web devices that take `notice.category` about it, through
@@ -53,7 +61,8 @@ pub fn notify_web(notice: &WebNotice) {
         report(notice.category, target, 0, "skipped=unpaired", false);
         return;
     }
-    let body = match plan(notice, &status.devices, |session| {
+    let show_content = super::policy::flags().show_push_content;
+    let body = match plan(notice, &status.devices, show_content, |session| {
         host.catalog_session_project(session)
     }) {
         Ok(body) => body,
@@ -174,10 +183,14 @@ impl Skip {
 /// `sessionId`, which the Worker rejects with 400) and only the Mono filter of
 /// a device applies. A habit run (session and Mono) reaches a device that
 /// selected either the project or the Mono and sets `habitRun`. A plain
-/// session follows the project only.
+/// session follows the project only. Only the devices that selected the
+/// project or Mono are listed, so the preview reaches no one else. With
+/// `show_content` off, or nothing readable to show, the body has no `title`
+/// or `preview` and the browser shows its generic line.
 fn plan(
     notice: &WebNotice,
     devices: &[super::host::Device],
+    show_content: bool,
     project_of: impl Fn(&str) -> Option<String>,
 ) -> Result<Value, Skip> {
     let status = match notice.category {
@@ -218,6 +231,17 @@ fn plan(
         "status": status,
         "deviceIds": ids,
     });
+    if show_content {
+        let text = notice
+            .preview
+            .map(super::preview::preview)
+            .unwrap_or_default();
+        let title = super::preview::title(notice.title);
+        if !text.is_empty() && !title.is_empty() {
+            body["title"] = json!(title);
+            body["preview"] = json!(text);
+        }
+    }
     if let Some(session) = session {
         body["sessionId"] = json!(session);
     }
@@ -374,7 +398,18 @@ mod tests {
             session_id: session,
             mono_id: mono,
             project: "Alpha",
+            title: "Bach Tieu Thuan",
+            preview: Some("Fixed the **login** bug.\n\n```sh\ncargo test\n```"),
         }
+    }
+
+    /// `plan` with message content on, as by default.
+    fn plan(
+        notice: &WebNotice,
+        devices: &[super::super::host::Device],
+        project_of: impl Fn(&str) -> Option<String>,
+    ) -> Result<Value, Skip> {
+        super::plan(notice, devices, true, project_of)
     }
 
     fn project_p1(session: &str) -> Option<String> {
@@ -702,5 +737,68 @@ mod tests {
         assert_eq!(lines[1]["outcome"], "result=sent(1)");
         assert_eq!(lines[0]["outcome"], "suppressed=watching");
         assert_eq!(lines[0]["devices"], 0);
+    }
+
+    #[test]
+    fn plan_adds_the_title_and_a_plain_preview_by_default() {
+        let devices = [web_device("all", None, None)];
+        let body = plan(
+            &notice("agentFinished", Some("s1"), None),
+            &devices,
+            project_p1,
+        )
+        .unwrap();
+        assert_eq!(body["title"], "Bach Tieu Thuan");
+        assert_eq!(body["preview"], "Fixed the login bug. cargo test");
+        assert_eq!(body["project"], "Alpha");
+    }
+
+    #[test]
+    fn plan_sends_the_old_generic_body_when_content_is_off_or_empty() {
+        let devices = [web_device("all", None, None)];
+        let off = super::plan(
+            &notice("agentFinished", Some("s1"), None),
+            &devices,
+            false,
+            project_p1,
+        )
+        .unwrap();
+        assert!(off.get("title").is_none() && off.get("preview").is_none());
+        assert!(!off.to_string().contains("login"));
+        let mut empty = notice("agentFinished", Some("s1"), None);
+        empty.preview = Some("```\n```");
+        let body = plan(&empty, &devices, project_p1).unwrap();
+        assert!(body.get("title").is_none() && body.get("preview").is_none());
+    }
+
+    #[test]
+    fn plan_keeps_the_preview_under_the_size_cap_and_off_unselected_devices() {
+        let long = "word ".repeat(2000);
+        let mut big = notice("agentInput", Some("s1"), None);
+        big.preview = Some(&long);
+        let devices = [
+            web_device("p1", Some(&["p1"]), None),
+            web_device("p2", Some(&["p2"]), None),
+        ];
+        let body = plan(&big, &devices, project_p1).unwrap();
+        assert!(body.to_string().len() < 1200, "{}", body.to_string().len());
+        // The p2 device did not select the project: it is not a recipient, so
+        // the Worker never gets a payload for it.
+        assert_eq!(body["deviceIds"], json!(["p1"]));
+    }
+
+    #[test]
+    fn plan_previews_unclipped_replies_without_fences_or_list_markers() {
+        let devices = [web_device("all", None, None)];
+        let mut n = notice("agentFinished", Some("s1"), None);
+        for (raw, want) in [
+            ("```sh\ncargo test\n```\n\nDone.", "cargo test Done."),
+            ("Run:\n```sh\ncargo test\n```", "Run: cargo test"),
+            ("Steps:\n- **a**\n- b", "Steps: a b"),
+            ("Error: Rate limit reached", "Error: Rate limit reached"),
+        ] {
+            n.preview = Some(raw);
+            assert_eq!(plan(&n, &devices, project_p1).unwrap()["preview"], want);
+        }
     }
 }

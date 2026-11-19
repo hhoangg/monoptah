@@ -399,3 +399,73 @@ describe("VAPID rotation, dual key", () => {
     expect(await subscriptionRow(w.subscriptionId)).not.toBeNull();
   });
 });
+
+describe("message content", () => {
+  const SECRET = "the-secret-reply-text-7f3a";
+
+  it("puts the title and the preview into the encrypted payload", async () => {
+    const w = await createWorld();
+    const f = fakeFetch();
+    await notifyWith(w, bodyFor(w, { title: "Bach Tieu Thuan", preview: SECRET }), f);
+    expect(await plain(w, f.sent[0]!)).toMatchObject({ t: "Bach Tieu Thuan", b: SECRET });
+    // Encrypted end to end: the bytes that reach the push service do not show the text.
+    expect(new TextDecoder("latin1").decode(f.sent[0]!.body)).not.toContain(SECRET);
+    expect(JSON.stringify(f.sent[0]!.headers)).not.toContain(SECRET);
+    expect(f.sent[0]!.url).not.toContain(SECRET);
+  });
+
+  it("falls back to the generic text without content or with only half of it", async () => {
+    const w = await createWorld();
+    const f = fakeFetch();
+    await notifyWith(w, bodyFor(w), f);
+    await notifyWith(w, bodyFor(w, { title: "Name" }), f);
+    await notifyWith(w, bodyFor(w, { preview: "   " , title: "Name" }), f);
+    for (const request of f.sent) expect(await plain(w, request)).toMatchObject({ b: "Alpha: Finished" });
+  });
+
+  it("collapses lines and cuts a long preview to 180 characters, and stays under 3 KiB", async () => {
+    const w = await createWorld();
+    const f = fakeFetch();
+    const big = `${":".repeat(100)}${"x".repeat(28)}`;
+    await notifyWith(w, bodyFor(w, { title: "\u{1F600}".repeat(500), preview: `a\n\n  b ${"\u{1F600}".repeat(1000)}`, sessionId: big, monoId: big, habitRun: true }), f);
+    const plaintext = await w.subscriber.decrypt(f.sent[0]!.body);
+    expect(plaintext.length).toBeLessThan(3072);
+    const payload = PushPayloadSchema.parse(JSON.parse(new TextDecoder().decode(plaintext)));
+    expect(payload.b.startsWith("a b ")).toBe(true);
+    expect(Array.from(payload.b)).toHaveLength(180);
+    expect(payload.b.endsWith("…")).toBe(true);
+    expect(Array.from(payload.t)).toHaveLength(64);
+    expect(f.sent[0]!.body.length).toBeLessThan(4096);
+  });
+
+  it("rejects an oversized preview in the request", async () => {
+    const w = await createWorld();
+    const f = fakeFetch();
+    expect(await notifyWith(w, bodyFor(w, { title: "n", preview: "x".repeat(5000) }), f)).toMatchObject({ ok: false, status: 400 });
+    expect(f.sent).toHaveLength(0);
+  });
+
+  it("never logs or stores the content, even when the push service fails", async () => {
+    const w = await createWorld();
+    const lines: string[] = [];
+    for (const method of ["log", "info", "warn", "error", "debug"] as const) {
+      vi.spyOn(console, method).mockImplementation((...args: unknown[]) => void lines.push(args.map(String).join(" ")));
+    }
+    try {
+      await notifyWith(w, bodyFor(w, { title: "Private Name", preview: SECRET }), fakeFetch(500));
+      await notifyWith(w, bodyFor(w, { title: "Private Name", preview: SECRET }), fakeFetch(201));
+    } finally {
+      vi.restoreAllMocks();
+    }
+    expect(lines.length).toBeGreaterThan(0);
+    expect(lines.join("\n")).not.toContain(SECRET);
+    expect(lines.join("\n")).not.toContain("Private Name");
+    const dump = JSON.stringify([
+      (await env.DB.prepare("SELECT * FROM audit_log").all()).results,
+      (await env.DB.prepare("SELECT * FROM push_subscriptions").all()).results,
+      (await env.DB.prepare("SELECT * FROM push_prefs").all()).results,
+    ]);
+    expect(dump).not.toContain(SECRET);
+    expect(dump).not.toContain("Private Name");
+  });
+});
