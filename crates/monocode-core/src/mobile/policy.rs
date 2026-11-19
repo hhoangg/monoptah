@@ -201,7 +201,6 @@ codes! {
     NeedsDesktop => "needs_desktop",
     WakeRequired => "wake_required",
     FreshRequired => "fresh_required",
-    RateLimited => "rate_limited",
 }
 
 impl Code {
@@ -232,7 +231,6 @@ impl Code {
             Code::NeedsDesktop => "Answer this request on the desktop",
             Code::WakeRequired => "Sending wakes the stopped cloud instance; confirm to continue",
             Code::FreshRequired => "Confirm with your passkey again to add projects",
-            Code::RateLimited => "Too many attempts to add projects; try again later",
         }
     }
 }

@@ -222,7 +222,7 @@ export async function revokeGrant(queryClient: QueryClient, desktopId: string, d
  * A single-use ticket that proves a fresh passkey re-auth to the desktop, so this browser (a Control device) can widen
  * its selection there. Fresh route: prompts for the passkey once when the server asks. The ticket is bound to this
  * desktop and device and lives about two minutes; it is never stored or logged. 403 `forbidden` means the grant is not
- * Control, 429 `rate_limited` means too many tickets this hour (both `ApiError`).
+ * Control (`ApiError`).
  */
 export async function requestSelectionTicket(desktopId: string, deviceId: string): Promise<string> {
   const { ticket } = await withFreshAuth(() => apiFetch(desktopEndpoints.selectionTicket, { params: { id: desktopId, deviceId } }));

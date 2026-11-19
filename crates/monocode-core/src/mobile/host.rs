@@ -374,7 +374,7 @@ pub struct MobileHost {
     shut_down: Arc<AtomicBool>,
     /// The web link's client task, status and pending grants.
     web: super::web_link::WebLink,
-    /// What `device.selection` needs of a web device: refs, attempts, tickets.
+    /// What `device.selection` needs of a web device: refs, tickets.
     selection: Arc<SelectionState>,
 }
 
@@ -393,7 +393,6 @@ type TicketVerifier = Arc<dyn Fn(String, String) -> bool + Send + Sync>;
 struct SelectionState {
     /// Keys the refs of unshared items; random per host, memory only.
     secret: [u8; 32],
-    limit: Mutex<super::selection::AttemptLimit>,
     /// Replaces the HTTP call to the web server (tests).
     verifier: Mutex<Option<TicketVerifier>>,
 }
@@ -405,7 +404,6 @@ impl SelectionState {
         rand::rng().fill_bytes(&mut secret);
         Self {
             secret,
-            limit: Mutex::default(),
             verifier: Mutex::default(),
         }
     }
@@ -1538,15 +1536,6 @@ impl MobileHost {
         let Some(server_id) = device.server_device_id.clone() else {
             return Err(refuse("ticket rejected", policy::Code::FreshRequired));
         };
-        let admitted = self
-            .selection
-            .limit
-            .lock()
-            .map_err(unavailable)?
-            .admit(&device.id, std::time::Instant::now());
-        if admitted.is_err() {
-            return Err(refuse("rate limited", policy::Code::RateLimited));
-        }
         if !self.verify_ticket(server_id, ticket).await {
             return Err(refuse("ticket rejected", policy::Code::FreshRequired));
         }

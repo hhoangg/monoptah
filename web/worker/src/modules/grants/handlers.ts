@@ -14,12 +14,10 @@ import {
 } from "@monoptah/protocol";
 import { apiError, respond, type AppContext, type AppEnv } from "../../http.ts";
 import { randomToken, sha256Hex } from "../../lib/crypto.ts";
-import { identifierHash } from "../../lib/ip.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth, requireFresh } from "../../middleware/auth.ts";
 import { notifyGrants, revokeInRooms, setGrantStateInRooms } from "../../relay/rooms.ts";
 import { auditStatement, PREVIOUS_CHANGED } from "../audit/audit.ts";
-import { auditBreach, consume, LIMITS, rateLimitKey } from "../ratelimit/index.ts";
 import { requireDesktopToken } from "../desktops/token.ts";
 
 const REVOKED = 4003;
@@ -251,7 +249,6 @@ export const SELECTION_TICKET_REAUTH_SECONDS = 60;
 /**
  * `POST /api/desktops/:id/grants/:deviceId/selection-ticket` (fresh session): a single-use ticket that proves a
  * passkey re-auth to the desktop, so a Control web device can widen its selection. Only the SHA-256 is stored.
- * 10 per user per hour.
  */
 export const createSelectionTicket: Handler<AppEnv> = async (c) => {
   const { user, session } = requireAuth(c);
@@ -260,13 +257,6 @@ export const createSelectionTicket: Handler<AppEnv> = async (c) => {
   if (session.reauthAt === null || session.reauthAt < nowSeconds() - SELECTION_TICKET_REAUTH_SECONDS) return apiError(c, 403, "fresh_required", "Re-authentication required");
   if (!(await ownsDesktop(c, desktopId, user.id))) return notFound(c);
   if ((await c.env.DB.prepare(CONTROL_GRANT_SQL).bind(desktopId, deviceId, user.id).first()) === null) return apiError(c, 403, "forbidden", "This device does not have Control access to this desktop");
-
-  const limit = await consume(c.env, rateLimitKey("selection-ticket", "user", await identifierHash(c.env, "user", user.id)), LIMITS["selection-ticket"].limit, LIMITS["selection-ticket"].windowSeconds);
-  if (!limit.ok) {
-    if (limit.firstBreach) await auditBreach(c, "selection-ticket", LIMITS["selection-ticket"], user.id);
-    c.header("Retry-After", String(limit.retryAfter));
-    return apiError(c, 429, "rate_limited", "Too many requests");
-  }
 
   const ticket = randomToken(32);
   const now = nowSeconds();

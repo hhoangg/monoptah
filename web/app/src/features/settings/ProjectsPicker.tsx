@@ -42,7 +42,6 @@ function granted(list: string[] | null, id: string): boolean {
 function failureCopy(error: unknown, legacy: boolean): string {
   if (error instanceof ReauthCancelledError) return "Passkey confirmation was cancelled. Nothing was changed.";
   if (error instanceof ApiError) {
-    if (error.code === "rate_limited") return "Too many attempts to add projects. Wait a while and try again.";
     if (error.code === "forbidden") return "This browser does not have Control access to this desktop, so it cannot add projects.";
     if (error.code === "fresh_required") return "Confirm with your passkey, then try again.";
     return SAVE_ERROR;
@@ -55,8 +54,6 @@ function failureCopy(error: unknown, legacy: boolean): string {
         return READ_ONLY_COPY;
       case "fresh_required":
         return "The desktop could not confirm your passkey. Try again, and confirm with your passkey when asked.";
-      case "rate_limited":
-        return "Too many attempts to add projects on this desktop. Wait a while and try again.";
       case "revoked":
         return "This browser no longer has access to this desktop. Ask the owner to share it again.";
       case "not_found":

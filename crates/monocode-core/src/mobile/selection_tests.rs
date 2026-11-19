@@ -426,39 +426,6 @@ async fn malformed_web_fields_are_invalid_parameters() {
 }
 
 #[tokio::test]
-async fn widening_attempts_are_rate_limited_per_device() {
-    let (_dir, host) = open();
-    host.add_device_for_test(row(DeviceKind::Web, Permission::Control, "w-ctl"));
-    host.add_device_for_test(row(DeviceKind::Web, Permission::Control, "w-other"));
-    host.set_ticket_verifier(|_, _| false);
-    let beta = ref_of(
-        &web(&host, "w-ctl", json!({})).await.unwrap(),
-        "projects",
-        "Beta",
-    );
-    let params = json!({"addProjects": [beta], "ticket": "t"});
-    // The first attempt reaches the server (and fails there); the second, at
-    // once, is over the 10 second gap.
-    assert_eq!(
-        code(web(&host, "w-ctl", params.clone()).await),
-        "fresh_required"
-    );
-    assert_eq!(
-        code(web(&host, "w-ctl", params.clone()).await),
-        "rate_limited"
-    );
-    // Another device has its own count.
-    assert_eq!(code(web(&host, "w-other", params).await), "fresh_required");
-    // Failures before the ticket check do not count.
-    for _ in 0..3 {
-        assert_eq!(
-            code(web(&host, "w-other", json!({"projects": null})).await),
-            "fresh_required"
-        );
-    }
-}
-
-#[tokio::test]
 async fn all_projects_including_new_ones_works_and_new_projects_show_as_shared() {
     let (_dir, host) = open();
     host.add_device_for_test(row(DeviceKind::Web, Permission::Control, "w-ctl"));
@@ -503,6 +470,35 @@ async fn all_projects_including_new_ones_works_and_new_projects_show_as_shared()
         .await
         .unwrap();
     assert_eq!(narrowed["projects"], json!(["/Users/someone/new"]));
+}
+
+#[tokio::test]
+async fn widening_is_not_rate_limited() {
+    let (_dir, host) = open();
+    host.add_device_for_test(row(DeviceKind::Web, Permission::Control, "w-ctl"));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
+    host.set_ticket_verifier(move |_, ticket| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        ticket == "good"
+    });
+    // More attempts than the old limit of five an hour, back to back.
+    for round in 0..7 {
+        let narrowed = web(&host, "w-ctl", json!({"projects": [SECRET_PATH]}))
+            .await
+            .unwrap();
+        assert_eq!(narrowed["projects"], json!([SECRET_PATH]), "round {round}");
+        let widened = web(&host, "w-ctl", json!({"projects": null, "ticket": "good"}))
+            .await
+            .unwrap_or_else(|failure| panic!("round {round}: {failure:?}"));
+        assert_eq!(widened["projects"], Value::Null, "round {round}");
+        assert_eq!(row_of(&host, "w-ctl").projects, None, "round {round}");
+    }
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        7,
+        "every attempt reached the server"
+    );
 }
 
 #[tokio::test]
@@ -658,22 +654,11 @@ async fn narrowing_and_refused_widening_are_audited_without_the_ticket() {
             web(
                 &host,
                 "w-aud",
-                json!({"addProjects": [beta.clone()], "ticket": secret_ticket}),
-            )
-            .await
-        ),
-        "fresh_required"
-    );
-    assert_eq!(
-        code(
-            web(
-                &host,
-                "w-aud",
                 json!({"addProjects": [beta], "ticket": secret_ticket}),
             )
             .await
         ),
-        "rate_limited"
+        "fresh_required"
     );
     let lines: Vec<Value> = audit::read_recent(&log, 50)
         .into_iter()
@@ -690,7 +675,7 @@ async fn narrowing_and_refused_widening_are_audited_without_the_ticket() {
     assert_eq!(
         // `read_recent` lists the newest first.
         detail_of("selection_widen_refused"),
-        ["rate limited", "ticket rejected", "no ticket"]
+        ["ticket rejected", "no ticket"]
     );
     assert!(
         !serde_json::to_string(&lines)

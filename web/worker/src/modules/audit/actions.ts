@@ -77,7 +77,6 @@ export const RATE_LIMIT_AUDIT_GROUPS = [
   "invite",
   "handle",
   "session",
-  "selection-ticket",
 ] as const;
 
 interface ActionSpec {

@@ -22,7 +22,6 @@ const MESSAGES: Readonly<Record<string, string>> = {
   needs_desktop: "Answer this one on the desktop. It cannot be allowed once from here.",
   not_found: "That could not be found on your desktop.",
   fresh_required: "Confirm with your passkey first, then try again.",
-  rate_limited: "Too many attempts. Wait a little and try again.",
   nothing_to_retry: "There is nothing to send again.",
 };
 

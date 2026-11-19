@@ -77,7 +77,6 @@ describe("error codes", () => {
         "needs_desktop",
         "wake_required",
         "fresh_required",
-        "rate_limited",
       ].sort(),
     );
   });

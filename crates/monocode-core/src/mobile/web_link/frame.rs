@@ -479,7 +479,7 @@ impl CloseCode {
 }
 
 /// The desktop `code` values (the same names as `mobile::policy::Code`).
-pub const DESKTOP_ERROR_CODES: [&str; 19] = [
+pub const DESKTOP_ERROR_CODES: [&str; 18] = [
     "auto_stopping",
     "busy",
     "disabled",
@@ -491,7 +491,6 @@ pub const DESKTOP_ERROR_CODES: [&str; 19] = [
     "not_pending",
     "not_selected",
     "path_denied",
-    "rate_limited",
     "read_only",
     "revoked",
     "starting",
