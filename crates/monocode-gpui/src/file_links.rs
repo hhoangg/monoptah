@@ -12,10 +12,7 @@
 //! one look the same, and an explicit absolute link must open the file it names.
 use gpui::{App, Global, Window, WindowId};
 use monocode_core::files::{self, remote::is_remote};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::Path};
 
 /// The project each window has open, for the link menu, which runs inside a transcript that
 /// cannot see the shell. The shell writes it when it draws.
@@ -74,65 +71,16 @@ pub(crate) fn candidate_roots(
     roots
 }
 
-/// `path` is a link resolved against its base. When nothing exists at it, the first root that
-/// has the same relative path wins; otherwise `path` comes back unchanged. The relative path is
-/// the link as written when it was relative (`written`), else what remains of an absolute
-/// `path` below one of the roots, which is how a chat's already bound link looks. A remote
-/// `path` is never looked up. `exists` is the disk check.
-fn reroot(
-    path: &str,
-    written: Option<&str>,
-    roots: &[String],
-    exists: impl Fn(&Path) -> bool,
-) -> String {
-    let bound = Path::new(path);
-    if roots.is_empty() || is_remote(bound) || !bound.is_absolute() || exists(bound) {
-        return path.to_owned();
-    }
-    let candidates: Vec<PathBuf> = match written {
-        Some(relative) => roots
-            .iter()
-            .map(|root| files::document::resolve_path(Path::new(relative), Path::new(root)))
-            .collect(),
-        None => {
-            let Some(relative) = roots
-                .iter()
-                .find_map(|root| bound.strip_prefix(root).ok())
-                .filter(|relative| !relative.as_os_str().is_empty())
-            else {
-                return path.to_owned();
-            };
-            roots
-                .iter()
-                .map(|root| PathBuf::from(root).join(relative))
-                .collect()
-        }
-    };
-    candidates
-        .into_iter()
-        .find(|candidate| exists(candidate))
-        .map_or_else(
-            || path.to_owned(),
-            |found| found.to_string_lossy().into_owned(),
-        )
-}
-
 /// A link's absolute path and its `:line:col` or `#L12` location, resolved against `base`
 /// (as [`crate::file_editor::file_location`] does) and then re-rooted among `roots`. With no
-/// roots, which is every chat that is not a Mono's, this is exactly `file_location`.
+/// roots, which is every chat that is not a Mono's, this is exactly `file_location`. The rules
+/// live in `monocode_core::files::links`, shared with the remote file preview.
 pub(crate) fn resolve_link(
     raw: &str,
     base: &str,
     roots: &[String],
 ) -> (String, Option<(usize, usize)>) {
-    let (path, location) = crate::file_editor::file_location(raw, base);
-    let (written, _) = crate::file_editor::split_location(raw);
-    // `~/x` and `file://` links are absolute once read; only a plain relative path is "written".
-    let relative = (!written.starts_with('~')
-        && !raw.starts_with("file://")
-        && Path::new(&written).is_relative())
-    .then_some(written.as_str());
-    (reroot(&path, relative, roots, |p| p.exists()), location)
+    files::links::resolve_link(raw, base, roots)
 }
 
 /// The root that holds `path`, for "Copy Relative Path".

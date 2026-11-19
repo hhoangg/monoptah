@@ -31,7 +31,32 @@
 //!   `Echo: <text>` is pushed over every watch. A text containing `[hold]` gets no reply until `session.cancel`.
 //! - `session.cancel` (the stop method of `web/protocol/methods.json`) ends the streaming: busy turns false.
 //! - `conversation.watch` opens a watch: the current turns at once, then one frame per change.
+//! - `chat.mentionedFile` runs the real core implementation (`monocode_core::mobile::mentioned_file::handle`,
+//!   the one the app uses) against a seeded folder, when the environment seeds one (see below); otherwise it
+//!   answers `unsupported`.
 //! - any other app method answers the error code `unsupported`.
+//!
+//! Seeding `chat.mentionedFile` (environment of the `serve` process):
+//!
+//! ```text
+//! WEB_LINK_HEADLESS_MENTION_DIR=<folder>   required to enable it; the session folder and the root of project `e2e-project`
+//! WEB_LINK_HEADLESS_MENTION_TEXT=<text>    optional: the one assistant message that mentions files; `{dir}` is replaced by
+//!                                          the canonical folder. Default: a message that mentions, as an absolute path in
+//!                                          backticks, every top-level regular file of the folder whose name does not start
+//!                                          with `unmentioned`
+//! WEB_LINK_HEADLESS_MENTION_TOOL_TEXT=<text>  optional: the files the agent ran a tool on, written like a message: every
+//!                                          file it mentions becomes one COMPLETED `Read` tool call (`{file_path}`), the
+//!                                          evidence a file OUTSIDE the device's projects needs besides the assistant
+//!                                          message (plain text is no evidence); `{dir}` is replaced as above. Default: the
+//!                                          same text as the assistant message, as if the agent read every file it names.
+//!                                          Set it to the empty string for a conversation without any tool row (a file
+//!                                          outside the projects is then `forbidden`)
+//! ```
+//!
+//! The conversation id is `e2e-session`. The seeded assistant message is the only one that authorizes paths (the
+//! fake `Echo:` turns do not). The folder is also the project `e2e-project` (selected when the device selection is
+//! all or lists it), so replies carry `project`. Files and subfolders are read at request time: a spec may create
+//! files after the start. The deny-list, budgets and paging are the real ones; no audit file is written.
 //!
 //! `--confirm-pending` is for the E2E harness only: it confirms every pending device with that permission on
 //! its own. It is never a default; without it a device stays pending until an `approve` command.
@@ -576,9 +601,102 @@ fn app_loop(
     }
 }
 
+/// The seeded folder and message of `chat.mentionedFile`, read from the environment once.
+struct MentionSeed {
+    dir: std::path::PathBuf,
+    text: Option<String>,
+    /// `Some("")` is no tool row at all; `None` is the default (the assistant's text). Every file
+    /// it mentions becomes a completed `Read` call.
+    tool_text: Option<String>,
+}
+
+fn mention_seed() -> Option<&'static MentionSeed> {
+    static SEED: std::sync::OnceLock<Option<MentionSeed>> = std::sync::OnceLock::new();
+    SEED.get_or_init(|| {
+        let dir = std::env::var("WEB_LINK_HEADLESS_MENTION_DIR").ok()?;
+        let dir = std::fs::canonicalize(dir).ok()?;
+        let text = std::env::var("WEB_LINK_HEADLESS_MENTION_TEXT")
+            .ok()
+            .map(|text| text.replace("{dir}", &dir.to_string_lossy()));
+        let tool_text = std::env::var("WEB_LINK_HEADLESS_MENTION_TOOL_TEXT")
+            .ok()
+            .map(|text| text.replace("{dir}", &dir.to_string_lossy()));
+        Some(MentionSeed {
+            dir,
+            text,
+            tool_text,
+        })
+    })
+    .as_ref()
+}
+
+/// The seeded assistant message: the given text, or one that mentions every top-level file.
+fn mention_text(seed: &MentionSeed) -> String {
+    if let Some(text) = &seed.text {
+        return text.clone();
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&seed.dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.starts_with("unmentioned"))
+        .collect();
+    names.sort();
+    let mentions: Vec<String> = names
+        .iter()
+        .map(|name| format!("`{}`", seed.dir.join(name).display()))
+        .collect();
+    format!("Files: {}", mentions.join(" "))
+}
+
+fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
+    use monocode_core::mobile::mentioned_file as mention;
+    let Some(seed) = mention_seed() else {
+        return Err(Failure::coded(
+            "unsupported",
+            "The E2E desktop does not serve this method",
+        ));
+    };
+    if request.params["conversationId"].as_str() != Some(SESSION_ID) {
+        return Err(Failure::from("Unknown conversation"));
+    }
+    let assistant = mention_text(seed);
+    let tool = seed.tool_text.clone().unwrap_or_else(|| assistant.clone());
+    let texts = vec![assistant];
+    // Structured evidence: one completed `Read` call per file the tool text mentions.
+    let tool_texts: Vec<String> = mention::mentions::extract_mentions(&tool)
+        .into_iter()
+        .map(|path| {
+            let mut call = monocode_core::tool::ToolCall::new("e2e-read", "Read");
+            call.state = monocode_core::tool::ToolState::Completed;
+            call.input = json!({ "file_path": path }).to_string();
+            serde_json::to_string(&call).unwrap_or_default()
+        })
+        .collect();
+    let id = PROJECT_ID.to_owned();
+    let selected = request
+        .device
+        .projects
+        .as_ref()
+        .is_none_or(|list| list.contains(&id));
+    let projects = vec![mention::Project::new(
+        &id,
+        &seed.dir,
+        selected,
+        monocode_core::mobile::denylist::DenyList::default(),
+    )];
+    let cwd = seed.dir.to_string_lossy().into_owned();
+    let mut ctx = mention::Context::new(&texts, &cwd, &[], &projects);
+    ctx.tool_texts = &tool_texts;
+    mention::handle(&request.device.id, &request.params, &ctx).result
+}
+
 fn answer(conversation: &mut Conversation, request: &Request) -> Result<Value, Failure> {
     let known = request.params["conversationId"].as_str() == Some(SESSION_ID);
     match request.method.as_str() {
+        "chat.mentionedFile" => answer_mentioned(request),
         "conversation.read" if known => Ok(conversation.read()),
         "conversation.send" if known => match request.params["text"].as_str() {
             Some(text) if !text.is_empty() => {
@@ -1245,6 +1363,9 @@ fn run_check_vectors(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i
 }
 
 fn main() {
+    // The HTML transform of `chat.mentionedFile` runs in a child of this executable, like the app.
+    monocode_core::mobile::mentioned_file::sandbox::maybe_run_child();
+    monocode_core::mobile::mentioned_file::sandbox::enable_subprocess();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();

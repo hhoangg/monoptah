@@ -12,7 +12,7 @@ export function bootstrapInvite(): string {
 }
 
 /** Named bootstrap invites minted by the global setup: one per spec that needs its own account. Never print them. */
-export type InviteName = "pairing" | "devices" | "ui" | "r12" | "w14" | "w14b";
+export type InviteName = "pairing" | "devices" | "ui" | "r12" | "w14" | "w14b" | "filepreview";
 
 export function namedInvite(name: InviteName): string {
   const value = process.env[`E2E_INVITE_${name.toUpperCase()}`];

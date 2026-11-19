@@ -938,6 +938,7 @@ fn a_click_in_the_document_lightbox_is_never_read_from_the_cloud(cx: &mut TestAp
                         kind: Kind::Markdown,
                         text: Some("[next](next.md)".into()),
                         web_root: None,
+                        scripts: true,
                     }),
                 }),
                 cx,

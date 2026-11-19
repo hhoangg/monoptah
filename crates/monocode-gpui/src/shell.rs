@@ -45,6 +45,9 @@ mod idle_agents;
 mod image_lightbox_tests;
 mod layout;
 mod live_agents;
+mod preview_path;
+#[cfg(test)]
+mod preview_path_tests;
 mod sandbox_picker;
 pub(crate) use app_commands::CLOUD_ARCHIVING;
 pub(crate) use cloud_app_archive::ArchiveFailure;
@@ -666,6 +669,8 @@ pub(crate) struct Shell {
         Entity<crate::document_lightbox::DocumentLightbox>,
         Subscription,
     )>,
+    /// The notice for a file mentioned in a chat that cannot be previewed.
+    cannot_preview: Option<(Entity<crate::file_preview::CannotPreview>, Subscription)>,
     app_bridge: Option<monocode_core::mono::bridge::Server>,
     mobile: mobile_host::Mobile,
     app_results: HashMap<(i64, String), (String, Result<serde_json::Value, String>)>,
@@ -1238,6 +1243,7 @@ impl Shell {
             quick_open: None,
             image_lightbox: None,
             document_lightbox: None,
+            cannot_preview: None,
             app_bridge: None,
             mobile: mobile_host::Mobile::default(),
             app_results: HashMap::new(),
@@ -9361,7 +9367,9 @@ impl Render for Shell {
         if let Some(m) = &self.monos {
             m.read(cx).hide_html(cx);
             // A native web view paints above the barrier, so a blocking dialog hides it too.
-            let covered = self.document_lightbox.is_some() || self.blocking_modal().is_some();
+            let covered = self.document_lightbox.is_some()
+                || self.cannot_preview.is_some()
+                || self.blocking_modal().is_some();
             m.update(cx, |m, cx| {
                 m.set_suppress_html(covered);
                 m.bind_window(window, cx)
@@ -9652,32 +9660,12 @@ impl Render for Shell {
             }))
             .on_action(
                 cx.listener(|this, open: &crate::image_lightbox::Open, window, cx| {
-                    let view = cx.new(|cx| {
-                        crate::image_lightbox::ImageLightbox::new(open.clone(), window, cx)
-                    });
-                    let closed =
-                        cx.subscribe(&view, |this, _, _: &crate::image_lightbox::Closed, cx| {
-                            this.image_lightbox = None;
-                            cx.notify();
-                        });
-                    this.image_lightbox = Some((view, closed));
-                    cx.notify();
+                    this.show_image_lightbox(open.clone(), window, cx)
                 }),
             )
             .on_action(
                 cx.listener(|this, open: &crate::document_lightbox::Open, window, cx| {
-                    let view = cx.new(|cx| {
-                        crate::document_lightbox::DocumentLightbox::new(open.clone(), window, cx)
-                    });
-                    let closed = cx.subscribe(
-                        &view,
-                        |this, _, _: &crate::document_lightbox::Closed, cx| {
-                            this.document_lightbox = None;
-                            cx.notify();
-                        },
-                    );
-                    this.document_lightbox = Some((view, closed));
-                    cx.notify();
+                    this.show_document_lightbox(open.clone(), window, cx)
                 }),
             )
             .flex()
@@ -9710,37 +9698,15 @@ impl Render for Shell {
                     if this.open_cloud_path(&event.0, window, cx) {
                         return;
                     }
-                    let cwd = this.git.read(cx).project().to_owned();
-                    // A Mono's chat links are bound to its first project; the file may be in
-                    // another one (or in the project the window shows).
-                    let roots = if this.mono_active(cx) {
-                        let projects = this
-                            .monos
-                            .as_ref()
-                            .and_then(|m| m.read(cx).current().map(|m| m.projects.clone()))
-                            .unwrap_or_default();
-                        crate::file_links::candidate_roots(Some(&this.workspace.project), &projects)
-                    } else {
-                        Vec::new()
-                    };
-                    let (path, location) = crate::file_links::resolve_link(&event.0, &cwd, &roots);
-                    this.open_review(crate::review::ReviewTab::File { cwd, path }, window, cx);
-                    // Monos render above the session pane tree. Give its file
-                    // an independent visible tab using the normal navigation
-                    // path, which retains the Mono tab and live conversation.
-                    if this.mono_active(cx)
-                        && let Some(owner) = this.workspace.active
-                        && let Some(pane) = this.independent_file_pane(owner, cx)
-                    {
-                        this.open_file_pane(pane, window, cx);
-                    }
-                    if let Some((line, column)) = location
-                        && let Some(pane) = this.active_review(cx)
-                    {
-                        pane.update(cx, |pane, cx| pane.navigate_file(line, column, cx));
-                    }
+                    let (cwd, path, location) = this.link_target(&event.0, cx);
+                    this.open_file_at(cwd, path, location, window, cx);
                 }),
             )
+            .on_action(cx.listener(
+                |this, event: &crate::file_preview::PreviewPath, window, cx| {
+                    this.preview_path(&event.0, window, cx)
+                },
+            ))
             .on_action(
                 cx.listener(|this, _: &crate::Quit, window, cx| this.request_quit(window, cx)),
             )
@@ -10246,6 +10212,11 @@ impl Render for Shell {
                 self.document_lightbox
                     .as_ref()
                     .map(|(view, _)| crate::document_lightbox::overlay(view)),
+            )
+            .children(
+                self.cannot_preview
+                    .as_ref()
+                    .map(|(view, _)| crate::modal::window_overlay(window, view.clone())),
             )
             .map(|root| {
                 #[cfg(target_os = "linux")]

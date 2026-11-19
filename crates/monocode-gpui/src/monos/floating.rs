@@ -307,6 +307,46 @@ impl Floating {
                     .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
             )
     }
+    /// A file chip or link in this panel's chat. The panel is small and floats over other apps,
+    /// so the file opens in the workspace window, which comes forward for it.
+    fn preview_path(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let owner = self.owner.read(cx);
+        let (Some(parent), Some(shell)) = (owner.parent_window, owner.owner.upgrade()) else {
+            return;
+        };
+        let projects = owner
+            .roster
+            .get(&self.selected)
+            .map(|m| m.projects.clone())
+            .unwrap_or_default();
+        let raw = raw.to_owned();
+        let app: &mut App = cx;
+        app.defer(move |cx| {
+            let _ = parent.update(cx, |_, window, cx| {
+                // The Mono's own projects decide where a relative link points, as in its chat.
+                let roots = crate::file_links::candidate_roots(
+                    crate::file_links::window_project(window, cx).as_deref(),
+                    &projects,
+                );
+                let target = if roots.is_empty() {
+                    raw
+                } else {
+                    let base = roots.first().map_or("", String::as_str);
+                    let (path, location) = crate::file_links::resolve_link(&raw, base, &roots);
+                    location.map_or(path.clone(), |(line, column)| {
+                        format!("{path}:{line}:{column}")
+                    })
+                };
+                window.activate_window();
+                cx.activate(true);
+                // Already resolved against the Mono's own projects: not a link of the active
+                // cloud session's transcript, so no cloud lookup.
+                shell.update(cx, |shell, cx| {
+                    shell.preview_local_path(&target, window, cx)
+                });
+            });
+        });
+    }
     fn stop(&mut self, cx: &mut Context<Self>) {
         if let Some(chat) = self.owner.read(cx).chats.get(&self.selected).cloned() {
             chat.update(cx, |v, cx| v.stop_if_busy(cx));
@@ -343,6 +383,11 @@ impl gpui::Render for Floating {
             .bg(shell_fill())
             .text_color(content(1.))
             .font_family(crate::fonts::UI)
+            .on_action(
+                cx.listener(|this, event: &crate::file_preview::PreviewPath, _, cx| {
+                    this.preview_path(&event.0, cx)
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
                     this.stop(cx);
@@ -629,5 +674,48 @@ impl Monos {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monos::tests::setup;
+    use gpui::{TestAppContext, VisualTestContext};
+
+    #[gpui::test]
+    fn a_file_link_in_the_floating_chat_previews_in_the_workspace_window(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        let report = std::path::PathBuf::from(&s.project).join("report.md");
+        std::fs::write(&report, "# Report\n").unwrap();
+        let visual = &mut VisualTestContext::from_window(s.window.into(), cx);
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        cx.update(|cx| {
+            s.manager
+                .update(cx, |m, cx| m.open_floating(s.id.clone(), cx))
+        });
+        cx.run_until_parked();
+        let floating = cx.update(|cx| {
+            let manager = s.manager.read(cx);
+            assert!(
+                manager.parent_window.is_some(),
+                "the workspace window is known"
+            );
+            manager.floating[0].downcast::<Floating>().unwrap()
+        });
+        // The panel has no file viewer of its own: the click is forwarded to the workspace.
+        floating
+            .update(cx, |view, _, cx| {
+                view.preview_path(&report.to_string_lossy(), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let shown = s
+            .window
+            .update(cx, |shell, _, cx| shell.document_preview_path(cx))
+            .unwrap();
+        assert_eq!(shown.as_deref(), Some(report.as_path()));
+        let _ = std::fs::remove_file(report);
     }
 }

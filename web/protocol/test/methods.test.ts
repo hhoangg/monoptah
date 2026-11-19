@@ -83,6 +83,10 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
   "project.worktrees": { params: { projectId: "p1" }, result: { worktrees: [{ path: "/w/a", name: "feature" }] } },
   "project.files": { params: { projectId: "p1", path: "src" }, result: { entries: [{ name: "a.ts", isDir: false, ignored: false }] } },
   "project.file": { params: { projectId: "p1", path: "src/a.ts" }, result: { path: "src/a.ts", text: "x", truncated: false } },
+  "chat.mentionedFile": {
+    params: { conversationId: "s1", path: "docs/report.html", asset: "img/a.png", offset: 0, source: false },
+    result: { path: "/work/app/docs/report.html", name: "report.html", size: 12, kind: "html", encoding: "utf8", data: "<p></p>", offset: 0, total: 7, assets: ["img/a.png"], project: { projectId: "p1", path: "docs/report.html" } },
+  },
   "project.search": { params: { projectId: "p1", query: "app" }, result: { results: [{ path: "src/app.ts", name: "app.ts" }] } },
   "project.fileHighlight": { params: { job: "j1", from: 0 }, result: { palette: ["#fff"], lines: [], done: true } },
   "project.git": {
@@ -186,6 +190,33 @@ describe("full-access is never sendable", () => {
     for (const mode of ["supervised", "auto-accept-edits", "auto"]) {
       expect(METHODS["session.configure"].params.safeParse({ conversationId: "s1", runtimeMode: mode }).success).toBe(true);
     }
+  });
+});
+
+describe("chat.mentionedFile", () => {
+  const params = METHODS["chat.mentionedFile"].params;
+  it("is a read method answered by the app", () => {
+    expect(METHODS["chat.mentionedFile"].class).toBe("read");
+    expect(METHODS["chat.mentionedFile"].transport).toBe("app");
+  });
+  it("limits the path and asset to 1024 chars and the offset to a non-negative integer", () => {
+    expect(params.safeParse({ conversationId: "mono:m1", path: "a".repeat(1024) }).success).toBe(true);
+    expect(params.safeParse({ conversationId: "s1", path: "a".repeat(1025) }).success).toBe(false);
+    expect(params.safeParse({ conversationId: "s1", path: "a", asset: "b".repeat(1025) }).success).toBe(false);
+    expect(params.safeParse({ conversationId: "s1", path: "a", offset: -1 }).success).toBe(false);
+    expect(params.safeParse({ conversationId: "s1", path: "a", offset: 1.5 }).success).toBe(false);
+    expect(params.safeParse({ path: "a" }).success).toBe(false);
+  });
+  it("takes an optional boolean source flag", () => {
+    expect(params.safeParse({ conversationId: "s1", path: "a.html", source: true }).success).toBe(true);
+    expect(params.safeParse({ conversationId: "s1", path: "a.html", source: "yes" }).success).toBe(false);
+  });
+  it("accepts only the five kinds and the three encodings", () => {
+    const result = METHODS["chat.mentionedFile"].result;
+    const base = { path: "/a", name: "a", size: 0, kind: "binary", encoding: "none", data: "", offset: 0, total: 0 };
+    expect(result.safeParse(base).success).toBe(true);
+    expect(result.safeParse({ ...base, kind: "video" }).success).toBe(false);
+    expect(result.safeParse({ ...base, encoding: "hex" }).success).toBe(false);
   });
 });
 

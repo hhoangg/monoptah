@@ -275,6 +275,11 @@ pub(crate) enum Part {
         id: String,
         caption: String,
     },
+    /// A local picture placed in a document (see `Block::Image`); a chat never has one.
+    Image {
+        src: String,
+        alt: String,
+    },
 }
 #[derive(Clone, PartialEq)]
 pub(crate) struct MarkdownRow {
@@ -392,6 +397,13 @@ fn flatten(
             Part::Visual {
                 id: id.clone(),
                 caption: caption.clone(),
+            },
+            16.,
+        ),
+        Block::Image { src, alt } => add(
+            Part::Image {
+                src: src.clone(),
+                alt: alt.clone(),
             },
             16.,
         ),
@@ -665,6 +677,12 @@ fn rich_inline(
                     .when(file, |d| {
                         let path = style.link.clone().unwrap_or_else(|| text.clone());
                         let menu_path = path.clone();
+                        // Only the tests look a chip up by its text: no string per chip per frame.
+                        #[cfg(test)]
+                        let d = {
+                            let text = text.clone();
+                            d.debug_selector(move || format!("file-chip:{text}"))
+                        };
                         d.cursor(gpui::CursorStyle::PointingHand)
                             .hover(|s| s.bg(content(0.13)))
                             .on_click(move |event, window, cx| {
@@ -958,7 +976,9 @@ fn open_link(url: &str, window: &mut Window, cx: &mut App) {
     if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("mailto:") {
         cx.open_url(url);
     } else if !url.starts_with('#') && (!url.contains("://") || url.starts_with("file://")) {
-        window.dispatch_action(Box::new(crate::file_editor::OpenPath(url.into())), cx);
+        // A click previews the file in the app (the document, image or code viewer that fits
+        // it); the link menu's "Open in Monoptah" still opens it in the editor.
+        window.dispatch_action(Box::new(crate::file_preview::PreviewPath(url.into())), cx);
     }
 }
 
@@ -1042,6 +1062,16 @@ pub(crate) fn body_selected(
                 "Visual".to_owned()
             } else {
                 caption.clone()
+            })
+            .into_any_element(),
+        // Only a document view draws the picture (see `TranscriptView::document_image`); anywhere
+        // else its alt text stands in for it.
+        Part::Image { src, alt } => body
+            .text_color(content(0.5))
+            .child(if alt.is_empty() {
+                src.clone()
+            } else {
+                alt.clone()
             })
             .into_any_element(),
         Part::Math(tex) => {

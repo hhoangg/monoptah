@@ -482,6 +482,37 @@ export const METHODS = {
       highlightJob: z.string().optional(),
     }),
   }),
+  /**
+   * A file an assistant message of the conversation mentions (chat.mentionedFile, capability `mentionedFiles`). The
+   * desktop serves it only when the path is mentioned in an assistant message and is not on the deny list. Large
+   * files come in pages (`nextOffset`); `asset` asks for an image an html or markdown file refers to.
+   */
+  "chat.mentionedFile": method({
+    class: "read",
+    transport: "app",
+    params: z.object({
+      conversationId: ConversationId,
+      path: z.string().min(1).max(1024),
+      asset: z.string().min(1).max(1024).optional(),
+      offset: z.number().int().min(0).optional(),
+      /** Answer an html or markdown file as its raw utf8 source (kind "text"), for a jump to a line. */
+      source: z.boolean().optional(),
+    }),
+    result: z.looseObject({
+      path: z.string(),
+      name: z.string(),
+      size: z.number().int().min(0),
+      kind: z.enum(["text", "markdown", "html", "image", "binary"]),
+      mime: z.string().optional(),
+      encoding: z.enum(["utf8", "base64", "none"]),
+      data: z.string(),
+      offset: z.number().int().min(0),
+      total: z.number().int().min(0),
+      nextOffset: z.number().int().min(0).optional(),
+      assets: z.array(z.string()).optional(),
+      project: z.looseObject({ projectId: z.string(), path: z.string() }).optional(),
+    }),
+  }),
   "project.search": method({
     class: "read",
     transport: "app",

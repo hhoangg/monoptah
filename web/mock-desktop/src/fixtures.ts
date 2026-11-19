@@ -22,6 +22,7 @@ import {
   type WatchFrame,
 } from "@monoptah/protocol";
 import type { METHODS } from "@monoptah/protocol";
+import { MENTION_MESSAGE, MentionError, mentionedFile } from "./mentioned.ts";
 import type { z } from "zod";
 
 /** Time used by default so fixtures are deterministic. */
@@ -139,6 +140,8 @@ export class MockWorld {
     approval.waiting = "approval";
     approval.approvals = [{ requestId: "41", label: "Run example command", detail: "example-cli --check (fake detail)" }];
     approval.script = [() => this.#clearApprovals(approval)];
+    const mentions = this.#addSession({ id: "sess-local-files", projectId: "proj-alpha", title: "Write the example report", target: { kind: "local" } });
+    this.addAssistantText(mentions.id, MENTION_MESSAGE);
     this.#addSession({ id: "sess-codespace-1", projectId: "proj-alpha", title: "Refactor on the fake codespace", target: { kind: "codespace", instance: "fake-codespace-one" }, cloudState: "available" });
     this.#addSession({ id: "sess-sandbox-stopped", projectId: "proj-beta", title: "Stopped sandbox work", target: { kind: "sandbox", instance: "fake-sandbox-one" }, cloudState: "stopped" });
     const starting = this.#addSession({ id: "sess-codespace-starting", projectId: "proj-beta", title: "Starting codespace work", target: { kind: "codespace", instance: "fake-codespace-two" }, cloudState: "starting" });
@@ -212,6 +215,14 @@ export class MockWorld {
     const s = this.sessions.get(conversationId);
     if (!s || !this.visibleSessions().includes(s)) throw new FixtureError(`Unknown conversation ${conversationId}`);
     return s;
+  }
+
+  /** Appends a finished assistant turn with `text` to a conversation (the mention fixtures use it). */
+  addAssistantText(conversationId: string, text: string): void {
+    const s = this.session(conversationId);
+    const at = this.now();
+    const id = `${s.id}-m${s.turns.length + 1}`;
+    s.turns.push({ id, stampAt: at - 30_000, completedAt: at - 20_000, durationMs: 10_000, items: [{ type: "text", id: `${id}-a`, text }] });
   }
 
   // --- Reads ---
@@ -656,6 +667,16 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
   "project.file": (p, { world }) => {
     project(world, p.projectId);
     return { path: p.path, text: p.path === LARGE_FILE_PATH ? largeText() : "Example file text.\n", truncated: false };
+  },
+  "chat.mentionedFile": (p, { world }) => {
+    // Mono chats (`mono:<id>`) exist as sessions of that id in a test world; the mention check is the fixture table.
+    world.session(p.conversationId);
+    try {
+      return mentionedFile(p);
+    } catch (error) {
+      if (error instanceof MentionError) throw new FixtureError(error.message, error.code);
+      throw error;
+    }
   },
   "project.search": (p, { world }) => {
     project(world, p.projectId);

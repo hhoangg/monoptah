@@ -2,7 +2,7 @@
 // (parser.ts) and rendered as React elements: there is no HTML sink anywhere, raw HTML in the
 // text is shown literally, links go through the allowlist (links.ts) and images are not loaded.
 import { Fragment, memo, useMemo, type CSSProperties, type ReactNode } from "react";
-import { Icon } from "@/ui/Icon";
+import { FileTypeIcon } from "@/features/files/FileTypeIcon";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import "@/styles/markdown.css";
 import { CodeBlock } from "./CodeBlock";
@@ -28,6 +28,11 @@ export interface MarkdownProps {
   animate?: boolean;
   /** Called when a file link or a file-naming code span is pressed. Without it files show unlinked. */
   onOpenFile?: (path: string, line?: number) => void;
+  /**
+   * File preview only: draws an image whose source is a relative path (`![a](img/x.png)`). Without it (chat) every
+   * image stays its alt text, and a remote image is never loaded either way.
+   */
+  renderImage?: (src: string, alt: string) => ReactNode;
   /** Called for in-app `/d/...` links; without it they navigate as plain links. */
   onNavigate?: (href: string) => void;
   className?: string;
@@ -35,6 +40,7 @@ export interface MarkdownProps {
 
 interface Handlers {
   onOpenFile?: (path: string, line?: number) => void;
+  renderImage?: (src: string, alt: string) => ReactNode;
   onNavigate?: (href: string) => void;
 }
 
@@ -47,19 +53,20 @@ export const Markdown = memo(function Markdown({
   streaming = false,
   animate = false,
   onOpenFile,
+  renderImage,
   onNavigate,
   className,
 }: MarkdownProps) {
   const reduceMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
   const shown = useStreamedText(text, streaming && !reduceMotion);
   const { blocks, count, ranges } = useMemo(() => {
-    const parsed = parseMarkdown(streaming ? closeOpenMarkers(shown) : shown);
+    const parsed = parseMarkdown(streaming ? closeOpenMarkers(shown) : shown, { localImages: renderImage !== undefined });
     return { blocks: parsed, ...numberWords(parsed) };
-  }, [shown, streaming]);
+  }, [shown, streaming, renderImage]);
   const { clock, now, fadeMs, live } = useWordFade(count, (animate || streaming) && !reduceMotion);
   const from = clock.firstFading(now, fadeMs);
   const fade: Fade | undefined = reduceMotion || !live ? undefined : { clock, now, ms: fadeMs, from };
-  const handlers = useMemo<Handlers>(() => ({ onOpenFile, onNavigate }), [onOpenFile, onNavigate]);
+  const handlers = useMemo<Handlers>(() => ({ onOpenFile, renderImage, onNavigate }), [onOpenFile, renderImage, onNavigate]);
   const last = blocks.length - 1;
   return (
     <div
@@ -257,7 +264,7 @@ function FileRef({
   const open = handlers.onOpenFile;
   if (!open) return <>{children}</>;
   return (
-    <button type="button" className="md-file-ref" onClick={() => open(path, line)}>
+    <button type="button" className="md-file-ref" data-testid="file-mention" data-path={path} onClick={() => open(path, line)}>
       {children}
     </button>
   );
@@ -276,11 +283,13 @@ function renderInline(node: Inline, fade: Fade | undefined, handlers: Handlers):
       if (!file) return <code className="md-inline-code">{node.text}</code>;
       return (
         <FileRef path={file.path} line={file.line} handlers={handlers}>
-          <Icon name="file" size={14} className="md-file-icon" />
+          <FileTypeIcon name={file.path} isDir={false} size={14} className="md-file-icon" />
           <code className="md-inline-code md-file-name">{node.text}</code>
         </FileRef>
       );
     }
+    case "image":
+      return handlers.renderImage?.(node.src, node.alt) ?? node.alt;
     case "strong":
       return (
         <strong>

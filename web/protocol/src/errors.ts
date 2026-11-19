@@ -15,6 +15,7 @@ export const DESKTOP_ERROR_CODES = [
   "read_only",
   "not_selected",
   "path_denied",
+  "not_found",
   "revoked",
   "disabled",
   "too_large",

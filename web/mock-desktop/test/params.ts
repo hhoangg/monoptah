@@ -24,6 +24,7 @@ export const SAMPLE_PARAMS: Record<MethodName, Record<string, unknown>> = {
   "project.worktrees": { projectId: "proj-alpha" },
   "project.files": { projectId: "proj-alpha" },
   "project.file": { projectId: "proj-alpha", path: "README.example.md" },
+  "chat.mentionedFile": { conversationId: "sess-local-files", path: "report.html" },
   "project.search": { projectId: "proj-alpha", query: "example" },
   "project.fileHighlight": { job: "job-1" },
   "project.git": { projectId: "proj-alpha" },

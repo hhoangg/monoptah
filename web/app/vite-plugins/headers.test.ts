@@ -23,6 +23,12 @@ describe("_headers generation", () => {
     expect(text).toContain(`Content-Security-Policy: ${buildCsp("zptah.app")}`);
   });
 
+  it("allows blob: frames for the sandboxed file preview and no other frame source", () => {
+    const text = renderHeaders("https://zptah.app");
+    expect(text).toContain("; frame-src blob:;");
+    expect(text).not.toMatch(/frame-src [^;]*(https?:|'self'|\*)/);
+  });
+
   it("carries every companion header of the Worker and the cache rules", () => {
     const text = renderHeaders("https://zptah.app");
     for (const [name, value] of Object.entries(COMPANION_HEADERS)) expect(text).toContain(`  ${name}: ${value}`);

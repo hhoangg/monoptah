@@ -169,6 +169,7 @@ fn a_cloud_file_in_memory_opens_without_reading_disk_or_offering_the_default_app
                         kind: crate::document_lightbox::Kind::Code,
                         text: Some("fn main() {}".into()),
                         web_root: None,
+                        scripts: true,
                     }),
                 }),
                 cx,

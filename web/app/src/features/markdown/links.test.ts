@@ -84,6 +84,15 @@ describe("file references", () => {
     expect(resolveFileReference("a b.ts")).toBeNull();
   });
 
+  it("accepts mentions with an absolute path, ~ and ./ and a line suffix, and still refuses traversal", () => {
+    expect(resolveFileReference("~/Documents/x/report.html")).toEqual({ path: "~/Documents/x/report.html" });
+    expect(resolveFileReference("/Users/me/report.html:12:3")).toEqual({ path: "/Users/me/report.html", line: 12, column: 3 });
+    expect(resolveFileReference("./out/uiux-findings.md#L12")).toEqual({ path: "./out/uiux-findings.md", line: 12 });
+    expect(inlineFileReference("~/Documents/x/report.html")).toEqual({ path: "~/Documents/x/report.html" });
+    expect(resolveFileReference("~/../etc/passwd.txt")).toBeNull();
+    expect(resolveFileReference("https://example.com/a.html")).toBeNull();
+  });
+
   it("names a file from an inline code span", () => {
     expect(inlineFileReference("src/main.rs:5")).toEqual({ path: "src/main.rs", line: 5 });
     expect(inlineFileReference("npm run build")).toBeNull();

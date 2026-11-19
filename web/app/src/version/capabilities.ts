@@ -12,6 +12,7 @@ export const FEATURES: Readonly<Record<KnownCapability, string>> = {
   gitPush: "Push from Git",
   monoTools: "Mono tools",
   monoFiles: "Mono files",
+  mentionedFiles: "File previews",
 };
 
 export type { KnownCapability };

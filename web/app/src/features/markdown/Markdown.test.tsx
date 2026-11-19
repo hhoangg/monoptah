@@ -55,6 +55,34 @@ describe("<Markdown>", () => {
     expect(screen.getAllByRole("button")).toHaveLength(2);
   });
 
+  it("makes a file-naming code span a chip with the icon of its file type, and a file link too", async () => {
+    const onOpenFile = vi.fn();
+    render(<Markdown text={"Wrote `report.html`, `~/Documents/x/notes.md:12`, `/abs/dir/a.png` and [the log](out/run.log#L7)."} onOpenFile={onOpenFile} />);
+    const chips = screen.getAllByTestId("file-mention");
+    expect(chips.map((chip) => chip.getAttribute("data-path"))).toEqual(["report.html", "~/Documents/x/notes.md", "/abs/dir/a.png", "out/run.log"]);
+    expect(chips[0]?.querySelector('[data-kind="markup"]')).not.toBeNull();
+    expect(chips[1]?.querySelector('[data-kind="markdown"]')).not.toBeNull();
+    expect(chips[2]?.querySelector('[data-kind="image"]')).not.toBeNull();
+    await userEvent.click(chips[1] as HTMLElement);
+    expect(onOpenFile).toHaveBeenLastCalledWith("~/Documents/x/notes.md", 12);
+    await userEvent.click(chips[3] as HTMLElement);
+    expect(onOpenFile).toHaveBeenLastCalledWith("out/run.log", 7);
+  });
+
+  it("keeps an image as its alt text in chat, and draws only a relative one when a renderImage is given", () => {
+    const text = "![chart](img/a.png) and ![remote](https://x.invalid/t.png) and ![abs](/etc/a.png)";
+    const chat = render(<Markdown text={text} />);
+    expect(chat.container.querySelector("img")).toBeNull();
+    expect(chat.container.textContent).toContain("chart and remote and abs");
+    chat.unmount();
+    const renderImage = vi.fn((src: string, alt: string) => <img data-testid="drawn" src={`blob:x/${src}`} alt={alt} />);
+    const preview = render(<Markdown text={text} renderImage={renderImage} />);
+    expect(renderImage).toHaveBeenCalledTimes(1);
+    expect(renderImage).toHaveBeenCalledWith("img/a.png", "chart");
+    expect(preview.container.querySelectorAll("img")).toHaveLength(1);
+    expect(preview.container.textContent).toContain("remote and abs");
+  });
+
   it("shows files unlinked without onOpenFile", () => {
     render(<Markdown text="See `src/a.ts`." />);
     expect(screen.queryByRole("button")).toBeNull();

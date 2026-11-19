@@ -187,6 +187,7 @@ codes! {
     Forbidden => "forbidden",
     NotSelected => "not_selected",
     PathDenied => "path_denied",
+    NotFound => "not_found",
     Revoked => "revoked",
     Disabled => "disabled",
     TooLarge => "too_large",
@@ -215,6 +216,7 @@ impl Code {
             Code::Forbidden => "Not allowed from a remote device",
             Code::NotSelected => "Not in this device's project selection",
             Code::PathDenied => "Hidden: sensitive file",
+            Code::NotFound => "File not found",
             Code::Revoked => "Device revoked",
             Code::Disabled => "Turned off on the desktop",
             Code::TooLarge => "Too large for a remote device",
@@ -355,6 +357,7 @@ pub const METHODS: &[Entry] = &[
     app("project.file", Class::Read),
     app("project.search", Class::Read),
     app("project.fileHighlight", Class::UnsupportedWeb),
+    app("chat.mentionedFile", Class::Read),
     app("project.git", Class::Read),
     app("project.gitAction", Class::Param),
     app("session.start", Class::Param),
@@ -736,6 +739,8 @@ fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
     if approvals_effective(flags, approvals_gate) {
         list.push("approvals".to_owned());
     }
+    // The app answers `chat.mentionedFile` (a read, always on).
+    list.push("mentionedFiles".to_owned());
     list
 }
 
@@ -844,6 +849,37 @@ mod tests {
         for method in ["device.push", "project.fileHighlight"] {
             assert_eq!(c(method, json!({})), Access::UnsupportedWeb);
         }
+    }
+
+    #[test]
+    fn a_mentioned_file_read_is_an_app_read_for_every_device_and_follows_the_mono_selection() {
+        let entry = entry("chat.mentionedFile").unwrap();
+        assert_eq!(
+            (entry.class, entry.transport),
+            (Class::Read, Transport::App)
+        );
+        let params = json!({"conversationId": "mono:m1", "path": "a.html"});
+        assert_eq!(classify("chat.mentionedFile", &params), Some(Access::Read));
+        for kind in [DeviceKind::Phone, DeviceKind::Web] {
+            let reader = ctx(kind, Permission::Read);
+            assert_eq!(
+                call(&reader, "chat.mentionedFile", params.clone(), &ON),
+                None
+            );
+            let mut narrowed = ctx(kind, Permission::Control);
+            narrowed.monos = Some(vec!["other".into()]);
+            assert_eq!(
+                call(&narrowed, "chat.mentionedFile", params.clone(), &ON),
+                Some(Code::NotSelected)
+            );
+            narrowed.monos = Some(vec!["m1".into()]);
+            assert_eq!(
+                call(&narrowed, "chat.mentionedFile", params.clone(), &ON),
+                None
+            );
+        }
+        assert!(capabilities_with(&PolicyFlags::default(), false)
+            .contains(&"mentionedFiles".to_owned()));
     }
 
     #[test]
@@ -1319,22 +1355,47 @@ mod tests {
 
     #[test]
     fn capabilities_follow_flags_and_the_approvals_gate() {
-        assert_eq!(capabilities_with(&PolicyFlags::default(), false), ["cloud"]);
+        assert_eq!(
+            capabilities_with(&PolicyFlags::default(), false),
+            ["cloud", "mentionedFiles"]
+        );
         assert_eq!(
             capabilities_with(&ON, false),
-            ["cloud", "gitPush", "cloudStart", "cloudMove"]
+            [
+                "cloud",
+                "gitPush",
+                "cloudStart",
+                "cloudMove",
+                "mentionedFiles"
+            ]
         );
         // The gate alone does not list approvals: the desktop toggle is needed too.
-        assert_eq!(capabilities_with(&PolicyFlags::default(), true), ["cloud"]);
+        assert_eq!(
+            capabilities_with(&PolicyFlags::default(), true),
+            ["cloud", "mentionedFiles"]
+        );
         let toggle = PolicyFlags {
             remote_approvals: true,
             ..PolicyFlags::default()
         };
-        assert_eq!(capabilities_with(&toggle, false), ["cloud"]);
-        assert_eq!(capabilities_with(&toggle, true), ["cloud", "approvals"]);
+        assert_eq!(
+            capabilities_with(&toggle, false),
+            ["cloud", "mentionedFiles"]
+        );
+        assert_eq!(
+            capabilities_with(&toggle, true),
+            ["cloud", "approvals", "mentionedFiles"]
+        );
         assert_eq!(
             capabilities_with(&ON, true),
-            ["cloud", "gitPush", "cloudStart", "cloudMove", "approvals"]
+            [
+                "cloud",
+                "gitPush",
+                "cloudStart",
+                "cloudMove",
+                "approvals",
+                "mentionedFiles"
+            ]
         );
     }
 
@@ -1349,17 +1410,26 @@ mod tests {
         };
         assert_eq!(
             capabilities_with(&flags(false, true), false),
-            ["cloud", "cloudStart"]
+            ["cloud", "cloudStart", "mentionedFiles"]
         );
         assert_eq!(
             capabilities_with(&flags(true, false), false),
-            ["cloud", "gitPush"]
+            ["cloud", "gitPush", "mentionedFiles"]
         );
         assert_eq!(
             capabilities_with(&flags(true, true), false),
-            ["cloud", "gitPush", "cloudStart", "cloudMove"]
+            [
+                "cloud",
+                "gitPush",
+                "cloudStart",
+                "cloudMove",
+                "mentionedFiles"
+            ]
         );
-        assert_eq!(capabilities_with(&flags(false, false), false), ["cloud"]);
+        assert_eq!(
+            capabilities_with(&flags(false, false), false),
+            ["cloud", "mentionedFiles"]
+        );
     }
 
     /// H-08: approvals are effective only with the U-13 gate AND the toggle.
@@ -1431,10 +1501,13 @@ mod tests {
             assert_eq!(answer(&reader, &on), Some(Code::ReadOnly), "{kind:?}");
             assert_eq!(answer(&reader, &off), Some(Code::ReadOnly), "{kind:?}");
         }
-        assert_eq!(capabilities_with(&off, REMOTE_APPROVALS_ENABLED), ["cloud"]);
+        assert_eq!(
+            capabilities_with(&off, REMOTE_APPROVALS_ENABLED),
+            ["cloud", "mentionedFiles"]
+        );
         assert_eq!(
             capabilities_with(&on, REMOTE_APPROVALS_ENABLED),
-            ["cloud", "approvals"]
+            ["cloud", "approvals", "mentionedFiles"]
         );
     }
 

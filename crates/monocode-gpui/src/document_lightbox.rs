@@ -24,7 +24,7 @@ fn shows_web_view(kind: Option<Kind>, covered: bool) -> bool {
 }
 
 /// Files above this size are not read; the user is offered the default app.
-pub(crate) const MAX_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -44,6 +44,9 @@ pub(crate) struct CloudDoc {
     pub text: Option<Arc<str>>,
     /// For HTML opened from disk: the folder the page may read its assets from.
     pub web_root: Option<PathBuf>,
+    /// Whether an HTML page opened from disk may run JavaScript. A file previewed from a chat
+    /// runs none; a download from a cloud workspace keeps it.
+    pub scripts: bool,
 }
 
 /// The fence that shows `text` as code, longer than any run of backticks inside it.
@@ -128,6 +131,8 @@ pub(crate) struct DocumentLightbox {
     text: Option<String>,
     /// The file exists on disk, so "Open with default app" can open it.
     on_disk: bool,
+    /// The folder a local markdown document's relative links and pictures belong to.
+    base: Option<PathBuf>,
     body: Body,
     error: Option<String>,
     /// A higher-priority overlay is up, so a native web view must not show.
@@ -148,12 +153,20 @@ impl DocumentLightbox {
             .map(|doc| doc.kind)
             .or_else(|| kind_of(&open.path));
         let in_memory = cloud.as_ref().is_some_and(|doc| doc.text.is_some());
+        // A document read from disk: its relative links and pictures sit beside it.
+        let base = cloud
+            .as_ref()
+            .is_none_or(|doc| doc.text.is_none())
+            .then(|| open.path.parent().map(Path::to_path_buf))
+            .flatten()
+            .filter(|folder| !folder.as_os_str().is_empty());
         let mut this = Self {
             path: open.path.clone(),
             title: open.title,
             kind,
             text: None,
             on_disk: !in_memory,
+            base,
             body: Body::Loading,
             error: None,
             covered: false,
@@ -175,13 +188,17 @@ impl DocumentLightbox {
         if let Some(CloudDoc {
             kind: Kind::Html,
             web_root: Some(root),
+            scripts,
             ..
         }) = &cloud
         {
-            // A downloaded page loads from disk with its assets; there is no size limit.
-            let (path, root) = (open.path.clone(), root.clone());
+            // A page loads from disk with its assets; there is no size limit.
+            let (path, root, scripts) = (open.path.clone(), root.clone(), *scripts);
             this.body = Body::Html(cx.new(|_| {
                 let mut html = Html::from_file(path, root);
+                if !scripts {
+                    html = html.without_scripts();
+                }
                 html.set_interactive(true);
                 html
             }));
@@ -214,7 +231,8 @@ impl DocumentLightbox {
                 let body = match self.kind {
                     Some(Kind::Markdown) => {
                         let shown = text.clone();
-                        Body::Markdown(cx.new(|cx| TranscriptView::document(shown, cx)))
+                        let base = self.base.clone();
+                        Body::Markdown(cx.new(|cx| TranscriptView::document_in(shown, base, cx)))
                     }
                     Some(Kind::Code) => {
                         let shown = code_block(&text, &self.path);
@@ -249,6 +267,31 @@ impl DocumentLightbox {
     #[cfg(test)]
     pub(crate) fn covered(&self) -> bool {
         self.covered
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kind(&self) -> Option<Kind> {
+        self.kind
+    }
+
+    /// The folder a document read from disk draws its pictures from.
+    #[cfg(test)]
+    pub(crate) fn base(&self) -> Option<&Path> {
+        self.base.as_deref()
+    }
+
+    /// Whether the web page shown runs JavaScript; `None` when no web page is shown.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn html_runs_scripts(&self, cx: &App) -> Option<bool> {
+        match &self.body {
+            Body::Html(html) => Some(html.read(cx).runs_scripts()),
+            _ => None,
+        }
     }
 
     pub(crate) fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {

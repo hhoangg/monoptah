@@ -45,6 +45,7 @@ mod explorer;
 mod file_editor;
 mod file_icons;
 mod file_links;
+mod file_preview;
 mod fix_terminal;
 mod fixtures;
 mod fonts;
@@ -214,6 +215,10 @@ fn plist_data_mode(plist: &str) -> Option<bool> {
     }
 }
 fn main() {
+    // A transform child of the mentioned-file preview: serves one request and exits, before
+    // anything else starts. Otherwise the parent runs its HTML transforms in such children.
+    monocode_core::mobile::mentioned_file::sandbox::maybe_run_child();
+    monocode_core::mobile::mentioned_file::sandbox::enable_subprocess();
     if let Some(code) = monocode_core::remote::ssh_askpass::maybe_run() {
         std::process::exit(code);
     }

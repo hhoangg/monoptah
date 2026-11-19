@@ -80,6 +80,12 @@ pub(crate) enum Block {
         id: String,
         caption: String,
     },
+    /// `![alt](path)` on its own line of a document (never of a chat): a local picture.
+    /// `src` is the destination as written; the document's folder resolves it.
+    Image {
+        src: String,
+        alt: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TopBlock {
@@ -99,12 +105,19 @@ pub(crate) struct MarkdownParser {
     display_full: bool,
     display_dirty: bool,
     full_only: bool,
+    /// Document mode: a paragraph that starts with an ordinary image becomes `Block::Image`.
+    images: bool,
     #[cfg(test)]
     parsed_bytes: usize,
 }
 impl MarkdownParser {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Reads `![alt](path)` images as `Block::Image`. Chat leaves this off, so an image there
+    /// stays its alt text. Set it before the first `set_text`.
+    pub fn set_images(&mut self, images: bool) {
+        self.images = images;
     }
     pub fn set_text(&mut self, text: &str) {
         if self.source == text {
@@ -158,7 +171,7 @@ impl MarkdownParser {
         self.tree.blocks.retain(|block| block.range.end <= boundary);
         self.tree
             .blocks
-            .extend(parse_at(&text[boundary..], boundary, false).blocks);
+            .extend(parse_at(&text[boundary..], boundary, false, self.images).blocks);
         // Display repairs flush at blank lines, not Markdown block borders.
         // Adjacent blocks may therefore share one synthetic closer.
         self.display_full |= self.tree.blocks.windows(2).any(|pair| {
@@ -192,9 +205,11 @@ impl MarkdownParser {
                 self.full_display = None;
                 return self.tree.clone();
             }
+            let images = self.images;
             let display = self.full_display.get_or_insert_with(|| DisplayCache {
                 source: self.source.clone(),
                 tree: self.tree.clone(),
+                images,
             });
             display.set_text(repaired);
             // Unrepaired prefix blocks share canonical storage, including on
@@ -220,7 +235,7 @@ impl MarkdownParser {
                     blocks: vec![block.clone()],
                 }
             } else {
-                parse_full(&repaired)
+                parse_at(&repaired, 0, false, self.images)
             };
             self.display.push((block.clone(), display));
         }
@@ -245,6 +260,7 @@ impl MarkdownParser {
 struct DisplayCache {
     source: String,
     tree: BlockTree,
+    images: bool,
 }
 impl DisplayCache {
     fn set_text(&mut self, text: String) {
@@ -270,7 +286,7 @@ impl DisplayCache {
         self.tree.blocks.retain(|block| block.range.end <= boundary);
         self.tree
             .blocks
-            .extend(parse_at(&text[boundary..], boundary, false).blocks);
+            .extend(parse_at(&text[boundary..], boundary, false, self.images).blocks);
         self.source = text;
     }
 }
@@ -457,10 +473,10 @@ pub(crate) fn parse_full_hard_breaks(text: &str) -> BlockTree {
 }
 
 fn parse_with_breaks(text: &str, hard_breaks: bool) -> BlockTree {
-    parse_at(text, 0, hard_breaks)
+    parse_at(text, 0, hard_breaks, false)
 }
 
-fn parse_at(text: &str, base: usize, hard_breaks: bool) -> BlockTree {
+fn parse_at(text: &str, base: usize, hard_breaks: bool, images: bool) -> BlockTree {
     let parser = Parser::new_ext(
         text,
         Options::ENABLE_TABLES
@@ -489,13 +505,17 @@ fn parse_at(text: &str, base: usize, hard_breaks: bool) -> BlockTree {
         if depth == 0 {
             let mut events = std::mem::take(&mut pending).into_iter().peekable();
             tree.blocks
-                .extend(blocks(&mut events, None, 0).into_iter().map(|mut block| {
-                    linkify_block(&mut block);
-                    Arc::new(TopBlock {
-                        range: base + start..base + range.end,
-                        block,
-                    })
-                }));
+                .extend(
+                    blocks(&mut events, None, 0, images)
+                        .into_iter()
+                        .map(|mut block| {
+                            linkify_block(&mut block);
+                            Arc::new(TopBlock {
+                                range: base + start..base + range.end,
+                                block,
+                            })
+                        }),
+                );
         }
     }
     tree
@@ -577,7 +597,12 @@ fn linkify_runs(runs: &mut Vec<InlineRun>) {
     }
     *runs = out;
 }
-fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<Block> {
+fn blocks(
+    events: &mut Events<'_>,
+    until: Option<TagEnd>,
+    depth: usize,
+    images: bool,
+) -> Vec<Block> {
     let mut out = Vec::new();
     while let Some(event) = events.next() {
         match event {
@@ -586,6 +611,9 @@ fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<B
                 Tag::Paragraph => {
                     if let Some(visual) = placed_visual(events) {
                         out.push(visual);
+                        continue;
+                    }
+                    if images && placed_images(events, &mut out) {
                         continue;
                     }
                     out.push(Block::Paragraph {
@@ -622,7 +650,7 @@ fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<B
                     out.push(Block::CodeBlock { language, code });
                 }
                 Tag::BlockQuote(kind) => out.push(Block::BlockQuote {
-                    children: blocks(events, Some(TagEnd::BlockQuote(kind)), depth + 1),
+                    children: blocks(events, Some(TagEnd::BlockQuote(kind)), depth + 1, images),
                 }),
                 Tag::List(start) => {
                     let mut items = Vec::new();
@@ -630,7 +658,7 @@ fn blocks(events: &mut Events<'_>, until: Option<TagEnd>, depth: usize) -> Vec<B
                         match event {
                             Event::End(TagEnd::List(_)) => break,
                             Event::Start(Tag::Item) => {
-                                items.push(blocks(events, Some(TagEnd::Item), depth + 1))
+                                items.push(blocks(events, Some(TagEnd::Item), depth + 1, images))
                             }
                             _ => {}
                         }
@@ -775,6 +803,72 @@ fn placed_visual(events: &mut Events<'_>) -> Option<Block> {
     }
     Some(Block::Visual { id, caption })
 }
+/// Document mode: a paragraph that starts with an ordinary image places each of its images as a
+/// `Block::Image`, with the prose between them kept. A remote (`http`, `https`, `data`) picture is
+/// never loaded: it becomes a link. Consumes the paragraph when it matches; leaves the events
+/// untouched otherwise.
+fn placed_images(events: &mut Events<'_>, out: &mut Vec<Block>) -> bool {
+    let first = matches!(
+        events.peek(),
+        Some(Event::Start(Tag::Image { dest_url, .. })) if !dest_url.starts_with("visual:")
+    );
+    if !first {
+        return false;
+    }
+    let mut prose: Vec<InlineRun> = Vec::new();
+    let flush = |prose: &mut Vec<InlineRun>, out: &mut Vec<Block>| {
+        if prose.iter().any(|run| !run.text.trim().is_empty()) {
+            out.push(Block::Paragraph {
+                runs: std::mem::take(prose),
+            });
+        } else {
+            prose.clear();
+        }
+    };
+    while let Some(event) = events.next() {
+        match event {
+            Event::End(TagEnd::Paragraph) => break,
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                let mut alt = String::new();
+                for event in events.by_ref() {
+                    match event {
+                        Event::End(TagEnd::Image) => break,
+                        Event::Text(text) | Event::Code(text) => alt.push_str(&text),
+                        _ => {}
+                    }
+                }
+                flush(&mut prose, out);
+                let src = dest_url.into_string();
+                let lower = src.to_ascii_lowercase();
+                if lower.starts_with("http://")
+                    || lower.starts_with("https://")
+                    || lower.starts_with("data:")
+                {
+                    out.push(Block::Paragraph {
+                        runs: vec![InlineRun {
+                            text: if alt.trim().is_empty() {
+                                src.clone()
+                            } else {
+                                alt
+                            },
+                            style: InlineStyle {
+                                link: Some(src),
+                                ..Default::default()
+                            },
+                        }],
+                    });
+                } else {
+                    out.push(Block::Image { src, alt });
+                }
+            }
+            Event::SoftBreak | Event::HardBreak if prose.is_empty() => {}
+            Event::Start(tag) => inline_span(events, tag, InlineStyle::default(), &mut prose),
+            event => append_run(&mut prose, event, InlineStyle::default()),
+        }
+    }
+    flush(&mut prose, out);
+    true
+}
 fn inlines(events: &mut Events<'_>, end: TagEnd) -> Vec<InlineRun> {
     let mut out = Vec::new();
     while let Some(event) = events.next() {
@@ -854,6 +948,10 @@ mod note_break_tests {
         assert_eq!(code, "one\ntwo\n");
     }
 }
+
+#[cfg(test)]
+#[path = "markdown_model/image_tests.rs"]
+mod image_tests;
 
 #[cfg(test)]
 #[path = "markdown_model/link_tests.rs"]

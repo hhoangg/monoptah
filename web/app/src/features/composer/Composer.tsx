@@ -136,6 +136,33 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   const [detailsOpen, setDetailsOpen] = useState(false);
   const reducedMotion = useReducedMotion();
   const [focusWithin, setFocusWithin] = useState(false);
+  // A press elsewhere on the page blurs the field, and collapsing the card then shrinks the composer and shifts the
+  // transcript under the pointer, so the press lands on something else and its click is lost. The collapse waits
+  // until the press ends (after the click has been dispatched).
+  const pressed = useRef(false);
+  const collapseTimer = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    const down = () => {
+      pressed.current = true;
+    };
+    const up = () => {
+      if (!pressed.current) return;
+      pressed.current = false;
+      window.clearTimeout(collapseTimer.current);
+      collapseTimer.current = window.setTimeout(() => {
+        if (!area.current?.closest("[data-shape]")?.contains(document.activeElement)) setFocusWithin(false);
+      }, 0);
+    };
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", up, true);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", up, true);
+      window.clearTimeout(collapseTimer.current);
+    };
+  }, []);
 
   const hasDraft = text.trim().length > 0 || attachments.length > 0;
   const card = focusWithin || hasDraft || !!shownNotice || !!error;
@@ -309,7 +336,9 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           if (event.target instanceof Element && event.target.closest("button") && !event.target.closest("[data-composer-extra]")) event.preventDefault();
         }}
         onBlur={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusWithin(false);
+          if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+          if (pressed.current) return;
+          setFocusWithin(false);
         }}
         onDragOver={(event) => {
           if (event.dataTransfer.types.includes("Files")) event.preventDefault();

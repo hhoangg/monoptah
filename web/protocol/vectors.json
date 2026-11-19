@@ -804,7 +804,8 @@
       "cloudMove",
       "gitPush",
       "monoTools",
-      "monoFiles"
+      "monoFiles",
+      "mentionedFiles"
     ],
     "messages": [
       {
@@ -823,7 +824,8 @@
           "cloudMove",
           "gitPush",
           "monoTools",
-          "monoFiles"
+          "monoFiles",
+          "mentionedFiles"
         ],
         "desktop": {
           "name": "Example Desktop",
@@ -844,6 +846,7 @@
       "forbidden",
       "instance_busy",
       "needs_desktop",
+      "not_found",
       "not_pending",
       "not_selected",
       "path_denied",

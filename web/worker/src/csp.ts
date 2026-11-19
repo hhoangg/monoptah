@@ -12,6 +12,7 @@ export function buildCsp(host: string): string {
     "style-src 'self'",
     "style-src-attr 'unsafe-inline'",
     "img-src 'self' data: blob:",
+    "frame-src blob:",
     "font-src 'self'",
     `connect-src 'self' wss://${host}`,
     "worker-src 'self'",

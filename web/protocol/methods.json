@@ -7,6 +7,11 @@
       "transport": "app"
     },
     {
+      "name": "chat.mentionedFile",
+      "class": "read",
+      "transport": "app"
+    },
+    {
       "name": "cloud.cancelMove",
       "class": "control",
       "transport": "app"

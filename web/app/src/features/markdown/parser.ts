@@ -3,6 +3,7 @@
 // HTML is never interpreted (it stays literal text) and images are shown as their alt text.
 // Hardened for hostile input: bounded nesting, bounded scans, no backtracking-prone patterns.
 
+import { hasControl } from "./fileLinks";
 export type Inline =
   /** `word`: the place of its first word in the reply, set by numberWords. */
   | { type: "text"; text: string; word?: number }
@@ -10,7 +11,9 @@ export type Inline =
   | { type: "strong"; children: Inline[] }
   | { type: "em"; children: Inline[] }
   | { type: "strike"; children: Inline[] }
-  | { type: "link"; href: string; children: Inline[] };
+  | { type: "link"; href: string; children: Inline[] }
+  /** Only with `parseMarkdown(source, { localImages: true })`: an image whose source is a relative path. */
+  | { type: "image"; src: string; alt: string };
 
 export type MarkdownBlock =
   | { type: "paragraph"; inline: Inline[] }
@@ -87,8 +90,29 @@ export function numberWords(blocks: MarkdownBlock[]): {
   return { count, ranges };
 }
 
-export function parseMarkdown(source: string): MarkdownBlock[] {
-  return parseBlocks(source.replace(/\r\n?/g, "\n").split("\n"), 0);
+export interface ParseOptions {
+  /**
+   * Keep an image whose source is a relative path as an `image` node (the file preview loads it through the
+   * desktop). Every other image, and every image when this is off (chat), stays its alt text.
+   */
+  localImages?: boolean;
+}
+
+let keepLocalImages = false;
+
+/** A relative path with no scheme, no `/` or `~` start and no backslash or control character. */
+export function isLocalImageSource(src: string): boolean {
+  if (!src || src.length > 1024 || /[\\\s]/.test(src) || hasControl(src)) return false;
+  return !/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith("/") && !src.startsWith("~") && !src.startsWith("#");
+}
+
+export function parseMarkdown(source: string, options: ParseOptions = {}): MarkdownBlock[] {
+  keepLocalImages = options.localImages === true;
+  try {
+    return parseBlocks(source.replace(/\r\n?/g, "\n").split("\n"), 0);
+  } finally {
+    keepLocalImages = false;
+  }
 }
 
 /** A heading's text without its closing hashes. */
@@ -395,8 +419,15 @@ export function parseInline(text: string, depth = 0, inLink = false): Inline[] {
       }
     }
     if (char === "!" && text[index + 1] === "[" && labelCanClose(index + 2)) {
-      // Images are never loaded: the alt text is shown instead.
+      // Images are never loaded from the net: the alt text is shown instead. A relative one is kept for the file
+      // preview (opt-in), which loads it through the desktop.
       const image = matchLink(text, index + 1, 0, memo);
+      if (image && keepLocalImages && isLocalImageSource(image.href)) {
+        flush();
+        out.push({ type: "image", src: image.href, alt: image.label });
+        index = image.end;
+        continue;
+      }
       if (image) {
         plain += image.label || "image";
         index = image.end;
@@ -462,7 +493,7 @@ function findClose(text: string, mark: string, from: number): number {
 /** A message's words without its markdown, for a one-line preview. */
 export function plainText(source: string): string {
   const inline = (parts: Inline[]): string =>
-    parts.map((part) => ("children" in part ? inline(part.children) : part.text)).join("");
+    parts.map((part) => ("children" in part ? inline(part.children) : part.type === "image" ? part.alt : part.text)).join("");
   const block = (item: MarkdownBlock): string => {
     switch (item.type) {
       case "paragraph":

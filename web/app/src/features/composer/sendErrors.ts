@@ -20,6 +20,7 @@ const MESSAGES: Readonly<Record<string, string>> = {
   unsupported_target: "This session cannot be sent to from the web.",
   not_pending: "This request is no longer waiting.",
   needs_desktop: "Answer this one on the desktop. It cannot be allowed once from here.",
+  not_found: "That could not be found on your desktop.",
   nothing_to_retry: "There is nothing to send again.",
 };
 

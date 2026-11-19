@@ -12,13 +12,13 @@ use objc2::{
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSView, NSWindowOrderingMode};
 #[cfg(target_os = "macos")]
+use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString, NSURL};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSObject, NSObjectProtocol};
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
-#[cfg(target_os = "macos")]
 use objc2_web_kit::{
-    WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType,
-    WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
+    WKContentRuleList, WKContentRuleListStore, WKNavigationAction, WKNavigationActionPolicy,
+    WKNavigationDelegate, WKNavigationType, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
 };
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -105,6 +105,32 @@ struct Hosted {
     web: Retained<WKWebView>,
     _guard: Retained<NavigationGuard>,
     markup: Arc<str>,
+    gate: Rc<RefCell<LoadGate>>,
+}
+#[cfg(target_os = "macos")]
+impl Rules {
+    /// A page may load only when it needs no rules or they are installed.
+    fn allows_load(self) -> bool {
+        matches!(self, Rules::NotNeeded | Rules::Ready)
+    }
+}
+/// Whether the remote-load rules stand in the way of loading a page, and the markup to load
+/// once they are installed (the latest one, whatever was asked for earlier).
+#[cfg(target_os = "macos")]
+struct LoadGate {
+    rules: Rules,
+    latest: Arc<str>,
+}
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rules {
+    /// The page needs no remote-load rules.
+    NotNeeded,
+    /// Being compiled: nothing may load yet.
+    Pending,
+    Ready,
+    /// They could not be had: the page stays blank rather than load without them.
+    Failed,
 }
 #[cfg(target_os = "macos")]
 struct Markup {
@@ -120,6 +146,8 @@ struct FilePage {
     root: std::path::PathBuf,
     /// Identity of the page for the reload check; never changes.
     marker: Arc<str>,
+    /// Whether the page may run JavaScript. A file shown as a preview runs none.
+    scripts: bool,
 }
 pub(crate) struct Html {
     body: String,
@@ -192,8 +220,22 @@ impl Html {
             marker: path.to_string_lossy().into_owned().into(),
             path,
             root,
+            scripts: true,
         }));
         this
+    }
+    /// The page runs no JavaScript at all: a file opened as a preview is shown, not executed.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn without_scripts(mut self) -> Self {
+        if let Some(file) = self.file.as_mut().and_then(Rc::get_mut) {
+            file.scripts = false;
+        }
+        self
+    }
+    /// Whether the page may run JavaScript (always, for generated markup in its sandbox).
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn runs_scripts(&self) -> bool {
+        self.file.as_ref().is_none_or(|file| file.scripts)
     }
     #[cfg(target_os = "macos")]
     fn markup(&mut self) -> Arc<str> {
@@ -242,6 +284,71 @@ fn load_page(web: &WKWebView, markup: &str, file: Option<&FilePage>) {
                 web.loadHTMLString_baseURL(&NSString::from_str(markup), None);
             }
         }
+    }
+}
+/// Content rules that block every remote load (http, https, ws, wss, ftp). A file shown as a
+/// preview runs no script, but its images, stylesheets and fonts would still be fetched from the
+/// network, which tells the page's author that (and when) the file was opened.
+#[cfg(target_os = "macos")]
+const BLOCK_REMOTE_RULES: &str =
+    r#"[{"trigger":{"url-filter":"^(https?|wss?|ftp)://"},"action":{"type":"block"}}]"#;
+
+/// Loads `markup` unless the remote-load rules are still pending or failed. While pending, the
+/// markup is only remembered: the completion of [`load_page_without_remote`] loads the latest.
+#[cfg(target_os = "macos")]
+fn request_load(
+    web: &WKWebView,
+    gate: &RefCell<LoadGate>,
+    markup: &Arc<str>,
+    file: Option<&FilePage>,
+) {
+    let mut gate = gate.borrow_mut();
+    gate.latest = markup.clone();
+    if gate.rules.allows_load() {
+        load_page(web, markup, file);
+    }
+}
+
+/// Installs the remote-load rules in `web`, then loads the gate's latest markup. Compiling a
+/// rule list is asynchronous, so nothing loads before its completion (see [`request_load`]);
+/// when the rules cannot be had, the page stays blank rather than load without them.
+#[cfg(target_os = "macos")]
+fn load_page_without_remote(
+    web: &Retained<WKWebView>,
+    mtm: MainThreadMarker,
+    gate: Rc<RefCell<LoadGate>>,
+    file: Option<Rc<FilePage>>,
+) {
+    let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+        gate.borrow_mut().rules = Rules::Failed;
+        return;
+    };
+    gate.borrow_mut().rules = Rules::Pending;
+    let web = web.clone();
+    let done = block2::RcBlock::new(move |list: *mut WKContentRuleList, _: *mut NSError| {
+        // SAFETY: WebKit passes a live list, or null with an error.
+        let Some(list) = (unsafe { list.as_ref() }) else {
+            gate.borrow_mut().rules = Rules::Failed;
+            return;
+        };
+        unsafe {
+            web.configuration()
+                .userContentController()
+                .addContentRuleList(list)
+        };
+        let latest = {
+            let mut gate = gate.borrow_mut();
+            gate.rules = Rules::Ready;
+            gate.latest.clone()
+        };
+        load_page(&web, &latest, file.as_deref());
+    });
+    unsafe {
+        store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+            Some(&NSString::from_str("monoptah-no-remote-loads")),
+            Some(&NSString::from_str(BLOCK_REMOTE_RULES)),
+            Some(&done),
+        );
     }
 }
 impl gpui::Render for Html {
@@ -317,6 +424,11 @@ impl gpui::Render for Html {
                             config
                                 .preferences()
                                 .setJavaScriptCanOpenWindowsAutomatically(false);
+                            if file.as_ref().is_some_and(|file| !file.scripts) {
+                                config
+                                    .defaultWebpagePreferences()
+                                    .setAllowsContentJavaScript(false);
+                            }
                             config.setWebsiteDataStore(
                                 &WKWebsiteDataStore::nonPersistentDataStore(mtm),
                             );
@@ -333,20 +445,34 @@ impl gpui::Render for Html {
                             });
                             let guard: Retained<NavigationGuard> = msg_send![super(guard), init];
                             web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*guard)));
-                            load_page(&web, &html, file.as_deref());
+                            let remote_blocked = file.as_ref().is_some_and(|file| !file.scripts);
+                            let gate = Rc::new(RefCell::new(LoadGate {
+                                rules: if remote_blocked {
+                                    Rules::Pending
+                                } else {
+                                    Rules::NotNeeded
+                                },
+                                latest: html.clone(),
+                            }));
+                            if remote_blocked {
+                                load_page_without_remote(&web, mtm, gate.clone(), file.clone());
+                            } else {
+                                load_page(&web, &html, file.as_deref());
+                            }
                             clip.addSubview(&web);
                             Hosted {
                                 clip,
                                 web,
                                 _guard: guard,
                                 markup: html.clone(),
+                                gate,
                             }
                         };
                         *view = Some(hosted);
                     }
                     if let Some(view) = view.as_mut() {
                         if !Arc::ptr_eq(&view.markup, &html) {
-                            load_page(&view.web, &html, file.as_deref());
+                            request_load(&view.web, &view.gate, &html, file.as_deref());
                             view.markup = html.clone();
                         }
                         parent.addSubview_positioned_relativeTo(
@@ -384,6 +510,34 @@ impl Drop for Html {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_page_loads_while_the_remote_load_rules_are_pending_or_failed() {
+        assert!(Rules::NotNeeded.allows_load());
+        assert!(Rules::Ready.allows_load());
+        assert!(!Rules::Pending.allows_load());
+        assert!(!Rules::Failed.allows_load());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_page_runs_scripts_only_until_it_is_made_a_preview() {
+        let page = Html::from_file("/tmp/a.html".into(), "/tmp".into());
+        assert!(page.runs_scripts());
+        assert!(!page.without_scripts().runs_scripts());
+        // Generated markup keeps its own sandbox and is not a file page.
+        assert!(Html::new("<p>".into()).runs_scripts());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_remote_load_rules_are_json_that_blocks_every_network_scheme() {
+        let rules: serde_json::Value = serde_json::from_str(BLOCK_REMOTE_RULES).unwrap();
+        assert_eq!(rules[0]["action"]["type"], "block");
+        let filter = rules[0]["trigger"]["url-filter"].as_str().unwrap();
+        for scheme in ["http", "https", "ws", "wss", "ftp"] {
+            assert!(filter.contains(scheme), "{scheme} is not blocked: {filter}");
+        }
+    }
     #[test]
     fn generated_markup_cannot_escape_the_opaque_iframe() {
         let html = sandbox("\"><script>window.top.postMessage('x','*')</script>");

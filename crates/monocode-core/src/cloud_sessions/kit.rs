@@ -49,6 +49,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::accounts::Profile;
+use crate::credential_guard::{
+    app_data_dirs, file_id, link_count, SecretIndex, INDEXED_HOME_PATHS,
+};
 use crate::provider::Kind;
 
 /// Largest single skill, measured on disk.
@@ -617,42 +620,8 @@ struct Guard {
     index_complete: bool,
 }
 
-/// Entries read when collecting credential file identities.
-const MAX_GUARD_ENTRIES: usize = 20_000;
-
 /// Folder names that are never part of a skill or plugin, wherever they sit.
 const SENSITIVE_NAMES: [&str; 3] = [".ssh", ".aws", ".gnupg"];
-
-/// Credential locations under `$HOME`, in the order they are indexed: the small and
-/// important ones first, the folders that may hold logs and caches last.
-const INDEXED_HOME_PATHS: [&str; 9] = [
-    ".claude/.credentials.json",
-    ".ssh",
-    ".aws",
-    ".config/gh",
-    ".gnupg",
-    ".codex/auth.json",
-    ".kube",
-    ".docker",
-    ".config/gcloud",
-];
-
-/// Folders that hold the app's own data, as the app finds them plus the per-OS layouts
-/// under the given home (the home may differ from the process one).
-fn app_data_dirs(home: &Path) -> Vec<PathBuf> {
-    let id = crate::brand::DESKTOP_APP_ID;
-    let mut out = vec![
-        home.join("Library/Application Support").join(id),
-        home.join(".local/share").join(id),
-    ];
-    if let Some(dir) = crate::store::monocode_database().parent() {
-        out.push(dir.to_path_buf());
-    }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        out.push(PathBuf::from(xdg).join(id));
-    }
-    out
-}
 
 impl Guard {
     fn new(roots: &KitRoots, home: &Path, started: Instant, budget: Duration) -> Self {
@@ -697,58 +666,15 @@ impl Guard {
             list.dedup();
         }
 
-        let mut secret_files = HashSet::new();
-        let mut budget_left = MAX_GUARD_ENTRIES;
-        let mut index_complete = true;
-        for rel in INDEXED_HOME_PATHS {
-            let path = home.join(rel);
-            // A credentials folder may itself be a link (stow-style dotfiles).
-            let path = std::fs::canonicalize(&path).unwrap_or(path);
-            if !collect_file_ids(&path, &mut secret_files, &mut budget_left, started, budget) {
-                index_complete = false;
-                break;
-            }
-        }
+        let index = SecretIndex::build(home, started, budget);
         Self {
             forbidden,
             app,
             exempt,
-            secret_files,
-            index_complete,
+            secret_files: index.ids,
+            index_complete: index.complete,
         }
     }
-}
-
-/// Add the (device, inode) of every regular file under `path`, without following links.
-/// Errors are ignored. Returns false when the entry cap or the time budget ran out.
-fn collect_file_ids(
-    path: &Path,
-    out: &mut HashSet<(u64, u64)>,
-    left: &mut usize,
-    started: Instant,
-    budget: Duration,
-) -> bool {
-    if *left == 0 || started.elapsed() >= budget {
-        return false;
-    }
-    *left -= 1;
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return true;
-    };
-    if meta.is_file() {
-        if let Some(id) = file_id(&meta) {
-            out.insert(id);
-        }
-    } else if meta.is_dir() {
-        if let Ok(reader) = std::fs::read_dir(path) {
-            for entry in reader.flatten() {
-                if !collect_file_ids(&entry.path(), out, left, started, budget) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
 }
 
 /// Is `real_root` a place that is never a skill or plugin? `root` is the path as named
@@ -1035,14 +961,6 @@ fn credential_file(path: &Path, meta: &std::fs::Metadata, guard: &Guard) -> Opti
     None
 }
 
-#[cfg(unix)]
-fn link_count(meta: &std::fs::Metadata) -> u64 {
-    std::os::unix::fs::MetadataExt::nlink(meta)
-}
-#[cfg(not(unix))]
-fn link_count(_meta: &std::fs::Metadata) -> u64 {
-    1
-}
 /// A relative path as the cloud names it: components joined with `/` on every platform (the
 /// Linux container and the tar never see a backslash).
 pub(super) fn slash_name(path: &Path) -> String {
@@ -1056,16 +974,6 @@ pub(super) fn slash_name(path: &Path) -> String {
 pub(super) fn file_stamp(meta: &std::fs::Metadata) -> Option<(u64, std::time::SystemTime)> {
     Some((meta.len(), meta.modified().ok()?))
 }
-#[cfg(unix)]
-fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
-}
-#[cfg(not(unix))]
-fn file_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    None
-}
-
 enum Link {
     /// Resolves to a path inside the item's own canonical root.
     Inside(PathBuf),

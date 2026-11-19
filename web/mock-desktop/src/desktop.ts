@@ -110,6 +110,7 @@ export interface SessionInfo {
 function requiredCapability(method: MethodName): string | undefined {
   if (method.startsWith("cloud.")) return "cloud";
   if (method === "session.answerApproval") return "approvals";
+  if (method === "chat.mentionedFile") return "mentionedFiles";
   return undefined;
 }
 
