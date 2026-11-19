@@ -58,6 +58,8 @@ describe("ChatBackground", () => {
     expect(img).toHaveAttribute("src", "blob:test");
     expect(img).toHaveAttribute("aria-hidden", "true");
     expect(img).toHaveStyle({ opacity: "0.3" });
+    // A scrim of the page background colour strong enough for muted text, with the photo still showing through.
+    expect(screen.getByTestId("chat-background-scrim").className).toContain("bg-background/75");
   });
 
   it("revokes its object URL when it unmounts", async () => {
