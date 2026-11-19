@@ -9,6 +9,7 @@ on:
     paths:
       - "web/**"
       - "crates/monocode-core/**"
+      - "crates/mobile-link/**"
       - "crates/monocode-gpui/Cargo.toml"
       - "crates/monocode-gpui/Cargo.lock"
       - "crates/monocode-gpui/.cargo/config.toml"
@@ -19,6 +20,7 @@ on:
     paths:
       - "web/**"
       - "crates/monocode-core/**"
+      - "crates/mobile-link/**"
       - "crates/monocode-gpui/Cargo.toml"
       - "crates/monocode-gpui/Cargo.lock"
       - "crates/monocode-gpui/.cargo/config.toml"
