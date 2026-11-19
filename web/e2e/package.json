@@ -1,0 +1,21 @@
+{
+  "name": "@monoptah/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "E-01 end-to-end harness: Playwright with a CDP virtual WebAuthn authenticator against local wrangler dev (Miniflare) and the headless desktop core",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "e2e": "playwright test"
+  },
+  "dependencies": {
+    "@monoptah/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.65.1",
+    "wrangler": "4.163.0"
+  }
+}

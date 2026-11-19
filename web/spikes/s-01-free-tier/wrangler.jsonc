@@ -1,0 +1,9 @@
+// Throwaway S-01 CPU probe Worker, deployed only by the maintainer (PENDING-MAC) under its own name.
+{
+  "name": "monoptah-spike-01",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "observability": { "enabled": true },
+  // Replace the id with the one printed by `wrangler d1 create monoptah-spike-01`.
+  "d1_databases": [{ "binding": "DB", "database_name": "monoptah-spike-01", "database_id": "REPLACE_WITH_D1_ID" }]
+}

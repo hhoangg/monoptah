@@ -1,0 +1,183 @@
+// W-14 helpers: UI registration, theme, viewports, overflow check, axe scan. Shared by tests/w14-*.spec.ts.
+import AxeBuilder from "@axe-core/playwright";
+import type { CDPSession, Locator, Page } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { outputDir } from "./paths.ts";
+
+export type Scheme = "light" | "dark";
+
+/**
+ * Registers through the /register page up to the end of the second-passkey step (skipped) and returns the 10
+ * recovery codes the page showed. Leaves the page on the first screen after sign-up with the codes acknowledged.
+ */
+export async function registerThroughUi(page: Page, invite: string, handle: string, displayName: string): Promise<string[]> {
+  await page.goto("/register");
+  await page.getByLabel("Invite code").fill(invite);
+  await page.getByLabel("Handle").fill(handle);
+  await page.getByLabel("Display name").fill(displayName);
+  await page.getByRole("button", { name: /create passkey/i }).click();
+  await expect(page.getByRole("heading", { name: "Save your recovery codes" })).toBeVisible();
+  const items = page.getByRole("list", { name: "Recovery codes" }).getByRole("listitem");
+  await expect(items).toHaveCount(10);
+  const codes = (await items.locator("span").evaluateAll((spans) => spans.filter((s) => !s.hasAttribute("aria-hidden")).map((s) => s.textContent ?? ""))).map((c) => c.trim());
+  expect(codes).toHaveLength(10);
+  await expect(page.getByRole("button", { name: "Continue" })).toBeDisabled();
+  await page.getByLabel("I saved these codes").check();
+  await page.getByRole("button", { name: "Continue" }).click();
+  await expect(page.getByRole("heading", { name: "Add a second passkey" })).toBeVisible();
+  await page.getByRole("button", { name: "Skip for now" }).click();
+  await expect(page).not.toHaveURL(/\/register/);
+  return codes;
+}
+
+/** Stores the appearance the way the app does (`monoptah.appearance`, read by public/theme-init.js on load). */
+export async function setScheme(page: Page, scheme: Scheme): Promise<void> {
+  await page.evaluate((scheme) => window.localStorage.setItem("monoptah.appearance", scheme), scheme);
+}
+
+/** Opens `path` in the given scheme and waits until the app set `data-scheme` and the network is idle. */
+export async function openIn(page: Page, path: string, scheme: Scheme): Promise<void> {
+  await setScheme(page, scheme);
+  // Leave the page first: a goto to the same URL (or the same URL with another hash, as `/pair/CODE#fp=...`) is a
+  // same-document navigation, so the page would keep the scheme it was loaded with and theme-init.js would not run again.
+  await page.goto("about:blank");
+  await page.goto(path, { waitUntil: "load" });
+  await expect(page.locator("html")).toHaveAttribute("data-scheme", scheme);
+  await page.waitForLoadState("networkidle");
+}
+
+export interface Viewport {
+  name: string;
+  /** CSS px width the page lays out at. */
+  width: number;
+  height: number;
+  /** CSS-pixel ratio: 2 only for the zoom emulation. */
+  scale: number;
+}
+
+/**
+ * Real browser zoom is not exposed to Playwright, and `deviceScaleFactor` alone only adds sharpness. What zoom does to
+ * layout is shrink the CSS viewport: Chromium at 200 percent zoom on a 1280 px window lays the page out at 640 CSS px
+ * and paints each CSS px as 2 device px. `zoom-200` therefore sets a 640 x 400 CSS viewport with a device scale factor
+ * of 2 (the screenshot is 1280 x 800 device px), which is the layout and the rasterisation a user at 200 percent sees.
+ */
+export const VIEWPORTS: Viewport[] = [
+  { name: "390", width: 390, height: 844, scale: 1 },
+  { name: "768", width: 768, height: 1024, scale: 1 },
+  { name: "1280", width: 1280, height: 800, scale: 1 },
+  { name: "zoom-200", width: 640, height: 400, scale: 2 },
+];
+
+/**
+ * One CDP session per page, kept attached. Chromium drops the emulation a session installed when that session detaches,
+ * so detaching right after the call loses the device scale factor on some platforms (the headless shell on macOS).
+ * The session ends with the page.
+ */
+const emulationSessions = new WeakMap<Page, CDPSession>();
+
+/** Applies a viewport through CDP so the device scale factor can change on a page that already exists. */
+export async function applyViewport(page: Page, viewport: Viewport): Promise<void> {
+  let cdp = emulationSessions.get(page);
+  if (!cdp) {
+    cdp = await page.context().newCDPSession(page);
+    emulationSessions.set(page, cdp);
+  }
+  await cdp.send("Emulation.setDeviceMetricsOverride", { width: viewport.width, height: viewport.height, deviceScaleFactor: viewport.scale, mobile: false });
+  const seen = await page.evaluate(() => ({ width: window.innerWidth, ratio: window.devicePixelRatio }));
+  expect(seen).toEqual({ width: viewport.width, ratio: viewport.scale });
+}
+
+/**
+ * Full-page screenshot laid out at the emulated CSS width. `page.screenshot({ fullPage: true })` re-applies Playwright's own
+ * viewport metrics while it captures, which re-laid the page out at 1280 px and cropped it (the A-0 bug). This captures through
+ * the kept CDP session instead, so the emulation set by `applyViewport` stays in force. The page is asserted to be at the
+ * intended width and scale right before the capture, so the bug cannot return silently.
+ */
+export async function screenshotAtViewport(page: Page, viewport: Viewport, file: string): Promise<void> {
+  const cdp = emulationSessions.get(page);
+  if (!cdp) throw new Error("screenshotAtViewport: call applyViewport first");
+  const seen = await page.evaluate(() => ({ width: window.innerWidth, ratio: window.devicePixelRatio }));
+  expect(seen, `${file}: page must be laid out at ${viewport.width} CSS px, scale ${viewport.scale}`).toEqual({ width: viewport.width, ratio: viewport.scale });
+  const metrics = await cdp.send("Page.getLayoutMetrics");
+  const content = metrics.cssContentSize ?? metrics.contentSize;
+  const width = viewport.width;
+  const height = Math.max(viewport.height, Math.ceil(content.height));
+  const shot = await cdp.send("Page.captureScreenshot", { format: "png", captureBeyondViewport: true, clip: { x: 0, y: 0, width, height, scale: 1 } });
+  writeFileSync(file, Buffer.from(shot.data, "base64"));
+}
+
+/** Back to the Playwright default viewport (1280 x 720, scale 1). */
+export async function resetViewport(page: Page): Promise<void> {
+  await applyViewport(page, { name: "default", width: 1280, height: 720, scale: 1 });
+}
+
+/** No horizontal scrolling: the document is not wider than the viewport. */
+export async function expectNoHorizontalOverflow(page: Page, label: string): Promise<void> {
+  const sizes = await page.evaluate(() => ({ scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth }));
+  expect(sizes.scroll, `${label}: scrollWidth ${sizes.scroll} > clientWidth ${sizes.client}`).toBeLessThanOrEqual(sizes.client);
+}
+
+export function visualDir(): string {
+  const dir = join(outputDir(), "w14-visual");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export interface AxeSummary {
+  rule: string;
+  impact: string | null | undefined;
+  nodes: string[];
+}
+
+/** Runs axe (wcag2a, wcag2aa) and returns the violations of impact serious or critical. */
+export async function axeSeriousViolations(page: Page): Promise<AxeSummary[]> {
+  const results = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa"]).analyze();
+  return results.violations
+    .filter((v) => v.impact === "serious" || v.impact === "critical")
+    .map((v) => ({ rule: v.id, impact: v.impact, nodes: v.nodes.map((n) => `${n.target.join(" ")} :: ${n.failureSummary?.split("\n").slice(0, 3).join(" | ") ?? ""}`) }));
+}
+
+/** True when the active element has a visible focus indicator (outline, ring shadow or border change). */
+export async function focusIsVisible(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const el = document.activeElement;
+    if (!el || el === document.body) return false;
+    const style = getComputedStyle(el);
+    const outline = style.outlineStyle !== "none" && parseFloat(style.outlineWidth) > 0;
+    const ring = style.boxShadow !== "none" && style.boxShadow !== "";
+    return outline || ring;
+  });
+}
+
+export const SCHEMES: Scheme[] = ["light", "dark"];
+
+export interface Screen {
+  name: string;
+  path: string;
+  /** What must be visible on the screen: its primary control or heading. */
+  key: (page: Page) => Locator;
+  /** Optional: content that must be visible before axe and the screenshots run (a transcript or list that loads over the link). */
+  ready?: (page: Page) => Locator;
+}
+
+export async function checkScreen(page: Page, screen: Screen): Promise<void> {
+  for (const scheme of SCHEMES) {
+    await resetViewport(page);
+    await openIn(page, screen.path, scheme);
+    // axe runs once per theme at the desktop width, before the viewport emulation changes anything.
+    await expect(screen.key(page).first(), `${screen.name} ${scheme}: key control`).toBeVisible();
+    if (screen.ready) await expect(screen.ready(page).first(), `${screen.name} ${scheme}: content loaded`).toBeVisible({ timeout: 30_000 });
+    const violations = await axeSeriousViolations(page);
+    expect(violations, `${screen.name} ${scheme}: axe serious or critical violations`).toEqual([]);
+    for (const viewport of VIEWPORTS) {
+      await applyViewport(page, viewport);
+      const label = `${screen.name} ${scheme} ${viewport.name}`;
+      await expect(screen.key(page).first(), `${label}: key control`).toBeVisible();
+      await expectNoHorizontalOverflow(page, label);
+      await screenshotAtViewport(page, viewport, join(visualDir(), `${screen.name}-${scheme}-${viewport.name}.png`));
+    }
+  }
+  await resetViewport(page);
+}

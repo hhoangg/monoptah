@@ -1,0 +1,32 @@
+/* Glass surface of design-system.md 4.1. Depth comes from blur and a hairline, never a shadow. */
+@layer components {
+.glass {
+  position: relative;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--glass-tint, var(--surface)) 92%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(1.2);
+  backdrop-filter: blur(16px) saturate(1.2);
+}
+.glass::before { /* gradient hairline */
+  content: "";
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.10), transparent 35%, transparent 65%, rgba(255, 255, 255, 0.09));
+  -webkit-mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+}
+.glass[data-pressable="true"]::after { /* hit slop of 4px */
+  content: "";
+  position: absolute;
+  inset: -4px;
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass { background: var(--sheet); } /* opaque fallback, keep the hairline */
+}
+@media (prefers-reduced-transparency: reduce) {
+  .glass { background: var(--sheet); backdrop-filter: none; -webkit-backdrop-filter: none; }
+}
+}

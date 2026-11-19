@@ -1,0 +1,9 @@
+# Copy to web/.dev.vars (git-ignored) for `wrangler dev`. Fake values only: never put a real secret here.
+VAPID_PRIVATE_KEY=fake-vapid-private-key-for-local-dev-only
+RECOVERY_PEPPER=fake-recovery-pepper-for-local-dev-only
+AUDIT_IP_SALT=fake-audit-ip-salt-for-local-dev-only
+# Local origin, overriding the official zptah.app values of wrangler.jsonc `vars`: WebAuthn and the
+# Origin checks need RP_ORIGIN to be the URL the browser really uses. 5173 is the `vite dev` port of
+# web/app; if you use `wrangler dev` (port 8787) instead, set RP_ORIGIN=http://localhost:8787.
+RP_ID=localhost
+RP_ORIGIN=http://localhost:5173

@@ -1020,6 +1020,52 @@ impl Shell {
             .map_or(cwd, |mark| mark.local_project.as_str())
     }
 
+    /// Whether the cloud marks are known, so a session without one is local for sure.
+    pub(crate) fn mobile_cloud_marks_loaded(&self) -> bool {
+        self.cloud_marks_loaded
+    }
+
+    /// What the mobile host may say about where a session runs, from cached state only: the
+    /// binding and cached state of a cloud session, its pending start, and whether it is a
+    /// remote-machine session. Never calls out and never wakes anything.
+    pub(crate) fn mobile_cloud_facts(&self, id: i64) -> Option<crate::mobile::cloud::Facts> {
+        let cwd = self.session_summaries.get(&id)?.cwd.clone();
+        let binding = self
+            .cloud_marks
+            .get(&id)
+            .map(|mark| crate::mobile::cloud::Binding {
+                local_project: mark.local_project.clone(),
+                instance: mark.codespace.clone(),
+                kind: mark.kind,
+                state: self
+                    .cloud_states
+                    .get(&mark.key())
+                    .copied()
+                    .unwrap_or(CloudState::Unknown),
+            });
+        let store = locked(&self.store).ok();
+        let start = binding
+            .as_ref()
+            .and_then(|_| monocode_core::cloud_sessions::start_record(store.as_deref()?, id));
+        let remote_machine = binding.is_none()
+            && monocode_core::remote::parse_remote_path(&cwd).is_some_and(|path| {
+                !monocode_core::store::is_pending_cloud_environment(&path.environment_id)
+                    && !store.as_deref().is_some_and(|store| {
+                        store
+                            .remote_session(id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|remote| remote.project.cloud().is_some())
+                    })
+            });
+        Some(crate::mobile::cloud::Facts {
+            cwd,
+            binding,
+            start,
+            remote_machine,
+        })
+    }
+
     /// Whether "New session in Codespace" applies to the project in view: a local
     /// folder whose `origin` is a GitHub repository.
     pub(super) fn offers_codespace(&self) -> bool {
@@ -1140,6 +1186,7 @@ impl Shell {
             self.forget_cloud_menus(cx);
         }
         self.cloud_marks = snapshot.marks;
+        self.cloud_marks_loaded = true;
         self.cloud_states = snapshot.states;
         self.sync_cloud_stopped(cx);
         self.sync_auto_stopping(cx);

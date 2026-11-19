@@ -1,9 +1,11 @@
-use crate::{tls, Address, Gate, Identity, LinkResult, REQUEST_LIMIT, RESPONSE_LIMIT};
+use crate::duplex::{accept, Accepted, Duplex, ServeOptions};
+use crate::{tls, Address, Failure, Gate, Identity, LinkResult, REQUEST_LIMIT, RESPONSE_LIMIT};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -88,13 +90,40 @@ pub const WATCH_HEARTBEAT: Duration = Duration::from_secs(10);
 /// goes to `watcher` instead, and its stream stays open: every value the
 /// watcher sends becomes a frame, with heartbeats between, until the watcher
 /// drops its sink or the phone goes away.
-pub async fn serve<F, Fut, W, WFut>(endpoint: quinn::Endpoint, gate: Gate, handler: F, watcher: W)
-where
+pub async fn serve<F, Fut, E, W, WFut, WE>(
+    endpoint: quinn::Endpoint,
+    gate: Gate,
+    handler: F,
+    watcher: W,
+) where
     F: Fn(String, Value) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = LinkResult<Value>> + Send + 'static,
+    Fut: Future<Output = Result<Value, E>> + Send + 'static,
+    E: Into<Failure> + 'static,
     W: Fn(String, Value, WatchSink) -> WFut + Send + Sync + 'static,
-    WFut: Future<Output = LinkResult<()>> + Send + 'static,
+    WFut: Future<Output = Result<(), WE>> + Send + 'static,
+    WE: Into<Failure> + 'static,
 {
+    serve_observed(endpoint, gate, handler, watcher, |_, _| {}).await;
+}
+
+/// [`serve`] that also tells `observer` when an admitted peer's connection
+/// opens (`true`) and when it ends (`false`), with the peer's key fingerprint.
+pub async fn serve_observed<F, Fut, E, W, WFut, WE, O>(
+    endpoint: quinn::Endpoint,
+    gate: Gate,
+    handler: F,
+    watcher: W,
+    observer: O,
+) where
+    F: Fn(String, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value, E>> + Send + 'static,
+    E: Into<Failure> + 'static,
+    W: Fn(String, Value, WatchSink) -> WFut + Send + Sync + 'static,
+    WFut: Future<Output = Result<(), WE>> + Send + 'static,
+    WE: Into<Failure> + 'static,
+    O: Fn(&str, bool) + Send + Sync + 'static,
+{
+    let observer = Arc::new(observer);
     let handler = Arc::new(handler);
     let watcher = Arc::new(watcher);
     let slots = Arc::new(Semaphore::new(32));
@@ -106,6 +135,7 @@ where
         let handler = handler.clone();
         let watcher = watcher.clone();
         let gate = gate.clone();
+        let observer = observer.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let Ok(Ok(connection)) = timeout(Duration::from_secs(10), incoming).await else {
@@ -121,129 +151,73 @@ where
                 return;
             };
             let key = crate::fingerprint(cert.as_ref());
-            while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            let admitted = gate.admits(&key);
+            if admitted {
+                observer(&key, true);
+            }
+            while let Ok((send, recv)) = connection.accept_bi().await {
                 if !gate.admits(&key) {
                     connection.close(1_u32.into(), b"Device revoked");
                     break;
                 }
-                // Long enough for a message's attachments over a slow network.
-                let request = timeout(REQUEST_UPLOAD, read_frame(&mut recv, REQUEST_LIMIT))
-                    .await
-                    .unwrap_or_else(|_| Err("Desktop request timed out".into()))
-                    .and_then(|request| {
-                        if gate.admits(&key) {
-                            Ok(request)
-                        } else {
-                            Err("Device revoked".into())
-                        }
-                    });
-                if let Some(request) = request
-                    .as_ref()
-                    .ok()
-                    .filter(|request| request["watch"] == true)
-                {
-                    // A watch runs beside the connection's requests, not in front of them.
-                    let (sink, updates) = mpsc::channel(64);
-                    let watching = watcher(key.clone(), request.clone(), sink);
-                    tokio::spawn(stream_watch(
-                        send,
-                        recv,
-                        updates,
-                        watching,
-                        gate.clone(),
-                        key.clone(),
-                    ));
-                    continue;
-                }
-                // Sequential per connection bounds work and preserves command ordering.
-                let response = match request {
-                    Ok(request) => timeout(Duration::from_secs(30), handler(key.clone(), request))
-                        .await
-                        .unwrap_or_else(|_| Err("Desktop request timed out".into())),
-                    Err(error) => Err(error),
+                let admits = {
+                    let gate = gate.clone();
+                    move |key: &str| gate.admits(key)
                 };
-                let response = match response {
-                    Ok(result) => serde_json::json!({"ok":true,"result":result}),
-                    Err(error) => serde_json::json!({"ok":false,"error":error}),
+                let stream = QuicStream {
+                    send,
+                    recv: Some(recv),
                 };
-                let _ = timeout(
-                    Duration::from_secs(10),
-                    write_frame(&mut send, &response, RESPONSE_LIMIT),
+                // Sequential per connection bounds work and preserves command
+                // ordering; a watch runs beside the connection's requests.
+                let accepted = accept(
+                    stream,
+                    &key,
+                    admits,
+                    &*handler,
+                    &*watcher,
+                    ServeOptions::QUIC,
                 )
                 .await;
+                if let Accepted::Watch(run) = accepted {
+                    tokio::spawn(run.run());
+                }
+            }
+            if admitted {
+                observer(&key, false);
             }
         });
     }
 }
-async fn stream_watch(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
-    mut updates: mpsc::Receiver<Value>,
-    watching: impl Future<Output = LinkResult<()>>,
-    gate: Gate,
-    key: String,
-) {
-    let frame = |result: LinkResult<Value>| match result {
-        Ok(value) => serde_json::json!({"ok":true,"result":value}),
-        Err(error) => serde_json::json!({"ok":false,"error":error}),
-    };
-    // The watcher answers first, as a request would: refused, or watching.
-    if let Err(error) = timeout(Duration::from_secs(30), watching)
-        .await
-        .unwrap_or_else(|_| Err("Desktop request timed out".into()))
-    {
-        let _ = timeout(
-            Duration::from_secs(10),
-            write_frame(&mut send, &frame(Err(error)), RESPONSE_LIMIT),
-        )
-        .await;
-        return;
+
+/// One QUIC bidirectional stream: length-prefixed JSON frames.
+struct QuicStream {
+    send: quinn::SendStream,
+    /// Taken by `closed`.
+    recv: Option<quinn::RecvStream>,
+}
+impl Duplex for QuicStream {
+    async fn read_request(&mut self, limit: usize) -> LinkResult<Value> {
+        let recv = self.recv.as_mut().ok_or("Request already read")?;
+        // Long enough for a message's attachments over a slow network.
+        timeout(REQUEST_UPLOAD, read_frame(recv, limit))
+            .await
+            .unwrap_or_else(|_| Err("Desktop request timed out".into()))
     }
-    if write_message(
-        &mut send,
-        &serde_json::json!({"ok":true,"watching":true}),
-        RESPONSE_LIMIT,
-    )
-    .await
-    .is_err()
-    {
-        return;
+    async fn write(&mut self, value: &Value, limit: usize) -> LinkResult<()> {
+        write_message(&mut self.send, value, limit).await
     }
-    // The phone closes its side to stop watching.
-    let mut closed =
-        Box::pin(
-            async move { while recv.read_chunk(1024, true).await.is_ok_and(|c| c.is_some()) {} },
-        );
-    let mut heartbeat = tokio::time::interval(WATCH_HEARTBEAT);
-    heartbeat.tick().await;
-    loop {
-        let value = tokio::select! {
-            update = updates.recv() => match update {
-                Some(value) => frame(Ok(value)),
-                None => break,
-            },
-            _ = heartbeat.tick() => serde_json::json!({"ok":true,"heartbeat":true}),
-            _ = &mut closed => return,
-        };
-        if !gate.admits(&key) {
-            let _ = write_frame(
-                &mut send,
-                &frame(Err("Device revoked".into())),
-                RESPONSE_LIMIT,
-            )
-            .await;
-            return;
-        }
-        let written = timeout(
-            Duration::from_secs(10),
-            write_message(&mut send, &value, RESPONSE_LIMIT),
-        )
-        .await;
-        if !matches!(written, Ok(Ok(()))) {
-            return;
-        }
+    fn finish(&mut self) -> LinkResult<()> {
+        self.send.finish().map_err(|e| e.to_string())
     }
-    let _ = send.finish();
+    fn closed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let recv = self.recv.take();
+        Box::pin(async move {
+            if let Some(mut recv) = recv {
+                while recv.read_chunk(1024, true).await.is_ok_and(|c| c.is_some()) {}
+            }
+        })
+    }
 }
 
 async fn connect(
@@ -357,15 +331,15 @@ fn give(key: &str, endpoint: quinn::Endpoint, connection: quinn::Connection) {
 
 /// Why a request on a connection failed: the link itself, which a fresh
 /// connection may not hit, or the desktop taking too long, which it would.
-enum Failure {
+enum Attempt {
     Link(String),
     Timeout,
 }
-impl From<Failure> for String {
-    fn from(failure: Failure) -> Self {
+impl From<Attempt> for String {
+    fn from(failure: Attempt) -> Self {
         match failure {
-            Failure::Link(error) => error,
-            Failure::Timeout => "Desktop request timed out".into(),
+            Attempt::Link(error) => error,
+            Attempt::Timeout => "Desktop request timed out".into(),
         }
     }
 }
@@ -382,7 +356,7 @@ async fn on_connection<T, F, Fut>(
 ) -> LinkResult<T>
 where
     F: Fn(quinn::Endpoint, quinn::Connection) -> Fut,
-    Fut: Future<Output = Result<(T, bool), Failure>>,
+    Fut: Future<Output = Result<(T, bool), Attempt>>,
 {
     let key = pool_key(identity, pin, addresses);
     if let Some((endpoint, connection)) = take(&key) {
@@ -393,7 +367,7 @@ where
                 }
                 return Ok(value);
             }
-            Err(Failure::Link(_)) => connection.close(0_u32.into(), b"Stale"),
+            Err(Attempt::Link(_)) => connection.close(0_u32.into(), b"Stale"),
             Err(failure) => {
                 connection.close(0_u32.into(), b"Timed out");
                 return Err(failure.into());
@@ -451,8 +425,8 @@ pub async fn exchange(
                 read_frame(&mut recv, RESPONSE_LIMIT).await
             })
             .await
-            .map_err(|_| Failure::Timeout)?
-            .map_err(Failure::Link)?;
+            .map_err(|_| Attempt::Timeout)?
+            .map_err(Attempt::Link)?;
             Ok((response, true))
         }
     })
@@ -541,8 +515,8 @@ pub async fn watch(
                 Ok::<_, String>((send, recv, answer))
             })
             .await
-            .map_err(|_| Failure::Timeout)?
-            .map_err(Failure::Link)?;
+            .map_err(|_| Attempt::Timeout)?
+            .map_err(Attempt::Link)?;
             let (send, recv, answer) = opened;
             if answer["ok"] != true {
                 let error = answer["error"]
@@ -624,12 +598,12 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             move |_, _, sink| {
                 let sinks = sinks.clone();
                 async move {
                     sinks.send(sink).await.unwrap();
-                    Ok(())
+                    Ok::<_, String>(())
                 }
             },
         ));
@@ -682,10 +656,10 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             |_, request: Value, sink: WatchSink| async move {
                 if request["method"] != "conversation.watch" {
-                    return Err("Unsupported mobile operation".into());
+                    return Err::<_, String>("Unsupported mobile operation".into());
                 }
                 tokio::spawn(async move {
                     for n in 0..3 {
@@ -736,7 +710,7 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             move |_, _, sink: WatchSink| {
                 let released = released.clone();
                 async move {
@@ -744,7 +718,7 @@ mod tests {
                         sink.closed().await;
                         released.send(()).await.unwrap();
                     });
-                    Ok(())
+                    Ok::<_, String>(())
                 }
             },
         ));
@@ -778,7 +752,7 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             no_watch,
         ));
         for host in ["127.0.0.1", "::1"] {
@@ -810,10 +784,10 @@ mod tests {
         let task = tokio::spawn(serve(
             endpoint.clone(),
             gate,
-            |_, request| async move { Ok(request) },
+            |_, request| async move { Ok::<_, String>(request) },
             |_, _, sink: WatchSink| async move {
                 tokio::spawn(async move { sink.closed().await });
-                Ok(())
+                Ok::<_, String>(())
             },
         ));
         let address = [Address {
@@ -841,6 +815,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_observer_hears_an_admitted_peer_connect_and_disconnect() {
+        let desktop = Identity::generate().unwrap();
+        let phone = Identity::generate().unwrap();
+        let gate = Gate::default();
+        gate.allow(phone.fingerprint().unwrap(), None);
+        let endpoint =
+            server_endpoint(&desktop, gate.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (events, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(serve_observed(
+            endpoint.clone(),
+            gate,
+            |_, request| async move { Ok::<_, String>(request) },
+            |_, _, _sink: WatchSink| async move { Ok::<_, String>(()) },
+            move |peer: &str, connected| {
+                let _ = events.send((peer.to_string(), connected));
+            },
+        ));
+        let address = [Address {
+            host: "127.0.0.1".into(),
+            port: endpoint.local_addr().unwrap().port(),
+        }];
+        let pin = desktop.fingerprint().unwrap();
+        exchange(&phone, &pin, &address, json!("hi")).await.unwrap();
+        assert_eq!(
+            heard.recv().await,
+            Some((phone.fingerprint().unwrap(), true))
+        );
+        endpoint.close(0_u32.into(), b"Test complete");
+        task.await.unwrap();
+        // The connection ends with the endpoint; the end is reported.
+        let closed = tokio::time::timeout(Duration::from_secs(5), heard.recv()).await;
+        assert_eq!(closed, Ok(Some((phone.fingerprint().unwrap(), false))));
+    }
+
+    #[tokio::test]
     async fn unpaired_and_wrongly_pinned_clients_never_reach_the_handler() {
         let desktop = Identity::generate().unwrap();
         let paired = Identity::generate().unwrap();
@@ -856,7 +865,7 @@ mod tests {
             gate,
             move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
-                async { Ok(Value::Null) }
+                async { Ok::<_, String>(Value::Null) }
             },
             no_watch,
         ));
@@ -885,6 +894,168 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// The bytes a phone reads for each kind of answer, pinned so the QUIC wire
+    /// format cannot drift: a 4-byte big-endian length, then the JSON object
+    /// with its keys in the order serde_json writes them.
+    fn framed(json: &str) -> Vec<u8> {
+        let mut bytes = (json.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(json.as_bytes());
+        bytes
+    }
+
+    /// An error answer as serde_json writes it. The key order of a JSON object
+    /// depends on whether `preserve_order` is unified into this build (the gpui
+    /// workspace does, the root workspace does not), so each mode is pinned
+    /// to its own exact literal, chosen by probing the active mode.
+    fn error_json(message: &str) -> String {
+        let insertion_ordered =
+            serde_json::to_string(&json!({"b":0,"a":0})).unwrap() == r#"{"b":0,"a":0}"#;
+        if insertion_ordered {
+            format!(r#"{{"ok":false,"error":"{message}"}}"#)
+        } else {
+            format!(r#"{{"error":"{message}","ok":false}}"#)
+        }
+    }
+
+    async fn raw_frame(recv: &mut quinn::RecvStream) -> Vec<u8> {
+        let length = recv.read_u32().await.unwrap();
+        let mut body = vec![0; length as usize];
+        recv.read_exact(&mut body).await.unwrap();
+        let mut bytes = length.to_be_bytes().to_vec();
+        bytes.extend(body);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn golden_quic_bytes_for_requests_watches_and_revocation() {
+        let desktop = Identity::generate().unwrap();
+        let phone = Identity::generate().unwrap();
+        let gate = Gate::default();
+        let key = phone.fingerprint().unwrap();
+        gate.allow(key.clone(), None);
+        let server =
+            server_endpoint(&desktop, gate.clone(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let (sinks, mut opened) = mpsc::channel(1);
+        let task = tokio::spawn(serve(
+            server.clone(),
+            gate.clone(),
+            |_, request| async move {
+                if request["method"] == "fail" {
+                    Err::<_, String>("boom".into())
+                } else {
+                    Ok(json!({"a":[2,"x"],"b":1}))
+                }
+            },
+            move |_, request: Value, sink: WatchSink| {
+                let sinks = sinks.clone();
+                async move {
+                    match request["method"].as_str() {
+                        Some("refuse") => Err::<_, String>("Unsupported mobile operation".into()),
+                        Some("hold") => {
+                            sinks.send(sink).await.unwrap();
+                            Ok(())
+                        }
+                        _ => {
+                            tokio::spawn(async move {
+                                for n in 0..2 {
+                                    sink.send(json!({ "n": n })).await.unwrap();
+                                }
+                            });
+                            Ok(())
+                        }
+                    }
+                }
+            },
+        ));
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            tls::client(&phone, &desktop.fingerprint().unwrap()).unwrap(),
+        );
+        let connection = client
+            .connect(server.local_addr().unwrap(), "monocode.local")
+            .unwrap()
+            .await
+            .unwrap();
+        // A request answered, then one failed, then one over the size limit.
+        for (request, expected) in [
+            (
+                json!({"method":"ok"}),
+                r#"{"ok":true,"result":{"a":[2,"x"],"b":1}}"#.to_string(),
+            ),
+            (json!({"method":"fail"}), error_json("boom")),
+        ] {
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            write_frame(&mut send, &request, REQUEST_LIMIT)
+                .await
+                .unwrap();
+            let bytes = recv.read_to_end(1024).await.unwrap();
+            assert_eq!(bytes, framed(&expected));
+        }
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_u32((REQUEST_LIMIT + 1) as u32).await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(
+            recv.read_to_end(1024).await.unwrap(),
+            framed(&error_json("Message exceeds the connection limit"))
+        );
+        // A refused watch answers like a request and ends.
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_message(
+            &mut send,
+            &json!({"watch":true,"method":"refuse"}),
+            REQUEST_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recv.read_to_end(1024).await.unwrap(),
+            framed(&error_json("Unsupported mobile operation"))
+        );
+        // An accepted watch: accept frame, two updates, then the end of the stream.
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_message(&mut send, &json!({"watch":true}), REQUEST_LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"watching":true}"#)
+        );
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"result":{"n":0}}"#)
+        );
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"result":{"n":1}}"#)
+        );
+        assert!(recv.read_to_end(1024).await.unwrap().is_empty());
+        drop(send);
+        // Revocation while watching: the next frame is replaced by an error frame.
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_message(
+            &mut send,
+            &json!({"watch":true,"method":"hold"}),
+            REQUEST_LIMIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_frame(&mut recv).await,
+            framed(r#"{"ok":true,"watching":true}"#)
+        );
+        let sink = opened.recv().await.unwrap();
+        gate.remove(&key);
+        sink.send(json!({"n":9})).await.unwrap();
+        assert_eq!(
+            recv.read_to_end(1024).await.unwrap(),
+            framed(&error_json("Device revoked"))
+        );
+        drop(send);
+        client.close(0_u32.into(), b"Test complete");
+        server.close(0_u32.into(), b"Test complete");
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn revocation_applies_to_an_existing_connection_and_large_frames_are_rejected() {
         let desktop = Identity::generate().unwrap();
@@ -901,7 +1072,7 @@ mod tests {
             gate.clone(),
             move |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
-                async { Ok(json!("accepted")) }
+                async { Ok::<_, String>(json!("accepted")) }
             },
             no_watch,
         ));

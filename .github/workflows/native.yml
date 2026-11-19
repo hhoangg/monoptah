@@ -60,6 +60,8 @@ jobs:
               - 'crates/monocode-core/**'
               - 'crates/monocode-gpui/**'
               - 'crates/mobile-link/**'
+              - 'web/protocol/methods.json'
+              - 'web/protocol/vectors.json'
               - 'vendor/gpui-pre*/**'
               - 'scripts/*native*'
               - 'scripts/native-editor/**'

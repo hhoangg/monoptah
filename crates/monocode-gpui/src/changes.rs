@@ -1976,8 +1976,19 @@ pub(crate) fn generate_commit_message(
     cwd: PathBuf,
     cancel: Arc<AtomicBool>,
 ) -> Result<String, String> {
+    generate_commit_message_with(harness, cwd, cancel, Ok)
+}
+
+/// [`generate_commit_message`] with a step that may trim the staged context
+/// before it reaches the provider (a remote device never sends a denied file).
+pub(crate) fn generate_commit_message_with(
+    harness: TextHarness,
+    cwd: PathBuf,
+    cancel: Arc<AtomicBool>,
+    trim: impl FnOnce(scm::StagedContext) -> Result<scm::StagedContext, String>,
+) -> Result<String, String> {
     let kind = harness.0;
-    let context = scm::staged_context(&cwd)?;
+    let context = trim(scm::staged_context(&cwd)?)?;
     let prompt =
         scm::commit_message_prompt(context.branch.as_deref(), &context.summary, &context.patch);
     let output = text_prompt(harness, cwd, prompt, cancel)?;

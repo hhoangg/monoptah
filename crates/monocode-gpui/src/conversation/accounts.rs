@@ -176,6 +176,7 @@ impl Conversation {
         match &mut self.settings.usage_limit {
             Some(limit) if !limit.resume_at_reset => {
                 limit.resume_at_reset = true;
+                limit.no_wake = false;
                 true
             }
             _ => false,
@@ -285,10 +286,12 @@ impl Conversation {
         if self.busy
             || self.stopping
             || self.account_switching
-            || self.settings.usage_limit.take().is_none()
+            || self.settings.usage_limit.is_none()
         {
             return;
         }
+        // A resume a remote device armed without consent runs without waking the workspace.
+        let carried = self.settings.usage_limit.take().is_some_and(|l| l.no_wake);
         self.status = "Ready".into();
         self.save_settings(cx);
         if self.settings.mono.is_some() {
@@ -297,7 +300,10 @@ impl Conversation {
             cx.notify();
             return;
         }
+        let outer = self.mobile_no_wake;
+        self.mobile_no_wake = outer || carried;
         self.launch_prompt("Continue from where you left off.".into(), cx);
+        self.mobile_no_wake = outer;
         cx.emit(SessionChanged);
         cx.notify();
     }
@@ -819,6 +825,7 @@ mod tests {
             let reported = Limit {
                 resets_at: Some(usage::now_ms() + 3_600_000),
                 resume_at_reset: false,
+                no_wake: false,
             };
             view.settings.usage_limit = Some(reported.clone());
             view.detect_usage_limit(cx);
@@ -853,6 +860,7 @@ mod tests {
                     view.settings.usage_limit = Some(Limit {
                         resets_at: Some(usage::now_ms() + 3_600_000),
                         resume_at_reset: false,
+                        no_wake: false,
                     });
                     view
                 })
@@ -1046,6 +1054,7 @@ mod tests {
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(at),
                 resume_at_reset: false,
+                no_wake: false,
             });
             v.detect_usage_limit(cx);
             let limit = v.settings.usage_limit.as_ref().unwrap();
@@ -1087,6 +1096,7 @@ mod tests {
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(usage::now_ms() + 3_600_000),
                 resume_at_reset: false,
+                no_wake: false,
             });
             v.set_usage_resume_at_reset(true, cx);
             v.set_usage_resume_at_reset(false, cx);
@@ -1119,6 +1129,7 @@ mod tests {
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(usage::now_ms() + 3_600_000),
                 resume_at_reset: true,
+                ..Default::default()
             });
             v.tick_usage(cx);
             v.tick_usage(cx);
@@ -1141,6 +1152,7 @@ mod tests {
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(usage::now_ms() - 3_600_000),
                 resume_at_reset: false,
+                no_wake: false,
             });
         });
         unknown.update(cx, |v, _| v.settings.usage_limit = Some(Limit::default()));
@@ -1164,6 +1176,7 @@ mod tests {
                 usage_limit: Some(Limit {
                     resets_at: Some(usage::now_ms() + offset),
                     resume_at_reset: false,
+                    no_wake: false,
                 }),
                 ..Default::default()
             };
@@ -1191,6 +1204,7 @@ mod tests {
                 v.settings.usage_limit = Some(Limit {
                     resets_at: reset,
                     resume_at_reset: false,
+                    no_wake: false,
                 });
                 v.settings.auto_resume_opt_out = optout;
             });
@@ -1210,6 +1224,7 @@ mod tests {
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(usage::now_ms() + 3_600_000),
                 resume_at_reset: false,
+                no_wake: false,
             });
             v.sweep_auto_resume(cx);
         });

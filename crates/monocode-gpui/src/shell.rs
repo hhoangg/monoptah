@@ -96,6 +96,7 @@ mod title_tabs;
 mod today_sessions;
 mod tui_busy;
 mod tui_sessions;
+mod web_link;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod window_chrome;
 mod worktrees;
@@ -750,6 +751,9 @@ pub(crate) struct Shell {
     move_labels: HashMap<i64, Option<String>>,
     /// Sessions that live in a codespace, by id, and the cached state of each codespace.
     cloud_marks: HashMap<i64, cloud::CloudMark>,
+    /// Whether a cloud snapshot has filled `cloud_marks` at least once. Until then a session
+    /// that is missing from it may still be a cloud one, so the mobile host says nothing of it.
+    cloud_marks_loaded: bool,
     /// The Claude setup block of each workspace, by `CloudRef::key`; see [`claude_setup`].
     claude_setups: claude_setup::Setups,
     /// Which side of a cloud session its Files and Changes panels show. In memory only; a
@@ -1300,6 +1304,7 @@ impl Shell {
             gh,
             codespaces_usage: Default::default(),
             cloud_marks: HashMap::new(),
+            cloud_marks_loaded: false,
             claude_setups: Default::default(),
             panel_modes: HashMap::new(),
             cloud_view: None,
@@ -1628,6 +1633,7 @@ impl Shell {
         this.resume_cloud_moves(cx);
         this.resume_return_cleanups(cx);
         this.init_mobile_host(cx);
+        this.init_web_link(cx);
         if let Some(id) = this.workspace.active {
             this.ensure_session(this.workspace.session_for_pane(id), cx);
             this.record_worktree_session(id, cx);
@@ -7493,6 +7499,7 @@ impl Shell {
             let search = settings.update(cx, |v, cx| v.search_field(true, cx));
             let select = cx.weak_entity();
             let back = select.clone();
+            let web_waiting = self.web_badge(cx);
             return crate::settings::nav(
                 section,
                 search,
@@ -7502,6 +7509,7 @@ impl Shell {
                 move |window, cx| {
                     let _ = back.update(cx, |this, cx| this.close_settings(window, cx));
                 },
+                web_waiting,
             );
         }
         if self.workspace.classic_layout {

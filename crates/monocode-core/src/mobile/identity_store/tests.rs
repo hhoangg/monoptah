@@ -204,3 +204,143 @@ fn unavailable_database_errors_without_generating() {
     assert!(!missing.exists());
     assert_eq!(keychain.gets.load(Ordering::SeqCst), 0);
 }
+
+const WEB_ACCOUNT: &str = "web:/tmp/mobile-access.json";
+const TOKEN: &str = "test-token-not-real";
+
+fn web_identity() -> WebIdentity {
+    WebIdentity {
+        static_private: [7; 32],
+        static_public: [9; 32],
+        desktop_id: "desktop-1".into(),
+        desktop_token: TOKEN.into(),
+        relay_url: "wss://relay.example.test/ws".into(),
+        account_handle: None,
+        desktop_name: None,
+    }
+}
+
+#[test]
+fn web_identity_saves_loads_and_wipes() {
+    let (_dir, path) = database();
+    assert_eq!(load_web(&path, WEB_ACCOUNT), Ok(None));
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    assert_eq!(load_web(&path, WEB_ACCOUNT), Ok(Some(web_identity())));
+    let mut changed = web_identity();
+    changed.desktop_id = "desktop-2".into();
+    save_web(&path, WEB_ACCOUNT, &changed).unwrap();
+    assert_eq!(load_web(&path, WEB_ACCOUNT), Ok(Some(changed)));
+    assert_eq!(rows(&path), 1);
+    wipe_web(&path, WEB_ACCOUNT).unwrap();
+    assert_eq!(load_web(&path, WEB_ACCOUNT), Ok(None));
+    wipe_web(&path, WEB_ACCOUNT).unwrap();
+}
+
+#[test]
+fn web_identity_keeps_the_desktop_name_chosen_at_pairing() {
+    let (_dir, path) = database();
+    let mut named = web_identity();
+    named.desktop_name = Some("w14-headless".into());
+    save_web(&path, WEB_ACCOUNT, &named).unwrap();
+    let loaded = load_web(&path, WEB_ACCOUNT).unwrap().unwrap();
+    assert_eq!(loaded.desktop_name.as_deref(), Some("w14-headless"));
+    // A row sealed before the name was kept has none.
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    assert_eq!(
+        load_web(&path, WEB_ACCOUNT).unwrap().unwrap().desktop_name,
+        None
+    );
+}
+
+#[test]
+fn wiping_before_the_table_exists_succeeds() {
+    let (_dir, path) = database();
+    wipe_web(&path, WEB_ACCOUNT).unwrap();
+}
+
+#[test]
+fn a_mobile_row_and_a_web_row_coexist() {
+    let (_dir, path) = database();
+    let keychain = FakeKeychain::default();
+    let mobile = load(Some(&path), ACCOUNT, false, &keychain).unwrap();
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    assert_eq!(rows(&path), 2);
+    let again = load(Some(&path), ACCOUNT, false, &keychain).unwrap();
+    assert_eq!(fingerprint(&mobile), fingerprint(&again));
+    wipe_web(&path, WEB_ACCOUNT).unwrap();
+    assert_eq!(rows(&path), 1);
+    let kept = load(Some(&path), ACCOUNT, false, &keychain).unwrap();
+    assert_eq!(fingerprint(&mobile), fingerprint(&kept));
+}
+
+#[test]
+fn a_row_of_one_kind_cannot_be_read_as_the_other() {
+    let (_dir, path) = database();
+    let keychain = FakeKeychain::default();
+    load(Some(&path), ACCOUNT, false, &keychain).unwrap();
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    // Swap the two rows' keys: each ciphertext now sits under the other's key.
+    for (from, to) in [
+        (ACCOUNT, "tmp"),
+        (WEB_ACCOUNT, ACCOUNT),
+        ("tmp", WEB_ACCOUNT),
+    ] {
+        conn.execute(
+            "UPDATE mobile_identity SET account=?2 WHERE account=?1",
+            params![from, to],
+        )
+        .unwrap();
+    }
+    assert_eq!(load_web(&path, WEB_ACCOUNT).unwrap_err(), WEB_UNREADABLE);
+    assert!(load(Some(&path), ACCOUNT, false, &keychain).is_err());
+}
+
+#[test]
+fn a_web_row_with_the_mobile_binding_does_not_open() {
+    let (_dir, path) = database();
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let row = read_row(&conn, WEB_ACCOUNT).unwrap().unwrap();
+    assert!(open_row(&path, WEB_ACCOUNT, &row).is_err());
+}
+
+#[test]
+fn a_tampered_web_row_is_unreadable() {
+    let (_dir, path) = database();
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("UPDATE mobile_identity SET ciphertext=zeroblob(40)", [])
+        .unwrap();
+    assert_eq!(load_web(&path, WEB_ACCOUNT).unwrap_err(), WEB_UNREADABLE);
+}
+
+#[test]
+fn an_unreadable_key_file_makes_the_web_row_unreadable() {
+    let (_dir, path) = database();
+    save_web(&path, WEB_ACCOUNT, &web_identity()).unwrap();
+    std::fs::write(path.parent().unwrap().join(sealed::KEY_FILE), b"short").unwrap();
+    assert_eq!(load_web(&path, WEB_ACCOUNT).unwrap_err(), WEB_UNREADABLE);
+}
+
+#[test]
+fn web_identity_debug_hides_the_token_and_the_private_key() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let identity = web_identity();
+    let shown = format!("{identity:?}");
+    assert!(!shown.contains(TOKEN));
+    assert!(!shown.contains(&URL_SAFE_NO_PAD.encode(identity.static_private)));
+    assert!(!shown.contains(&"07".repeat(32)));
+    assert!(!shown.contains("[7, 7"));
+    assert!(shown.contains("desktop-1"));
+}
+
+#[test]
+fn web_identity_storage_unavailable_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("absent.db");
+    assert!(load_web(&missing, WEB_ACCOUNT).is_err());
+    assert!(save_web(&missing, WEB_ACCOUNT, &web_identity()).is_err());
+    assert!(wipe_web(&missing, WEB_ACCOUNT).is_err());
+    assert!(!missing.exists());
+}

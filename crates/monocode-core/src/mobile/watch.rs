@@ -3,6 +3,17 @@
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
+/// The frame's own fields, which an extra field may not use.
+const RESERVED: [&str; 7] = [
+    "usageLimit",
+    "busy",
+    "older",
+    "order",
+    "question",
+    "turns",
+    "patches",
+];
+
 /// What the phone last received for a watch, to send only what changed since.
 #[derive(Clone, Debug, Default)]
 pub struct Baseline {
@@ -11,6 +22,8 @@ pub struct Baseline {
     usage_limit: Value,
     /// The pending question as last sent, as JSON; "null" for none.
     question: String,
+    /// Extra fields as last sent, by name.
+    extra: Map<String, Value>,
     order: Vec<String>,
     turns: HashMap<String, String>,
 }
@@ -62,6 +75,12 @@ fn edits_between(before: &Value, after: &Value, path: &mut Vec<Value>, out: &mut
 /// comes with the first frame and again whenever it changes, null once it is
 /// answered. None when nothing changed.
 /// Usage state changes must publish even when no transcript row changes.
+/// `extra` is a JSON object of field to value that the baseline remembers: a
+/// key joins the frame only when its value differs from the baseline's (an
+/// empty array clears one; a key left out is unchanged). Null or an empty
+/// object adds nothing. A key sent before that is missing from an object
+/// `extra` is cleared once (`[]` for a list, null otherwise).
+#[allow(clippy::too_many_arguments)]
 pub fn update(
     baseline: Option<&Baseline>,
     busy: bool,
@@ -70,8 +89,42 @@ pub fn update(
     turns: &[Value],
     incremental: bool,
     usage_limit: &Value,
+    extra: &Value,
 ) -> Option<(Value, Baseline)> {
     let asked = question.to_string();
+    let mut sent = baseline.map(|b| b.extra.clone()).unwrap_or_default();
+    let mut extra_changed = Map::new();
+    if let Value::Object(fields) = extra {
+        for (key, value) in fields {
+            // Never a phone field: it is not sent, so it is not remembered.
+            if RESERVED.contains(&key.as_str()) {
+                continue;
+            }
+            if sent.get(key) != Some(value) {
+                extra_changed.insert(key.clone(), value.clone());
+                sent.insert(key.clone(), value.clone());
+            }
+        }
+        // A key sent before and gone now is cleared once: an empty array for
+        // a list, null for anything else. (A null `extra` is "no fields",
+        // not "clear them all": the caller has no opinion then.)
+        let gone: Vec<String> = sent
+            .keys()
+            .filter(|key| !fields.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in gone {
+            let clear = if sent[&key].is_array() {
+                json!([])
+            } else {
+                Value::Null
+            };
+            if sent[&key] != clear {
+                extra_changed.insert(key.clone(), clear.clone());
+                sent.insert(key, clear);
+            }
+        }
+    }
     let order: Vec<String> = turns
         .iter()
         .map(|turn| turn["id"].as_str().unwrap_or_default().to_string())
@@ -91,6 +144,7 @@ pub fn update(
             && baseline.older == older
             && baseline.usage_limit == *usage_limit
             && baseline.question == asked
+            && extra_changed.is_empty()
             && changed.is_empty()
             && baseline.order == order
         {
@@ -130,6 +184,9 @@ pub fn update(
     if !patches.is_empty() {
         frame.insert("patches".into(), Value::Array(patches));
     }
+    for (key, value) in extra_changed {
+        frame.insert(key, value);
+    }
     Some((
         Value::Object(frame),
         Baseline {
@@ -137,6 +194,7 @@ pub fn update(
             older,
             usage_limit: usage_limit.clone(),
             question: asked,
+            extra: sent,
             order,
             turns: serialized,
         },
@@ -190,6 +248,7 @@ mod tests {
             &[turn("1", "hi")],
             false,
             &Value::Null,
+            &Value::Null,
         )
         .unwrap();
         assert_eq!(first["turns"].as_array().unwrap().len(), 1);
@@ -200,6 +259,7 @@ mod tests {
             &none,
             &[turn("1", "hi")],
             false,
+            &Value::Null,
             &Value::Null
         )
         .is_none());
@@ -210,6 +270,7 @@ mod tests {
             &none,
             &[turn("1", "hi"), turn("2", "yo")],
             false,
+            &Value::Null,
             &Value::Null,
         )
         .unwrap();
@@ -230,6 +291,7 @@ mod tests {
             &[turn("1", &long)],
             true,
             &Value::Null,
+            &Value::Null,
         )
         .unwrap();
         let grown = format!("{long} more");
@@ -240,6 +302,7 @@ mod tests {
             &none,
             &[turn("1", &grown)],
             true,
+            &Value::Null,
             &Value::Null,
         )
         .unwrap();
@@ -254,8 +317,17 @@ mod tests {
     fn the_pending_question_comes_first_and_again_only_when_it_changes() {
         let turns = [turn("1", "hi")];
         let question = json!({"requestId": 7, "questions": []});
-        let (first, asked) =
-            update(None, true, false, &question, &turns, false, &Value::Null).unwrap();
+        let (first, asked) = update(
+            None,
+            true,
+            false,
+            &question,
+            &turns,
+            false,
+            &Value::Null,
+            &Value::Null,
+        )
+        .unwrap();
         assert_eq!(first["question"], question);
         // Unchanged: nothing to send, and a frame for other reasons omits it.
         assert!(update(
@@ -265,6 +337,7 @@ mod tests {
             &question,
             &turns,
             false,
+            &Value::Null,
             &Value::Null
         )
         .is_none());
@@ -275,6 +348,7 @@ mod tests {
             &question,
             &turns,
             false,
+            &Value::Null,
             &Value::Null,
         )
         .unwrap();
@@ -288,6 +362,7 @@ mod tests {
             &turns,
             false,
             &Value::Null,
+            &Value::Null,
         )
         .unwrap();
         assert!(answered["question"].is_null());
@@ -298,6 +373,7 @@ mod tests {
             &Value::Null,
             &turns,
             false,
+            &Value::Null,
             &Value::Null
         )
         .is_none());
@@ -316,8 +392,17 @@ mod tests {
     #[test]
     fn usage_state_changes_publish_without_transcript_changes() {
         let limit = json!({"token":"a", "resetsAt":123456, "resumeAtReset":false});
-        let (first, baseline) =
-            update(None, false, false, &Value::Null, &[], true, &limit).unwrap();
+        let (first, baseline) = update(
+            None,
+            false,
+            false,
+            &Value::Null,
+            &[],
+            true,
+            &limit,
+            &Value::Null,
+        )
+        .unwrap();
         assert_eq!(first["usageLimit"], limit);
         assert!(update(
             Some(&baseline),
@@ -326,7 +411,8 @@ mod tests {
             &Value::Null,
             &[],
             true,
-            &limit
+            &limit,
+            &Value::Null
         )
         .is_none());
         let armed = json!({"token":"b", "resetsAt":123456, "resumeAtReset":true});
@@ -338,6 +424,7 @@ mod tests {
             &[],
             true,
             &armed,
+            &Value::Null,
         )
         .unwrap();
         assert_eq!(next["usageLimit"], armed);
@@ -349,8 +436,256 @@ mod tests {
             &[],
             true,
             &Value::Null,
+            &Value::Null,
         )
         .unwrap();
         assert!(cleared["usageLimit"].is_null());
+    }
+
+    #[test]
+    fn extra_fields_join_a_frame_only_when_they_change() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let extra = json!({"cloud": {"state": "running"}, "approvals": []});
+        let (first, baseline) =
+            update(None, true, false, &none, &turns, false, &none, &extra).unwrap();
+        assert_eq!(first["cloud"], json!({"state": "running"}));
+        assert_eq!(first["approvals"], json!([]));
+        // Same values: nothing to send.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &extra
+        )
+        .is_none());
+        // A frame for another reason leaves unchanged extras out.
+        let (idle, baseline) = update(
+            Some(&baseline),
+            false,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &extra,
+        )
+        .unwrap();
+        assert!(idle.get("cloud").is_none() && idle.get("approvals").is_none());
+        // One changed key travels with the clear of the key that is gone.
+        let next = json!({"approvals": [{"id": "r1"}]});
+        let (changed, baseline) = update(
+            Some(&baseline),
+            false,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &next,
+        )
+        .unwrap();
+        assert_eq!(changed["approvals"], json!([{"id": "r1"}]));
+        assert_eq!(changed["cloud"], Value::Null);
+        assert!(update(
+            Some(&baseline),
+            false,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &next
+        )
+        .is_none());
+        // An empty array clears.
+        let clear = json!({"approvals": []});
+        let (cleared, _) = update(
+            Some(&baseline),
+            false,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &clear,
+        )
+        .unwrap();
+        assert_eq!(cleared["approvals"], json!([]));
+    }
+
+    #[test]
+    fn an_extra_cleared_to_an_empty_array_is_sent_once() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let full = json!({"approvals": [{"requestId": "r1"}]});
+        let empty = json!({"approvals": []});
+        let (_, baseline) = update(None, true, false, &none, &turns, false, &none, &full).unwrap();
+        let (frame, baseline) = update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(frame["approvals"], json!([]));
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &empty
+        )
+        .is_none());
+    }
+
+    /// A key that disappears is cleared once: `[]` for a list, null for an
+    /// object; a null `extra` clears nothing.
+    #[test]
+    fn a_key_that_disappears_is_cleared_once() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let both = json!({"approvals": [{"requestId": "r1"}], "cloud": {"state": "running"}});
+        let (_, baseline) = update(None, true, false, &none, &turns, false, &none, &both).unwrap();
+        // Null `extra` is no opinion.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &Value::Null
+        )
+        .is_none());
+        let (frame, baseline) = update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(frame["approvals"], json!([]));
+        assert_eq!(frame["cloud"], Value::Null);
+        assert!(frame.as_object().unwrap().contains_key("cloud"));
+        // Cleared once, and a key that comes back is sent again.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({})
+        )
+        .is_none());
+        let (frame, _) = update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({"approvals": [{"requestId": "r2"}]}),
+        )
+        .unwrap();
+        assert_eq!(frame["approvals"], json!([{"requestId": "r2"}]));
+        assert!(frame.get("cloud").is_none());
+    }
+
+    /// The first frame of a (re)opened watch carries an explicit `cloud: null`
+    /// and `approvals: []`, so a web that kept old state drops it.
+    #[test]
+    fn the_first_frame_carries_explicit_clears() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let extra = json!({"cloud": null, "approvals": []});
+        let (first, baseline) =
+            update(None, true, false, &none, &turns, false, &none, &extra).unwrap();
+        assert!(first.as_object().unwrap().contains_key("cloud"));
+        assert_eq!(first["cloud"], Value::Null);
+        assert_eq!(first["approvals"], json!([]));
+        // Said once.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &extra
+        )
+        .is_none());
+        // While the marks are not loaded the key is left out and the first frame has no `cloud`.
+        let (unknown, _) = update(
+            None,
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &json!({"approvals": []}),
+        )
+        .unwrap();
+        assert!(!unknown.as_object().unwrap().contains_key("cloud"));
+    }
+
+    #[test]
+    fn an_empty_extra_leaves_frames_exactly_as_before() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let (with_null, _) =
+            update(None, true, false, &none, &turns, false, &none, &Value::Null).unwrap();
+        let (with_empty, _) =
+            update(None, true, false, &none, &turns, false, &none, &json!({})).unwrap();
+        assert_eq!(with_null, with_empty);
+        let keys: Vec<_> = with_null.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["busy", "older", "order", "question", "turns", "usageLimit"]
+        );
+    }
+
+    #[test]
+    fn an_extra_named_like_a_phone_field_is_ignored_and_not_remembered() {
+        let turns = [turn("1", "hi")];
+        let none = Value::Null;
+        let clash = json!({"busy": "extra", "cloud": 1});
+        let (first, baseline) =
+            update(None, true, false, &none, &turns, false, &none, &clash).unwrap();
+        assert_eq!(first["busy"], true);
+        assert_eq!(first["cloud"], 1);
+        // Nothing changed: the ignored key does not keep forcing frames.
+        assert!(update(
+            Some(&baseline),
+            true,
+            false,
+            &none,
+            &turns,
+            false,
+            &none,
+            &clash
+        )
+        .is_none());
     }
 }

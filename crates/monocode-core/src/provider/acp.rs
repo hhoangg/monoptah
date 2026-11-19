@@ -736,6 +736,7 @@ impl Protocol {
                                 && request["options"].as_array().is_some_and(|options| {
                                     options.iter().any(|o| o["kind"] == "allow_always")
                                 }),
+                            can_allow_once: offers_allow_once(request),
                         }));
                     }
                 } else {
@@ -1368,6 +1369,18 @@ pub(super) fn content_text(value: &Value) -> String {
     }
 }
 
+/// Whether the request offers a one-time allow. Without one, `respond` maps
+/// Allow to `allow_always`, which a remote device must never trigger.
+fn offers_allow_once(request: &Value) -> bool {
+    request["options"].as_array().is_some_and(|options| {
+        options.iter().any(|o| {
+            o["kind"] == "allow_once"
+                || o["optionId"] == "allow_once"
+                || o["optionId"] == "allow-once"
+        })
+    })
+}
+
 pub(super) fn respond(
     stdin: &mut impl Write,
     wire: Value,
@@ -1598,6 +1611,42 @@ mod tests {
         let events = p.frame(json!({"id":"permission","method":"session/request_permission","params":{"toolCall":{"kind":"execute"},"options":[{"kind":"allow_once","optionId":"yes"},{"kind":"reject_once","optionId":"no"}]}}),&mut out).unwrap();
         assert!(events.is_empty());
         assert_eq!(last(&mut out)["result"]["outcome"]["optionId"], "no");
+    }
+    #[test]
+    fn an_approval_without_a_one_time_allow_says_so_so_a_remote_allow_is_refused() {
+        // U13-1: with no allow_once the desktop's Allow would fall back to
+        // allow_always, so the request is marked and a remote device never allows it.
+        let ask = |options: Value| {
+            let mut p = protocol(Kind::Cursor);
+            p.acp.stage = Stage::Prompt;
+            let request = json!({"id":"permission","method":"session/request_permission","params":{"toolCall":{"kind":"execute"},"options":options}});
+            let events = p.frame(request, &mut Vec::new()).unwrap();
+            let Event::Approval(approval) = &events[0] else {
+                panic!("expected approval")
+            };
+            approval.clone()
+        };
+        let without = ask(
+            json!([{"kind":"allow_always","optionId":"always"},{"kind":"reject_once","optionId":"no"}]),
+        );
+        assert!(!without.can_allow_once);
+        assert!(without.can_remember);
+        let with = ask(
+            json!([{"kind":"allow_once","optionId":"yes"},{"kind":"allow_always","optionId":"always"},{"kind":"reject_once","optionId":"no"}]),
+        );
+        assert!(with.can_allow_once);
+        let by_id = ask(json!([{"optionId":"allow-once"},{"optionId":"reject-once"}]));
+        assert!(by_id.can_allow_once);
+        // The desktop's own Allow still takes the fallback; only a remote answer is refused upstream.
+        let mut out = Vec::new();
+        respond(
+            &mut out,
+            json!(1),
+            &json!({"options":[{"kind":"allow_always","optionId":"always"},{"kind":"reject_once","optionId":"no"}]}),
+            Decision::Allow,
+        )
+        .unwrap();
+        assert_eq!(last(&mut out)["result"]["outcome"]["optionId"], "always");
     }
     #[test]
     fn sparse_permission_requests_keep_the_tool_preview() {

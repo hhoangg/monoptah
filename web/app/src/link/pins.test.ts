@@ -1,0 +1,109 @@
+import { IDBFactory } from "fake-indexeddb";
+import { beforeEach, describe, expect, it } from "vitest";
+import { displayFingerprint, fingerprint, normalizeFingerprint } from "./fingerprint.ts";
+import { checkPin, commitPin, forgetPins, getPin, inspectPin, repinFromVerify } from "./pins.ts";
+
+const keyA = new Uint8Array(32).fill(1);
+const keyB = new Uint8Array(32).fill(2);
+const DESKTOP = "0123456789abcdef0123456789abcdef";
+
+beforeEach(() => {
+  globalThis.indexedDB = new IDBFactory();
+});
+
+describe("desktop key pins", () => {
+  it("pins on first success, then matches", async () => {
+    expect(await checkPin(DESKTOP, keyA)).toBe("pinned-now");
+    expect(await checkPin(DESKTOP, keyA)).toBe("match");
+    expect((await getPin(DESKTOP))?.fingerprint).toBe(fingerprint(keyA));
+  });
+
+  it("reports a changed key and never replaces the pin", async () => {
+    await checkPin(DESKTOP, keyA);
+    expect(await checkPin(DESKTOP, keyB)).toBe("changed");
+    expect(await checkPin(DESKTOP, keyB)).toBe("changed");
+    expect(await checkPin(DESKTOP, keyA)).toBe("match");
+  });
+
+  it("keeps pins per desktop", async () => {
+    await checkPin(DESKTOP, keyA);
+    expect(await checkPin("fedcba9876543210fedcba9876543210", keyB)).toBe("pinned-now");
+  });
+
+  it("re-pins from verify only on an exact full fingerprint match (case-insensitive)", async () => {
+    await checkPin(DESKTOP, keyA);
+    const result = await repinFromVerify(DESKTOP, fingerprint(keyB).toUpperCase(), keyB);
+    expect(result).toEqual({ ok: true, fingerprint: fingerprint(keyB) });
+    expect(await checkPin(DESKTOP, keyB)).toBe("match");
+    expect(await checkPin(DESKTOP, keyA)).toBe("changed");
+  });
+
+  it("refuses a mismatching fingerprint and keeps the old pin", async () => {
+    await checkPin(DESKTOP, keyA);
+    expect(await repinFromVerify(DESKTOP, fingerprint(keyA), keyB)).toEqual({ ok: false, reason: "mismatch" });
+    expect(await checkPin(DESKTOP, keyA)).toBe("match");
+  });
+
+  it("refuses a truncated (32 char) fingerprint", async () => {
+    await checkPin(DESKTOP, keyA);
+    const truncated = fingerprint(keyB).slice(0, 32);
+    expect(await repinFromVerify(DESKTOP, truncated, keyB)).toEqual({ ok: false, reason: "invalid_fingerprint" });
+    expect(await checkPin(DESKTOP, keyA)).toBe("match");
+  });
+
+  it("forgetPins(deviceId) drops only the pins of that device and the ones from before owners were recorded", async () => {
+    const OTHER = "fedcba9876543210fedcba9876543210";
+    const THIRD = "00112233445566778899aabbccddeeff";
+    await checkPin(DESKTOP, keyA, "device-1");
+    await commitPin(OTHER, keyB, "device-2");
+    await checkPin(THIRD, keyA); // a legacy pin without an owner
+    await forgetPins("device-1");
+    expect(await getPin(DESKTOP)).toBeUndefined();
+    expect(await getPin(THIRD)).toBeUndefined();
+    expect((await getPin(OTHER))?.deviceId).toBe("device-2");
+    expect(await checkPin(OTHER, keyB)).toBe("match");
+  });
+
+  it("a re-pin from verify keeps the owner of the pin it replaces", async () => {
+    await checkPin(DESKTOP, keyA, "device-1");
+    await repinFromVerify(DESKTOP, fingerprint(keyB), keyB);
+    expect((await getPin(DESKTOP))?.deviceId).toBe("device-1");
+    await forgetPins("device-2");
+    expect(await getPin(DESKTOP)).toBeDefined();
+  });
+
+  it("forgetPins drops every pin", async () => {
+    await checkPin(DESKTOP, keyA);
+    await forgetPins();
+    expect(await getPin(DESKTOP)).toBeUndefined();
+    expect(await checkPin(DESKTOP, keyB)).toBe("pinned-now");
+  });
+});
+
+describe("fingerprint display", () => {
+  it("shows the first 32 hex chars as 8 groups of 4", () => {
+    const hex = fingerprint(keyA);
+    const shown = displayFingerprint(hex);
+    expect(shown.split(" ")).toHaveLength(8);
+    expect(shown.replaceAll(" ", "")).toBe(hex.slice(0, 32));
+  });
+
+  it("normalizes only full 64 hex fingerprints", () => {
+    const hex = fingerprint(keyA);
+    expect(normalizeFingerprint(hex.toUpperCase())).toBe(hex);
+    expect(normalizeFingerprint(hex.slice(0, 32))).toBeNull();
+    expect(normalizeFingerprint("z".repeat(64))).toBeNull();
+  });
+
+  it("inspectPin never writes, and commitPin pins a first-use key atomically (L2)", async () => {
+    expect(await inspectPin(DESKTOP, keyA)).toEqual({ status: "new", pinnedFingerprint: null });
+    expect(await getPin(DESKTOP)).toBeUndefined();
+    expect(await commitPin(DESKTOP, keyA)).toBe("pinned-now");
+    expect(await inspectPin(DESKTOP, keyA)).toMatchObject({ status: "match", pinnedFingerprint: (await getPin(DESKTOP))?.fingerprint });
+    expect(await inspectPin(DESKTOP, keyB)).toMatchObject({ status: "changed" });
+    // A pin that appeared meanwhile wins and is never replaced.
+    expect(await commitPin(DESKTOP, keyA)).toBe("match");
+    expect(await commitPin(DESKTOP, keyB)).toBe("changed");
+    expect(Array.from((await getPin(DESKTOP))?.publicKey ?? [])).toEqual(Array.from(keyA));
+  });
+});

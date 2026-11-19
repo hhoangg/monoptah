@@ -156,6 +156,7 @@ impl Conversation {
             title: "Run a command?".into(),
             detail: "git status --short".into(),
             can_remember: true,
+            can_allow_once: true,
         });
         if announce {
             cx.emit(SessionChanged);

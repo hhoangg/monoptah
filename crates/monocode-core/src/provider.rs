@@ -1105,6 +1105,7 @@ impl Protocol {
             title,
             detail,
             can_remember: self.request.kind != Kind::Codex && !file_change,
+            can_allow_once: true,
         }));
         Ok(())
     }

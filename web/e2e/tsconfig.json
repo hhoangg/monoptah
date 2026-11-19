@@ -1,0 +1,6 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "types": ["node"], "lib": ["ES2023", "DOM", "DOM.Iterable"] },
+  "include": ["lib/**/*.ts", "tests/**/*.ts", "test/**/*.ts", "*.config.ts", "eslint.config.js"],
+  "exclude": ["node_modules"]
+}

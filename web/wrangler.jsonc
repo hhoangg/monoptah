@@ -1,0 +1,76 @@
+// Monoptah web: ONE Worker serving the SPA assets, the Hono /api routes and the
+// DesktopRoom Durable Object (architecture.md 4.1). Paths are relative to this file.
+// Free tier only: no paid binding is declared. Never deploy from CI or from a sandbox.
+{
+  "name": "monoptah-web",
+  "main": "worker/src/index.ts",
+  // nodejs_compat is on by default from 2026-08-04, so no compatibility_flags are listed.
+  // Checked against the installed workerd (1.20261117.1): 2026-09-01 is accepted.
+  "compatibility_date": "2026-09-01",
+
+  // The official host serves the root domain only (the passkey RP ID). No workers.dev or preview URL, so the
+  // app has exactly one origin. Self-hosters change the pattern to their own domain.
+  "routes": [{ "pattern": "zptah.app", "custom_domain": true }],
+  "workers_dev": false,
+  "preview_urls": false,
+
+  "assets": {
+    // The client output of web/app (`pnpm --filter @monoptah/app build`). It holds `_headers` and no Worker
+    // bundle: the Vite build also writes app/dist/monoptah_web (a Worker bundle and its sourcemap), which
+    // must never be served as an asset, so this is app/dist/client and not app/dist. For `wrangler dev` and
+    // the tests worker/scripts/ensure-assets.mjs creates a git-ignored placeholder when it is absent.
+    "directory": "app/dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    // Only the API and the relay run the Worker first; everything else is a free asset request.
+    "run_worker_first": ["/api/*", "/relay/*"]
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM", "class_name": "DesktopRoom" }]
+  },
+  // SQLite-backed class (the only kind the free plan allows). Forward-only: add a new tag, never edit v1.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DesktopRoom"] }],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "monoptah",
+      // The official host's database (`wrangler d1 create monoptah`). Self-hosters create their own and
+      // replace this id; `--local` and the tests do not use it.
+      "database_id": "11eee6d9-4097-41f6-a06a-580fcb9f656a",
+      "migrations_dir": "worker/migrations"
+    }
+  ],
+
+  // Daily cleanup (worker/src/cron.ts): expired challenges, sessions, rate limit windows, old audit rows.
+  "triggers": { "crons": ["17 3 * * *"] },
+
+  // Every non-secret setting the program reads. Official host values; self-hosters change them.
+  "vars": {
+    // RP_ID must never change after the first user registers: every passkey would break.
+    "RP_ID": "zptah.app",
+    "RP_ORIGIN": "https://zptah.app",
+    // Public half of the official host's VAPID key pair (P-256, base64url, from `pnpm vapid:generate`).
+    "VAPID_PUBLIC_KEY": "BB1PzReHnjoUI6Ya2zu3mIg_q9smtWPUkLtSjm_nLgn3KHRaI6JDZhOTLP0qb3C_rUWIgqFxT_8LjXQvVZ03_as",
+    // Which VAPID key the public key above is (stored in push_subscriptions.vapid_key_id, for rotation).
+    "VAPID_KEY_ID": "v1",
+    "VAPID_SUBJECT": "mailto:admin@zptah.app",
+    // VAPID key rotation only (docs/deploy-runbook.md "VAPID key rotation"): add the OLD public key and its key id
+    // here for the rotation period, and the old private key as the secret VAPID_PREVIOUS_PRIVATE_KEY. Never put a
+    // key in this file that is not public. Remove all three when the rotation ends. Not set normally:
+    //   "VAPID_PREVIOUS_PUBLIC_KEY": "<old public key, base64url>",
+    //   "VAPID_PREVIOUS_KEY_ID": "v1",
+    // Registered users for the whole instance, incl. blocked. "0" means unlimited (self-host default).
+    "MAX_USERS": "150",
+    "MAX_DESKTOPS_PER_USER": "5",
+    "MAX_DEVICES_PER_USER": "10"
+  }
+
+  // Secrets are NEVER in `vars`. Set each with `wrangler secret put <NAME>` (local dev: web/.dev.vars,
+  // git-ignored; web/.dev.vars.example lists them with fake values):
+  //   VAPID_PRIVATE_KEY  private half of the VAPID key pair (P-256, base64url)
+  //   VAPID_PREVIOUS_PRIVATE_KEY  (rotation only) private half of the previous pair, removed when the rotation ends
+  //   RECOVERY_PEPPER    HMAC key for recovery code hashes (32 random bytes, base64; back it up)
+  //   AUDIT_IP_SALT      salt for the IP hashes in audit_log and pairing_requests (32 random bytes, base64)
+}

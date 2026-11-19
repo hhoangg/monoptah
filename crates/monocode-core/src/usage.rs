@@ -75,6 +75,9 @@ pub struct ResetCredit {
 pub struct Limit {
     pub resets_at: Option<i64>,
     pub resume_at_reset: bool,
+    /// A remote device armed the resume without consent to wake a stopped cloud workspace:
+    /// the scheduled resume runs without waking it. Cleared by a desktop (re)arm.
+    pub no_wake: bool,
 }
 impl Limit {
     /// Manual continuation becomes available when the reported reset passes.
@@ -99,6 +102,7 @@ impl Limit {
             .then(|| Self {
                 resets_at: timestamp(&info["resetsAt"]),
                 resume_at_reset: false,
+                no_wake: false,
             })
     }
     pub fn resume_due(&self, now: i64, busy: bool) -> bool {
@@ -596,6 +600,7 @@ mod tests {
         let mut limit = Limit {
             resets_at: Some(200_000),
             resume_at_reset: false,
+            no_wake: false,
         };
         assert!(!limit.resume_due(230_000, false));
         limit.resume_at_reset = true;
@@ -614,6 +619,7 @@ mod tests {
         let mut limit = Limit {
             resets_at: Some(200_000),
             resume_at_reset: false,
+            no_wake: false,
         };
         assert_eq!(limit.auto_resume(100_000), None);
         limit.resume_at_reset = true;
