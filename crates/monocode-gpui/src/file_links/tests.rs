@@ -1,4 +1,5 @@
 use super::*;
+use std::path::PathBuf;
 
 /// A fake home folder and fake projects under one temp dir; removed when dropped.
 struct Fixture(PathBuf);

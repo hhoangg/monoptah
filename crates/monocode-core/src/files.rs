@@ -2,6 +2,7 @@
 //! pure name and path helpers from the files feature model.
 pub mod document;
 mod index;
+pub mod links;
 pub(crate) use index::{git_output_capped, is_indexable_root};
 pub use index::{list_project_files, list_project_files_sync_cancellable, ProjectFile};
 mod name;

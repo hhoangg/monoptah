@@ -167,6 +167,21 @@ pub struct FileRead<'a> {
     pub outcome: Outcome,
 }
 
+/// A `chat.mentionedFile` call to record: the conversation, the canonical path
+/// served (or the requested one when refused), the asset asked for, the bytes
+/// of the reply and how it ended.
+#[derive(Clone, Copy)]
+pub struct MentionedFile<'a> {
+    pub fingerprint: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub path: &'a str,
+    pub asset: Option<&'a str>,
+    pub bytes: u64,
+    pub command_id: Option<&'a str>,
+    pub transport: Transport,
+    pub outcome: Outcome,
+}
+
 /// One answer to a remote approval, written by the app once it resolved the
 /// project. Ids and the decision only: never the label or detail text.
 #[derive(Clone, Copy)]
@@ -220,13 +235,25 @@ fn written_by_the_app(event: &AuditEvent) -> bool {
     if event.method == "session.answerApproval" {
         return event.from_app && matches!(event.outcome, Outcome::Ok | Outcome::Denied(_));
     }
-    event.method == "project.file"
+    mentioned_file_answered(event)
+        || event.method == "project.file"
+            && event.from_app
+            && matches!(
+                event.outcome,
+                Outcome::Ok
+                    | Outcome::Denied(
+                        Code::NotSelected | Code::PathDenied | Code::UnsupportedTarget
+                    )
+            )
+}
+
+/// `chat.mentionedFile` is audited by the app for every outcome, successes
+/// too, with its own fields (conversation, asset, bytes). Any answer the app
+/// worded with a code, and `ok`, is its line; the host's would be a second.
+fn mentioned_file_answered(event: &AuditEvent) -> bool {
+    event.method == "chat.mentionedFile"
         && event.from_app
-        && matches!(
-            event.outcome,
-            Outcome::Ok
-                | Outcome::Denied(Code::NotSelected | Code::PathDenied | Code::UnsupportedTarget)
-        )
+        && matches!(event.outcome, Outcome::Ok | Outcome::Denied(_))
 }
 
 fn now_ms() -> u64 {
@@ -317,6 +344,36 @@ impl Log {
             "outcome": outcome.text(),
             "commandId": command_id.map(|id| capped(id, ID_CHARS)),
             "path": capped(path, PATH_CHARS),
+        }));
+    }
+
+    /// One line per `chat.mentionedFile` call, success included: who, which
+    /// conversation, what path, which asset, how many bytes and the outcome.
+    pub fn record_mentioned_file(&self, device: &DeviceContext, read: &MentionedFile) {
+        let MentionedFile {
+            fingerprint,
+            conversation_id,
+            path,
+            asset,
+            bytes,
+            command_id,
+            transport,
+            outcome,
+        } = *read;
+        self.append(&json!({
+            "ts": now_ms(),
+            "deviceId": capped(&device.id, ID_CHARS),
+            "fingerprint": prefix(fingerprint),
+            "transport": transport.as_str(),
+            "event": "call",
+            "method": "chat.mentionedFile",
+            "projectId": null,
+            "outcome": outcome.text(),
+            "commandId": command_id.map(|id| capped(id, ID_CHARS)),
+            "conversationId": conversation_id.map(|id| capped(id, ID_CHARS)),
+            "path": capped(path, PATH_CHARS),
+            "asset": asset.map(|asset| capped(asset, PATH_CHARS)),
+            "bytes": bytes,
         }));
     }
 
@@ -430,6 +487,13 @@ pub fn record(device: &DeviceContext, event: &AuditEvent) {
 pub fn record_file_read_with(device: &DeviceContext, read: &FileRead) {
     if let Some(log) = global() {
         log.record_file_read(device, read);
+    }
+}
+
+/// Records one `chat.mentionedFile` call. A no-op before [`init`].
+pub fn record_mentioned_file_with(device: &DeviceContext, read: &MentionedFile) {
+    if let Some(log) = global() {
+        log.record_mentioned_file(device, read);
     }
 }
 
@@ -652,6 +716,62 @@ mod tests {
         assert_eq!(line["transport"], "quic");
         assert_eq!(line["outcome"], "denied:path_denied");
         assert_eq!(line["fingerprint"], "abcdef01");
+    }
+
+    #[test]
+    fn a_mentioned_file_call_is_written_on_success_and_on_denial_with_its_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        for (outcome, bytes) in [(Outcome::Ok, 42), (Outcome::Denied(Code::PathDenied), 0)] {
+            log.record_mentioned_file(
+                &device(),
+                &MentionedFile {
+                    fingerprint: "abcdef0123456789",
+                    conversation_id: Some("mono:m1"),
+                    path: "/work/report.html",
+                    asset: Some("img/a.png"),
+                    bytes,
+                    command_id: Some("c9"),
+                    transport: Transport::Web,
+                    outcome,
+                },
+            );
+        }
+        let all = lines(dir.path());
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0]["method"], "chat.mentionedFile");
+        assert_eq!(all[0]["outcome"], "ok");
+        assert_eq!(all[0]["bytes"], 42);
+        assert_eq!(all[0]["conversationId"], "mono:m1");
+        assert_eq!(all[0]["path"], "/work/report.html");
+        assert_eq!(all[0]["asset"], "img/a.png");
+        assert_eq!(all[0]["transport"], "web");
+        assert_eq!(all[1]["outcome"], "denied:path_denied");
+    }
+
+    #[test]
+    fn a_mentioned_file_call_writes_one_line_not_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        // The host's line for what the app already wrote is dropped, whatever the code.
+        for outcome in [
+            Outcome::Ok,
+            Outcome::Denied(Code::Forbidden),
+            Outcome::Denied(Code::Busy),
+            Outcome::Denied(Code::NotFound),
+        ] {
+            let mut answered = event("chat.mentionedFile", outcome);
+            answered.from_app = true;
+            log.record(&device(), &answered);
+        }
+        assert!(lines(dir.path()).is_empty());
+        // A refusal from the core (read-only is not one: it is a read) or a failure still writes.
+        log.record(&device(), &event("chat.mentionedFile", Outcome::Error));
+        log.record(
+            &device(),
+            &event("chat.mentionedFile", Outcome::Denied(Code::NotSelected)),
+        );
+        assert_eq!(lines(dir.path()).len(), 2);
     }
 
     #[test]

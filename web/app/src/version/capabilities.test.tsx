@@ -33,6 +33,7 @@ describe("FEATURES", () => {
       gitPush: "Push from Git",
       monoTools: "Mono tools",
       monoFiles: "Mono files",
+      mentionedFiles: "File previews",
     });
   });
 });

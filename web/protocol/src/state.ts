@@ -13,6 +13,7 @@ export const KNOWN_CAPABILITIES = [
   "gitPush",
   "monoTools",
   "monoFiles",
+  "mentionedFiles",
 ] as const;
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 

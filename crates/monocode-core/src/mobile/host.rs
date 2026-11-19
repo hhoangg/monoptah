@@ -49,6 +49,7 @@ pub(super) const APP_METHODS: &[&str] = &[
     "project.file",
     "project.search",
     "project.fileHighlight",
+    "chat.mentionedFile",
     "project.git",
     "project.gitAction",
     "session.start",

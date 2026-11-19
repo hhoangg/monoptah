@@ -64,6 +64,7 @@ describe("error codes", () => {
         "read_only",
         "not_selected",
         "path_denied",
+        "not_found",
         "revoked",
         "disabled",
         "too_large",
@@ -101,7 +102,7 @@ describe("state message", () => {
     state: "confirmed",
     permission: "control",
     proto: 1,
-    capabilities: ["approvals", "cloud", "cloudStart", "cloudMove", "gitPush", "monoTools", "monoFiles"],
+    capabilities: ["approvals", "cloud", "cloudStart", "cloudMove", "gitPush", "monoTools", "monoFiles", "mentionedFiles"],
     desktop: { name: "Studio Mac", version: "1.4.0" },
   };
   it("parses a confirmed message", () => {

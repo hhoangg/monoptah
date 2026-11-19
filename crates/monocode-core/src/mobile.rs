@@ -7,6 +7,7 @@ pub mod cloud_policy;
 pub mod denylist;
 pub mod host;
 pub(crate) mod identity_store;
+pub mod mentioned_file;
 pub mod notify;
 pub mod policy;
 mod router;

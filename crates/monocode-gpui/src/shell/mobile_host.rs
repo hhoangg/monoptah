@@ -265,6 +265,52 @@ impl FileRead {
     }
 }
 
+/// What the audit line of a `chat.mentionedFile` call needs, kept until it ended.
+struct MentionAudit {
+    device: DeviceContext,
+    fingerprint: String,
+    conversation: String,
+    path: String,
+    asset: Option<String>,
+    command_id: String,
+}
+
+impl MentionAudit {
+    fn record(&self, result: &Result<Value, Failure>, path: &str, bytes: u64) {
+        let outcome = match result {
+            Ok(_) => audit::Outcome::Ok,
+            Err(error) => {
+                policy::code_of_failure(error).map_or(audit::Outcome::Error, audit::Outcome::Denied)
+            }
+        };
+        audit::record_mentioned_file_with(
+            &self.device,
+            &audit::MentionedFile {
+                fingerprint: &self.fingerprint,
+                conversation_id: Some(&self.conversation),
+                path,
+                asset: self.asset.as_deref(),
+                bytes,
+                command_id: Some(&self.command_id),
+                transport: self.device.kind.into(),
+                outcome,
+            },
+        );
+    }
+
+    fn record_call(&self, call: &monocode_core::mobile::mentioned_file::Call) {
+        self.record(&call.result, &call.path, call.bytes);
+    }
+}
+
+/// What the conversation says, before the older pages are added.
+struct Gathered {
+    texts: Vec<String>,
+    cwd: String,
+    /// The store cursor of the turns above the loaded rows.
+    cursor: Option<i64>,
+}
+
 fn not_selected() -> Failure {
     policy::Code::NotSelected.failure()
 }
@@ -1083,6 +1129,7 @@ impl Shell {
                 request.reply(answer);
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
+            "chat.mentionedFile" => self.mobile_mentioned_file(request, cx),
             "cloud.instances" | "cloud.startOptions" => cloud::dispatch_request(
                 self,
                 request,
@@ -1092,6 +1139,131 @@ impl Shell {
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
+    }
+
+    /// `chat.mentionedFile`: a file the assistant mentioned in this conversation, read for a
+    /// remote device. The rules (mention check first, deny-list, budgets, paging) live in
+    /// `monocode_core::mobile::mentioned_file`; this gathers what they judge against: every
+    /// assistant message of the conversation (the open chat's rows, else the store's, and the
+    /// older pages of a long Mono), the session folder, the Mono's local project roots and the
+    /// projects this device selected. It audits every call, success included.
+    fn mobile_mentioned_file(&mut self, request: Request, cx: &mut Context<Self>) {
+        use monocode_core::mobile::mentioned_file as mention;
+        let conversation = string(&request.params, "conversationId").unwrap_or_default();
+        let audited = MentionAudit {
+            device: request.device.clone(),
+            fingerprint: self.mobile_fingerprint(&request.device.id),
+            conversation: conversation.clone(),
+            path: string(&request.params, "path").unwrap_or_default(),
+            asset: string(&request.params, "asset"),
+            command_id: request.command_id.clone(),
+        };
+        let target = match self.mobile_target(&conversation, &request.device, cx) {
+            Ok(target) => target,
+            Err(error) => {
+                audited.record(&Err(error.clone()), &audited.path, 0);
+                return request.reply(Err(error));
+            }
+        };
+        let (session, mono_projects) = match &target {
+            Target::Session(id) => (Some(*id), Vec::new()),
+            Target::Mono(id) => {
+                let mono = self
+                    .monos
+                    .as_ref()
+                    .and_then(|m| m.read(cx).roster.get(id).cloned());
+                (
+                    mono.as_ref().and_then(|m| m.session_id),
+                    mono.map(|m| m.projects).unwrap_or_default(),
+                )
+            }
+        };
+        let roots = crate::file_links::candidate_roots(None, &mono_projects);
+        let device = request.device.clone();
+        let projects: Vec<(String, String, bool)> = self
+            .mobile_projects(cx)
+            .into_iter()
+            .map(|path| {
+                let id = project_id(&path);
+                let selected = in_selection(&device.projects, &id);
+                (id, path, selected)
+            })
+            .collect();
+        let private = locked(&self.store)
+            .ok()
+            .and_then(|store| store.data_dir().map(Path::to_path_buf));
+        let store = self.store.clone();
+        // The open chat's rows when its history is in memory, else the saved ones.
+        let live = self.with_live_snapshot(&target, &device, cx, |snapshot: &Snapshot| {
+            Ok::<_, String>(Gathered {
+                texts: mention::assistant_texts(snapshot.rows),
+                cwd: snapshot.cwd.to_owned(),
+                cursor: snapshot.history,
+            })
+        });
+        let saved = match live {
+            Some(_) => None,
+            None => Some(self.load_saved(&target, &device, cx)),
+        };
+        let params = request.params.clone();
+        cx.spawn(async move |_, cx| {
+            let gathered = match (live, saved) {
+                (Some(live), _) => live,
+                (None, Some(load)) => load.await.map(|saved| Gathered {
+                    texts: mention::assistant_texts(&saved.rows),
+                    cwd: saved.cwd.clone(),
+                    cursor: saved.history,
+                }),
+                (None, None) => Err("Conversation is no longer available".to_owned()),
+            };
+            let call = match gathered {
+                Ok(gathered) => {
+                    let work = cx.background_executor().spawn(async move {
+                        let mut texts = gathered.texts;
+                        // A long Mono keeps its older turns in the store: scan all of them.
+                        if let (Some(session), Some(mut cursor)) = (session, gathered.cursor) {
+                            for _ in 0..100_000 {
+                                let Ok(store) = locked(&store) else { break };
+                                let Ok(page) = store.load_before(session, cursor, false) else {
+                                    break;
+                                };
+                                drop(store);
+                                texts.extend(mention::assistant_texts(&page.rows));
+                                match page.before {
+                                    Some(before) if before != cursor => cursor = before,
+                                    _ => break,
+                                }
+                            }
+                        }
+                        let projects: Vec<mention::Project> = projects
+                            .iter()
+                            .map(|(id, path, selected)| {
+                                mention::Project::new(
+                                    id,
+                                    Path::new(path),
+                                    *selected,
+                                    DenyList::for_project(path),
+                                )
+                            })
+                            .collect();
+                        let mut ctx =
+                            mention::Context::new(&texts, &gathered.cwd, &roots, &projects);
+                        ctx.private_dirs = private.into_iter().collect();
+                        mention::handle(&device.id, &params, &ctx)
+                    });
+                    work.await
+                }
+                Err(error) => mention::Call {
+                    result: Err(error.into()),
+                    path: audited.path.clone(),
+                    asset: audited.asset.clone(),
+                    bytes: 0,
+                },
+            };
+            audited.record_call(&call);
+            request.reply(call.result)
+        })
+        .detach();
     }
 
     /// Project reads run on the background executor against a checked root.

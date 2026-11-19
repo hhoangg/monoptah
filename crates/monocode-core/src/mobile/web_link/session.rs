@@ -879,12 +879,15 @@ mod tests {
             msgs[0]["capabilities"].clone()
         };
         policy::set_flags(policy::PolicyFlags::default());
-        assert_eq!(capabilities(&mut h()), json!(["cloud"]));
+        assert_eq!(capabilities(&mut h()), json!(["cloud", "mentionedFiles"]));
         policy::set_flags(policy::PolicyFlags {
             remote_cloud_start: true,
             ..Default::default()
         });
-        assert_eq!(capabilities(&mut h()), json!(["cloud", "cloudStart"]));
+        assert_eq!(
+            capabilities(&mut h()),
+            json!(["cloud", "cloudStart", "mentionedFiles"])
+        );
         policy::set_flags(before);
     }
 
@@ -903,7 +906,7 @@ mod tests {
         policy::set_flags(PolicyFlags::default());
         assert_eq!(
             h.table.state_message(&mode)["capabilities"],
-            json!(["cloud"])
+            json!(["cloud", "mentionedFiles"])
         );
         policy::set_flags(PolicyFlags {
             remote_approvals: true,
@@ -911,7 +914,7 @@ mod tests {
         });
         assert_eq!(
             h.table.state_message(&mode)["capabilities"],
-            json!(["cloud", "approvals"])
+            json!(["cloud", "approvals", "mentionedFiles"])
         );
         policy::set_flags(before);
     }
@@ -932,7 +935,7 @@ mod tests {
                 "state": "confirmed",
                 "permission": "read",
                 "proto": 1,
-                "capabilities": ["cloud"],
+                "capabilities": ["cloud", "mentionedFiles"],
                 "desktop": {"name": "Test Desktop", "version": "1.2.3"},
             })]
         );
@@ -964,12 +967,12 @@ mod tests {
         let pending = Mode::Pending { since: 0 };
         assert_eq!(
             h.table.state_message_with(&pending, &flags)["capabilities"],
-            json!(["cloud", "gitPush"])
+            json!(["cloud", "gitPush", "mentionedFiles"])
         );
         assert_eq!(
             h.table
                 .state_message_with(&pending, &PolicyFlags::default())["capabilities"],
-            json!(["cloud"])
+            json!(["cloud", "mentionedFiles"])
         );
     }
 

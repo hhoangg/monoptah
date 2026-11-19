@@ -5,3 +5,4 @@ export * from "./secure-channel.ts";
 export * from "./transport.ts";
 export * from "./fixtures.ts";
 export * from "./desktop.ts";
+export * from "./mentioned.ts";
