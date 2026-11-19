@@ -412,6 +412,26 @@ impl Log {
         }));
     }
 
+    /// One line per web push attempt or drop: category, target kind
+    /// (`session`, `mono`, `habit`), device count and the outcome text. Metadata
+    /// only: no token, URL, title, name or message text.
+    pub fn record_web_push(&self, category: &str, target: &str, devices: usize, outcome: &str) {
+        self.append(&json!({
+            "ts": now_ms(),
+            "deviceId": null,
+            "fingerprint": null,
+            "transport": Transport::Web.as_str(),
+            "event": "webPush",
+            "method": null,
+            "projectId": null,
+            "outcome": capped(outcome, DETAIL_CHARS),
+            "commandId": null,
+            "category": capped(category, METHOD_CHARS),
+            "target": capped(target, METHOD_CHARS),
+            "devices": devices,
+        }));
+    }
+
     pub fn record_lifecycle(
         &self,
         kind: Lifecycle,
@@ -509,6 +529,13 @@ pub fn record_approval_answer_with(device: &DeviceContext, answer: &ApprovalAnsw
     }
 }
 
+/// Records one web push attempt or drop. A no-op before [`init`].
+pub fn record_web_push(category: &str, target: &str, devices: usize, outcome: &str) {
+    if let Some(log) = global() {
+        log.record_web_push(category, target, devices, outcome);
+    }
+}
+
 /// Records a moment in a device's life. A no-op before [`init`].
 pub fn record_lifecycle(
     kind: Lifecycle,
@@ -602,6 +629,40 @@ mod tests {
         let mut all = read_recent(dir, 1000);
         all.reverse();
         all
+    }
+
+    #[test]
+    fn a_web_push_writes_one_metadata_only_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        log.record_web_push("agentFinished", "habit", 2, "result=retry failed http 500");
+        let lines = lines(dir.path());
+        assert_eq!(lines.len(), 1);
+        let line = lines[0].as_object().unwrap();
+        let mut keys: Vec<&str> = line.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "category",
+                "commandId",
+                "deviceId",
+                "devices",
+                "event",
+                "fingerprint",
+                "method",
+                "outcome",
+                "projectId",
+                "target",
+                "transport",
+                "ts"
+            ]
+        );
+        assert_eq!(line["event"], "webPush");
+        assert_eq!(line["category"], "agentFinished");
+        assert_eq!(line["target"], "habit");
+        assert_eq!(line["devices"], 2);
+        assert_eq!(line["outcome"], "result=retry failed http 500");
     }
 
     #[test]
