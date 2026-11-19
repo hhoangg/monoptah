@@ -426,12 +426,11 @@ describe("tab strip structure and keyboard", () => {
     }
   });
 
-  it("keeps the scroll offsets and the focus of a pane when a split moves it in the DOM", async () => {
+  it("hands the focus to the new pane when a split starts inside a composer, and keeps the scroll offset of the old one", async () => {
     const user = userEvent.setup();
-    await openThree();
+    const { router } = await openThree();
     const box = (await screen.findByRole("textbox", { name: "Message" })) as HTMLTextAreaElement;
-    const body = screen.getByTestId("pane-body");
-    body.scrollTop = 120;
+    screen.getByTestId("pane-body").scrollTop = 120;
     await user.click(box);
     // A real browser resets scroll offsets of a node that is re-inserted: model that.
     const append = Node.prototype.appendChild;
@@ -443,30 +442,26 @@ describe("tab strip structure and keyboard", () => {
     key("KeyD");
     await waitFor(() => expect(screen.getAllByRole("tablist")).toHaveLength(2));
     expect(within(screen.getByTestId("pane-p1")).getByTestId("pane-body").scrollTop).toBe(120);
-    expect(box).toHaveFocus();
+    // The focus stays with the new pane: not given back to the old composer, and the URL moves to New session.
+    await waitFor(() => expect(path(router)).toMatch(/\/p\/proj-alpha\/new$/));
+    expect(getWorkspace(DESKTOP_ID).focused).toBe("p2");
+    expect(box).not.toHaveFocus();
+    expect(await within(screen.getByTestId("pane-p2")).findByTestId("new-session-screen")).toBeInTheDocument();
   });
 
-  it("shows this page's URL tab in its pane when another browser tab moved that tab to another pane", async () => {
+  it("keeps the focus of a pane that stays the focused one when the layout moves it", async () => {
+    const user = userEvent.setup();
     await openThree();
-    // The other browser tab put sess-seed-2 in a second pane and left its focus and active tab elsewhere.
-    let other = openTab(openTab(openTab(emptyWorkspace(), sessionTab("sess-seed-0")), sessionTab("sess-seed-1")), sessionTab("sess-seed-2"));
-    other = splitPane(other, "p1", "row");
-    other = moveTab(other, sessionTab("sess-seed-2"), "p2");
-    other = activateTab(other, "p1", sessionTab("sess-seed-0"));
-    expect(other.focused).toBe("p1");
-    localStorage.setItem(tabsKey(DESKTOP_ID), serializeWorkspace(other));
-    act(() => {
-      window.dispatchEvent(new StorageEvent("storage", { key: tabsKey(DESKTOP_ID) }));
-    });
-    await waitFor(() => expect(getWorkspace(DESKTOP_ID).focused).toBe("p2"));
-    expect(getWorkspace(DESKTOP_ID).panes.p2?.active).toBe(sessionTab("sess-seed-2"));
-    expect(screen.getByTestId("pane-p2")).toHaveAttribute("data-focused", "true");
-    // Once the URL tab shows, a second event writes nothing.
-    const written = localStorage.getItem(tabsKey(DESKTOP_ID));
-    act(() => {
-      window.dispatchEvent(new StorageEvent("storage", { key: tabsKey(DESKTOP_ID) }));
-    });
-    expect(localStorage.getItem(tabsKey(DESKTOP_ID))).toBe(written);
+    key("KeyD");
+    await waitFor(() => expect(screen.getAllByRole("tablist")).toHaveLength(2));
+    const box = within(screen.getByTestId("pane-p1")).getByRole("textbox", { name: "Message" });
+    await user.click(box);
+    expect(getWorkspace(DESKTOP_ID).focused).toBe("p1");
+    // Too narrow for two panes: only p1 shows, and its host moves.
+    sizeChatArea(500);
+    await waitFor(() => expect(screen.getByTestId("tabbed-chat")).toHaveAttribute("data-panes", "1"));
+    expect(within(screen.getByTestId("pane-p1")).getByRole("textbox", { name: "Message" })).toBe(box);
+    expect(box).toHaveFocus();
   });
 
   it("keeps this page's focused pane and active tab when another browser tab changes them (no write back)", async () => {

@@ -19,7 +19,11 @@ export class PaneHosts {
 
   /** Forgets the hosts of panes that are not in `ids` (closed, or hidden while the window is too narrow). */
   retain(ids: readonly string[]): void {
-    for (const id of [...this.hosts.keys()]) if (!ids.includes(id)) this.hosts.delete(id);
+    for (const [id, host] of [...this.hosts]) {
+      if (ids.includes(id)) continue;
+      this.hosts.delete(id);
+      this.pending.delete(host);
+    }
   }
 
   private readonly pending = new Map<HTMLElement, Snapshot>();
@@ -32,8 +36,12 @@ export class PaneHosts {
     this.pending.set(host, { scrolled, focused });
   }
 
-  /** Moves a host into `slot`, keeping the scroll offsets of everything inside it and the focused element. */
-  moveInto(host: HTMLElement, slot: HTMLElement): void {
+  /**
+   * Moves a host into `slot`, keeping the scroll offsets of everything inside it. The focused element gets its focus
+   * back only with `restoreFocus` (the pane is still the focused pane): after a split the new pane owns the focus, and
+   * giving it back to the old pane would hand the focus, and the URL, back to it.
+   */
+  moveInto(host: HTMLElement, slot: HTMLElement, restoreFocus: boolean): void {
     if (host.parentNode === slot) return;
     if (!this.pending.has(host)) this.snapshot(host);
     const { scrolled, focused } = this.pending.get(host) as Snapshot;
@@ -43,7 +51,7 @@ export class PaneHosts {
       element.scrollTop = top;
       element.scrollLeft = left;
     }
-    focused?.focus({ preventScroll: true });
+    if (restoreFocus) focused?.focus({ preventScroll: true });
   }
 }
 

@@ -114,10 +114,10 @@ function EmptyPane() {
 }
 
 /** The place of one pane in the layout: it adopts the pane's host element, which carries the pane view. */
-function PaneSlot({ host, hosts }: { host: HTMLElement; hosts: PaneHosts }) {
+function PaneSlot({ host, hosts, restoreFocus }: { host: HTMLElement; hosts: PaneHosts; restoreFocus: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
-    if (ref.current) hosts.moveInto(host, ref.current);
+    if (ref.current) hosts.moveInto(host, ref.current, restoreFocus);
   });
   // A slot that goes away takes its DOM out first: note the scroll offsets and the focus before that happens.
   useLayoutEffect(() => () => hosts.snapshot(host), [hosts, host]);
@@ -125,7 +125,7 @@ function PaneSlot({ host, hosts }: { host: HTMLElement; hosts: PaneHosts }) {
 }
 
 function Tree({ node, path, context, hosts }: { node: PaneNode; path: number[]; context: TreeContext; hosts: PaneHosts }) {
-  if (node.type === "leaf") return <PaneSlot host={hosts.of(node.id)} hosts={hosts} />;
+  if (node.type === "leaf") return <PaneSlot host={hosts.of(node.id)} hosts={hosts} restoreFocus={context.ws.focused === node.id} />;
   const row = node.dir === "row";
   return (
     <div data-testid="pane-split" data-dir={node.dir} className={`flex min-h-0 min-w-0 flex-1 ${row ? "flex-row" : "flex-col"}`}>
