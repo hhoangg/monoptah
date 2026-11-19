@@ -22,6 +22,7 @@
   content: "";
   position: absolute;
   inset: -4px;
+  z-index: -1; /* under the content, so the wrapped control gets its own clicks; Glass forwards slop clicks */
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   .glass { background: var(--sheet); } /* opaque fallback, keep the hairline */

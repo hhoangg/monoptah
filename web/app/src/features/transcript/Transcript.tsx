@@ -18,6 +18,7 @@ import { useStableValue } from "@/lib/useStableValue";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { TranscriptActionsContext, TranscriptOpened, type TranscriptActions, type TranscriptAgent } from "./context";
+import { innerScrollerTakes } from "./innerScroller";
 import { captureAnchor, restoreAnchor, type ScrollAnchor } from "./prependAnchor";
 import { isAwayFromBottom, TranscriptJumpToBottom, useTranscriptJumpVisibility } from "./TranscriptJumpToBottom";
 import { TranscriptTurn } from "./TranscriptTurn";
@@ -31,6 +32,9 @@ const FOLLOW_PX = 48;
 const OLDER_TRIGGER_PX = 320;
 const ESTIMATE_ROW_PX = 140;
 const PADDING_PX = 16;
+/** A jump to the end is done once scrolling has been quiet this long, or the scroller reached the real end. */
+const JUMP_SETTLE_MS = 120;
+const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
 /** The anchored message rests this far under the top of the scroller. */
 const ANCHOR_REST_PX = 8;
 
@@ -97,6 +101,9 @@ export function Transcript({
   const [opened, setOpened] = useState(false);
   const following = useRef(true);
   const adjustments = useRef<number | undefined>(undefined);
+  // True from the jump button's press until the scroller rests at the real end or the reader takes over.
+  const jumping = useRef(false);
+  const jumpTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const visibility = useTranscriptJumpVisibility();
 
   const synthetic = useMemo(
@@ -153,6 +160,8 @@ export function Transcript({
   // Re-evaluates the end-follow state and the jump button from the scroller's geometry.
   const syncScroll = useCallback(() => {
     if (!scroller) return;
+    // Scroll events of the jump's own smooth scroll are far from the end: they must not turn following off.
+    if (jumping.current) return;
     following.current = !isAwayFromBottom(scroller, FOLLOW_PX);
     visibility.setVisible(isAwayFromBottom(scroller));
   }, [scroller, visibility]);
@@ -168,11 +177,75 @@ export function Transcript({
     [scroller],
   );
 
+  const endJump = useCallback(() => {
+    clearTimeout(jumpTimer.current);
+    jumpTimer.current = undefined;
+    jumping.current = false;
+  }, []);
+
+  // The jump button: scroll to the end and keep following. Heights measured while the smooth scroll runs
+  // move the end, so the jump is only over once the scroller rests at the real end (landing there if the
+  // browser stopped short).
+  const settleJump = useCallback(() => {
+    if (!jumping.current) return;
+    if (!scroller) {
+      jumping.current = false;
+      return;
+    }
+    clearTimeout(jumpTimer.current);
+    jumpTimer.current = setTimeout(() => {
+      if (!jumping.current) return;
+      scrollToEnd(false);
+      endJump();
+      following.current = true;
+      visibility.setVisible(false);
+    }, JUMP_SETTLE_MS);
+  }, [scroller, scrollToEnd, endJump, visibility]);
+
+  const jumpToEnd = useCallback(() => {
+    following.current = true;
+    jumping.current = true;
+    visibility.setVisible(false);
+    scrollToEnd(true);
+    settleJump();
+  }, [scrollToEnd, settleJump, visibility]);
+
+  // A reader gesture during the jump takes the scroller over: stop it and let the position decide.
+  useEffect(() => {
+    if (!scroller) return;
+    const cancel = () => {
+      if (!jumping.current) return;
+      endJump();
+      if (typeof scroller.scrollTo === "function") scroller.scrollTo({ top: scroller.scrollTop, behavior: "auto" });
+      syncScroll();
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (SCROLL_KEYS.has(event.key)) cancel();
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (!innerScrollerTakes(scroller, event)) cancel();
+    };
+    scroller.addEventListener("wheel", onWheel, { passive: true });
+    scroller.addEventListener("touchstart", cancel, { passive: true });
+    scroller.addEventListener("touchmove", cancel, { passive: true });
+    scroller.addEventListener("pointerdown", cancel, { passive: true });
+    scroller.addEventListener("keydown", onKey);
+    return () => {
+      scroller.removeEventListener("wheel", onWheel);
+      scroller.removeEventListener("touchstart", cancel);
+      scroller.removeEventListener("touchmove", cancel);
+      scroller.removeEventListener("pointerdown", cancel);
+      scroller.removeEventListener("keydown", onKey);
+    };
+  }, [scroller, endJump, syncScroll]);
+
+  useEffect(() => () => clearTimeout(jumpTimer.current), []);
+
   // Open at the end, then keep to it while the reader follows the reply.
   useLayoutEffect(() => {
     if (!scroller || rows.length === 0) return;
     if (following.current) scrollToEnd(false);
-    visibility.setVisible(isAwayFromBottom(scroller));
+    visibility.setVisible(!jumping.current && isAwayFromBottom(scroller));
   }, [scroller, rows.length, total, scrollToEnd, visibility]);
 
   // Reveal after the first scroll to the end, so the list appears in place (design-system.md: 280 ms).
@@ -239,9 +312,14 @@ export function Transcript({
   }, [loadingOlder, rows]);
 
   const onScroll = useCallback(() => {
+    if (jumping.current && scroller) {
+      if (Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) < 1) endJump();
+      else settleJump();
+    }
     syncScroll();
-    if (scroller && scroller.scrollTop < OLDER_TRIGGER_PX) requestOlder();
-  }, [scroller, syncScroll, requestOlder]);
+    // A page landing mid-jump would reset the offset the jump is heading to.
+    if (scroller && !jumping.current && scroller.scrollTop < OLDER_TRIGGER_PX) requestOlder();
+  }, [scroller, endJump, settleJump, syncScroll, requestOlder]);
 
   // The history of a short transcript may not fill the viewport: ask for more without a scroll.
   useEffect(() => {
@@ -329,10 +407,7 @@ export function Transcript({
 
       <TranscriptJumpToBottom
         visibility={visibility}
-        onJump={() => {
-          following.current = true;
-          scrollToEnd(true);
-        }}
+        onJump={jumpToEnd}
       />
       <p role="status" className="sr-only">
         {busy ? "Working" : ""}
