@@ -91,7 +91,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
   if (live.length === 0 && finished.length === 0) return null;
   if (live.length === 0) {
     return (
-      <div data-testid="now-working" className="pointer-events-none sticky mt-auto bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3 pt-3">
+      <div data-testid="now-working" className="pointer-events-none sticky bottom-0 mt-auto pb-app-inset z-30 flex flex-col items-center gap-2 px-3 pt-3">
         <FinishedDeck desktopId={desktopId} entries={finished} />
       </div>
     );
@@ -120,7 +120,7 @@ export function NowWorking({ desktopId, projectId, readOnly }: { desktopId: stri
   return (
     <div
       data-testid="now-working"
-      className="@container pointer-events-none sticky mt-auto bottom-[calc(env(safe-area-inset-bottom)+0.75rem)] z-30 flex flex-col items-center gap-2 px-3 pt-3"
+      className="@container pointer-events-none sticky bottom-0 mt-auto pb-app-inset z-30 flex flex-col items-center gap-2 px-3 pt-3"
     >
       <FinishedDeck desktopId={desktopId} entries={finished} />
       {expanded ? (

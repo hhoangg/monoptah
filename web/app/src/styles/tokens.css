@@ -2,6 +2,12 @@
    Generated once from the section 1 tables; edit by hand from here on and keep
    theme-init.js and themes.ts in step (a test compares the background values). */
 
+/* The one space under every bottom-anchored bar (composer, now-working pill, sticky action bars): the home-indicator
+   safe area, never less than 0.75rem. Use the `pb-app-inset` utility; do not repeat env(safe-area-inset-bottom). */
+:root {
+  --app-bottom-inset: max(env(safe-area-inset-bottom), 0.75rem);
+}
+
 :root,
 :root[data-scheme="light"] {
   color-scheme: light;

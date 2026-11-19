@@ -185,12 +185,7 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
   );
 
   return (
-    <WorkspaceFrame desktopId={desktopId} title={project?.name ?? "Project"} subtitle={project?.path} actions={missing ? null : newSession}>
-      {wide ? null : (
-        <div className="-mx-4 min-[24rem]:-mx-5">
-          <ProjectBar variant="bar" />
-        </div>
-      )}
+    <WorkspaceFrame desktopId={desktopId} title={project?.name ?? "Project"} subtitle={project?.path} actions={missing ? null : newSession} flush compact>
       {missing ? (
         <section className="flex flex-col items-start gap-4 py-8">
           <h2 className="text-title font-semibold">This project is not on this device</h2>
@@ -202,7 +197,7 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
           </Button>
         </section>
       ) : (
-        <SessionListBody desktopId={desktopId} projectId={projectId} />
+        <SessionListBody desktopId={desktopId} projectId={projectId} tools={wide ? null : <ProjectBar variant="inline" />} />
       )}
     </WorkspaceFrame>
   );

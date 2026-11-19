@@ -15,7 +15,7 @@ const button =
 const railButton =
   "inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection aria-pressed:bg-selection aria-pressed:text-content aria-[current=page]:bg-selection aria-[current=page]:text-content pointer-fine:size-9";
 
-export function ProjectBar({ variant = "bar" }: { variant?: "bar" | "foot" | "rail" }) {
+export function ProjectBar({ variant = "bar" }: { variant?: "bar" | "foot" | "rail" | "inline" }) {
   const tools = useProjectTools();
   if (!tools.scope) return null;
   return (
@@ -25,13 +25,13 @@ export function ProjectBar({ variant = "bar" }: { variant?: "bar" | "foot" | "ra
       data-testid="project-bar"
       data-variant={variant}
       className={
-        variant === "bar" ? "flex items-center justify-end gap-1 px-4 pt-2" : variant === "foot" ? "flex flex-nowrap items-center gap-0.5 border-t border-stroke px-2 py-2" : "flex flex-col items-center gap-1"
+        variant === "bar" ? "flex items-center justify-end gap-1 px-4 pt-2" : variant === "inline" ? "flex shrink-0 items-center gap-0.5" : variant === "foot" ? "flex flex-nowrap items-center gap-0.5 border-t border-stroke px-2 py-2" : "flex flex-col items-center gap-1"
       }
     >
       {tools.panels.map((kind) => (
-        <button key={kind} type="button" aria-label={PANEL_LABELS[kind]} data-panel-trigger="" aria-pressed={kind === tools.current ? undefined : tools.isOpen(kind)} aria-current={kind === tools.current ? "page" : undefined} onClick={() => tools.toggle(kind)} className={variant === "rail" ? railButton : button}>
+        <button key={kind} type="button" aria-label={PANEL_LABELS[kind]} title={PANEL_LABELS[kind]} data-panel-trigger="" aria-pressed={kind === tools.current ? undefined : tools.isOpen(kind)} aria-current={kind === tools.current ? "page" : undefined} onClick={() => tools.toggle(kind)} className={variant === "rail" || variant === "inline" ? railButton : button}>
           <Icon name={ICONS[kind]} size={18} />
-          {variant === "rail" ? null : PANEL_LABELS[kind]}
+          {variant === "rail" || variant === "inline" ? null : PANEL_LABELS[kind]}
         </button>
       ))}
       <button

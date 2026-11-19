@@ -47,7 +47,9 @@ beforeEach(() => {
   resetMonoSeen();
   previous = registerPersistAdapter(new MemoryPersistAdapter());
 });
+const originalMatchMedia = window.matchMedia;
 afterEach(() => {
+  window.matchMedia = originalMatchMedia;
   Object.assign(FIXTURE_HANDLERS, original);
   resetLinkConnections();
   clearLinkStores();
@@ -124,8 +126,15 @@ describe("Mono chat (F-69)", () => {
 });
 
 describe("Mono menu (F-70)", () => {
+  it("has one details button and no menu on a phone", async () => {
+    mount(`/monos/${MONO}`);
+    expect(await screen.findByRole("link", { name: "Mono profile" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/monos/${MONO}/profile`);
+    expect(screen.queryByRole("button", { name: "Mono actions" })).toBeNull();
+  });
+
   it("offers Details only: reset and delete are never shown, and Settings is not the action", async () => {
     const user = userEvent.setup();
+    window.matchMedia = ((query: string) => ({ matches: /min-width/.test(query), media: query, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => false })) as never;
     mount(`/monos/${MONO}`);
     await user.click(await screen.findByRole("button", { name: "Mono actions" }));
     const menu = await screen.findByRole("menu");

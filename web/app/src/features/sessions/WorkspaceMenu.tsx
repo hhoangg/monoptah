@@ -39,7 +39,7 @@ export function WorkspaceMenu({ desktopId, projectId, projectPath, checkoutBranc
           type="button"
           aria-label={`Workspace: ${label}`}
           data-scoped={!!value}
-          className="inline-flex min-h-11 max-w-full items-center gap-1.5 rounded-pill bg-fill px-3.5 text-label text-content hover:bg-selection data-[scoped=true]:text-brand pointer-fine:min-h-9"
+          className="inline-flex min-h-11 min-w-0 max-w-full items-center gap-1.5 rounded-pill bg-fill px-3.5 text-label text-content hover:bg-selection data-[scoped=true]:text-brand pointer-fine:min-h-9"
         >
           <Icon name="branch" size={16} className="shrink-0" />
           <span className="truncate">{label}</span>

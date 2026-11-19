@@ -19,7 +19,8 @@ import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useMentionPreview } from "@/features/filePreview/useMentionPreview";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
-import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
+import { WIDE_QUERY, useReadOnly } from "@/features/sessions/WorkspaceFrame";
+import { useMediaQuery } from "@/ui/useMediaQuery";
 import { Transcript } from "@/features/transcript/Transcript";
 import type { TranscriptActions } from "@/features/transcript/context";
 import { useOlderTurns } from "@/features/transcript/useOlderTurns";
@@ -54,6 +55,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const catalog = useCatalog().data;
   const mono = catalog?.monos.find((candidate) => candidate.id === monoId);
   const monoTools = catalog?.monoTools === true;
+  const wide = useMediaQuery(WIDE_QUERY);
   const conversationId = monoConversationId(monoId);
   const conversation = useConversation(conversationId);
   const state = conversation.state;
@@ -159,7 +161,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
               >
                 <Icon name="info" size={18} />
               </Link>
-              <MonoMenu desktopId={desktopId} monoId={monoId} />
+              {/* The menu holds only "View details", which the info button already opens: on a phone it is a duplicate. */}
+              {wide ? <MonoMenu desktopId={desktopId} monoId={monoId} /> : null}
             </>
           ) : (
             <Link

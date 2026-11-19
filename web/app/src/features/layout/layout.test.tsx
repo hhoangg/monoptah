@@ -893,11 +893,11 @@ describe("project tools (project bar and palette)", () => {
     expect(screen.queryByTestId("panel-overlay")).toBeNull();
   });
 
-  it("is the bar above the screen below 640px in a project, and absent outside a project", async () => {
+  it("is the icon row beside the branch chip below 640px in a project, and absent outside a project", async () => {
     mount(390, ALPHA);
     await screen.findByTestId("app-shell");
     const bar = await screen.findByRole("toolbar", { name: "Project tools" });
-    expect(bar).toHaveAttribute("data-variant", "bar");
+    expect(bar).toHaveAttribute("data-variant", "inline");
     expect(screen.queryByTestId("app-sidebar")).toBeNull();
     expect(within(bar).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Files", "Changes", "Git", "Background"]);
   });

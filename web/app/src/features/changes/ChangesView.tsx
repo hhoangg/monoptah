@@ -166,7 +166,7 @@ export function ChangesView({ projectId, selectedPath, onOpenFile }: ChangesView
         {renderSection("changes", "Changes", unstaged)}
       </div>
       {readOnly ? null : (
-        <div className="shrink-0 border-t border-stroke bg-surface p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+        <div className="shrink-0 border-t border-stroke bg-surface px-3 pt-3 pb-app-inset">
           <GitActionBar
             projectId={projectId}
             files={files}

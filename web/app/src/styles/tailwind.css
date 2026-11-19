@@ -2,6 +2,10 @@
 @import "tailwindcss";
 @custom-variant dark (&:where([data-scheme="dark"], [data-scheme="dark"] *));
 
+@utility pb-app-inset {
+  padding-bottom: var(--app-bottom-inset);
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--content);
