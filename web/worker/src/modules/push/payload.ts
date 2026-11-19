@@ -22,14 +22,29 @@ export interface PayloadInput {
   desktopName: string;
   project: string;
   status: NotifyStatus;
-  sessionId: string;
+  /** Absent for a Mono's own chat, which has no session. Then `monoId` is required. */
+  sessionId?: string | undefined;
   monoId?: string | undefined;
   habitRun?: boolean | undefined;
+}
+
+/**
+ * What notices collapse on: the session id, or `mono:<monoId>` for a Mono's own chat (no session id). It is the
+ * payload `tag`, the `Topic` source and part of the dedupe key.
+ */
+export function targetKey(input: Pick<PayloadInput, "sessionId" | "monoId">): string {
+  if (input.sessionId !== undefined) return input.sessionId;
+  if (input.monoId === undefined) throw new Error("Push target needs a session id or a mono id");
+  return `mono:${input.monoId}`;
 }
 
 /** The click URL, built here only: a Mono message opens the chat, everything else (habit runs too) the session. */
 export function notificationUrl(input: Pick<PayloadInput, "desktopId" | "sessionId" | "monoId" | "habitRun">): string {
   const desktop = encodeURIComponent(input.desktopId);
+  if (input.sessionId === undefined) {
+    if (input.monoId === undefined) throw new Error("Push target needs a session id or a mono id");
+    return `/d/${desktop}/monos/${encodeURIComponent(input.monoId)}`;
+  }
   if (input.monoId !== undefined && input.habitRun !== true) return `/d/${desktop}/monos/${encodeURIComponent(input.monoId)}`;
   return `/d/${desktop}/s/${encodeURIComponent(input.sessionId)}`;
 }
@@ -47,7 +62,7 @@ export function buildPayload(input: PayloadInput): Uint8Array {
       t: truncate(input.desktopName, limit),
       b: `${truncate(input.project, limit)}: ${BODY_SUFFIX[input.status]}`,
       url,
-      tag: input.sessionId,
+      tag: targetKey(input),
     };
     const bytes = encoder.encode(JSON.stringify(payload));
     if (bytes.length < MAX_PAYLOAD_BYTES) return bytes;
@@ -55,7 +70,7 @@ export function buildPayload(input: PayloadInput): Uint8Array {
   throw new Error("Push payload over 1 KiB");
 }
 
-/** `Topic` header: first 32 base64url characters of SHA-256(sessionId), so notices of one session collapse. */
-export async function topicFor(sessionId: string): Promise<string> {
-  return toBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(sessionId)))).slice(0, 32);
+/** `Topic` header: first 32 base64url characters of SHA-256(`value`), so notices of one target collapse. */
+export async function topicFor(value: string): Promise<string> {
+  return toBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(value)))).slice(0, 32);
 }

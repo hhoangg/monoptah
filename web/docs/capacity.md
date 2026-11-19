@@ -77,7 +77,7 @@ Unit: one daily active user (DAU) with one or more desktops. One room (one DO) p
 | Push notifications sent | 3 | 10 | 30 |
 | API calls to `/api/*` (auth, desktop list, push register, device approve, admin) | 40 | 100 | 300 |
 | D1 queries per API call (indexed, about 5 rows read each) | 2 | 2 | 2 |
-| D1 rows written per day (session touch, push, audit, device) | 3 | 5 | 15 |
+| D1 rows written per day (session touch, push, audit, device; a clean push notify writes nothing, only a failed, gone or backed-off attempt adds one audit row) | 3 | 5 | 15 |
 
 Basis: the desktop sends watch frames today at up to 20/s with a 50 ms coalescing timer (`crates/monocode-gpui/src/shell/mobile_host.rs:28`); the web path coalesces on the desktop to 2/s before encryption (mitigation below). The app heartbeat is kept at 25 s on the web path (10 s on QUIC), which is about 2.4 messages per minute per open watch; socket liveness additionally comes from the WebSocket auto-response ping.
 
@@ -120,7 +120,7 @@ Formula: `GB-s = active seconds x 0.125 GB x 1.3`. Active seconds are the stream
 | Users per 100,000/day | 1,880 | 746 | 218 |
 | D1 rows read (calls x 2 queries x 5 rows) | 400 | 1,000 | 3,000 |
 | Users per 5M/day | 12,500 | 5,000 | 1,667 |
-| D1 rows written | 3 | 5 | 15 |
+| D1 rows written (a clean push notify writes none; the audit row is only for a failed, gone or backed-off attempt) | 3 | 5 | 15 |
 | Users per 100,000/day | 33,000 | 20,000 | 6,600 |
 | DO SQLite rows written (about 5 per connect, quotas kept in memory) | 50 | 120 | 640 |
 | Users per 100,000/day | 2,000 | 833 | 156 |

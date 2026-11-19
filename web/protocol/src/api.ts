@@ -314,6 +314,20 @@ export const PushSubscriptionBody = z.object({
 export const PushSubscriptionResponse = z.object({ id: Id });
 export const PushPrefsBody = z.object({ enabled: z.boolean(), categories: z.record(PushCategory, z.boolean()) });
 export const PushPrefsResponse = z.object({ enabled: z.boolean(), categories: z.record(PushCategory, z.boolean()) });
+/**
+ * `GET /api/push/prefs/:desktopId`. `stored` is false when no row exists: the defaults (enabled, every category on)
+ * are returned and those are also what the Worker applies.
+ */
+export const PushPrefsStateResponse = z.object({ enabled: z.boolean(), categories: z.record(PushCategory, z.boolean()), stored: z.boolean() });
+export type PushPrefsState = z.infer<typeof PushPrefsStateResponse>;
+/** `POST /api/push/test`: sends a test notification to the caller's own device. */
+export const PushTestBody = z.object({ deviceId: Id });
+export const PUSH_TEST_OUTCOMES = ["ok", "gone", "backoff", "failed", "skipped_key"] as const;
+export const PushTestResponse = z.object({
+  sent: z.number().int().nonnegative(),
+  /** One entry per subscription tried. `status` is the push service HTTP status, 0 when there was no answer. */
+  results: z.array(z.object({ outcome: z.enum(PUSH_TEST_OUTCOMES), status: z.number().int().nonnegative() })),
+});
 
 /** Desktop -> Worker (architecture.md 8). No title, no assistant text, no transcript. */
 export const PushNotifyBody = z.object({
@@ -321,7 +335,12 @@ export const PushNotifyBody = z.object({
   /** Display name of the project (the Mono name for Mono notices). */
   project: z.string(),
   status: z.enum(["finished", "needs_input", "message"]),
-  sessionId: z.string(),
+  /**
+   * Optional since a Mono's own chat has no session. At least one of `sessionId` and `monoId` is required, and
+   * `habitRun: true` needs `sessionId` (the Worker answers 400 otherwise). An empty string counts as absent only when
+   * `monoId` is set. Older desktops always send `sessionId`.
+   */
+  sessionId: z.string().optional(),
   monoId: z.string().optional(),
   habitRun: z.boolean().optional(),
   /** Server ids of confirmed web devices whose selection includes the project or Mono. */
@@ -338,7 +357,7 @@ export const PushPayloadSchema = z.object({
   /** `<project>: Finished`, `: Needs your input` or `: New message`. */
   b: z.string(),
   url: z.string(),
-  /** The session id; repeated notices for one session collapse. */
+  /** The session id, or `mono:<monoId>` for a Mono's own chat; repeated notices for one target collapse. */
   tag: z.string(),
 });
 export type PushPayload = z.infer<typeof PushPayloadSchema>;
@@ -413,7 +432,7 @@ export interface RouteRequest {
  * either unlimited (health, public GETs) or falls under the general authenticated limit
  * (120 per session per minute, in memory), which needs no per-route flag.
  */
-export const RATE_LIMIT_GROUPS = ["register", "login", "recover", "pair-start", "pair-poll", "push-notify"] as const;
+export const RATE_LIMIT_GROUPS = ["register", "login", "recover", "pair-start", "pair-poll", "push-notify", "push-test"] as const;
 export type RateLimitGroup = (typeof RATE_LIMIT_GROUPS)[number];
 
 export interface ApiRoute {
@@ -510,6 +529,8 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "POST", path: "/api/push/subscriptions", auth: "session", module: "push", request: { body: PushSubscriptionBody }, response: PushSubscriptionResponse }),
   r({ method: "DELETE", path: "/api/push/subscriptions/:id", auth: "session", module: "push", request: { params: idParam }, response: Ok }),
   r({ method: "PUT", path: "/api/push/prefs/:desktopId", auth: "session", module: "push", owner: true, request: { params: z.object({ desktopId: Id }), body: PushPrefsBody }, response: PushPrefsResponse }),
+  r({ method: "GET", path: "/api/push/prefs/:desktopId", auth: "session", module: "push", owner: true, request: { params: z.object({ desktopId: Id }) }, response: PushPrefsStateResponse }),
+  r({ method: "POST", path: "/api/push/test", rateLimit: "push-test", auth: "session", module: "push", request: { body: PushTestBody }, response: PushTestResponse }),
   r({ method: "POST", path: "/api/push/notify", rateLimit: "push-notify", auth: "token:push", module: "push", request: { body: PushNotifyBody }, response: PushNotifyResponse }),
 
   r({ method: "GET", path: "/api/admin/users", auth: "admin", module: "admin", request: {}, response: AdminUsersResponse }),

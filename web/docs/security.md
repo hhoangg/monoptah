@@ -101,6 +101,7 @@ The groups below the last row use the D1 `rate_limits` table (fixed windows; low
 | `pair/start` | 5 per IP per 10 min, 3 outstanding per IP (pending and unexpired requests, `limitOutstandingPairings`) |
 | `pair/poll` | 1 per `interval` (3 s) per `deviceCode`; WS-A addition: 120 per IP per minute, checked first |
 | `push/notify` | 30 per desktop token per minute; WS-A addition: 120 per IP per minute, checked first |
+| `push/test` | 3 per user per 10 min (counted in the handler, after auth, keyed by a salted hash of the user id; a breach is audited with the user as actor). No per-IP limit: the IP middleware runs before auth and would add an unauthenticated D1 write, so unauthenticated calls get 401 with no write |
 | Everything else authenticated | 120 per session per minute (in memory, per isolate, best effort) |
 
 How the D1 limiter spends writes (WS-A):
@@ -314,7 +315,7 @@ Staging drill (P-06 acceptance, done by the maintainer, not by agents): on a sta
 ## 10. Logging and privacy
 
 - The Worker and DO log metadata only: request id, route, status, duration, user id (not handle), desktop id, close codes, rate-limit hits. Never request bodies, never frame bytes, never tokens, cookies, codes or push payloads. Logging of `Authorization` and `Cookie` headers is disabled; tail logs are not persisted.
-- `audit_log` events (register, login, passkey changes, recovery use and regenerate, invite create/use/revoke, pairing approve, desktop/device create and revoke, grant changes, block/unblock, admin actions, rate-limit breaches) store ids and coarse metadata only (`meta` forbids secrets and content; IP stored as a salted hash, truncated country optional).
+- `audit_log` events (register, login, passkey changes, recovery use and regenerate, invite create/use/revoke, pairing approve, desktop/device create and revoke, grant changes, block/unblock, admin actions, rate-limit breaches, push notify attempts and test sends) store ids and coarse metadata only (`meta` forbids secrets and content; IP stored as a salted hash, truncated country optional).
 - Retention: `audit_log` 180 days, `sessions` until expiry plus 7 days, `pairing_requests` 24 h after resolution, `challenges` 1 h, `rate_limits` 1 day, push subscriptions until removal or failure, accounts until deleted; user-initiated account deletion removes all rows for the user (desktops, devices, grants, subscriptions, passkeys, codes) and leaves anonymized audit rows.
 - The desktop audit log (section 7) stays on the desktop and is never uploaded.
 - No analytics, no third-party scripts, no telemetry from the SPA.

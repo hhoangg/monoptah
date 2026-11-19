@@ -41,6 +41,8 @@ export const LIMITS = {
   "pair-poll": { limit: 1, windowSeconds: 3 },
   /** `push/notify`: per desktop token. */
   "push-notify": { limit: 30, windowSeconds: 60 },
+  /** `push/test`: per signed-in user, counted in the handler (the user is known only after auth). */
+  "push-test": { limit: 3, windowSeconds: 600 },
   /**
    * Attempts per invite code across register/options and register/verify. The table gives no window; an
    * hour matches the other registration limit, and the invite code is hashed in the key.
@@ -63,6 +65,8 @@ export const IP_LIMITS = {
   "pair-start": LIMITS["pair-start"],
   "pair-poll": { limit: 120, windowSeconds: 60 },
   "push-notify": { limit: 120, windowSeconds: 60 },
+  /** `push/test` has no per-IP limit: the IP middleware runs before auth, so it would add an unauthenticated D1 write; the per-user limit runs after auth. */
+  "push-test": null,
 } as const satisfies Record<RateLimitGroup, LimitSpec | null>;
 
 /** `Retry-After` 429 for a refused call. */

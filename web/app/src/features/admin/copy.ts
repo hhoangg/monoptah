@@ -45,6 +45,8 @@ const AUDIT_TITLES: Record<string, string> = {
   "session.logout": "Signed out",
   "session.revoke": "Sessions ended",
   "ratelimit.breach": "Too many requests blocked",
+  "push.notify": "Push notification had a problem",
+  "push.test": "Test notification sent",
   "system.deploy": "Server updated",
   // Older names kept so rows written before the registry still read well.
   "user.register": "Account created",

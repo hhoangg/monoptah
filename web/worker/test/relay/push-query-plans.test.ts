@@ -6,10 +6,12 @@ import {
   DELETE_SUBSCRIPTION_SQL,
   OWN_DESKTOP_SQL,
   OWN_DEVICE_SQL,
+  SELECT_PREFS_SQL,
   SUBSCRIPTION_ID_SQL,
   UPSERT_PREFS_SQL,
   UPSERT_SUBSCRIPTION_SQL,
 } from "../../src/modules/push/subscriptions.ts";
+import { DEVICE_SUBSCRIPTIONS_SQL } from "../../src/modules/push/test.ts";
 import { BUMP_FAILURES_SQL, DELETE_SUBSCRIPTION_BY_ID_SQL, MARK_SUCCESS_SQL } from "../../src/modules/push/notify.ts";
 
 const cases: { name: string; sql: string; bind: unknown[] }[] = [
@@ -23,6 +25,8 @@ const cases: { name: string; sql: string; bind: unknown[] }[] = [
   { name: "mark success", sql: MARK_SUCCESS_SQL, bind: [1, "i"] },
   { name: "bump failures", sql: BUMP_FAILURES_SQL, bind: ["i"] },
   { name: "upsert subscription", sql: UPSERT_SUBSCRIPTION_SQL, bind: ["i", "u", "d", "e", "p", "a", "k", null, 1, "d", "e"] },
+  { name: "read prefs", sql: SELECT_PREFS_SQL, bind: ["u", "d"] },
+  { name: "subscriptions of one device", sql: DEVICE_SUBSCRIPTIONS_SQL, bind: ["u", "d"] },
   { name: "upsert prefs", sql: UPSERT_PREFS_SQL, bind: ["u", "d", 1, "{}"] },
 ];
 

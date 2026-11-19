@@ -80,7 +80,11 @@ export interface PushHeaders {
 export type PushFetch = (input: string, init: RequestInit) => Promise<Response>;
 
 /** What the push service answered, reduced to what the notify flow acts on. */
-export type PushOutcome = { kind: "ok" } | { kind: "gone" } | { kind: "backoff"; retryAfterSeconds: number } | { kind: "failed" };
+export type PushOutcome =
+  | { kind: "ok"; status: number }
+  | { kind: "gone"; status: number }
+  | { kind: "backoff"; status: number; retryAfterSeconds: number }
+  | { kind: "failed"; status: number };
 
 export const MAX_BACKOFF_SECONDS = 3600;
 const DEFAULT_BACKOFF_SECONDS = 60;
@@ -100,7 +104,7 @@ export function parseRetryAfter(value: string | null, nowMs: number): number {
   return Math.min(Math.max(seconds, 1), MAX_BACKOFF_SECONDS);
 }
 
-/** Encrypts and posts one message. Never throws: a network failure is `failed`. */
+/** Encrypts and posts one message. Never throws: a network failure or timeout is `failed` with `status` 0. */
 export async function sendWebPush(
   fetchFn: PushFetch,
   target: PushTarget,
@@ -127,11 +131,12 @@ export async function sendWebPush(
     });
     // The body is never read: release the connection.
     void res.body?.cancel().catch(() => {});
-    if (res.status >= 200 && res.status < 300) return { kind: "ok" };
-    if (res.status === 404 || res.status === 410) return { kind: "gone" };
-    if (res.status === 429) return { kind: "backoff", retryAfterSeconds: parseRetryAfter(res.headers.get("Retry-After"), nowMs) };
-    return { kind: "failed" };
+    const status = res.status;
+    if (status >= 200 && status < 300) return { kind: "ok", status };
+    if (status === 404 || status === 410) return { kind: "gone", status };
+    if (status === 429) return { kind: "backoff", status, retryAfterSeconds: parseRetryAfter(res.headers.get("Retry-After"), nowMs) };
+    return { kind: "failed", status };
   } catch {
-    return { kind: "failed" };
+    return { kind: "failed", status: 0 };
   }
 }

@@ -1,9 +1,10 @@
 // Push subscriptions and prefs (P-01): vapid-key, subscribe, unsubscribe and per-desktop prefs.
 import type { Handler } from "hono";
-import { PUSH_CATEGORIES, PushPrefsBody, PushPrefsResponse, PushSubscriptionBody, PushSubscriptionResponse, VapidKeyResponse } from "@monoptah/protocol";
+import { PUSH_CATEGORIES, PushPrefsBody, PushPrefsResponse, PushPrefsStateResponse, PushSubscriptionBody, PushSubscriptionResponse, VapidKeyResponse } from "@monoptah/protocol";
 import { apiError, respond, type AppEnv } from "../../http.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
+import { resolvePrefs } from "./prefs.ts";
 import { fromBase64Url } from "./vapid.ts";
 
 /** Push services a subscription endpoint may point to, so the Worker never POSTs to an arbitrary URL. */
@@ -46,6 +47,7 @@ export const SUBSCRIPTION_ID_SQL = "SELECT id FROM push_subscriptions WHERE endp
 export const OWN_DEVICE_SQL = "SELECT id FROM devices WHERE id = ? AND user_id = ? AND revoked_at IS NULL";
 export const DELETE_SUBSCRIPTION_SQL = "DELETE FROM push_subscriptions WHERE id = ? AND user_id = ?";
 export const OWN_DESKTOP_SQL = "SELECT id FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL";
+export const SELECT_PREFS_SQL = "SELECT enabled, categories FROM push_prefs WHERE user_id = ? AND desktop_id = ?";
 export const UPSERT_PREFS_SQL = `INSERT INTO push_prefs (user_id, desktop_id, enabled, categories) VALUES (?, ?, ?, ?)
   ON CONFLICT (user_id, desktop_id) DO UPDATE SET enabled = excluded.enabled, categories = excluded.categories`;
 
@@ -87,7 +89,17 @@ export const unsubscribe: Handler<AppEnv> = async (c) => {
   return c.json({ ok: true as const });
 };
 
-/** `PUT /api/push/prefs/:desktopId`: owner of a non-revoked desktop. Absent row means push is off. */
+/** `GET /api/push/prefs/:desktopId`: owner of a non-revoked desktop. With no stored row the defaults (all on) come back with `stored: false`. */
+export const getPrefs: Handler<AppEnv> = async (c) => {
+  const { user } = requireAuth(c);
+  const desktopId = c.req.param("desktopId") ?? "";
+  const desktop = await c.env.DB.prepare(OWN_DESKTOP_SQL).bind(desktopId, user.id).first();
+  if (!desktop) return apiError(c, 404, "not_found", "Desktop not found");
+  const row = await c.env.DB.prepare(SELECT_PREFS_SQL).bind(user.id, desktopId).first<{ enabled: number; categories: string }>();
+  return respond(c, PushPrefsStateResponse, resolvePrefs({ enabled: row?.enabled ?? null, categories: row?.categories ?? null }));
+};
+
+/** `PUT /api/push/prefs/:desktopId`: owner of a non-revoked desktop. Without a stored row the defaults (all on) apply. */
 export const putPrefs: Handler<AppEnv> = async (c) => {
   const { user } = requireAuth(c);
   const parsed = PushPrefsBody.safeParse(await c.req.json().catch(() => null));
