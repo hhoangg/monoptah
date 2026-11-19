@@ -55,6 +55,24 @@ describe("readMention paging", () => {
     await expect(readMention(async () => page({ total: 9, nextOffset: 0 }), { path: "a" })).rejects.toThrow("bad page offset");
   });
 
+  it("counts the pages of the main document against the 40 MiB cap: a bigger file stops after the first page", async () => {
+    const request = vi.fn(async () => page({ data: "x", total: MAX_PREVIEW_BYTES + 1, nextOffset: 1 }));
+    await expect(readMention(request, { path: "a.txt" })).rejects.toBeInstanceOf(PreviewLimitError);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops following pages once more arrived than the file has (a desktop that lies about its total)", async () => {
+    const request = vi.fn(async (params: { offset?: number }) => page({ data: "abcd", offset: params.offset ?? 0, total: 6, nextOffset: (params.offset ?? 0) + 4 }));
+    await expect(readMention(request, { path: "a.txt" })).rejects.toBeInstanceOf(PreviewLimitError);
+    expect(request.mock.calls.length).toBeLessThanOrEqual(2);
+  });
+
+  it("passes the source flag on every page request", async () => {
+    const request = vi.fn(async (params: { offset?: number }) => page({ data: "ab", offset: params.offset ?? 0, total: 4, ...(params.offset ? {} : { nextOffset: 2 }) }));
+    await readMention(request, { path: "a.html", source: true });
+    expect(request.mock.calls.map(([params]) => params)).toEqual([{ path: "a.html", source: true }, { path: "a.html", source: true, offset: 2 }]);
+  });
+
   it("stops when aborted", async () => {
     const controller = new AbortController();
     const request = vi.fn(async () => {
@@ -200,6 +218,7 @@ describe("messages", () => {
     expect(previewProblem({ code: "not_found" }).title).toBe("This file could not be found");
     expect(previewProblem({ code: "busy" })).toMatchObject({ kind: "busy", retry: true });
     expect(previewProblem({ code: "not_selected" }).title).toBe("Not on this device's projects");
+    expect(previewProblem(new PreviewLimitError())).toMatchObject({ kind: "too_large", retry: false });
     expect(previewProblem(new Error("x"))).toMatchObject({ kind: "failed", retry: true });
   });
 });

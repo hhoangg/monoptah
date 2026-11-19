@@ -495,6 +495,8 @@ export const METHODS = {
       path: z.string().min(1).max(1024),
       asset: z.string().min(1).max(1024).optional(),
       offset: z.number().int().min(0).optional(),
+      /** Answer an html or markdown file as its raw utf8 source (kind "text"), for a jump to a line. */
+      source: z.boolean().optional(),
     }),
     result: z.looseObject({
       path: z.string(),

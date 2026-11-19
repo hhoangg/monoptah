@@ -19,8 +19,8 @@ export function useMentionRequester(conversationId: string): MentionRequester {
   );
 }
 
-async function load(request: MentionRequester, path: string, signal: AbortSignal): Promise<PreviewData> {
-  const content = await readMention(request, { path }, { signal });
+async function load(request: MentionRequester, path: string, source: boolean, signal: AbortSignal): Promise<PreviewData> {
+  const content = await readMention(request, { path, ...(source ? { source } : {}) }, { signal });
   const { meta } = content;
   switch (meta.kind) {
     case "text":
@@ -39,12 +39,13 @@ async function load(request: MentionRequester, path: string, signal: AbortSignal
   }
 }
 
-export function useMentionedFile(conversationId: string, path: string, enabled = true) {
+/** `source`: ask for the raw text of an html or markdown file (a jump to a line wants the lines, not the render). */
+export function useMentionedFile(conversationId: string, path: string, source = false, enabled = true) {
   const desktopId = useLinkDesktopId();
   const request = useMentionRequester(conversationId);
   return useQuery<PreviewData, LinkRequestError>({
-    queryKey: ["link", desktopId, "mentionedFile", conversationId, path],
-    queryFn: ({ signal }) => load(request, path, signal),
+    queryKey: ["link", desktopId, "mentionedFile", conversationId, path, source],
+    queryFn: ({ signal }) => load(request, path, source, signal),
     enabled,
     networkMode: "always",
     retry: false,
@@ -58,7 +59,9 @@ export function useMentionedFile(conversationId: string, path: string, enabled =
 }
 
 /**
- * An object URL for `parts`, made once for the life of the component (the parts are fixed per mount: callers key the
+ * An object URL for the html preview document only (it carries its own CSP and is shown in a `sandbox=""` iframe).
+ * Bytes from the desktop that are not that document (images) never get a blob: URL: they use data: URIs, because a
+ * blob: URL is an app-origin address that a crafted page could be navigated to. Made once for the life of the component (the parts are fixed per mount: callers key the
  * component by the data) and revoked after it unmounts. The revoke waits a tick, so a StrictMode unmount followed by an
  * immediate remount keeps its URL.
  */

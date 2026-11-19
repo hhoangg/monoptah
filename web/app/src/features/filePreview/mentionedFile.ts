@@ -7,7 +7,7 @@ import { hasControl } from "@/features/markdown/fileLinks";
 
 export type MentionedPage = ResultOf<"chat.mentionedFile">;
 /** `chat.mentionedFile` over the link of one conversation. */
-export type MentionRequester = (params: { path: string; asset?: string; offset?: number }, signal?: AbortSignal) => Promise<MentionedPage>;
+export type MentionRequester = (params: { path: string; asset?: string; offset?: number; source?: boolean }, signal?: AbortSignal) => Promise<MentionedPage>;
 
 export const MAX_PREVIEW_ASSETS = 64;
 export const MAX_PREVIEW_BYTES = 40 * 1024 * 1024;
@@ -90,7 +90,7 @@ export interface MentionContent {
 }
 
 /** Follows `nextOffset` until the file is complete. `budget` (assets only) is charged before the data comes. */
-export async function readMention(request: MentionRequester, params: { path: string; asset?: string }, options: { signal?: AbortSignal; budget?: PreviewBudget } = {}): Promise<MentionContent> {
+export async function readMention(request: MentionRequester, params: { path: string; asset?: string; source?: boolean }, options: { signal?: AbortSignal; budget?: PreviewBudget } = {}): Promise<MentionContent> {
   const { signal, budget } = options;
   if (budget && !budget.takeAsset()) throw new PreviewLimitError();
   let offset = 0;
@@ -104,6 +104,8 @@ export async function readMention(request: MentionRequester, params: { path: str
     if (page.offset !== offset) throw new Error("The desktop sent a page out of order");
     if (!meta) {
       meta = { ...page, data: "" };
+      // The main document counts against the same 40 MiB as the assets: stop before following its pages.
+      if (page.total > MAX_PREVIEW_BYTES) throw new PreviewLimitError();
       if (budget && !budget.reserve(page.total)) throw new PreviewLimitError();
     }
     if (page.encoding === "utf8") {
@@ -114,6 +116,7 @@ export async function readMention(request: MentionRequester, params: { path: str
       chunks.push(bytes);
       length += bytes.length;
     }
+    if (length > page.total || length > MAX_PREVIEW_BYTES) throw new PreviewLimitError();
     if (page.nextOffset === undefined) break;
     if (page.nextOffset <= offset || page.nextOffset > page.total) throw new Error("The desktop sent a bad page offset");
     offset = page.nextOffset;
@@ -221,6 +224,9 @@ export interface PreviewProblem {
 export const HIDDEN_PREVIEW_MESSAGE = "This file is hidden by Monoptah";
 
 export function previewProblem(error: unknown): PreviewProblem {
+  if (error instanceof PreviewLimitError) {
+    return { kind: "too_large", title: "This file is too large to preview", detail: "It is more than the preview can load here. Open it on your desktop instead.", retry: false };
+  }
   const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
   switch (code) {
     case "path_denied":

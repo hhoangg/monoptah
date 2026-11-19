@@ -1,10 +1,10 @@
 // An image from the desktop in a viewer with zoom: buttons, Ctrl/Cmd + wheel (a trackpad pinch sends it) and a
-// two-finger pinch. The bytes become a blob: URL shown through `<img>` only, also for svg (never inline, object or
+// two-finger pinch. The bytes become a data: URI (never a blob: URL, which is an app-origin address) shown through `<img>` only, also for svg (never inline, object or
 // iframe), so an svg cannot run anything.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/ui/Icon";
 import { cn } from "@/lib/utils";
-import { useBlobUrl } from "./useMentionedFile";
+import { concat, imageDataUri } from "./mentionedFile";
 
 const MIN_WIDTH = 24;
 const MAX_WIDTH = 30_000;
@@ -13,8 +13,8 @@ const clamp = (width: number) => Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, width))
 
 const BUTTON = "inline-flex min-h-11 min-w-11 items-center justify-center rounded-pill px-3 text-label text-content hover:bg-selection pointer-fine:min-h-9 pointer-fine:min-w-9";
 
-export function ImageViewer({ chunks, mime, name, className }: { chunks: BlobPart[]; mime: string; name: string; className?: string }) {
-  const url = useBlobUrl(chunks, mime);
+export function ImageViewer({ chunks, mime, name, className }: { chunks: Uint8Array[]; mime: string; name: string; className?: string }) {
+  const url = useMemo(() => imageDataUri(mime, concat(chunks, chunks.reduce((sum, chunk) => sum + chunk.length, 0))) ?? "", [chunks, mime]);
   /** `null` is "fit": the image as wide as the pane and no taller than it. */
   const [width, setWidth] = useState<number | null>(null);
   const pane = useRef<HTMLDivElement>(null);
@@ -88,7 +88,7 @@ export function ImageViewer({ chunks, mime, name, className }: { chunks: BlobPar
           pinch.current = null;
         }}
       >
-        {/* A blob: URL made here from the bytes; never a URL from the message. */}
+        {/* A data: URI made here from the bytes of an allowlisted image type; never a URL from the message. */}
         <img
           ref={image}
           src={url}

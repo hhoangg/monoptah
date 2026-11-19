@@ -170,7 +170,7 @@ describe("mentions in a session chat", () => {
     const body = await within(await dialog()).findByTestId("preview-markdown");
     expect(within(body).getByText("Example findings")).toBeInTheDocument();
     const image = await within(body).findByTestId("preview-md-image");
-    expect(image.getAttribute("src")).toMatch(/^blob:/);
+    expect(image.getAttribute("src")).toMatch(/^data:image\/png;base64,[A-Za-z0-9+/=]+$/);
     expect(image).toHaveAttribute("alt", "chart");
     expect(body.querySelectorAll("img")).toHaveLength(1);
     expect(body.querySelector('[src*="example.invalid"], [href*="example.invalid"]')).toBeNull();
@@ -178,14 +178,13 @@ describe("mentions in a session chat", () => {
     expect(requests.filter((request) => request.asset)).toEqual([expect.objectContaining({ path: "docs/findings.md", asset: "img/chart.png" })]);
   });
 
-  it("opens an image in a viewer with zoom, from a blob URL", async () => {
+  it("opens an image in a viewer with zoom, from a data: URI", async () => {
     const user = userEvent.setup();
     mount(`/s/${SESSION}`);
     await user.click(await mentionChip("img/chart.png"));
     const image = await within(await dialog()).findByTestId("preview-image");
     expect(image.tagName).toBe("IMG");
-    expect(image.getAttribute("src")).toMatch(/^blob:/);
-    expect(blobs.get(image.getAttribute("src")!)!.type).toBe("image/png");
+    expect(image.getAttribute("src")).toMatch(/^data:image\/png;base64,[A-Za-z0-9+/=]+$/);
     expect(image).toHaveAttribute("data-zoom", "fit");
     await user.click(screen.getByRole("button", { name: "Zoom in" }));
     const zoomed = Number(image.getAttribute("data-zoom"));
@@ -217,7 +216,10 @@ describe("mentions in a session chat", () => {
     const open = await dialog();
     const image = await within(open).findByTestId("preview-image");
     expect(image.tagName).toBe("IMG");
-    expect(blobs.get(image.getAttribute("src")!)!.type).toBe("image/svg+xml");
+    expect(image.getAttribute("src")).toMatch(/^data:image\/svg\+xml;base64,[A-Za-z0-9+/=]+$/);
+    // No app-origin blob: URL is ever made for desktop bytes that are not the sandboxed html document.
+    expect([...blobs.values()].map((blob) => blob.type)).not.toContain("image/svg+xml");
+    expect([...blobs.values()].filter((blob) => blob.type.startsWith("image/"))).toEqual([]);
     expect(open.querySelector("svg:not([aria-hidden]), object, embed, iframe")).toBeNull();
     expect(open.querySelector("circle, rect[fill='#4f8cff']")).toBeNull();
   });
@@ -298,12 +300,21 @@ describe("mentions in a session chat", () => {
     expect(await within(await dialog()).findByTestId("preview-binary")).toBeInTheDocument();
   });
 
-  it("shows an update hint, and asks nothing, when the desktop does not advertise mentionedFiles", async () => {
+  it("shows an update hint for a file outside the project, and asks nothing, when the desktop does not advertise mentionedFiles", async () => {
     const user = userEvent.setup();
     mount(`/s/${SESSION}`, { capabilities: ["approvals", "cloud"] });
-    await user.click(await mentionChip("report.html"));
+    await user.click(await mentionChip("~/Documents/x/notes.py"));
     const hint = await within(await dialog()).findByTestId("capability-notice");
     expect(hint).toHaveTextContent("Update Monoptah on your desktop to use File previews");
+    expect(requests).toEqual([]);
+  });
+
+  it("routes any file of the project to the Files route without the capability, and only an outside file gets the notice", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(`/s/${SESSION}`, { capabilities: ["approvals", "cloud"] });
+    await user.click(await mentionChip("report.html"));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/p/proj-alpha/files/report.html`));
+    expect(screen.queryByTestId("file-preview-dialog")).toBeNull();
     expect(requests).toEqual([]);
   });
 
@@ -334,6 +345,26 @@ describe("mentions in a Mono chat", () => {
     const lines = await within(await dialog()).findByTestId("preview-lines");
     expect(lines.textContent).toContain("export const answer");
     expect(requests.at(-1)).toMatchObject({ path: "src/example.ts" });
+  });
+
+  it("asks for the raw source of a markdown file when the mention has a line, and shows it as highlighted lines", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}`, { seed: (desktop) => desktop.world.addAssistantText(`mono:${MONO}`, "The finding is at `docs/findings.md:3`.") });
+    await user.click(await mentionChip("docs/findings.md:3"));
+    const lines = await within(await dialog()).findByTestId("preview-lines");
+    expect(lines.textContent).toContain("# Example findings");
+    expect(requests[0]).toMatchObject({ path: "docs/findings.md", source: true });
+    const marked = within(lines).getAllByTestId("file-line").filter((row) => row.getAttribute("data-highlighted") === "true");
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toHaveAttribute("data-index", "2");
+  });
+
+  it("does not ask for the source without a line, so html and markdown stay rendered", async () => {
+    const user = userEvent.setup();
+    mount(`/monos/${MONO}`);
+    await user.click(await mentionChip("docs/findings.md"));
+    await within(await dialog()).findByTestId("preview-markdown");
+    expect(requests[0]).not.toHaveProperty("source");
   });
 
   it("follows nextOffset until the whole file is in", async () => {

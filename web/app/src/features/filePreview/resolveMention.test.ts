@@ -29,6 +29,16 @@ describe("routeMention", () => {
     }
   });
 
+  it("without the mentionedFiles capability, any kind inside the project goes to the Files route and only the outside previews", () => {
+    for (const path of ["report.html", "docs/findings.md", "diagram.svg", "chart.png", "tool.bin", ".env"]) {
+      expect(routeMention(path, project, false), path).toEqual({ to: "project", path });
+    }
+    expect(routeMention("/Users/me/work/app/report.html", project, false)).toEqual({ to: "project", path: "report.html" });
+    expect(routeMention("~/Documents/x/report.html", project, false)).toEqual({ to: "preview" });
+    expect(routeMention("/Users/me/other/report.html", project, false)).toEqual({ to: "preview" });
+    expect(routeMention("report.html", undefined, false)).toEqual({ to: "preview" });
+  });
+
   it("previews everything when there is no project (Mono chats)", () => {
     expect(routeMention("src/main.ts", undefined)).toEqual({ to: "preview" });
   });

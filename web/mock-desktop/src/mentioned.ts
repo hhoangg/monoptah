@@ -111,8 +111,10 @@ function safeAsset(asset: string): string | null {
   return parts.filter((part) => part !== ".").join("/");
 }
 
-function serve(canonical: string, served: Served, offset: number): MentionedFileResult {
-  if ("error" in served) throw new MentionError(served.error, served.code);
+function serve(canonical: string, requested: Served, offset: number, source = false): MentionedFileResult {
+  if ("error" in requested) throw new MentionError(requested.error, requested.code);
+  // `source`: an html or markdown file answers as its raw text, like any text file (for a jump to a line).
+  const served: Served = source && (requested.kind === "html" || requested.kind === "markdown") ? { kind: "text", text: requested.text } : requested;
   const name = lastName(canonical);
   if (served.kind === "binary") return { path: canonical, name, size: served.size, kind: "binary", encoding: "none", data: "", offset: 0, total: served.size };
   const bytes = served.kind === "image" ? served.bytes : encoder.encode(served.text);
@@ -137,13 +139,13 @@ function serve(canonical: string, served: Served, offset: number): MentionedFile
 }
 
 /** The reply of `chat.mentionedFile`, or a `MentionError`. The mention check comes before anything else. */
-export function mentionedFile(params: { path: string; asset?: string | undefined; offset?: number | undefined }): MentionedFileResult {
+export function mentionedFile(params: { path: string; asset?: string | undefined; offset?: number | undefined; source?: boolean | undefined }): MentionedFileResult {
   const raw = params.path.replace(/^\.\//, "");
   const canonical = MENTIONS[raw];
   if (!canonical) throw new MentionError("This file is not mentioned in this conversation", "forbidden");
   const served = FILES[canonical];
   if (!served) throw new MentionError("This file is not mentioned in this conversation", "forbidden");
-  if (params.asset === undefined) return serve(canonical, served, params.offset ?? 0);
+  if (params.asset === undefined) return serve(canonical, served, params.offset ?? 0, params.source === true);
   const asset = safeAsset(params.asset);
   if (asset === null) throw new MentionError("This asset is not allowed", "forbidden");
   const folder = canonical.slice(0, canonical.lastIndexOf("/"));

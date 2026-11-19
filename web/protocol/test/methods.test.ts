@@ -84,7 +84,7 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
   "project.files": { params: { projectId: "p1", path: "src" }, result: { entries: [{ name: "a.ts", isDir: false, ignored: false }] } },
   "project.file": { params: { projectId: "p1", path: "src/a.ts" }, result: { path: "src/a.ts", text: "x", truncated: false } },
   "chat.mentionedFile": {
-    params: { conversationId: "s1", path: "docs/report.html", asset: "img/a.png", offset: 0 },
+    params: { conversationId: "s1", path: "docs/report.html", asset: "img/a.png", offset: 0, source: false },
     result: { path: "/work/app/docs/report.html", name: "report.html", size: 12, kind: "html", encoding: "utf8", data: "<p></p>", offset: 0, total: 7, assets: ["img/a.png"], project: { projectId: "p1", path: "docs/report.html" } },
   },
   "project.search": { params: { projectId: "p1", query: "app" }, result: { results: [{ path: "src/app.ts", name: "app.ts" }] } },
@@ -206,6 +206,10 @@ describe("chat.mentionedFile", () => {
     expect(params.safeParse({ conversationId: "s1", path: "a", offset: -1 }).success).toBe(false);
     expect(params.safeParse({ conversationId: "s1", path: "a", offset: 1.5 }).success).toBe(false);
     expect(params.safeParse({ path: "a" }).success).toBe(false);
+  });
+  it("takes an optional boolean source flag", () => {
+    expect(params.safeParse({ conversationId: "s1", path: "a.html", source: true }).success).toBe(true);
+    expect(params.safeParse({ conversationId: "s1", path: "a.html", source: "yes" }).success).toBe(false);
   });
   it("accepts only the five kinds and the three encodings", () => {
     const result = METHODS["chat.mentionedFile"].result;

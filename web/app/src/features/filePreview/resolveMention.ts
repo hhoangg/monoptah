@@ -29,8 +29,13 @@ function insideProject(path: string, projectPath: string): string | null {
   return relative && !relative.split("/").includes("..") ? relative : null;
 }
 
-export function routeMention(path: string, project: { path: string } | undefined): MentionRoute {
+/**
+ * `canPreview` is whether the desktop advertises `mentionedFiles`. Without it a file inside the project still opens
+ * the Files route for any kind (as before the preview existed); only a file outside it reaches the update notice.
+ */
+export function routeMention(path: string, project: { path: string } | undefined, canPreview = true): MentionRoute {
   if (!project) return { to: "preview" };
   const relative = insideProject(path, project.path);
-  return relative !== null && opensInFiles(relative) ? { to: "project", path: relative } : { to: "preview" };
+  if (relative === null) return { to: "preview" };
+  return !canPreview || opensInFiles(relative) ? { to: "project", path: relative } : { to: "preview" };
 }

@@ -95,8 +95,13 @@ function PathLine({ path }: { path: string }) {
   );
 }
 
+/** A jump to a line in an html or markdown file wants the lines of its source, not the rendered page. */
+function wantsSource(target: PreviewTarget): boolean {
+  return target.line !== undefined && /\.(html?|md|markdown|mdx)$/i.test(target.path);
+}
+
 function PreviewContent({ conversationId, target }: { conversationId: string; target: PreviewTarget }) {
-  const query = useMentionedFile(conversationId, target.path);
+  const query = useMentionedFile(conversationId, target.path, wantsSource(target));
   if (query.isError) {
     const problem = previewProblem(query.error);
     return (
@@ -140,7 +145,7 @@ function PreviewKind({ conversationId, target, data }: { conversationId: string;
     case "html":
       return <HtmlPreview document={data.document} name={name} limited={data.limited} />;
     case "image":
-      return <ImageViewer chunks={data.chunks as BlobPart[]} mime={data.mime} name={name} />;
+      return <ImageViewer chunks={data.chunks} mime={data.mime} name={name} />;
     case "binary":
       return (
         <div data-testid="preview-binary" className="min-h-0 flex-1 overflow-auto">
