@@ -191,7 +191,14 @@ export function concat(chunks: readonly Uint8Array[], length: number): Uint8Arra
   return out;
 }
 
-/** A relative asset path of a markdown image or html reference as the desktop accepts it, or null. */
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "avif", "bmp", "ico"]);
+
+/**
+ * The key of an image reference of a markdown image, exactly as the desktop lists it in `assets`
+ * (`normalize_reference` in mentioned_file/html.rs): relative (`a.png`, `../a.png`), absolute (`/p/a.png`) or `file://`
+ * (empty or `localhost` host), with `?query` and `#fragment` cut and percent-decoding applied once. Whether the desktop
+ * reads it is its decision (inside the project of the file, else the file's folder); this only drops what is never an image path.
+ */
 export function assetPath(source: string): string | null {
   let value = source.trim().replace(/[?#][\s\S]*$/, "");
   try {
@@ -199,11 +206,18 @@ export function assetPath(source: string): string | null {
   } catch {
     return null;
   }
-  if (!value || value.length > 1024 || value.includes("\\") || hasControl(value)) return null;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(value) || value.startsWith("/") || value.startsWith("~")) return null;
+  if (/^file:\/\//i.test(value)) {
+    value = value.slice(7);
+    if (/^localhost\//i.test(value)) value = value.slice(9);
+    if (!value.startsWith("/")) return null;
+  }
+  if (!value || value.length > 1024 || value.startsWith("~") || value.includes("\\") || value.includes(":") || hasControl(value)) return null;
   const parts = value.split("/").filter((part) => part !== "." && part !== "");
-  if (parts.length === 0 || parts.includes("..")) return null;
-  return parts.join("/");
+  if (parts.length === 0) return null;
+  const key = parts.join("/");
+  const extension = key.slice(key.lastIndexOf(".") + 1).toLowerCase();
+  if (!key.includes(".") || !IMAGE_EXTENSIONS.has(extension)) return null;
+  return value.startsWith("/") ? `/${key}` : key;
 }
 
 export function formatSize(bytes: number): string {

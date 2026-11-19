@@ -27,6 +27,7 @@ import {
   FilterHorizontalIcon,
   FingerPrintIcon,
   FlashIcon,
+  FullScreenIcon,
   Folder01Icon,
   GitBranchIcon,
   Image01Icon,
@@ -45,6 +46,7 @@ import {
   LockIcon,
   Logout01Icon,
   Mic01Icon,
+  MinimizeScreenIcon,
   MinusSignIcon,
   Moon02Icon,
   MoreHorizontalIcon,
@@ -152,6 +154,8 @@ export const ICONS = {
   account: UserCircleIcon,
   splitRight: LayoutTwoColumnIcon,
   splitDown: LayoutTwoRowIcon,
+  fullscreen: FullScreenIcon,
+  exitFullscreen: MinimizeScreenIcon,
 } as const satisfies Record<string, IconSvgElement>;
 
 export type IconName = keyof typeof ICONS;

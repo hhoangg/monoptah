@@ -13,6 +13,7 @@ import { useLinkDesktopId } from "@/link";
 import { RequireCapability, useCapability } from "@/version";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
+import { cn } from "@/lib/utils";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { Icon } from "@/ui/Icon";
 import { HtmlPreview } from "./HtmlPreview";
@@ -33,24 +34,62 @@ export interface FilePreviewDialogProps {
   onClose: () => void;
 }
 
+/** The dialog over the viewport edge to edge, with the device safe areas as padding (CSS only: iOS Safari has no Fullscreen API for elements). */
+const FULLSCREEN_CLASS =
+  "top-0 left-0 h-dvh max-h-none w-full max-w-none translate-x-0 translate-y-0 rounded-none border-0 pt-[max(1rem,env(safe-area-inset-top))] pr-[max(1rem,env(safe-area-inset-right))] pb-[max(1rem,env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))]";
+
 export function FilePreviewDialog({ conversationId, target, onClose }: FilePreviewDialogProps) {
   const name = target ? leafName(target.path) || target.path : "File";
+  // Fullscreen belongs to one opened target: a closed dialog, or another target, is never fullscreen.
+  const [fullscreenFor, setFullscreenFor] = useState<PreviewTarget | null>(null);
+  const fullscreen = target !== null && fullscreenFor === target;
   return (
-    <Dialog open={target !== null} onOpenChange={(open) => (open ? undefined : onClose())}>
+    <Dialog
+      open={target !== null}
+      onOpenChange={(open) => {
+        if (open) return;
+        setFullscreenFor(null);
+        onClose();
+      }}
+    >
       <DialogContent
         aria-describedby={undefined}
         data-testid="file-preview-dialog"
-        className="h-[min(88dvh,60rem)] max-w-4xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden"
+        data-fullscreen={fullscreen}
+        // Fullscreen: the close button sits inside the safe areas (notch, home indicator side).
+        closeClassName={fullscreen ? "top-[max(0.75rem,env(safe-area-inset-top))] right-[max(0.75rem,env(safe-area-inset-right))]" : undefined}
+        // Escape leaves fullscreen first; the next one closes the dialog.
+        onEscapeKeyDown={(event) => {
+          if (!fullscreen) return;
+          event.preventDefault();
+          setFullscreenFor(null);
+        }}
+        className={cn(
+          "h-[min(88dvh,60rem)] max-w-4xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden",
+          fullscreen && FULLSCREEN_CLASS,
+        )}
       >
-        <DialogHeader>
-          <DialogTitle className="flex min-w-0 items-center gap-2 text-title">
-            <FileTypeIcon name={name} isDir={false} />
-            <span className="min-w-0 truncate" data-testid="file-preview-name">
-              {name}
-            </span>
-          </DialogTitle>
+        <DialogHeader className="min-w-0">
+          <div className="flex min-w-0 items-center gap-2">
+            <DialogTitle className="flex min-w-0 flex-1 items-center gap-2 text-title">
+              <FileTypeIcon name={name} isDir={false} />
+              <span className="min-w-0 truncate" data-testid="file-preview-name">
+                {name}
+              </span>
+            </DialogTitle>
+            <button
+              type="button"
+              data-testid="file-preview-fullscreen"
+              aria-label={fullscreen ? "Exit full screen" : "Full screen"}
+              aria-pressed={fullscreen}
+              onClick={() => setFullscreenFor(fullscreen ? null : target)}
+              className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill text-muted-text hover:bg-selection pointer-fine:size-9"
+            >
+              <Icon name={fullscreen ? "exitFullscreen" : "fullscreen"} size={20} />
+            </button>
+          </div>
         </DialogHeader>
-        <div className="flex min-h-0 flex-col" data-testid="file-preview-body">
+        <div className="flex min-h-0 min-w-0 flex-col" data-testid="file-preview-body">
           {target ? (
             <RequireCapability name="mentionedFiles" fallback="notice">
               <PreviewContent conversationId={conversationId} target={target} />
@@ -86,7 +125,7 @@ function CopyPath({ path }: { path: string }) {
 
 function PathLine({ path }: { path: string }) {
   return (
-    <div className="mb-2 flex shrink-0 items-center gap-2">
+    <div className="mb-2 flex min-w-0 shrink-0 items-center gap-2">
       <p data-testid="file-preview-path" title={path} className="min-w-0 flex-1 truncate text-small text-muted-text [unicode-bidi:isolate]">
         {path}
       </p>

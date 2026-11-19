@@ -69,7 +69,7 @@ describe("<Markdown>", () => {
     expect(onOpenFile).toHaveBeenLastCalledWith("out/run.log", 7);
   });
 
-  it("keeps an image as its alt text in chat, and draws only a relative one when a renderImage is given", () => {
+  it("keeps an image as its alt text in chat, and asks renderImage for a path (relative or absolute) but never for a remote one", () => {
     const text = "![chart](img/a.png) and ![remote](https://x.invalid/t.png) and ![abs](/etc/a.png)";
     const chat = render(<Markdown text={text} />);
     expect(chat.container.querySelector("img")).toBeNull();
@@ -77,10 +77,11 @@ describe("<Markdown>", () => {
     chat.unmount();
     const renderImage = vi.fn((src: string, alt: string) => <img data-testid="drawn" src={`blob:x/${src}`} alt={alt} />);
     const preview = render(<Markdown text={text} renderImage={renderImage} />);
-    expect(renderImage).toHaveBeenCalledTimes(1);
+    expect(renderImage).toHaveBeenCalledTimes(2);
     expect(renderImage).toHaveBeenCalledWith("img/a.png", "chart");
-    expect(preview.container.querySelectorAll("img")).toHaveLength(1);
-    expect(preview.container.textContent).toContain("remote and abs");
+    expect(renderImage).toHaveBeenCalledWith("/etc/a.png", "abs");
+    expect(preview.container.querySelectorAll("img")).toHaveLength(2);
+    expect(preview.container.textContent).toContain("remote");
   });
 
   it("shows files unlinked without onOpenFile", () => {

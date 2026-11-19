@@ -100,10 +100,15 @@ export interface ParseOptions {
 
 let keepLocalImages = false;
 
-/** A relative path with no scheme, no `/` or `~` start and no backslash or control character. */
+/**
+ * A path on the desktop: relative (`../` included), absolute (one `/`, not `//host`) or `file:///`, with no other
+ * scheme, no `~` or `#` start and no backslash or control character. Whether the desktop reads it is its decision.
+ */
 export function isLocalImageSource(src: string): boolean {
   if (!src || src.length > 1024 || /[\\\s]/.test(src) || hasControl(src)) return false;
-  return !/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith("/") && !src.startsWith("~") && !src.startsWith("#");
+  if (/^file:\/\/(localhost)?\//i.test(src)) return true;
+  if (src.startsWith("//")) return false;
+  return !/^[a-z][a-z0-9+.-]*:/i.test(src) && !src.startsWith("~") && !src.startsWith("#");
 }
 
 export function parseMarkdown(source: string, options: ParseOptions = {}): MarkdownBlock[] {

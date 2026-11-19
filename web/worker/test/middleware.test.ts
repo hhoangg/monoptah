@@ -178,7 +178,7 @@ describe("response headers", () => {
 describe("buildCsp", () => {
   it("is exactly the policy of security.md 8.1 with HOST substituted", () => {
     expect(buildCsp("zptah.app")).toBe(
-      "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; frame-src blob:; font-src 'self'; connect-src 'self' wss://zptah.app; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'; require-trusted-types-for 'script'; trusted-types default; upgrade-insecure-requests",
+      "default-src 'none'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; frame-src blob:; font-src 'self'; connect-src 'self' wss://zptah.app; worker-src 'self'; manifest-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'; object-src 'none'; require-trusted-types-for 'script'; trusted-types default; upgrade-insecure-requests",
     );
   });
 

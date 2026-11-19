@@ -1308,7 +1308,8 @@ fn a_markdown_file_references_its_images_and_only_those() {
     }
     assert_eq!(
         markdown_assets("![a](x/a.png) ![b](https://e.test/b.png) ![c](../c.png) ![d](d.txt)"),
-        ["x/a.png"]
+        // A `..` key is listed like any other; whether it may be read is decided on the request.
+        ["x/a.png", "../c.png"]
     );
 }
 
@@ -2208,4 +2209,188 @@ fn a_call_carries_its_rule_to_the_audit_line() {
         last = Some(handle(device, &json!({"path": "a.md"}), &ctx));
     }
     assert_eq!(last.unwrap().rule, Some(rule::BUDGET));
+}
+
+// ---- assets anywhere inside the project of the document ----
+
+/// A project `proj` holding `reports/r.html` and `reports/g.md`, which name the images below;
+/// `out.png` lies beside the project (outside it). Relative references only, so it runs on
+/// every OS; the absolute and `file://` forms are in the unix tests after it.
+fn project_site() -> (Fx, Project) {
+    let fx = Fx::new();
+    fx.write("proj/img/a.png", [1u8, 2, 3]);
+    fx.write("proj/reports/local.png", [4u8, 5]);
+    fx.write("proj/img/.git/x.png", "fake");
+    fx.write("proj/img/other.png", "x");
+    fx.write("out.png", "outside");
+    fx.write(
+        "proj/reports/r.html",
+        concat!(
+            "<img src=local.png><img src=../img/a.png><img src=../../out.png>",
+            "<img src=../img/.git/x.png><img src=../img/leak.png><img src=../img/gone.png>",
+            "<img src=link/../out.png><img src=link/../missing.png>",
+        ),
+    );
+    fx.write(
+        "proj/reports/g.md",
+        "![a](../img/a.png) ![b](../../out.png) ![c](local.png) ![d](../img/%61.png?v=1#x)",
+    );
+    let project = Project::new("p", &fx.path("proj"), true, DenyList::default());
+    (fx, project)
+}
+
+fn project_ask(fx: &Fx, project: &Project, doc: &str, params: &Params) -> Result<Reply, Failure> {
+    let said = format!("`{doc}`");
+    run_with(
+        &[said.as_str()],
+        &fx.path("proj/reports"),
+        std::slice::from_ref(project),
+        params,
+        |_| {},
+    )
+}
+
+fn project_asset(fx: &Fx, project: &Project, doc: &str, key: &str) -> Result<Reply, Failure> {
+    project_ask(fx, project, doc, &asset(doc, key))
+}
+
+#[test]
+fn the_document_lists_its_references_as_keys() {
+    let (fx, project) = project_site();
+    let reply = project_ask(&fx, &project, "r.html", &params("r.html")).unwrap();
+    let assets = reply.assets.unwrap();
+    for key in ["local.png", "../img/a.png", "../../out.png"] {
+        assert!(
+            assets.iter().any(|a| a == key),
+            "{key} missing in {assets:?}"
+        );
+    }
+    // The markdown file lists the same kind of keys (`%61` decoded, query and fragment cut): `../img/a.png`
+    // is readable, which only a listed key can be.
+    assert!(project_asset(&fx, &project, "g.md", "../img/a.png").is_ok());
+}
+
+#[test]
+fn dot_dot_references_resolve_inside_the_project_for_html_and_markdown() {
+    let (fx, project) = project_site();
+    for doc in ["r.html", "g.md"] {
+        for key in ["local.png", "../img/a.png"] {
+            let reply = project_asset(&fx, &project, doc, key)
+                .unwrap_or_else(|e| panic!("{doc} {key}: {e:?}"));
+            assert_eq!(reply.kind, Kind::Image, "{doc} {key}");
+        }
+        let reply = project_asset(&fx, &project, doc, "../img/a.png").unwrap();
+        assert_eq!(STANDARD.decode(&reply.data).unwrap(), [1, 2, 3]);
+        assert_eq!(reply.path, fx.text("proj/img/a.png"));
+    }
+}
+
+#[test]
+fn references_that_leave_the_project_are_refused_without_looking_at_the_disk() {
+    let (fx, project) = project_site();
+    for doc in ["r.html", "g.md"] {
+        let result = project_asset(&fx, &project, doc, "../../out.png");
+        assert_eq!(code(&result), Some(Code::Forbidden), "{doc}");
+    }
+    // An image the document does not name is refused even when it is inside the project.
+    assert_eq!(
+        code(&project_asset(&fx, &project, "r.html", "../img/other.png")),
+        Some(Code::Forbidden)
+    );
+}
+
+#[test]
+fn a_deny_listed_file_inside_the_project_is_refused() {
+    let (fx, project) = project_site();
+    assert_eq!(
+        code(&project_asset(&fx, &project, "r.html", "../img/.git/x.png")),
+        Some(Code::PathDenied)
+    );
+}
+
+#[test]
+fn a_missing_image_inside_the_project_is_not_found() {
+    let (fx, project) = project_site();
+    assert_eq!(
+        code(&project_asset(&fx, &project, "r.html", "../img/gone.png")),
+        Some(Code::NotFound)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_inside_the_project_that_points_outside_is_refused() {
+    let (fx, project) = project_site();
+    std::os::unix::fs::symlink(fx.path("out.png"), fx.path("proj/img/leak.png")).unwrap();
+    assert_eq!(
+        code(&project_asset(&fx, &project, "r.html", "../img/leak.png")),
+        Some(Code::Forbidden)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dot_dot_after_a_link_out_of_the_project_never_says_whether_the_target_exists() {
+    let (fx, project) = project_site();
+    // `proj/reports/link` points into a folder beside the project: `link/../out.png` is lexically
+    // inside the project but leaves it once the link is followed. A real and a missing target answer alike.
+    fx.write("elsewhere/out.png", "real");
+    std::fs::create_dir_all(fx.path("elsewhere/deep")).unwrap();
+    std::os::unix::fs::symlink(fx.path("elsewhere/deep"), fx.path("proj/reports/link")).unwrap();
+    for key in ["link/../out.png", "link/../missing.png"] {
+        let result = project_asset(&fx, &project, "r.html", key);
+        assert_eq!(code(&result), Some(Code::Forbidden), "{key}");
+    }
+}
+
+/// Absolute and `file://` references name a path with `/` and `:` parts, so these run where those are paths.
+#[cfg(unix)]
+#[test]
+fn absolute_and_file_references_resolve_inside_the_project_only() {
+    let (fx, project) = project_site();
+    let inside = fx.text("proj/img/a.png");
+    let outside = fx.text("out.png");
+    fx.write(
+        "proj/reports/abs.html",
+        format!(
+            "<img src=\"{inside}\"><img src=\"{outside}\"><img src=\"file://{inside}?v=1#x\"><img src=\"file://localhost{inside}\">"
+        ),
+    );
+    let reply = project_ask(&fx, &project, "abs.html", &params("abs.html")).unwrap();
+    let assets = reply.assets.unwrap();
+    // `file://`, a query, a fragment and `localhost` all reduce to the one key.
+    assert_eq!(assets, [inside.clone(), outside.clone()]);
+    let ok = project_asset(&fx, &project, "abs.html", &inside).unwrap();
+    assert_eq!(STANDARD.decode(&ok.data).unwrap(), [1, 2, 3]);
+    assert_eq!(
+        code(&project_asset(&fx, &project, "abs.html", &outside)),
+        Some(Code::Forbidden)
+    );
+    // The same for a markdown file.
+    fx.write(
+        "proj/reports/abs.md",
+        format!("![a]({inside}) ![b](file://{outside}) ![c](file://{inside})"),
+    );
+    assert!(project_asset(&fx, &project, "abs.md", &inside).is_ok());
+    assert_eq!(
+        code(&project_asset(&fx, &project, "abs.md", &outside)),
+        Some(Code::Forbidden)
+    );
+}
+
+#[test]
+fn without_a_project_the_root_stays_the_documents_own_folder() {
+    let fx = Fx::new();
+    fx.write("site/img/a.png", [1u8]);
+    fx.write("site/up.png", [9u8]);
+    fx.write("out.png", "x");
+    fx.write(
+        "site/sub/r.html",
+        "<img src=../up.png><img src=../../out.png><img src=../img/a.png>",
+    );
+    let ask = |key: &str| run(&["`r.html`"], &fx.path("site/sub"), &asset("r.html", key));
+    // Every one of them is above the document's folder `site/sub`: refused without a project.
+    for key in ["../up.png", "../../out.png", "../img/a.png"] {
+        assert_eq!(code(&ask(key)), Some(Code::Forbidden), "{key}");
+    }
 }

@@ -17,7 +17,9 @@ export function buildCsp(host: string): string {
     `connect-src 'self' wss://${host}`,
     "worker-src 'self'",
     "manifest-src 'self'",
-    "frame-ancestors 'none'",
+    // Not 'none': the file preview frame is a blob: document that inherits this policy, and WebKit then refuses to load it
+    // (a blank frame) because its parent is not allowed by frame-ancestors. 'self' still blocks every other origin.
+    "frame-ancestors 'self'",
     "base-uri 'none'",
     "form-action 'self'",
     "object-src 'none'",

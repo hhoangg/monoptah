@@ -126,6 +126,13 @@ describe("buildPreviewDocument", () => {
     expect(imageMime("application/pdf")).toBeNull();
   });
 
+  it("keeps an inline data: image the desktop already checked, next to a placeholder", () => {
+    const inline = "data:image/png;base64,iVBORw0KGgo=";
+    const out = buildPreviewDocument(`<img src="${inline}"><img src="monoptah-asset:0">`, uris);
+    expect(out).toContain(`<img src="${inline}">`);
+    expect(out).toContain('<img src="data:image/png;base64,AAAA">');
+  });
+
   it("does not treat `$&` in a data URI replacement as a pattern", () => {
     expect(buildPreviewDocument("<img src='monoptah-asset:0'>", new Map([[0, "data:image/png;base64,$&$1"]]))).toContain("src='data:image/png;base64,$&$1'");
   });
@@ -217,8 +224,16 @@ describe("assetPath", () => {
     expect(assetPath("./img/a%20b.png?raw=1#x")).toBe("img/a b.png");
   });
 
-  it("refuses anything that is not relative and inside the folder", () => {
-    for (const bad of ["../a.png", "a/../../b.png", "/etc/a.png", "~/a.png", "https://x.invalid/a.png", "data:image/png;base64,AA", "a\\b.png", "a%00.png", "", "%E0%A4%A"]) {
+  it("keeps ../, absolute and file:// references as the desktop's keys", () => {
+    expect(assetPath("../img/a.png")).toBe("../img/a.png");
+    expect(assetPath("a/../b.png")).toBe("a/../b.png");
+    expect(assetPath("/home/me/p/a.PNG?v=1")).toBe("/home/me/p/a.PNG");
+    expect(assetPath("file:///home/me/a%20b.png#x")).toBe("/home/me/a b.png");
+    expect(assetPath("FILE://localhost/home/me/a.png")).toBe("/home/me/a.png");
+  });
+
+  it("refuses what is never an image path", () => {
+    for (const bad of ["~/a.png", "https://x.invalid/a.png", "file://host/a.png", "data:image/png;base64,AA", "a\\b.png", "a%00.png", "", "%E0%A4%A", "a.txt", "dir/", "noext", "/"]) {
       expect(assetPath(bad), bad).toBeNull();
     }
   });

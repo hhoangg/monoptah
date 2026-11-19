@@ -8,8 +8,12 @@
 //! attribute from scratch:
 //!
 //! * `<a href>` keeps only a `#fragment`;
-//! * `<img src>` and `<img srcset>` keep only relative image references that stay inside the folder,
-//!   each replaced by the text `monoptah-asset:<index>` (index into [`Document::assets`]);
+//! * `<img src>`, `<img srcset>` and `<picture><source srcset>` keep only image references (relative
+//!   with or without `..`, absolute or `file://`, see [`normalize_reference`]), each replaced by the
+//!   text `monoptah-asset:<index>` (index into [`Document::assets`]); whether a key may be read is
+//!   decided when the asset is requested (inside the project of the document, else its folder); an
+//!   `<img src>` may also be an inline raster or svg image `data:image/<type>;base64,<payload>`
+//!   (checked by [`data_image`]: allowed type, base64 characters only, size cap);
 //! * a style attribute loses every declaration that carries a URL other than such an image, any
 //!   escape, `expression(`, `@import` or a script scheme, and `url(x.png)` becomes
 //!   `url(monoptah-asset:<index>)`;
@@ -20,7 +24,10 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     panic::AssertUnwindSafe,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, LazyLock, Mutex,
+    },
 };
 
 use ammonia::{Builder, UrlRelative};
@@ -73,7 +80,7 @@ pub fn transform(source: &str, sheets: Arc<dyn Sheets>) -> Document {
     .and_then(Result::ok)
     // Without inlining the styles are lost, never passed on.
     .unwrap_or_else(|| source.to_owned());
-    let assets = Arc::new(Mutex::new(Vec::<String>::new()));
+    let assets = Arc::new(Refs::default());
     // The sanitizer drops the `<html>` and `<body>` tags, and with them the styles inlined onto
     // them (the page's background, text color, font, padding): they go on a wrapper div, through
     // the same style filter, `<html>` first so `<body>` wins like in a browser. The wrapper
@@ -89,7 +96,7 @@ pub fn transform(source: &str, sheets: Arc<dyn Sheets>) -> Document {
         .collect::<Vec<_>>()
         .join(";");
     let body = format!("<div style=\"{style}\">{body}</div>");
-    let assets = std::mem::take(&mut *assets.lock().unwrap_or_else(|e| e.into_inner()));
+    let assets = std::mem::take(&mut *assets.list.lock().unwrap_or_else(|e| e.into_inner()));
     Document {
         html: format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body style=\"margin:0\">{body}</body></html>"
@@ -100,11 +107,11 @@ pub fn transform(source: &str, sheets: Arc<dyn Sheets>) -> Document {
 
 /// The safe declarations of the first `<html>` or `<body>` tag's `style` attribute (`name` says
 /// which), ready for a double-quoted attribute, or an empty string.
-fn element_style(inlined: &str, name: &str, assets: &Mutex<Vec<String>>) -> String {
+fn element_style(inlined: &str, name: &str, assets: &Refs) -> String {
     element_style_of(inlined, name, assets).unwrap_or_default()
 }
 
-fn element_style_of(inlined: &str, name: &str, assets: &Mutex<Vec<String>>) -> Option<String> {
+fn element_style_of(inlined: &str, name: &str, assets: &Refs) -> Option<String> {
     let body = Regex::new(&format!(
         r#"(?is)<{name}(?:\s(?:"[^"]*"|'[^']*'|[^>"'])*)?>"#
     ))
@@ -153,7 +160,7 @@ const URL_ATTRIBUTES: &[&str] = &[
     "lowsrc",
 ];
 
-fn sanitizer(assets: Arc<Mutex<Vec<String>>>) -> Builder<'static> {
+fn sanitizer(assets: Arc<Refs>) -> Builder<'static> {
     let mut builder = Builder::default();
     builder
         .clean_content_tags(HashSet::from([
@@ -161,10 +168,12 @@ fn sanitizer(assets: Arc<Mutex<Vec<String>>>) -> Builder<'static> {
             "textarea",
         ]))
         .add_generic_attributes(["style", "id"])
+        .add_tags(["picture", "source"])
         .add_tag_attributes("img", ["srcset"])
+        .add_tag_attributes("source", ["srcset"])
         .link_rel(Some("noopener noreferrer"))
         .url_relative(UrlRelative::PassThrough)
-        .url_schemes(HashSet::from(["monoptah-asset"]))
+        .url_schemes(HashSet::from(["monoptah-asset", "data", "file"]))
         .strip_comments(true)
         .attribute_filter(move |element, attribute, value| {
             filter(&assets, element, attribute, value)
@@ -173,7 +182,7 @@ fn sanitizer(assets: Arc<Mutex<Vec<String>>>) -> Builder<'static> {
 }
 
 fn filter<'u>(
-    assets: &Mutex<Vec<String>>,
+    assets: &Refs,
     element: &str,
     attribute: &str,
     value: &'u str,
@@ -182,18 +191,68 @@ fn filter<'u>(
         (_, "style") => sanitize_style(value, assets).map(Cow::Owned),
         ("a", "href") => value.starts_with('#').then(|| Cow::Owned(value.to_owned())),
         ("a", "rel") => Some(Cow::Borrowed(value)),
-        ("img", "src") => placeholder(assets, value).map(Cow::Owned),
-        ("img", "srcset") => srcset(assets, value).map(Cow::Owned),
+        ("img", "src") => placeholder(assets, value)
+            .or_else(|| data_image(assets, value))
+            .map(Cow::Owned),
+        ("img" | "source", "srcset") => srcset(assets, value).map(Cow::Owned),
         (_, name) if URL_ATTRIBUTES.contains(&name) => None,
         _ => Some(Cow::Borrowed(value)),
     }
 }
 
+/// Image types an inline `data:` image may have.
+const DATA_IMAGE_TYPES: &[&str] = &[
+    "png", "jpeg", "gif", "webp", "avif", "bmp", "svg+xml", "x-icon",
+];
+
+/// The most base64 characters all the inline images of one document may carry together.
+pub const MAX_DATA_IMAGE_TOTAL_CHARS: usize = 8 * 1024 * 1024;
+
+/// What a document names while it is sanitized: its image keys (placeholder order) and the
+/// characters of inline images kept so far.
+#[derive(Default)]
+struct Refs {
+    list: Mutex<Vec<String>>,
+    data: AtomicUsize,
+}
+
+/// The most base64 characters one inline image may carry.
+pub const MAX_DATA_IMAGE_CHARS: usize = 4 * 1024 * 1024;
+
+/// `value` as `data:image/<type>;base64,<payload>` when it is exactly that: an allowed image type,
+/// no parameters, and a payload of base64 characters only (so it cannot close a quote or smuggle
+/// markup). Anything else, `data:text/html` and url-encoded payloads included, is `None`.
+fn data_image(refs: &Refs, value: &str) -> Option<String> {
+    let value = value.trim();
+    let head_len = "data:image/".len();
+    if !value.get(..head_len)?.eq_ignore_ascii_case("data:image/") {
+        return None;
+    }
+    let (kind, payload) = value[head_len..].split_once(";base64,")?;
+    let kind = kind.to_ascii_lowercase();
+    if !DATA_IMAGE_TYPES.contains(&kind.as_str())
+        || payload.is_empty()
+        || payload.len() > MAX_DATA_IMAGE_CHARS
+        || !payload
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+    {
+        return None;
+    }
+    // A stylesheet image is copied by the inliner into every element its rule matches: the document
+    // keeps inline images only up to a total, later ones are dropped (the page still renders).
+    let total = refs.data.fetch_add(payload.len(), Ordering::Relaxed) + payload.len();
+    if total > MAX_DATA_IMAGE_TOTAL_CHARS {
+        refs.data.fetch_sub(payload.len(), Ordering::Relaxed);
+        return None;
+    }
+    Some(format!("data:image/{kind};base64,{payload}"))
+}
+
 /// `monoptah-asset:<index>` for a relative image reference, or `None` when it may not be an asset.
-fn placeholder(assets: &Mutex<Vec<String>>, reference: &str) -> Option<String> {
-    let path = reference.split(['?', '#']).next().unwrap_or("");
-    let path = normalize_asset(&percent_decode(path))?;
-    let mut assets = assets.lock().unwrap_or_else(|e| e.into_inner());
+fn placeholder(assets: &Refs, reference: &str) -> Option<String> {
+    let path = normalize_reference(reference)?;
+    let mut assets = assets.list.lock().unwrap_or_else(|e| e.into_inner());
     let index = match assets.iter().position(|known| *known == path) {
         Some(index) => index,
         None if assets.len() < MAX_ASSETS => {
@@ -205,7 +264,7 @@ fn placeholder(assets: &Mutex<Vec<String>>, reference: &str) -> Option<String> {
     Some(format!("monoptah-asset:{index}"))
 }
 
-fn srcset(assets: &Mutex<Vec<String>>, value: &str) -> Option<String> {
+fn srcset(assets: &Refs, value: &str) -> Option<String> {
     let kept: Vec<String> = value
         .split(',')
         .filter_map(|candidate| {
@@ -236,7 +295,7 @@ fn descriptor_ok(descriptor: &str) -> bool {
 }
 
 /// Declarations of a style attribute that are safe to keep, or `None` when none are.
-fn sanitize_style(value: &str, assets: &Mutex<Vec<String>>) -> Option<String> {
+fn sanitize_style(value: &str, assets: &Refs) -> Option<String> {
     let kept: Vec<String> = split_declarations(value)
         .into_iter()
         .filter_map(|declaration| sanitize_declaration(&declaration, assets))
@@ -297,7 +356,7 @@ const FORBIDDEN: &[&str] = &[
     "/*",
 ];
 
-fn sanitize_declaration(declaration: &str, assets: &Mutex<Vec<String>>) -> Option<String> {
+fn sanitize_declaration(declaration: &str, assets: &Refs) -> Option<String> {
     let declaration = declaration.trim();
     let (property, value) = declaration.split_once(':')?;
     let property = property.trim();
@@ -337,7 +396,7 @@ fn sanitize_declaration(declaration: &str, assets: &Mutex<Vec<String>>) -> Optio
             })
             .unwrap_or(argument)
             .trim();
-        let id = placeholder(assets, argument)?;
+        let id = placeholder(assets, argument).or_else(|| data_image(assets, argument))?;
         out.push_str(&value[rest..start]);
         out.push_str(&format!("url({id})"));
         rest = end + 1;
@@ -376,6 +435,59 @@ pub fn extension(path: &str) -> Option<String> {
     Some(name.rsplit_once('.')?.1.to_ascii_lowercase())
 }
 
+/// The key of an image reference as the document names it: relative (`a/b.png`, `../a.png`),
+/// absolute (`/home/me/a.png`) or `file://` (percent-decoded, an empty or `localhost` host).
+/// `?query` and `#fragment` are cut. Whether the key may be read is decided on the desktop at
+/// request time ([`super::serve_asset`]): this only refuses what can never be an image path
+/// (another scheme, `~`, backslashes, control characters, no image extension).
+pub fn normalize_reference(reference: &str) -> Option<String> {
+    let reference = reference.trim();
+    let reference = reference.split(['?', '#']).next().unwrap_or("");
+    let decoded = percent_decode(reference);
+    let lower = decoded.get(..7).map(str::to_ascii_lowercase);
+    let path = if lower.as_deref() == Some("file://") {
+        let rest = &decoded[7..];
+        let rest = match rest.get(..10).map(str::to_ascii_lowercase).as_deref() {
+            Some("localhost/") => &rest[9..],
+            _ => rest,
+        };
+        if !rest.starts_with('/') {
+            return None;
+        }
+        rest.to_owned()
+    } else {
+        decoded
+    };
+    normalize_key(&path)
+}
+
+/// [`normalize_reference`] for a path that is already decoded (an `asset` the client sends back):
+/// the same key comes out, so the request is held to exactly what the document named.
+pub fn normalize_key(path: &str) -> Option<String> {
+    if path.is_empty()
+        || path.chars().count() > 1024
+        || path.starts_with('~')
+        || path.contains(['\\', ':'])
+        || path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let absolute = path.starts_with('/');
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let key = parts.join("/");
+    let extension = extension(&key)?;
+    if !IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+        return None;
+    }
+    Some(if absolute { format!("/{key}") } else { key })
+}
+
 /// [`normalize_relative`] for a path that must be an image.
 pub fn normalize_asset(path: &str) -> Option<String> {
     let path = normalize_relative(path)?;
@@ -390,10 +502,14 @@ pub(super) fn percent_decode(text: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        let escaped = (bytes[at] == b'%' && at + 2 < bytes.len())
-            .then(|| std::str::from_utf8(&bytes[at + 1..at + 3]).ok())
-            .flatten()
-            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        // `%XX` needs two hex digits and may end the text (`at + 2` is its last byte).
+        let escaped = (bytes[at] == b'%'
+            && at + 2 < bytes.len()
+            && bytes[at + 1].is_ascii_hexdigit()
+            && bytes[at + 2].is_ascii_hexdigit())
+        .then(|| std::str::from_utf8(&bytes[at + 1..at + 3]).ok())
+        .flatten()
+        .and_then(|hex| u8::from_str_radix(hex, 16).ok());
         match escaped {
             Some(byte) => {
                 out.push(byte);
@@ -431,7 +547,7 @@ mod tests {
             "<iframe src=\"https://e.test/\"></iframe><object data=\"a.swf\"></object>",
             "<form action=\"https://e.test/\"><input name=a></form>",
             "<img src=\"https://e.test/a.png\" onerror=\"x()\">",
-            "<img src=\"data:image/png;base64,AAAA\">",
+            "<img src=\"data:text/html;base64,AAAA\">",
             "<a href=\"javascript:alert(1)\">j</a><a href=\"https://e.test/\">r</a>",
             "<base href=\"https://e.test/\"><meta http-equiv=\"refresh\" content=\"0;url=https://e.test/\">",
             "<link rel=\"stylesheet\" href=\"https://e.test/a.css\">",
@@ -461,6 +577,82 @@ mod tests {
     }
 
     #[test]
+    fn inline_data_images_are_kept_and_nothing_else_with_a_data_scheme() {
+        let png = "data:image/png;base64,iVBORw0KGgo=";
+        let doc = run(&format!(
+            "<img id=a src=\"{png}\"><img id=b src=\"DATA:image/SVG+xml;base64,PHN2Zz48L3N2Zz4=\">"
+        ));
+        assert!(doc.html.contains(&format!("src=\"{png}\"")), "{}", doc.html);
+        assert!(
+            doc.html
+                .contains("data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="),
+            "{}",
+            doc.html
+        );
+        assert!(doc.assets.is_empty());
+        for bad in [
+            "data:text/html;base64,PGgxPg==",
+            "data:image/png;charset=utf-8;base64,AAAA",
+            "data:image/png,%3Csvg%3E",
+            "data:image/png;base64,AA AA\"onerror=\"x()",
+            "data:image/png;base64,",
+            "data:image/tiff;base64,AAAA",
+            "data:application/javascript;base64,AAAA",
+        ] {
+            let doc = run(&format!("<img src='{bad}'><p>kept</p>"));
+            assert!(
+                !doc.html.to_ascii_lowercase().contains("data:"),
+                "{bad} survived: {}",
+                doc.html
+            );
+            assert!(!doc.html.contains("onerror"), "{}", doc.html);
+            assert!(doc.html.contains("kept"));
+        }
+        // Only <img src>: other places that take a URL still lose a data: image.
+        let doc = run(&format!(
+            "<a href=\"{png}\">a</a><img srcset=\"{png} 1x\"><div background=\"{png}\">e</div>"
+        ));
+        assert!(!doc.html.contains("data:"), "{}", doc.html);
+        // A css url() takes the same inline images, and srcset or a picture source takes references.
+        let doc = run(&format!(
+            "<div style=\"background:url({png})\">d</div><picture><source srcset=\"../a.png 1x, b.webp 2x\"><img src=\"c.png\"></picture><div style=\"background:url(../bg.png)\">e</div>"
+        ));
+        assert!(doc.html.contains(&format!("url({png})")), "{}", doc.html);
+        assert_eq!(doc.assets, ["../a.png", "b.webp", "c.png", "../bg.png"]);
+        assert!(doc.html.contains("<source"), "{}", doc.html);
+        // The size cap.
+        let big = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(MAX_DATA_IMAGE_CHARS + 4)
+        );
+        assert!(!run(&format!("<img src=\"{big}\">")).html.contains("data:"));
+    }
+
+    #[test]
+    fn inline_images_stop_at_a_document_total_and_the_page_still_renders() {
+        // One 3 MiB image copied by a rule into 4 elements: the first two fit under 8 MiB, the rest go.
+        let payload = "A".repeat(3 * 1024 * 1024);
+        let uri = format!("data:image/png;base64,{payload}");
+        struct Owned(String);
+        impl Sheets for Owned {
+            fn load(&self, _href: &str) -> Option<String> {
+                Some(self.0.clone())
+            }
+        }
+        let sheets = Owned(format!(".c {{ background: url({uri}) }}"));
+        let doc = transform(
+            "<link rel=stylesheet href=t.css><p class=c>1</p><p class=c>2</p><p class=c>3</p><p class=c>4</p>",
+            Arc::new(sheets),
+        );
+        let kept = doc.html.matches("data:image/png;base64,").count();
+        assert_eq!(kept, 2, "{}", &doc.html[..200.min(doc.html.len())]);
+        assert!(doc.html.len() < MAX_DATA_IMAGE_TOTAL_CHARS + 4096);
+        for n in 1..=4 {
+            assert!(doc.html.contains(&format!(">{n}</p>")));
+        }
+    }
+
+    #[test]
     fn anchors_keep_only_fragments() {
         let doc =
             run("<a href=\"#top\">up</a><a href=\"page.html\">p</a><a href=\"//e.test/\">x</a>");
@@ -470,21 +662,33 @@ mod tests {
     }
 
     #[test]
-    fn relative_images_become_placeholders_and_the_rest_vanish() {
+    fn image_references_become_placeholders_and_the_rest_vanish() {
         let doc = run(concat!(
             "<img src=\"img/a.png\"><img src=\"./img/a.png?v=2\"><img src=\"b%20c.jpg\">",
             "<img src=\"../x.png\"><img src=\"/abs.png\"><img src=\"%2e%2e/x.png\">",
+            "<img src=\"file:///home/me/p.png#f\"><img src=\"file://host/p.png\">",
             "<img src=\"a\\b.png\"><img src=\"notes.txt\"><img src=\"monoptah-asset:7\">",
+            "<img src=\"~/a.png\"><img src=\"https://e.test/q.png\">",
         ));
-        assert_eq!(doc.assets, ["img/a.png", "b c.jpg"]);
+        assert_eq!(
+            doc.assets,
+            [
+                "img/a.png",
+                "b c.jpg",
+                "../x.png",
+                "/abs.png",
+                "/home/me/p.png"
+            ]
+        );
         assert!(
             doc.html.contains("src=\"monoptah-asset:0\""),
             "{}",
             doc.html
         );
-        assert!(doc.html.contains("src=\"monoptah-asset:1\""));
+        assert!(doc.html.contains("src=\"monoptah-asset:4\""));
         assert!(!doc.html.contains("monoptah-asset:7"));
         assert!(!doc.html.contains("x.png") && !doc.html.contains("abs.png"));
+        assert!(!doc.html.contains("q.png") && !doc.html.contains("p.png"));
         assert!(!doc.html.contains("notes.txt"));
     }
 
@@ -549,7 +753,8 @@ mod tests {
         ] {
             assert!(!doc.html.contains(bad), "{bad} survived: {}", doc.html);
         }
-        assert_eq!(doc.assets, ["b.png"]);
+        // An absolute path is only a key: reading it is refused at request time unless it is inside the root.
+        assert_eq!(doc.assets, ["b.png", "/etc/passwd.png"]);
     }
 
     #[test]
@@ -623,6 +828,46 @@ mod tests {
         );
         assert!(doc.html.contains("<p>hi</p>"));
         assert!(doc.html.starts_with("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn percent_decoding_handles_the_end_of_the_text_and_bad_escapes() {
+        assert_eq!(percent_decode("a%2e"), "a.");
+        assert_eq!(percent_decode("%2E%2e/x.png"), "../x.png");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("a%"), "a%");
+        assert_eq!(percent_decode("a%+1b"), "a%+1b");
+        assert_eq!(percent_decode("100%zz"), "100%zz");
+    }
+
+    #[test]
+    fn reference_rules() {
+        for (given, key) in [
+            ("a.png", "a.png"),
+            ("./a//b.PNG?x#y", "a/b.PNG"),
+            ("../a.png", "../a.png"),
+            ("/abs/a.png", "/abs/a.png"),
+            ("file:///abs/a%20b.png", "/abs/a b.png"),
+            ("FILE://localhost/abs/a.png", "/abs/a.png"),
+        ] {
+            assert_eq!(normalize_reference(given).as_deref(), Some(key), "{given}");
+            assert_eq!(normalize_key(key).as_deref(), Some(key), "{key}");
+        }
+        for bad in [
+            "",
+            "~/a.png",
+            "a\\b.png",
+            "a.txt",
+            "dir/",
+            "file://host/a.png",
+            "http://x/a.png",
+            "data:image/png;base64,AA",
+            "C:/a.png",
+            "a\0.png",
+            "/",
+        ] {
+            assert!(normalize_reference(bad).is_none(), "{bad:?}");
+        }
     }
 
     #[test]
