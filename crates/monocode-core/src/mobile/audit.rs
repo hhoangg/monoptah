@@ -248,12 +248,11 @@ fn written_by_the_app(event: &AuditEvent) -> bool {
 }
 
 /// `chat.mentionedFile` is audited by the app for every outcome, successes
-/// too, with its own fields (conversation, asset, bytes). Any answer the app
-/// worded with a code, and `ok`, is its line; the host's would be a second.
+/// too, with its own fields (conversation, asset, bytes). Every answer the app
+/// gave (`ok`, a coded refusal, an uncoded failure) is its line; the host's
+/// would be a second. Only a failure from the core before the app is the host's.
 fn mentioned_file_answered(event: &AuditEvent) -> bool {
-    event.method == "chat.mentionedFile"
-        && event.from_app
-        && matches!(event.outcome, Outcome::Ok | Outcome::Denied(_))
+    event.method == "chat.mentionedFile" && event.from_app
 }
 
 fn now_ms() -> u64 {
@@ -759,13 +758,15 @@ mod tests {
             Outcome::Denied(Code::Forbidden),
             Outcome::Denied(Code::Busy),
             Outcome::Denied(Code::NotFound),
+            Outcome::Error,
         ] {
             let mut answered = event("chat.mentionedFile", outcome);
             answered.from_app = true;
             log.record(&device(), &answered);
         }
         assert!(lines(dir.path()).is_empty());
-        // A refusal from the core (read-only is not one: it is a read) or a failure still writes.
+        // A refusal or failure from the core before the app (read-only is not one: it is a
+        // read) still writes: the app never saw the call.
         log.record(&device(), &event("chat.mentionedFile", Outcome::Error));
         log.record(
             &device(),

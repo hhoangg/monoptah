@@ -168,6 +168,18 @@ impl Shell {
         if self.open_cloud_path(raw, window, cx) {
             return;
         }
+        self.preview_local_path(raw, window, cx);
+    }
+
+    /// [`Shell::preview_path`] for a link that is known to name a file of this machine: one a
+    /// floating Mono forwarded, already resolved against its own projects. The active cloud
+    /// session has nothing to say about it, so it never goes through `open_cloud_path`.
+    pub(crate) fn preview_local_path(
+        &mut self,
+        raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let (cwd, path, location) = self.link_target(raw, cx);
         // A file on another machine is not on this disk to look at: the editor reads it.
         if monocode_core::files::remote::is_remote(Path::new(&path)) {

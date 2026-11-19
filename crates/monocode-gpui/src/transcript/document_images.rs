@@ -12,7 +12,7 @@ const FRAME_HEIGHT: f32 = 320.;
 /// Where `src` (as written in the document) lives: a relative path beside the document, `~` and
 /// `file://` links as every file link reads them. `None` for anything that is not a local file.
 pub(super) fn image_path(src: &str, folder: &str) -> Option<PathBuf> {
-    let (written, _) = crate::file_editor::split_location(src);
+    let (written, _) = monocode_core::files::links::split_location(src);
     let path = monocode_core::files::document::resolve_path(Path::new(&written), Path::new(folder));
     (!monocode_core::files::remote::is_remote(&path)).then_some(path)
 }

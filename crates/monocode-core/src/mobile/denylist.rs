@@ -38,10 +38,19 @@ pub const DEFAULT_PATTERNS: &[&str] = &[
     ".pypirc",
     ".netrc",
     ".htpasswd",
-    "credentials*.json",
+    // Also `.credentials.json` (a leading dot is not matched by `credentials*`).
+    "*credentials*.json",
     "secrets.*",
     "*.tfstate",
     "*.kdbx",
+    ".git-credentials",
+    ".gitconfig",
+    ".cargo/credentials*",
+    ".vault-token",
+    ".pgpass",
+    ".my.cnf",
+    // Shell histories (`.zsh_history`, `.bash_history`) hold pasted secrets.
+    ".*_history",
 ];
 
 /// Final file names exempt from the `.env.*` pattern (and only from it).
@@ -342,11 +351,23 @@ mod tests {
             "secrets.yml",
             "x.tfstate",
             "vault.kdbx",
+            ".credentials.json",
+            "a/.claude/.credentials.json",
+            "x_credentials_y.json",
+            ".git-credentials",
+            ".gitconfig",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".vault-token",
+            ".pgpass",
+            ".my.cnf",
+            ".zsh_history",
+            ".bash_history",
         ];
         for sample in samples {
             assert!(list().is_denied_rel(sample), "{sample} should be denied");
         }
-        assert_eq!(DEFAULT_PATTERNS.len(), 25);
+        assert_eq!(DEFAULT_PATTERNS.len(), 32);
     }
 
     #[test]

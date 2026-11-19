@@ -44,6 +44,12 @@
 //!                                          the canonical folder. Default: a message that mentions, as an absolute path in
 //!                                          backticks, every top-level regular file of the folder whose name does not start
 //!                                          with `unmentioned`
+//! WEB_LINK_HEADLESS_MENTION_TOOL_TEXT=<text>  optional: the one tool row of the conversation (plain text), the evidence a
+//!                                          file OUTSIDE the device's projects needs besides the assistant message; `{dir}`
+//!                                          is replaced as above. Default: the same text as the assistant message, as if the
+//!                                          agent ran a tool on every file it names. Set it to the empty string for a
+//!                                          conversation without any tool row (a file outside the projects is then
+//!                                          `forbidden`)
 //! ```
 //!
 //! The conversation id is `e2e-session`. The seeded assistant message is the only one that authorizes paths (the
@@ -598,6 +604,8 @@ fn app_loop(
 struct MentionSeed {
     dir: std::path::PathBuf,
     text: Option<String>,
+    /// `Some("")` is no tool row at all; `None` is the default (the assistant's text).
+    tool_text: Option<String>,
 }
 
 fn mention_seed() -> Option<&'static MentionSeed> {
@@ -608,7 +616,14 @@ fn mention_seed() -> Option<&'static MentionSeed> {
         let text = std::env::var("WEB_LINK_HEADLESS_MENTION_TEXT")
             .ok()
             .map(|text| text.replace("{dir}", &dir.to_string_lossy()));
-        Some(MentionSeed { dir, text })
+        let tool_text = std::env::var("WEB_LINK_HEADLESS_MENTION_TOOL_TEXT")
+            .ok()
+            .map(|text| text.replace("{dir}", &dir.to_string_lossy()));
+        Some(MentionSeed {
+            dir,
+            text,
+            tool_text,
+        })
     })
     .as_ref()
 }
@@ -645,7 +660,13 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
     if request.params["conversationId"].as_str() != Some(SESSION_ID) {
         return Err(Failure::from("Unknown conversation"));
     }
-    let texts = vec![mention_text(seed)];
+    let assistant = mention_text(seed);
+    let tool = seed.tool_text.clone().unwrap_or_else(|| assistant.clone());
+    let texts = vec![assistant];
+    let tool_texts: Vec<String> = Some(tool)
+        .filter(|text| !text.is_empty())
+        .into_iter()
+        .collect();
     let id = PROJECT_ID.to_owned();
     let selected = request
         .device
@@ -659,7 +680,8 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
         monocode_core::mobile::denylist::DenyList::default(),
     )];
     let cwd = seed.dir.to_string_lossy().into_owned();
-    let ctx = mention::Context::new(&texts, &cwd, &[], &projects);
+    let mut ctx = mention::Context::new(&texts, &cwd, &[], &projects);
+    ctx.tool_texts = &tool_texts;
     mention::handle(&request.device.id, &request.params, &ctx).result
 }
 

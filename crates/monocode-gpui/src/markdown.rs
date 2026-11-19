@@ -677,9 +677,13 @@ fn rich_inline(
                     .when(file, |d| {
                         let path = style.link.clone().unwrap_or_else(|| text.clone());
                         let menu_path = path.clone();
-                        let selector = format!("file-chip:{text}");
-                        d.debug_selector(move || selector)
-                            .cursor(gpui::CursorStyle::PointingHand)
+                        // Only the tests look a chip up by its text: no string per chip per frame.
+                        #[cfg(test)]
+                        let d = {
+                            let text = text.clone();
+                            d.debug_selector(move || format!("file-chip:{text}"))
+                        };
+                        d.cursor(gpui::CursorStyle::PointingHand)
                             .hover(|s| s.bg(content(0.13)))
                             .on_click(move |event, window, cx| {
                                 if activate_link(event, clicked_selection.as_ref()) {

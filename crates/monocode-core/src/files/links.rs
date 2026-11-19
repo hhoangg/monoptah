@@ -11,12 +11,17 @@ use super::{document, path_key, remote::is_remote};
 pub fn split_location(raw: &str) -> (String, Option<(usize, usize)>) {
     let mut path = raw.strip_prefix("file://").unwrap_or(raw).to_owned();
     let mut location = None;
-    let hash_line = path.rsplit_once("#L").and_then(|(file, line)| {
-        let line = line.split('-').next().unwrap_or("").parse::<usize>().ok()?;
-        Some((file.to_owned(), line))
+    // `#L12`, `#L12C3`, `#L12-L20`, `#L12C3-L20C5`: the start of the range.
+    let hash_line = path.rsplit_once("#L").and_then(|(file, anchor)| {
+        let start = anchor.split('-').next().unwrap_or("");
+        let (line, column) = match start.split_once('C') {
+            Some((line, column)) => (line, Some(column.parse::<usize>().ok()?)),
+            None => (start, None),
+        };
+        Some((file.to_owned(), line.parse::<usize>().ok()?, column))
     });
-    if let Some((file, line)) = hash_line {
-        location = Some((line.max(1), 1));
+    if let Some((file, line, column)) = hash_line {
+        location = Some((line.max(1), column.unwrap_or(1).max(1)));
         path = file;
     } else {
         let colon = path.rsplit_once(':').and_then(|(prefix, number)| {
@@ -168,6 +173,11 @@ mod tests {
         assert_eq!(split_location("a.rs:12:3"), ("a.rs".into(), Some((12, 3))));
         assert_eq!(split_location("a.rs:40"), ("a.rs".into(), Some((40, 1))));
         assert_eq!(split_location("a.rs#L7-L9"), ("a.rs".into(), Some((7, 1))));
+        assert_eq!(split_location("a.rs#L7C4"), ("a.rs".into(), Some((7, 4))));
+        assert_eq!(
+            split_location("a.rs#L7C4-L9C2"),
+            ("a.rs".into(), Some((7, 4)))
+        );
         assert_eq!(split_location("a.rs"), ("a.rs".into(), None));
         assert_eq!(
             split_location("file:///tmp/a%20b.html"),

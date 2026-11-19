@@ -4,7 +4,7 @@
 //! looks like a file (no whitespace, and either its last segment has a dot or it starts with `/`,
 //! `~/` or `./`), a markdown link destination with no scheme (or `file://`), and a bare word that
 //! starts with `/`, `~/` or `./`. Fenced and indented code blocks are not mentions. Trailing
-//! punctuation and a `:12`, `:12:3` or `#L12` suffix are stripped. The result is the path text as
+//! punctuation and a `:12`, `:12:3`, `#L12`, `#L12C3` or `#L12-L20` suffix are stripped. The result is the path text as
 //! written; resolving it against a folder is `files::links`'s job.
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -65,7 +65,17 @@ fn code_span(code: &str) -> Option<String> {
     // `foo.rs:12` has its dot in the file name; the suffix is judged after it is cut.
     let cut = clean(code, false)?;
     let name = cut.rsplit('/').next().unwrap_or(&cut);
-    (path_start(&cut) || name.contains('.')).then_some(cut)
+    (path_start(&cut) || name.contains('.') || is_known_name(name)).then_some(cut)
+}
+
+/// Extension-less names the web chat also turns into a file chip
+/// (`web/app/src/features/markdown/fileLinks.ts`, `KNOWN_NAMES`), in any case.
+const KNOWN_NAMES: [&str; 5] = ["dockerfile", "makefile", "gemfile", "license", "readme"];
+
+pub(super) fn is_known_name(name: &str) -> bool {
+    KNOWN_NAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
 }
 
 /// A markdown link destination that points at a file.
@@ -109,20 +119,38 @@ fn clean(text: &str, punctuation: bool) -> Option<String> {
     .then(|| text.to_owned())
 }
 
+/// [`clean`] with trailing punctuation trimmed, for a token taken out of running text.
+pub(super) fn clean_path(text: &str) -> Option<String> {
+    clean(text, true)
+}
+
 fn trim_trailing(text: &str) -> &str {
     text.trim_end_matches([
         '.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '"', '\'', '*', '|', '`',
     ])
 }
 
-/// `path:12`, `path:12:3` and `path#L12` (also `#L12-L20`) without the suffix.
+/// The text after `#L` of a line anchor: `12`, `12C3`, `12-20`, `12-L20`, `12C3-L20C5`.
+fn is_line_anchor(anchor: &str) -> bool {
+    fn position(part: &str) -> bool {
+        let (line, column) = match part.split_once('C') {
+            Some((line, column)) => (line, Some(column)),
+            None => (part, None),
+        };
+        let digits =
+            |n: &str| !n.is_empty() && n.len() <= 9 && n.bytes().all(|b| b.is_ascii_digit());
+        digits(line) && column.is_none_or(digits)
+    }
+    match anchor.split_once('-') {
+        Some((from, to)) => position(from) && position(to.strip_prefix('L').unwrap_or(to)),
+        None => position(anchor),
+    }
+}
+
+/// `path:12`, `path:12:3` and `path#L12` (also `#L12C3`, `#L12-L20`) without the suffix.
 fn strip_location(text: &str) -> &str {
     if let Some((file, line)) = text.rsplit_once("#L") {
-        if line
-            .split('-')
-            .next()
-            .is_some_and(|n| n.parse::<usize>().is_ok())
-        {
+        if is_line_anchor(line) {
             return file;
         }
     }
@@ -178,9 +206,25 @@ mod tests {
         assert_eq!(found("`src/a.rs:12:3`"), ["src/a.rs"]);
         assert_eq!(found("`src/a.rs#L12`"), ["src/a.rs"]);
         assert_eq!(found("`src/a.rs#L12-L20`"), ["src/a.rs"]);
+        assert_eq!(found("`src/a.rs#L12C3`"), ["src/a.rs"]);
+        assert_eq!(found("`src/a.rs#L12C3-L20C5`"), ["src/a.rs"]);
+        assert_eq!(found("`src/a.rs#L12-20`"), ["src/a.rs"]);
         assert_eq!(found("see ./notes/a.md."), ["./notes/a.md"]);
         assert_eq!(found("(see ~/x/a.md:7)."), ["~/x/a.md"]);
         assert_eq!(found("it is at /tmp/out.html, then"), ["/tmp/out.html"]);
+    }
+
+    #[test]
+    fn known_extensionless_names_are_mentions_like_on_the_web() {
+        assert_eq!(
+            found("see `Makefile` and `docker/Dockerfile`"),
+            ["Makefile", "docker/Dockerfile"]
+        );
+        assert_eq!(
+            found("`LICENSE` `readme` `Gemfile:3`"),
+            ["LICENSE", "readme", "Gemfile"]
+        );
+        assert!(found("the `Makefiles` and `build` words").is_empty());
     }
 
     #[test]

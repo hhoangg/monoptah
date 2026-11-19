@@ -12,13 +12,13 @@ use objc2::{
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSView, NSWindowOrderingMode};
 #[cfg(target_os = "macos")]
+use objc2_foundation::{NSError, NSPoint, NSRect, NSSize, NSString, NSURL};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSObject, NSObjectProtocol};
 #[cfg(target_os = "macos")]
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSURL};
-#[cfg(target_os = "macos")]
 use objc2_web_kit::{
-    WKNavigationAction, WKNavigationActionPolicy, WKNavigationDelegate, WKNavigationType,
-    WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
+    WKContentRuleList, WKContentRuleListStore, WKNavigationAction, WKNavigationActionPolicy,
+    WKNavigationDelegate, WKNavigationType, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
 };
 #[cfg(target_os = "macos")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -260,6 +260,47 @@ fn load_page(web: &WKWebView, markup: &str, file: Option<&FilePage>) {
         }
     }
 }
+/// Content rules that block every remote load (http, https, ws, wss, ftp). A file shown as a
+/// preview runs no script, but its images, stylesheets and fonts would still be fetched from the
+/// network, which tells the page's author that (and when) the file was opened.
+#[cfg(target_os = "macos")]
+const BLOCK_REMOTE_RULES: &str =
+    r#"[{"trigger":{"url-filter":"^(https?|wss?|ftp)://"},"action":{"type":"block"}}]"#;
+
+/// [`load_page`] once the remote-load rules are installed in `web`. Compiling a rule list is
+/// asynchronous, so the page is loaded from its completion; when the rules cannot be had, the
+/// page stays blank rather than load without them.
+#[cfg(target_os = "macos")]
+fn load_page_without_remote(
+    web: &Retained<WKWebView>,
+    mtm: MainThreadMarker,
+    markup: Arc<str>,
+    file: Option<Rc<FilePage>>,
+) {
+    let Some(store) = (unsafe { WKContentRuleListStore::defaultStore(mtm) }) else {
+        return;
+    };
+    let web = web.clone();
+    let done = block2::RcBlock::new(move |list: *mut WKContentRuleList, _: *mut NSError| {
+        // SAFETY: WebKit passes a live list, or null with an error.
+        let Some(list) = (unsafe { list.as_ref() }) else {
+            return;
+        };
+        unsafe {
+            web.configuration()
+                .userContentController()
+                .addContentRuleList(list)
+        };
+        load_page(&web, &markup, file.as_deref());
+    });
+    unsafe {
+        store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+            Some(&NSString::from_str("monoptah-no-remote-loads")),
+            Some(&NSString::from_str(BLOCK_REMOTE_RULES)),
+            Some(&done),
+        );
+    }
+}
 impl gpui::Render for Html {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_os = "macos")]
@@ -354,7 +395,11 @@ impl gpui::Render for Html {
                             });
                             let guard: Retained<NavigationGuard> = msg_send![super(guard), init];
                             web.setNavigationDelegate(Some(ProtocolObject::from_ref(&*guard)));
-                            load_page(&web, &html, file.as_deref());
+                            if file.as_ref().is_some_and(|file| !file.scripts) {
+                                load_page_without_remote(&web, mtm, html.clone(), file.clone());
+                            } else {
+                                load_page(&web, &html, file.as_deref());
+                            }
                             clip.addSubview(&web);
                             Hosted {
                                 clip,
@@ -413,6 +458,16 @@ mod tests {
         assert!(!page.without_scripts().runs_scripts());
         // Generated markup keeps its own sandbox and is not a file page.
         assert!(Html::new("<p>".into()).runs_scripts());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_remote_load_rules_are_json_that_blocks_every_network_scheme() {
+        let rules: serde_json::Value = serde_json::from_str(BLOCK_REMOTE_RULES).unwrap();
+        assert_eq!(rules[0]["action"]["type"], "block");
+        let filter = rules[0]["trigger"]["url-filter"].as_str().unwrap();
+        for scheme in ["http", "https", "ws", "wss", "ftp"] {
+            assert!(filter.contains(scheme), "{scheme} is not blocked: {filter}");
+        }
     }
     #[test]
     fn generated_markup_cannot_escape_the_opaque_iframe() {

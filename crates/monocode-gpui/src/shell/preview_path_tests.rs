@@ -354,3 +354,31 @@ fn a_new_preview_replaces_the_one_before(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_forwarded_link_never_goes_to_the_active_cloud_session(cx: &mut TestAppContext) {
+    use super::cloud::CloudMark;
+    use monocode_core::cloud_sessions::CloudBackendKind;
+    let (window, mut visual) = start(cx);
+    window
+        .update(&mut visual, |shell, w, cx| {
+            let id = shell.workspace.active.unwrap_or(7);
+            shell.workspace.active = Some(id);
+            shell.cloud_marks.insert(
+                id,
+                CloudMark {
+                    local_project: "/work/monocode".into(),
+                    codespace: "octo-abc".into(),
+                    kind: CloudBackendKind::Codespaces,
+                },
+            );
+            // A click in the cloud session's own transcript is read from the cloud workspace.
+            shell.preview_path("/workspaces/widgets/a.md", w, cx);
+            assert!(shell.cloud_view.is_some());
+            shell.dismiss_cloud_view(cx);
+            // A link a floating Mono forwarded names a file of this machine: no cloud read.
+            shell.preview_local_path("/workspaces/widgets/a.md", w, cx);
+            assert!(shell.cloud_view.is_none());
+        })
+        .unwrap();
+}

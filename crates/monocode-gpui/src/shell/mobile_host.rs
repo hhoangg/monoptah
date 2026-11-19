@@ -305,10 +305,42 @@ impl MentionAudit {
 
 /// What the conversation says, before the older pages are added.
 struct Gathered {
-    texts: Vec<String>,
+    source: EvidenceSource,
+    /// Which state of the conversation `source` covers, for the evidence cache.
+    key: (usize, usize),
     cwd: String,
-    /// The store cursor of the turns above the loaded rows.
-    cursor: Option<i64>,
+}
+
+enum EvidenceSource {
+    /// Evidence kept from an earlier call on the same state, and where the scan of the older
+    /// pages stopped.
+    Cached(monocode_core::mobile::mentioned_file::Evidence, Option<i64>),
+    /// The assistant and tool rows to extract it from, and the store cursor of the turns above.
+    Rows(Vec<Row>, Option<i64>),
+}
+
+impl Gathered {
+    /// The evidence of `conversation` at `rows`: the kept one when the conversation did not move
+    /// (same row count and last row length), else a copy of the rows that matter.
+    fn of(conversation: &str, rows: &[Row], cwd: &str, cursor: Option<i64>) -> Self {
+        use monocode_core::mobile::mentioned_file::evidence;
+        let key = (rows.len(), rows.last().map_or(0, |row| row.text.len()));
+        let source = match evidence::cached(conversation, key) {
+            Some((kept, scanned_to)) => EvidenceSource::Cached(kept, scanned_to),
+            None => EvidenceSource::Rows(
+                rows.iter()
+                    .filter(|row| matches!(row.role.as_str(), "assistant" | "tool"))
+                    .cloned()
+                    .collect(),
+                cursor,
+            ),
+        };
+        Self {
+            source,
+            key,
+            cwd: cwd.to_owned(),
+        }
+    }
 }
 
 fn not_selected() -> Failure {
@@ -1142,11 +1174,14 @@ impl Shell {
     }
 
     /// `chat.mentionedFile`: a file the assistant mentioned in this conversation, read for a
-    /// remote device. The rules (mention check first, deny-list, budgets, paging) live in
-    /// `monocode_core::mobile::mentioned_file`; this gathers what they judge against: every
-    /// assistant message of the conversation (the open chat's rows, else the store's, and the
-    /// older pages of a long Mono), the session folder, the Mono's local project roots and the
-    /// projects this device selected. It audits every call, success included.
+    /// remote device. The rules (mention check first, tool evidence outside the device's
+    /// projects, deny-list, budgets, paging) live in `monocode_core::mobile::mentioned_file`;
+    /// this gathers what they judge against: the assistant and tool rows of the conversation
+    /// (the open chat's, else the store's, and the older pages of a long Mono, newest first and
+    /// only as far as the request needs), the session folder, the Mono's local project roots and
+    /// the projects this device selected. The budget is counted before any of that is gathered,
+    /// and the extracted evidence is kept for a short time so a page or an asset request of the
+    /// same file does not scan the history again. It audits every call, success included, once.
     fn mobile_mentioned_file(&mut self, request: Request, cx: &mut Context<Self>) {
         use monocode_core::mobile::mentioned_file as mention;
         let conversation = string(&request.params, "conversationId").unwrap_or_default();
@@ -1160,6 +1195,19 @@ impl Shell {
         };
         let target = match self.mobile_target(&conversation, &request.device, cx) {
             Ok(target) => target,
+            Err(error) => {
+                audited.record(&Err(error.clone()), &audited.path, 0);
+                return request.reply(Err(error));
+            }
+        };
+        // Budget and shape first: a device over budget, or a malformed request, gathers nothing.
+        if let Err(code) = mention::budget::admit(&request.device.id) {
+            let error = code.failure();
+            audited.record(&Err(error.clone()), &audited.path, 0);
+            return request.reply(Err(error));
+        }
+        let parsed = match mention::Params::from_json(&request.params) {
+            Ok(parsed) => parsed,
             Err(error) => {
                 audited.record(&Err(error.clone()), &audited.path, 0);
                 return request.reply(Err(error));
@@ -1193,48 +1241,34 @@ impl Shell {
             .ok()
             .and_then(|store| store.data_dir().map(Path::to_path_buf));
         let store = self.store.clone();
-        // The open chat's rows when its history is in memory, else the saved ones.
+        // The open chat's rows when its history is in memory, else the saved ones. Only what
+        // the rules read is copied here; the extraction runs off the main thread.
+        let key_conversation = conversation.clone();
         let live = self.with_live_snapshot(&target, &device, cx, |snapshot: &Snapshot| {
-            Ok::<_, String>(Gathered {
-                texts: mention::assistant_texts(snapshot.rows),
-                cwd: snapshot.cwd.to_owned(),
-                cursor: snapshot.history,
-            })
+            Ok::<_, String>(Gathered::of(
+                &key_conversation,
+                snapshot.rows,
+                snapshot.cwd,
+                snapshot.history,
+            ))
         });
         let saved = match live {
             Some(_) => None,
             None => Some(self.load_saved(&target, &device, cx)),
         };
         let params = request.params.clone();
+        let key_conversation = conversation.clone();
         cx.spawn(async move |_, cx| {
             let gathered = match (live, saved) {
                 (Some(live), _) => live,
-                (None, Some(load)) => load.await.map(|saved| Gathered {
-                    texts: mention::assistant_texts(&saved.rows),
-                    cwd: saved.cwd.clone(),
-                    cursor: saved.history,
+                (None, Some(load)) => load.await.map(|saved| {
+                    Gathered::of(&key_conversation, &saved.rows, &saved.cwd, saved.history)
                 }),
                 (None, None) => Err("Conversation is no longer available".to_owned()),
             };
             let call = match gathered {
                 Ok(gathered) => {
                     let work = cx.background_executor().spawn(async move {
-                        let mut texts = gathered.texts;
-                        // A long Mono keeps its older turns in the store: scan all of them.
-                        if let (Some(session), Some(mut cursor)) = (session, gathered.cursor) {
-                            for _ in 0..100_000 {
-                                let Ok(store) = locked(&store) else { break };
-                                let Ok(page) = store.load_before(session, cursor, false) else {
-                                    break;
-                                };
-                                drop(store);
-                                texts.extend(mention::assistant_texts(&page.rows));
-                                match page.before {
-                                    Some(before) if before != cursor => cursor = before,
-                                    _ => break,
-                                }
-                            }
-                        }
                         let projects: Vec<mention::Project> = projects
                             .iter()
                             .map(|(id, path, selected)| {
@@ -1246,10 +1280,38 @@ impl Shell {
                                 )
                             })
                             .collect();
-                        let mut ctx =
-                            mention::Context::new(&texts, &gathered.cwd, &roots, &projects);
+                        let Gathered { source, key, cwd } = gathered;
+                        let (mut evidence, mut cursor) = match source {
+                            EvidenceSource::Cached(evidence, cursor) => (evidence, cursor),
+                            EvidenceSource::Rows(rows, cursor) => {
+                                (mention::Evidence::from_rows(&rows), cursor)
+                            }
+                        };
+                        // A long Mono keeps its older turns in the store: read them newest
+                        // first, and only until the file is accounted for.
+                        let no_texts: [String; 0] = [];
+                        for _ in 0..100_000 {
+                            let mut ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+                            ctx.evidence = Some(&evidence);
+                            if mention::sufficient(&ctx, &parsed) {
+                                break;
+                            }
+                            let (Some(session), Some(before)) = (session, cursor) else {
+                                break;
+                            };
+                            let Ok(store) = locked(&store) else { break };
+                            let Ok(page) = store.load_before(session, before, false) else {
+                                break;
+                            };
+                            drop(store);
+                            evidence.absorb_rows(&page.rows);
+                            cursor = page.before.filter(|next| *next != before);
+                        }
+                        mention::evidence::remember(&key_conversation, key, &evidence, cursor);
+                        let mut ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+                        ctx.evidence = Some(&evidence);
                         ctx.private_dirs = private.into_iter().collect();
-                        mention::handle(&device.id, &params, &ctx)
+                        mention::handle_admitted(&device.id, &params, &ctx)
                     });
                     work.await
                 }

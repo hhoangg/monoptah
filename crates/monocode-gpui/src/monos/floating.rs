@@ -339,7 +339,11 @@ impl Floating {
                 };
                 window.activate_window();
                 cx.activate(true);
-                shell.update(cx, |shell, cx| shell.preview_path(&target, window, cx));
+                // Already resolved against the Mono's own projects: not a link of the active
+                // cloud session's transcript, so no cloud lookup.
+                shell.update(cx, |shell, cx| {
+                    shell.preview_local_path(&target, window, cx)
+                });
             });
         });
     }
