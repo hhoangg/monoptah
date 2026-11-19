@@ -1,13 +1,13 @@
 // The tab strip of one pane (design-system.md section 11): a tablist of the pane's sessions and Mono chats, a close
 // button per tab, drag to reorder or to another pane, and the pane's split and close buttons. Tabs scroll sideways
-// when they do not fit (edge fades show it, and an "All tabs" menu jumps to any tab) and the active one scrolls into view.
+// when they do not fit (edge fades show it) and the active one scrolls into view. An "All tabs" menu opens or closes any tab.
 //
 // The tablist holds only tabs (aria-required-children). The per-tab close button is a mouse and touch affordance that
 // is hidden from assistive technology: a tab closes from the keyboard with Delete (aria-keyshortcuts on the tab).
 import { useCallback, useEffect, useRef, useState, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { useCatalog } from "@/data";
 import { cn } from "@/lib/utils";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { Icon } from "@/ui/Icon";
 import { IconTip } from "@/ui/tooltip";
 import { isMac } from "../shortcuts";
@@ -55,6 +55,7 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
   const [dropAt, setDropAt] = useState<number | null>(null);
   // Which sides have tabs scrolled out of sight (the strip overflows), for the edge fades and the "All tabs" menu.
   const [overflow, setOverflow] = useState({ left: false, right: false });
+  const selectedRef = useRef<TabKey | null>(selected);
   const measureOverflow = useCallback(() => {
     const list = listRef.current;
     if (!list) return;
@@ -62,26 +63,42 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
     const right = list.scrollLeft + list.clientWidth < list.scrollWidth - 1;
     setOverflow((previous) => (previous.left === left && previous.right === right ? previous : { left, right }));
   }, []);
+  /** Scrolls the selected tab into view (the strip may have been resized, or moved in the DOM, which resets its scroll). */
+  const revealSelected = useCallback(() => {
+    const key = selectedRef.current;
+    if (!key) return;
+    for (const element of listRef.current?.querySelectorAll<HTMLElement>('[role="tab"]') ?? []) {
+      if (element.dataset.key === key) element.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    }
+  }, []);
   useEffect(() => {
     measureOverflow();
     const list = listRef.current;
-    const observer = typeof ResizeObserver === "function" && list ? new ResizeObserver(measureOverflow) : null;
-    if (list) observer?.observe(list);
+    // The strip itself and every tab: a resize, a split that moved the strip, or a title that changes a tab's width.
+    const observer =
+      typeof ResizeObserver === "function" && list
+        ? new ResizeObserver(() => {
+            revealSelected();
+            measureOverflow();
+          })
+        : null;
+    if (list) {
+      observer?.observe(list);
+      for (const child of list.children) observer?.observe(child);
+    }
     window.addEventListener("resize", measureOverflow);
     return () => {
       observer?.disconnect();
       window.removeEventListener("resize", measureOverflow);
     };
-  }, [measureOverflow, pane.tabs.length]);
+  }, [measureOverflow, revealSelected, pane.tabs.length]);
 
   // Keep the selected tab in view when the strip overflows.
   useEffect(() => {
-    if (!selected) return;
-    for (const element of listRef.current?.querySelectorAll<HTMLElement>('[role="tab"]') ?? []) {
-      if (element.dataset.key === selected) element.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-    }
+    selectedRef.current = selected;
+    revealSelected();
     measureOverflow();
-  }, [selected, pane.tabs.length, measureOverflow]);
+  }, [selected, pane.tabs.length, revealSelected, measureOverflow]);
 
   const tabButtons = () => [...(listRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]') ?? [])];
 
@@ -102,7 +119,8 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
     else if (event.key === "ArrowLeft") target = (index - 1 + buttons.length) % buttons.length;
     else if (event.key === "Home") target = 0;
     else if (event.key === "End") target = buttons.length - 1;
-    else if (event.key === "Delete") {
+    else if (event.key === "Delete" || event.key === "Backspace") {
+      // Backspace too: the Mac Delete key reports it.
       event.preventDefault();
       actions.close(pane.id, key);
       // The tab that takes its place (the right neighbour, else the left one) keeps the keyboard focus.
@@ -194,7 +212,7 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
                 id={`tab-${desktopId}-${pane.id}-${key}`}
                 data-key={key}
                 aria-selected={isSelected}
-                aria-keyshortcuts="Delete"
+                aria-keyshortcuts="Delete Backspace"
                 tabIndex={tabbable ? 0 : -1}
                 draggable
                 onDragStart={(event) => {
@@ -242,7 +260,7 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
       {overflow.right ? <span aria-hidden="true" data-testid="tabs-fade-right" className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-drawer to-transparent" /> : null}
       </div>
       <div className="flex shrink-0 items-center gap-0.5 px-1">
-        {overflow.left || overflow.right ? (
+        {pane.tabs.length > 0 ? (
           <DropdownMenu>
             <IconTip label="All tabs">
               <DropdownMenuTrigger asChild>
@@ -262,6 +280,14 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
                   </DropdownMenuItem>
                 );
               })}
+              {/* Closing by touch and with a screen reader: the per-tab close buttons are hidden from assistive tech. */}
+              <DropdownMenuSeparator />
+              {pane.tabs.map((key) => (
+                <DropdownMenuItem key={`close-${key}`} onSelect={() => actions.close(pane.id, key)}>
+                  <Icon name="close" size={16} className="shrink-0" />
+                  <span className="min-w-0 flex-1 truncate">{`Close ${titleOf(key).title}`}</span>
+                </DropdownMenuItem>
+              ))}
             </DropdownMenuContent>
           </DropdownMenu>
         ) : null}

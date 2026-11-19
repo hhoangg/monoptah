@@ -1,6 +1,6 @@
 // The tab of a session that was deleted or archived goes with it: it leaves every pane of the desktop's workspace, and
-// when the URL still points at the session the page moves on to the project (the pane's next tab, if any, is shown by
-// TabbedChat once the URL is no longer a tab).
+// when the URL still points at the session the page moves on to the project page (the project's New session page, not
+// the pane's next tab: the pane shows that page in place of its active tab until a tab is chosen).
 import { useRouter } from "@tanstack/react-router";
 import { useCallback } from "react";
 import { pruneTabs, sessionTab } from "./paneTree";

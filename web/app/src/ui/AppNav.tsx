@@ -39,6 +39,7 @@ export function AppNav({ className }: { className?: string }) {
   const fold = inDesktop && narrow;
   const shown = fold ? nav.filter((item) => item.to === "/desktops") : nav;
   const folded = fold ? nav.filter((item) => item.to !== "/desktops") : [];
+  const moreCurrent = folded.some((item) => item.to === pathname || (item.alsoActiveFor !== undefined && pathname.startsWith(item.alsoActiveFor)));
   return (
     <TooltipProvider delayDuration={300}>
     <nav aria-label="Main" className={cn("flex items-center gap-1", className)}>
@@ -73,7 +74,8 @@ export function AppNav({ className }: { className?: string }) {
             <button
               type="button"
               aria-label="More"
-              data-current={folded.some((item) => item.to === pathname || (item.alsoActiveFor !== undefined && pathname.startsWith(item.alsoActiveFor))) ? "true" : undefined}
+              data-current={moreCurrent ? "true" : undefined}
+              aria-current={moreCurrent ? "page" : undefined}
               className={navLink}
             >
               <Icon name="more" />

@@ -12,7 +12,7 @@ vi.mock("@/features/backgrounds", () => ({
   ChatBackground: () => null,
   useFirstBackgroundProject: () => null,
 }));
-import { resetChatDrafts } from "@/features/composer/chatDraft";
+import { readChatDraft, resetChatDrafts } from "@/features/composer/chatDraft";
 import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } from "@/data";
 import { resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
@@ -325,7 +325,9 @@ describe("tab strip structure and keyboard", () => {
       expect(close).toHaveAttribute("aria-hidden", "true");
       expect(close).toHaveAttribute("tabindex", "-1");
     }
-    for (const tab of screen.getAllByRole("tab")) expect(tab).toHaveAttribute("aria-keyshortcuts", "Delete");
+    // The session header's action group yields to the title: it can shrink and is capped.
+    expect(screen.getByRole("button", { name: "Session actions" }).parentElement!.className).toContain("max-w-[55%]");
+    for (const tab of screen.getAllByRole("tab")) expect(tab).toHaveAttribute("aria-keyshortcuts", "Delete Backspace");
   });
 
   it("closes the focused tab with Delete and moves the focus to its neighbour", async () => {
@@ -364,7 +366,8 @@ describe("tab strip structure and keyboard", () => {
       expect(await screen.findByTestId("tabs-fade-left")).toBeInTheDocument();
       await user.click(screen.getByRole("button", { name: "All tabs" }));
       const menu = await screen.findByRole("menu");
-      expect(within(menu).getAllByRole("menuitem")).toHaveLength(3);
+      // An item per tab to open it, then one per tab to close it.
+      expect(within(menu).getAllByRole("menuitem")).toHaveLength(6);
       await user.click(within(menu).getAllByRole("menuitem")[0]!);
       await waitFor(() => expect(path(router)).toBe(`/d/${DESKTOP_ID}${S(0)}`));
     } finally {
@@ -373,10 +376,97 @@ describe("tab strip structure and keyboard", () => {
     }
   });
 
-  it("shows no fades and no All tabs button while the tabs fit", async () => {
-    await openThree();
+  it("shows no fades while the tabs fit, but the All tabs menu can still close a tab (no close button for a screen reader)", async () => {
+    const user = userEvent.setup();
+    const { router } = await openThree();
     expect(screen.queryByTestId("tabs-fade-right")).toBeNull();
-    expect(screen.queryByRole("button", { name: "All tabs" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "All tabs" }));
+    const menu = await screen.findByRole("menu");
+    await user.click(within(menu).getAllByRole("menuitem", { name: /^Close / })[0]!);
+    await waitFor(() => expect(tabKeys()).toHaveLength(2));
+    await waitFor(() => expect(path(router)).toMatch(/\/s\//));
+  });
+
+  it("closes the focused tab with Backspace too (the Mac Delete key)", async () => {
+    const user = userEvent.setup();
+    await openThree();
+    screen.getAllByRole("tab")[2]!.focus();
+    await user.keyboard("{Backspace}");
+    await waitFor(() => expect(tabKeys()).toHaveLength(2));
+  });
+
+  it("scrolls the selected tab back into view when the strip is resized or moved (the observer fires)", async () => {
+    // Only the observers of the tab strip (the virtualized transcript has its own).
+    const callbacks: Array<() => void> = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        callback: () => void;
+        constructor(callback: () => void) {
+          this.callback = callback;
+        }
+        observe(element: Element) {
+          if (element.getAttribute("role") === "tablist") callbacks.push(this.callback);
+        }
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    try {
+      await openThree();
+      const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+      scroll.mockClear();
+      act(() => {
+        for (const callback of callbacks) callback();
+      });
+      expect(scroll).toHaveBeenCalled();
+      expect((scroll.mock.contexts as Element[]).some((node) => node.getAttribute("data-key") === sessionTab("sess-seed-2"))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps the scroll offsets and the focus of a pane when a split moves it in the DOM", async () => {
+    const user = userEvent.setup();
+    await openThree();
+    const box = (await screen.findByRole("textbox", { name: "Message" })) as HTMLTextAreaElement;
+    const body = screen.getByTestId("pane-body");
+    body.scrollTop = 120;
+    await user.click(box);
+    // A real browser resets scroll offsets of a node that is re-inserted: model that.
+    const append = Node.prototype.appendChild;
+    vi.spyOn(Node.prototype, "appendChild").mockImplementation(function (this: Node, node: Node) {
+      const result = append.call(this, node);
+      if (node instanceof HTMLElement && node.style.display === "contents") for (const element of node.querySelectorAll("*")) element.scrollTop = 0;
+      return result;
+    } as typeof append);
+    key("KeyD");
+    await waitFor(() => expect(screen.getAllByRole("tablist")).toHaveLength(2));
+    expect(within(screen.getByTestId("pane-p1")).getByTestId("pane-body").scrollTop).toBe(120);
+    expect(box).toHaveFocus();
+  });
+
+  it("keeps this page's focused pane and active tab when another browser tab changes them (no write back)", async () => {
+    await openThree();
+    key("KeyD");
+    await waitFor(() => expect(screen.getAllByRole("tablist")).toHaveLength(2));
+    const here = getWorkspace(DESKTOP_ID);
+    // Another browser tab activated sess-seed-0 in p1 and focused it, and opened a tab of its own.
+    const other = JSON.parse(localStorage.getItem(tabsKey(DESKTOP_ID))!);
+    other.ws.panes.p1.active = sessionTab("sess-seed-0");
+    other.ws.focused = "p1";
+    other.ws.panes.p2.tabs = [sessionTab("sess-seed-9")];
+    other.ws.panes.p2.active = sessionTab("sess-seed-9");
+    const raw = JSON.stringify(other);
+    localStorage.setItem(tabsKey(DESKTOP_ID), raw);
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: tabsKey(DESKTOP_ID) }));
+    });
+    await waitFor(() => expect(tabKeys(screen.getByTestId("pane-p2"))).toEqual([sessionTab("sess-seed-9")]));
+    // Their tab sets are adopted; the focus and the active tab stay what this page had.
+    expect(getWorkspace(DESKTOP_ID).focused).toBe(here.focused);
+    expect(getWorkspace(DESKTOP_ID).panes.p1?.active).toBe(here.panes.p1?.active);
+    expect(localStorage.getItem(tabsKey(DESKTOP_ID))).toBe(raw);
   });
 
   it("does not leave a page that is not a tab when a tab closes or moves", async () => {
@@ -434,6 +524,16 @@ describe("tab strip structure and keyboard", () => {
     expect(await screen.findByRole("textbox", { name: "Message" })).toHaveValue("half a thought");
   });
 
+  it("drops the draft of a sent message, so a remount cannot bring it back to be sent twice", async () => {
+    const user = userEvent.setup();
+    await openThree();
+    const box = await screen.findByRole("textbox", { name: "Message" });
+    await user.type(box, "send me once");
+    expect(readChatDraft(DESKTOP_ID, "sess-seed-2")).toBe("send me once");
+    await user.keyboard("{Control>}{Enter}{/Control}");
+    await waitFor(() => expect(readChatDraft(DESKTOP_ID, "sess-seed-2")).toBe(""));
+  });
+
   it("mounts the drop zones over the pane, outside the scrolling body, and a drop on the tab's own pane moves nothing", async () => {
     await openThree();
     const dataTransfer = { setData: vi.fn(), effectAllowed: "", dropEffect: "" };
@@ -450,12 +550,25 @@ describe("tab strip structure and keyboard", () => {
 });
 
 describe("tab shortcuts and AltGr", () => {
-  it("does not treat AltGr (Ctrl+Alt with the AltGraph modifier) as a shortcut", async () => {
+  it("still closes a tab with Ctrl+Alt+W outside inputs, whatever the browser reports for AltGraph", async () => {
     await openThree();
+    fireEvent.keyDown(window, { code: "KeyW", key: "w", ctrlKey: true, altKey: true });
+    await waitFor(() => expect(tabKeys()).toHaveLength(2));
+    // Firefox reports AltGraph for every Ctrl+Alt on Windows: still a shortcut when the key typed nothing new.
     fireEvent.keyDown(window, { code: "KeyW", key: "w", ctrlKey: true, altKey: true, modifierAltGraph: true });
-    key("BracketRight", { altKey: true, modifierAltGraph: true });
+    await waitFor(() => expect(tabKeys()).toHaveLength(1));
+  });
+
+  it("does not swallow AltGr characters: Ctrl+Alt+Digit2 typing \"@\" and Ctrl+Alt+Digit8 typing \"[\"", async () => {
+    await openThree();
+    const event = fireEvent.keyDown(window, { code: "Digit2", key: "@", ctrlKey: true, altKey: true, modifierAltGraph: true });
+    expect(event).toBe(true);
+    expect(fireEvent.keyDown(window, { code: "Digit8", key: "[", ctrlKey: true, altKey: true })).toBe(true);
+    expect(fireEvent.keyDown(window, { code: "BracketRight", key: "~", ctrlKey: true, altKey: true })).toBe(true);
     expect(tabKeys()).toHaveLength(3);
     expect(selectedKey()).toEqual([sessionTab("sess-seed-2")]);
+    // The same chord with the plain character is the shortcut (and is cancelled).
+    expect(fireEvent.keyDown(window, { code: "Digit2", key: "2", ctrlKey: true, altKey: true })).toBe(false);
   });
 
   it("leaves the Mod+Alt chords to a focused text field off the Mac, but still takes Mod+D", async () => {

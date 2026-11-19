@@ -5,9 +5,11 @@
 // Git, a Mono profile) shows its page, the route `children`, in the focused pane in place of that pane's active tab.
 // Only the active tab of each pane is mounted, so a long list of tabs holds no live transcripts.
 //
-// A pane keeps its state (the composer draft, scroll, open menus) when the layout around it changes: a split, a closed
+// A pane keeps its React state (the composer draft, open menus) when the layout around it changes: a split, a closed
 // neighbour or a narrow window that hides the others. Each pane view renders through a portal into a host element of
 // its own that lives as long as the pane is on screen, and the layout tree only decides which slot the host sits in.
+// Moving a host in the DOM resets the browser's scroll offsets and focus, so PaneHosts.moveInto restores both. A pane
+// that is hidden while the window is too narrow is unmounted and comes back with its tabs but fresh DOM state.
 import { useRouterState } from "@tanstack/react-router";
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -112,16 +114,18 @@ function EmptyPane() {
 }
 
 /** The place of one pane in the layout: it adopts the pane's host element, which carries the pane view. */
-function PaneSlot({ host }: { host: HTMLElement }) {
+function PaneSlot({ host, hosts }: { host: HTMLElement; hosts: PaneHosts }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
-    if (ref.current && host.parentNode !== ref.current) ref.current.appendChild(host);
+    if (ref.current) hosts.moveInto(host, ref.current);
   });
+  // A slot that goes away takes its DOM out first: note the scroll offsets and the focus before that happens.
+  useLayoutEffect(() => () => hosts.snapshot(host), [hosts, host]);
   return <div ref={ref} className="flex min-h-0 min-w-0 flex-1" />;
 }
 
 function Tree({ node, path, context, hosts }: { node: PaneNode; path: number[]; context: TreeContext; hosts: PaneHosts }) {
-  if (node.type === "leaf") return <PaneSlot host={hosts.of(node.id)} />;
+  if (node.type === "leaf") return <PaneSlot host={hosts.of(node.id)} hosts={hosts} />;
   const row = node.dir === "row";
   return (
     <div data-testid="pane-split" data-dir={node.dir} className={`flex min-h-0 min-w-0 flex-1 ${row ? "flex-row" : "flex-col"}`}>
