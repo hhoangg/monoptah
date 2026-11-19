@@ -215,7 +215,9 @@ describe("route stubs", () => {
       expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
       // The sign-in family shows no app navigation. /install is public and rendered here for a signed-out
       // visitor, so it shows the brand only as well (A-9); the signed-in /install case is in settings.test.tsx.
-      if (["/login", "/register", "/recover", "/install"].includes(new URL(url, "http://x").pathname)) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+      // The /d routes have no header: their nav sits in the desktop-switcher slot (not registered here, see Shell.test.tsx).
+      const path = new URL(url, "http://x").pathname;
+      if (["/login", "/register", "/recover", "/install"].includes(path) || path.startsWith("/d/")) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
       else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
       return;
     }
@@ -225,8 +227,9 @@ describe("route stubs", () => {
     for (const [key, value] of Object.entries(params)) {
       expect(stub.querySelector(`[data-param="${key}"]`)).toHaveTextContent(value);
     }
-    // The shared shell wraps every stub.
-    expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+    // The shared shell wraps every stub: outside /d the header carries the nav, inside it the switcher row does.
+    if (new URL(url, "http://x").pathname.startsWith("/d/")) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+    else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
   });
 
   it("keeps the brand a link home everywhere, and /install offers a way back into the app", async () => {

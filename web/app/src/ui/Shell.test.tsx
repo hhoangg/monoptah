@@ -4,7 +4,9 @@ import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { getLinkStore } from "@/link/store";
+import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { mountApp } from "@/features/desktops/testMount";
+import { clearSlots, registerSlot } from "./slots";
 
 // design-system.md section 9: a skip link as the first focusable element, and one `main` landmark.
 describe("app shell landmarks", () => {
@@ -53,6 +55,28 @@ describe("app shell frame and navigation", () => {
     mountApp("/admin");
     const nav = await screen.findByRole("navigation", { name: "Main" });
     expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("data-current", "true");
+  });
+
+  it("has no header row on /d routes: the nav icons share the desktop switcher row, right aligned", async () => {
+    clearSlots();
+    registerSlot("desktop-switcher", DesktopSwitcher);
+    try {
+      mountApp("/d/dk-frame/settings");
+      const switcher = await screen.findByRole("button", { name: /Switch desktop/ });
+      const nav = screen.getByRole("navigation", { name: "Main" });
+      expect(screen.queryByRole("banner")).toBeNull();
+      expect(screen.queryByRole("link", { name: "Monoptah" })).toBeNull();
+      // One row: the switcher and the nav share the same parent, nav last.
+      const row = nav.parentElement as HTMLElement;
+      expect(row).toContainElement(switcher);
+      expect(row.lastElementChild).toBe(nav);
+      expect(within(nav).getByRole("link", { name: "Desktops" })).toHaveAttribute("href", "/desktops");
+      expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("href", "/settings");
+      // The switcher row is inside the single main landmark.
+      expect(screen.getByRole("main")).toContainElement(nav);
+    } finally {
+      clearSlots();
+    }
   });
 
   it("is a fixed-height column on /d routes and a normal page elsewhere", async () => {
