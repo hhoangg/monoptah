@@ -58,11 +58,21 @@ afterEach(() => {
 });
 
 describe("desktop switcher", () => {
-  it("is not rendered while any blocking layer shows, including the requesting one", async () => {
+  it("puts the app nav icons right aligned on the switcher row", async () => {
+    mountSlot(<DesktopSwitcher />);
+    const trigger = await screen.findByRole("button", { name: /Switch desktop/ });
+    const nav = screen.getByRole("navigation", { name: "Main" });
+    expect(nav.parentElement).toContainElement(trigger);
+    expect(nav.parentElement?.lastElementChild).toBe(nav);
+    expect(within(nav).getAllByRole("link").map((link) => link.getAttribute("aria-label"))).toEqual(["Desktops", "Account", "Install"]);
+  });
+
+  it("is not rendered while any blocking layer shows, including the requesting one (the nav icons stay)", async () => {
     mountSlot(<DesktopSwitcher />);
     await screen.findByRole("button", { name: /Switch desktop/ });
     act(() => setBlockingLayerShown("d1", true));
     expect(screen.queryByRole("button", { name: /Switch desktop/ })).toBeNull();
+    expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
     act(() => setBlockingLayerShown("d1", false));
     expect(await screen.findByRole("button", { name: /Switch desktop/ })).toBeInTheDocument();
   });
@@ -119,6 +129,7 @@ describe("desktop switcher", () => {
     await screen.findByRole("button", { name: /Switch desktop/ });
     act(() => getLinkStore("d1").setState({ status: "closed", blocked: "key_changed" }));
     await waitFor(() => expect(screen.queryByRole("button", { name: /Switch desktop/ })).toBeNull());
+    expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
     act(() => getLinkStore("d1").setState({ status: "pending", blocked: null }));
     expect(screen.queryByRole("button", { name: /Switch desktop/ })).toBeNull();
     act(() => getLinkStore("d1").setState({ status: "ready" }));

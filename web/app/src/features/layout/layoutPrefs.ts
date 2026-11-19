@@ -1,14 +1,22 @@
 // Persisted layout preferences of the app shell (design-system.md section 11), kept in localStorage:
 //   monoptah.layout.sidebarCollapsed  "1" | "0"   tablet sidebar collapsed to a rail
 //   monoptah.layout.sidebarWidth      px, clamped to 320-360 (desktop, resizable)
+//   monoptah.layout.sessionListWidth px, clamped to 240-560 (desktop, resizable: the project's session list, as in the native classic layout)
 //   monoptah.layout.panelWidth        px, clamped to 380-480 (docked right panel, resizable)
 import { create } from "zustand";
 
 export const SIDEBAR_COLLAPSED_KEY = "monoptah.layout.sidebarCollapsed";
 export const SIDEBAR_WIDTH_KEY = "monoptah.layout.sidebarWidth";
+export const SESSION_LIST_WIDTH_KEY = "monoptah.layout.sessionListWidth";
 export const PANEL_WIDTH_KEY = "monoptah.layout.panelWidth";
 
 export const SIDEBAR_WIDTH = { min: 320, max: 360, default: 320 } as const;
+/**
+ * The session-list column beside the sidebar from 1024px, resizable like the native classic sidebar (native: 260
+ * default, 200-560). The web session card carries more (branch, model, status, menu) than the native compact card, so
+ * the default is wider and the minimum higher.
+ */
+export const SESSION_LIST_WIDTH = { min: 240, max: 560, default: 320 } as const;
 export const PANEL_WIDTH = { min: 380, max: 480, default: 420 } as const;
 /** The main pane never gets narrower than this while a panel is docked. */
 export const MIN_MAIN_WIDTH = 320;
@@ -47,6 +55,15 @@ function readWidth(key: string, range: Range): number {
 }
 
 /**
+ * The widest the session list may be at `viewport` px when `taken` px go to the sidebar and a docked panel: the chat
+ * keeps `MIN_MAIN_WIDTH` (the native sidebar is capped at half the window, this is the same idea for a narrower web
+ * window). The list is the pane that gives way: it shrinks to `SESSION_LIST_WIDTH.min` before the panel narrows.
+ */
+export function sessionListMax(viewport: number, taken: number): number {
+  return Math.max(SESSION_LIST_WIDTH.min, Math.min(SESSION_LIST_WIDTH.max, viewport - taken - MIN_MAIN_WIDTH));
+}
+
+/**
  * The widest a docked panel may be at `viewport` px with a `sidebar` px sidebar, keeping `MIN_MAIN_WIDTH`
  * for the main pane; null when even the narrowest panel (380) does not fit, so the shell uses the overlay.
  */
@@ -58,19 +75,23 @@ export function dockedPanelMax(viewport: number, sidebar: number): number | null
 interface LayoutPrefsState {
   sidebarCollapsed: boolean;
   sidebarWidth: number;
+  sessionListWidth: number;
   panelWidth: number;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setSidebarWidth: (width: number) => void;
+  setSessionListWidth: (width: number) => void;
   setPanelWidth: (width: number) => void;
   /** Widths change in memory while dragging; these write the current value to localStorage. */
   persistSidebarWidth: () => void;
+  persistSessionListWidth: () => void;
   persistPanelWidth: () => void;
 }
 
-function load(): Pick<LayoutPrefsState, "sidebarCollapsed" | "sidebarWidth" | "panelWidth"> {
+function load(): Pick<LayoutPrefsState, "sidebarCollapsed" | "sidebarWidth" | "sessionListWidth" | "panelWidth"> {
   return {
     sidebarCollapsed: read(SIDEBAR_COLLAPSED_KEY) === "1",
     sidebarWidth: readWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_WIDTH),
+    sessionListWidth: readWidth(SESSION_LIST_WIDTH_KEY, SESSION_LIST_WIDTH),
     panelWidth: readWidth(PANEL_WIDTH_KEY, PANEL_WIDTH),
   };
 }
@@ -82,8 +103,10 @@ export const useLayoutPrefs = create<LayoutPrefsState>((set, get) => ({
     set({ sidebarCollapsed: collapsed });
   },
   setSidebarWidth: (width) => set({ sidebarWidth: clampWidth(SIDEBAR_WIDTH, width) }),
+  setSessionListWidth: (width) => set({ sessionListWidth: clampWidth(SESSION_LIST_WIDTH, width) }),
   setPanelWidth: (width) => set({ panelWidth: clampWidth(PANEL_WIDTH, width) }),
   persistSidebarWidth: () => write(SIDEBAR_WIDTH_KEY, String(get().sidebarWidth)),
+  persistSessionListWidth: () => write(SESSION_LIST_WIDTH_KEY, String(get().sessionListWidth)),
   persistPanelWidth: () => write(PANEL_WIDTH_KEY, String(get().panelWidth)),
 }));
 

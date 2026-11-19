@@ -288,6 +288,8 @@ describe("now working pill (F-28)", () => {
     const user = userEvent.setup();
     mount("/p/proj-alpha");
     const pill = await screen.findByTestId("now-working");
+    // A container: in the 320px session list the pill drops its artwork and shortens "1 of 3" (container query).
+    expect(pill).toHaveClass("@container");
     // sess-seed-0 works; sess-seed-1 works and has a question; sess-local-approval works and waits.
     expect(within(pill).getByRole("button", { name: /working sessions/ })).toBeInTheDocument();
     const before = [...link.desktop.world.sessions.values()].filter((s) => s.busy && s.projectId === "proj-alpha").length;
@@ -363,7 +365,7 @@ describe("project screen wide layout (F-18, design-system.md section 11)", () =>
     stubQueries(["(min-width: 640px)"]);
     mount("/p/proj-alpha");
     await screen.findByRole("heading", { level: 1, name: "Example Alpha" });
-    expect(screen.queryByTestId("project-split")).toBeNull();
+    expect(screen.queryByTestId("chat-new-session")).toBeNull();
     expect(screen.queryByTestId("new-session-screen")).toBeNull();
     expect(screen.getByRole("link", { name: "New session" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/p/proj-alpha/new`);
   });
@@ -375,34 +377,29 @@ describe("project screen wide layout (F-18, design-system.md section 11)", () =>
     // Let the catalog arrive before the test ends, so the link is not torn down mid-handshake.
     await screen.findByText("Example Alpha");
     expect(screen.getByRole("heading", { level: 1, name: "New session" })).toBeInTheDocument();
-    expect(screen.queryByTestId("project-split")).toBeNull();
+    expect(screen.queryByTestId("chat-new-session")).toBeNull();
   });
 
-  it("from 1024 px the sessions list and the New session page are both visible on the project URL", async () => {
+  it("from 1024 px the project URL shows the New session page filling the chat; the list is the app shell's sidebar", async () => {
     stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
     mount("/p/proj-alpha");
-    expect(await screen.findByRole("heading", { level: 1, name: "Example Alpha" })).toBeInTheDocument();
-    const split = await screen.findByTestId("project-split");
-    expect(await within(split).findByTestId("sessions-list")).toBeInTheDocument();
-    const detail = within(split).getByTestId("project-split-detail");
-    expect(within(detail).getByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
-    expect(within(detail).getByRole("heading", { level: 2, name: "What should we work on?" })).toBeInTheDocument();
-    // One h1 only, and no button that points at the page already open.
-    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    expect(screen.queryByRole("link", { name: "New session" })).toBeNull();
-    // The split is a fill frame: the list column scrolls on its own and the pane fills the row.
-    expect(split).toHaveClass("min-h-0", "flex-1");
-    expect(split.firstElementChild).toHaveClass("overflow-y-auto");
-    expect(detail).toHaveClass("h-full");
-    expect(screen.getByTestId("workspace-frame")).toHaveClass("h-full");
+    const chat = await screen.findByTestId("chat-new-session");
+    const embedded = await within(chat).findByTestId("new-session-screen");
+    expect(embedded).toHaveAttribute("data-embedded", "true");
+    expect(within(chat).getByRole("heading", { level: 2, name: "What should we work on?" })).toBeInTheDocument();
+    // The sessions page of the narrow layout is gone (the SessionListPane of the shell carries the list, see layout.test.tsx).
+    expect(screen.queryByTestId("sessions-list")).toBeNull();
+    // Edge to edge: the page fills the chat with no card of its own.
+    expect(chat).toHaveClass("min-h-0", "flex-1");
+    expect(embedded.className).not.toMatch(/rounded|border|max-w-/);
+    await screen.findByText("Example Alpha");
   });
 
-  it("from 1024 px the /new URL shows the same split, so a bookmark or a link still lands on both panes", async () => {
+  it("from 1024 px the /new URL shows the same chat, so a bookmark or a link still lands on it", async () => {
     stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
     mount("/p/proj-alpha/new");
-    const split = await screen.findByTestId("project-split");
-    expect(await within(split).findByTestId("sessions-list")).toBeInTheDocument();
-    expect(within(split).getByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
+    const chat = await screen.findByTestId("chat-new-session");
+    expect(await within(chat).findByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
   });
 });
 
@@ -438,13 +435,13 @@ describe("New session survives crossing 1024 px (F-18)", () => {
     await user.type(field, "keep this draft");
 
     setWide(true);
-    const split = await screen.findByTestId("project-split");
+    const split = await screen.findByTestId("chat-new-session");
     expect(within(split).getByTestId("new-session-screen")).toHaveAttribute("data-embedded", "true");
     expect(within(split).getByRole("textbox", { name: "Message" })).toBe(field);
     expect(field).toHaveValue("keep this draft");
 
     setWide(false);
-    await waitFor(() => expect(screen.queryByTestId("project-split")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("chat-new-session")).toBeNull());
     expect(screen.getByRole("textbox", { name: "Message" })).toBe(field);
     expect(field).toHaveValue("keep this draft");
     expect(screen.getByTestId("new-session-screen")).not.toHaveAttribute("data-embedded");
@@ -453,7 +450,7 @@ describe("New session survives crossing 1024 px (F-18)", () => {
   it("does not move focus into the side pane when the project list opens wide (embedded: no autofocus)", async () => {
     stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
     mount("/p/proj-alpha");
-    const split = await screen.findByTestId("project-split");
+    const split = await screen.findByTestId("chat-new-session");
     await within(split).findByTestId("new-session-screen");
     expect(within(split).getByRole("textbox", { name: "Message" })).not.toHaveFocus();
   });
@@ -485,17 +482,17 @@ describe("New session draft on the sessions URL across 1024 px (F-18)", () => {
     const setWide = flippable(true);
     const user = userEvent.setup();
     mount("/p/proj-alpha");
-    const split = await screen.findByTestId("project-split");
+    const split = await screen.findByTestId("chat-new-session");
     await within(split).findByText("Example Alpha");
     const field = within(split).getByRole("textbox", { name: "Message" });
     await user.type(field, "side pane draft");
 
     setWide(false);
-    await waitFor(() => expect(screen.queryByTestId("project-split")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("chat-new-session")).toBeNull());
     expect(screen.queryByTestId("new-session-screen")).toBeNull();
 
     setWide(true);
-    const again = await screen.findByTestId("project-split");
+    const again = await screen.findByTestId("chat-new-session");
     const back = within(again).getByRole("textbox", { name: "Message" });
     expect(back).not.toBe(field); // the page was unmounted while narrow; the store gave the draft back
     expect(back).toHaveValue("side pane draft");
@@ -510,10 +507,10 @@ describe("New session draft on the sessions URL across 1024 px (F-18)", () => {
     await user.click(field);
     expect(document.activeElement).toBe(field);
     setWide(true);
-    await screen.findByTestId("project-split");
+    await screen.findByTestId("chat-new-session");
     expect(document.activeElement).toBe(field);
     setWide(false);
-    await waitFor(() => expect(screen.queryByTestId("project-split")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("chat-new-session")).toBeNull());
     expect(document.activeElement).toBe(field);
   });
 });
@@ -546,7 +543,7 @@ describe("narrow sessions page does not load the New session page (F-18)", () =>
     stubQueries(["(min-width: 640px)", "(min-width: 64rem)"]);
     mount("/p/proj-alpha");
     const methods = spyRequests();
-    await screen.findByTestId("project-split");
+    await screen.findByTestId("chat-new-session");
     await waitFor(() => expect(methods).toContain("models.list"));
   });
 });

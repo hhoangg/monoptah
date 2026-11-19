@@ -1,7 +1,7 @@
 // The composer of an open session (W-08) and the cards that sit above it: the pending question (W-10, F-58) and
 // the usage limit card (U-07). `SessionScreen` mounts `SessionQuestionCard` and `SessionUsageCard` in the `above`
 // part of the composer region and `SessionComposer` as its children.
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import type { QuestionPrompt, QuestionReply, SessionCard, UsageLimit } from "@monoptah/protocol";
 import type { SendOptions, SendResult } from "@/data";
@@ -13,6 +13,7 @@ import { UsageLimitCard } from "@/features/models/UsageLimitCard";
 import { useUsageLimitActions } from "@/features/models/hooks";
 import { assertFitsRequest, toWire } from "./attachments";
 import { Composer } from "./Composer";
+import { readChatDraft, writeChatDraft } from "./chatDraft";
 import { useRequestControl } from "./useRequestControl";
 import { QuestionForm } from "./QuestionForm";
 import { sendErrorMessage } from "./sendErrors";
@@ -47,6 +48,9 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
   const cancel = useLinkMutation("session.cancel");
   const defaults = useDefaultModels(desktopId).defaults;
   const [configError, setConfigError] = useState<string | null>(null);
+  // The typed text survives a remount (a tab switch, a split): it is read once, when the composer mounts.
+  const [initialText] = useState(() => readChatDraft(desktopId, sessionId));
+  const rememberText = useCallback((text: string) => writeChatDraft(desktopId, sessionId, text), [desktopId, sessionId]);
   const defaultModelId = defaults.harness ? defaults.models[defaults.harness]?.model : undefined;
 
   const submit = async (text: string, attachments: Parameters<typeof toWire>[0]) => {
@@ -59,6 +63,9 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
       send(text, wire.length > 0 ? wire : undefined, options),
     );
     if (!result.sent && result.error === "wake_required") throw new Error(sendErrorMessage(result.error));
+    // The composer may have unmounted while the send was in flight (a tab switch): its own clearing never ran, so the
+    // draft would come back and be sent twice. Drop it when it still is the sent text.
+    if (readChatDraft(desktopId, sessionId).trim() === text.trim()) writeChatDraft(desktopId, sessionId, "");
   };
 
   const toolbar = (
@@ -78,6 +85,8 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
   return (
     <>
       <Composer
+        initialText={initialText}
+        onTextChange={rememberText}
         onSubmit={submit}
         busy={busy}
         onStop={async () => {

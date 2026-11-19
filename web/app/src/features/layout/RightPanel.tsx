@@ -21,7 +21,7 @@ export type PanelMode = "sheet" | "overlay" | "docked";
 const FULL = "h-full min-h-0";
 
 /** The panel to show for the screen's project, with its registration; undefined when there is none. */
-function useVisiblePanel(desktopId: string, projectId: string | null): { open: OpenPanel; definition: PanelDefinition } | undefined {
+export function useVisiblePanel(desktopId: string, projectId: string | null): { open: OpenPanel; definition: PanelDefinition } | undefined {
   const open = usePanels((state) => state.open);
   const scopeTarget = usePanels((state) => state.scopeTarget);
   const capabilities = useLinkState((state) => state.capabilities);

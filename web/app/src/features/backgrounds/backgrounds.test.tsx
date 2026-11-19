@@ -5,7 +5,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { BackgroundControls } from "./BackgroundControls";
 import { BackgroundsSection } from "./BackgroundsSection";
-import { BACKGROUND_CONTAINER_CLASS, EmptySessionBackground } from "./EmptySessionBackground";
+import { BACKGROUND_CONTAINER_CLASS, ChatBackground } from "./ChatBackground";
 import { getBackground, listBackgrounds, putBackground, removeBackground, setBackgroundOpacity } from "./store";
 
 const renderBackground = vi.hoisted(() => vi.fn());
@@ -49,21 +49,23 @@ describe("store", () => {
   });
 });
 
-describe("EmptySessionBackground", () => {
+describe("ChatBackground", () => {
   it("renders nothing without a stored photo, then the photo at its opacity", async () => {
-    render(<EmptySessionBackground projectId="p1" />);
-    expect(screen.queryByTestId("empty-session-background")).toBeNull();
+    render(<ChatBackground projectId="p1" />);
+    expect(screen.queryByTestId("chat-background")).toBeNull();
     await act(() => putBackground({ projectId: "p1", projectName: "P", image: png(), opacity: 0.3, updatedAt: 1 }));
-    const img = await screen.findByTestId("empty-session-background");
+    const img = await screen.findByTestId("chat-background");
     expect(img).toHaveAttribute("src", "blob:test");
     expect(img).toHaveAttribute("aria-hidden", "true");
     expect(img).toHaveStyle({ opacity: "0.3" });
+    // A scrim of the page background colour strong enough for muted text, with the photo still showing through.
+    expect(screen.getByTestId("chat-background-scrim").className).toContain("bg-background/75");
   });
 
   it("revokes its object URL when it unmounts", async () => {
     await putBackground({ projectId: "p1", projectName: "P", image: png(), opacity: 0.3, updatedAt: 1 });
-    const view = render(<EmptySessionBackground projectId="p1" />);
-    await screen.findByTestId("empty-session-background");
+    const view = render(<ChatBackground projectId="p1" />);
+    await screen.findByTestId("chat-background");
     expect(URL.revokeObjectURL).not.toHaveBeenCalled();
     view.unmount();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:test");

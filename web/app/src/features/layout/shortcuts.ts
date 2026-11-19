@@ -59,7 +59,7 @@ export function isMod(event: Pick<KeyboardEvent, "metaKey" | "ctrlKey">): boolea
 const OVERLAY_SELECTOR = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
 
 /** True while a dialog, sheet or menu is mounted anywhere, except the command palette's own (and its list). */
-function otherOverlayOpen(): boolean {
+export function otherOverlayOpen(): boolean {
   const palette = isCommandPaletteOpen();
   for (const element of document.querySelectorAll(OVERLAY_SELECTOR)) {
     if (palette && (element.querySelector("[data-command-palette]") || element.closest("[data-command-palette]"))) continue;

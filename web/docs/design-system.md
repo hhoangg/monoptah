@@ -562,6 +562,7 @@ New web-only icons (all "to confirm" in the installed package, pick the nearest 
 | external link | LinkSquare01Icon |
 | cloud (Cloud page and its empty state) | CloudIcon |
 | account / person (header Account entry) | UserCircleIcon (`account`) |
+| split pane right / down (tab strip) | LayoutTwoColumnIcon (`splitRight`), LayoutTwoRowIcon (`splitDown`) |
 
 Sizes in use: 22 menu leading icon, 20 default and circle buttons, 18 settings rows and chevrons, 16 fold marks, 14 inline file icon and swatch check, 11 Mono done check. Non-Hugeicons glyphs: braille spinner, provider logos as SVG (`src/features/sessions/providerSvgs.ts`), Monocode mark PNGs tinted via `mark` (use CSS `mask-image` + `background: var(--mark)`), file-type icons (`src/features/files/FileTypeIcon.tsx`).
 
@@ -666,9 +667,10 @@ Information architecture, as in mobile (`ScenePager.tsx`, `WorkspaceDrawer.tsx`)
 
 | | Mobile (<640) | Tablet (640-1024) | Desktop (>=1024) |
 |---|---|---|---|
-| Desktop list / switcher | top of the drawer as a desktop switcher (sheet); manage screen under settings | persistent narrow rail (icons, 64px) or top of the sidebar | top of the sidebar (collapsible group per desktop) |
-| Session list | off-canvas drawer (swipe from edge, width `min(82vw, 330px)`), also home when no session is open | persistent sidebar 300px (collapsible with button) | persistent sidebar 320-360px (resizable, remembered) |
-| Transcript | full screen, one pane at a time | main pane, flex | main pane, content max-width 760px centered |
+| Desktop list / switcher | one slim row at the top of the `/d` frame: the desktop switcher (sheet) on the left, the app nav icons (Search on a phone, Desktops, Account, Install) right aligned; there is no separate header row on `/d` routes. On a phone (under 640px) the row keeps Search and Desktops and folds Account and Install into one "More" menu, so the desktop name keeps its room. The connection banner sits under this row, which already clears the notch | same row | same row |
+| Workspace list (Monos, projects, Cloud, settings) | off-canvas drawer (swipe from edge, width `min(82vw, 330px)`), also home when no session is open | persistent sidebar 300px (collapsible with button) | persistent sidebar 320-360px (resizable, remembered) |
+| Session list of a project | the project page (its own screen) | the project page (its own screen) | a second sidebar beside the workspace sidebar, 240-560px, default 320 (resizable, `monoptah.layout.sessionListWidth`), shown on every screen of a project (project routes, a session, Files, Changes, Git); the native classic layout has the same column (260 default, 200-560) |
+| Transcript | full screen, one pane at a time, no tabs | main pane, flex, with a tab strip (section 11.2) | chat pane with tabs and split panes (section 11.2): fills the rest of the width edge to edge (no card, no border, no centering of the pane); the transcript text column inside keeps max-width 768px centered |
 | Composer | bottom, floating glass pill | same | same, max-width aligned with the transcript column |
 | Side panels (files, changes, git, usage) | full-screen sheet (vaul, 92dvh) pushed over the transcript | right panel 360px overlay (slides over, dismissable) | right panel 380-480px docked, resizable, can stay open beside the transcript |
 | Navigation | drawer + horizontal page pager between scenes, header glass buttons | sidebar + header | sidebar + header, keyboard shortcuts, no pager |
@@ -677,6 +679,10 @@ Information architecture, as in mobile (`ScenePager.tsx`, `WorkspaceDrawer.tsx`)
 | Settings | full-screen routes, drawer-level entry | two-pane (list left, detail right) in a modal dialog 720px | two-pane in a dialog 800px or a full route |
 | Desktop manager, admin | full-screen routes | two-pane | table-like list with detail panel |
 | Pointer model | touch, swipe gestures | touch + pointer | pointer first, hover states, context menus, tooltips |
+
+The desktop layout mirrors the native classic layout: workspace sidebar | session list sidebar | chat pane (`ChatPane`, `features/layout/ChatPane.tsx`; from 640px it holds the tabs and split panes of section 11.2) | optional docked right panel. A docked panel is sized as if the session list were at its 240px minimum and the list shrinks to make room (the stored width is untouched), so the chat pane never drops below 320px; where 380px does not fit, the panel is the overlay. With the default 320px sidebar and the session list at its 240px minimum that means the Files, Changes and Git panel docks only from about 1260px on project screens (320 + 240 + 320 chat + 380 panel) and opens as the 360px overlay below that, down to the 1024px of the classic layout. The project routes (`/p/:projectId`, `/p/:projectId/new`) show the New session page in the chat pane, and the session list names the project (it holds the page's only h1; on a session or tool screen the chat holds the h1 and the list heading is an h2). Below 1024px there is no session list column: the project page and `/new` are separate pages as before.
+
+The pages outside a desktop (`/desktops`, `/settings`, `/admin`, `/install`) keep the 44px header (a glass pill with the brand link and the same nav icons); the sign-in pages and the public `/install` show the brand only. A chat view (New session, a session, a Mono chat) draws the project's background behind everything, under a scrim of the page background colour at 75% so text keeps its contrast in light and dark (at 50% the muted text measured about 2.7:1 over a dark or a bright photo; `--muted` on `--background` is 4.4:1 in the classic light theme before any photo, so 4.5:1 is not reachable for muted text there); a Mono chat uses the background of the first of its projects that has one.
 
 Rules:
 
@@ -702,6 +708,29 @@ Rules:
 - Inputs at 16px or larger (the composer is 17px) so iOS does not zoom on focus.
 - `touch-action: pan-y` on pager scenes, `manipulation` on buttons, `-webkit-tap-highlight-color: transparent`, `user-select: none` on chrome, `text` on transcript content.
 - Manifest: `display: "standalone"`, `orientation: "any"`, maskable icons derived from `mobile/assets/images/icon.png`, `theme_color` and `background_color` `#131313`.
+
+### 11.2 Session tabs and split panes
+
+Code: `features/layout/tabs/` (`paneTree.ts` the pure model, `tabsStore.ts` persistence, `TabbedChat.tsx` the panes, `TabStrip.tsx`, `PaneDivider.tsx`, `PaneDropZones.tsx`, `useTabActions.ts`, `tabShortcuts.ts`). `ChatPane` renders it from 640px; below that it is the plain route screen (one session at a time, no tabs, no split, nothing stored).
+
+- **Tabs.** A tab is a session (`/d/:desktopId/s/:id`) or a Mono chat (`/d/:desktopId/monos/:id`). The New session page, Files, Changes, Git and the Mono profile are not tabs: they show in the focused pane in place of its active tab (no tab is selected), so New session behaves as a page you start from, like the native New session button. A pane with no tab and no split shows no strip, so project pages look as before. A tab whose session the catalog does not list keeps a plain name ("Session", "Mono", italic) and can be closed; the catalog may carry only recent sessions, so tabs are never dropped for being absent.
+- **URL is the source of truth.** Navigating to a session or Mono (list, link, palette) opens its tab at the end of the focused pane, or focuses the pane that already has it (one tab per session in the workspace). Choosing a tab or focusing a pane navigates to the focused pane's active tab; closing a tab navigates only when it was the page on screen (to the focused pane's active tab, else the project or the workspace home), so closing or reordering tabs never leaves a New session, Files, Changes or Git page. The text typed in the composer of a session or Mono chat is kept in memory per chat (like the New session draft) and survives a tab switch, a split or a closed pane. Only the active tab of each pane is mounted.
+- **Strip.** `role="tablist"` of `role="tab"` buttons (`aria-selected`, roving tabindex, Left/Right/Home/End move focus, Enter or Space opens, Delete closes, Alt+Left/Right reorders), each with a close button that is a mouse and touch affordance only (hidden from assistive technology, so the tablist holds only tabs; the keyboard closes the focused tab with Delete, announced by `aria-keyshortcuts` on the tab), then the pane's Split right, Split down and Close pane buttons. Targets are 44px on coarse pointers (36px fine). Tabs are 120-224px wide and scroll sideways (mouse wheel too); the selected tab scrolls into view. When tabs are scrolled out of sight the strip shows an edge fade on that side and an "All tabs" menu button after the tabs lists every tab of the pane (choose one to open it). After Delete closes a tab, focus moves to the neighbouring tab. A tab of a session that is deleted or archived closes with it. Middle click closes a tab. Drag a tab to reorder or onto another strip. Tabs and panes persist per desktop in `monoptah.layout.tabs.<desktopId>`.
+- **Panes.** A tree of splits (row or column, fractional sizes, up to 6 panes). Each pane has its own tab list and active tab; the focused pane (pointer or keyboard focus inside it) drives the URL, and its strip marks the active tab with the brand colour. Dividers resize with the pointer or arrow keys (min 320px wide, 280px high per pane). While a tab is dragged, each pane shows drop zones: the middle moves the tab into the pane, an edge splits the pane and puts the tab in the new half. Split right/down from the buttons or the shortcuts opens a new empty pane and the New session page of the active session's project in it (the native split does the same: a new session beside the focused one). The last tab of a pane closes the pane. Only the focused pane's title is an h1, the others are h2.
+- **Room.** A split is offered only while the result fits the chat area (two 320px panes side by side, two 280px panes stacked), measured on the chat area, so a tablet at 1024px (chat area about 700px) can split in two and one at 768px cannot. When the area becomes too narrow for the existing panes (window resize, a docked panel opening), only the focused pane shows and its strip says "+N hidden"; the others keep their tabs and come back when there is room.
+- **Shortcuts** (Mod is Cmd on macOS, Ctrl elsewhere; keys match `event.code`; they do nothing under a dialog or menu):
+
+| Action | Web | Native (`shell.rs:262-325`) |
+|---|---|---|
+| Split right | Mod+D | Mod+D |
+| Split down | Mod+Shift+D | Mod+Shift+D |
+| Close tab (the last one closes the pane) | Mod+Alt+W | Mod+W |
+| Next tab / previous tab | Mod+Alt+] / Mod+Alt+[ | Mod+Shift+] / Mod+Shift+[, Ctrl+Tab |
+| Tab 1 to 8, last tab | Mod+Alt+1..8, Mod+Alt+9 | Mod+1..8, Mod+9 |
+| Focus next / previous pane | Mod+Alt+Shift+Right or Down / Left or Up | Mod+Alt+arrows (by direction) |
+
+  The browser keeps Mod+W, Mod+T, Mod+N, Ctrl+Tab and Mod+1..9 and a page cannot take them, so the web moves close, next/previous and jump to Mod+Alt, and focus-pane to Mod+Alt+Shift (Mod+Alt+arrows switch browser tabs in Chrome). Windows reports AltGr as Ctrl+Alt, so Mod+Alt chords could swallow the characters an AltGr layout types ({ [ ] | \ # ^): an event with the AltGraph modifier is never a shortcut, and off the Mac the Mod+Alt chords do nothing while the focus is in an input, a textarea or editable content (use Mod+D from anywhere, or click a tab, while typing). Off the Mac the check is a heuristic: a Mod+Alt event that typed a character other than its key's US character counts as typing. On non-US layouts (AZERTY for example) some Mod+Alt tab shortcuts may therefore not fire, but characters are never swallowed.
+- **Native parity.** The native workspace keeps one pane tree per tab (`pane_layout.rs`, `split_session`, `close_pane`, drops on a pane edge); the web uses the editor-group model (each pane has its own tab list), so a drag to a pane replaces the native "tab holds a split" and there are no per-tab split trees or pinned tabs.
 
 ## 12. Checklist for new features
 

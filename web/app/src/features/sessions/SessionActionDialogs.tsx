@@ -1,6 +1,7 @@
 // F-25 and F-40: the dialogs behind a session's Rename and Archive menu items (the card menu of the lists
 // and, later, the session header menu). Rename is a small form; Archive is the `archive-dialog` slot host,
 // whose default is a plain confirmation (a cloud session also asks whether to keep or stop its instance).
+import { useCloseSessionTab } from "@/features/layout/tabs/useCloseSessionTab";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import type { SessionCard } from "@monoptah/protocol";
@@ -95,6 +96,7 @@ export const isCloudSession = (session: Pick<SessionCard, "target">): boolean =>
 function DefaultArchiveDialog({ desktopId, session, open, onOpenChange }: DialogProps) {
   const archive = useLinkMutation("session.archive");
   const refresh = useRefreshSessions(desktopId);
+  const closeTab = useCloseSessionTab(desktopId);
   const cloud = isCloudSession(session);
   const run = (choice?: "keep" | "stop") =>
     archive.mutate(
@@ -102,6 +104,7 @@ function DefaultArchiveDialog({ desktopId, session, open, onOpenChange }: Dialog
       {
         onSuccess: () => {
           refresh();
+          closeTab(session);
           onOpenChange(false);
         },
       },

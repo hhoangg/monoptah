@@ -57,6 +57,16 @@ describe("CloudChip", () => {
     }
   });
 
+  it("ellipsizes the kind and the state and keeps a few characters of each, so a narrow card cuts no word in the middle", () => {
+    render(<CloudChip placement={{ kind: "codespace", state: "available" }} />);
+    const chip = screen.getByTestId("cloud-chip");
+    // Left aligned: the overflow is cut on the right, so the first letters never disappear.
+    expect(chip).toHaveClass("min-w-0", "overflow-hidden", "justify-start");
+    const [kind, , state] = Array.from(chip.children);
+    expect(kind).toHaveClass("truncate", "min-w-[3ch]");
+    expect(state).toHaveClass("truncate", "min-w-[3ch]");
+  });
+
   it("reads Not connected for unknown and shows nothing for a local or absent placement", () => {
     expect(STATE_LABELS.unknown).toBe("Not connected");
     const { container } = render(

@@ -1,19 +1,24 @@
 // The `desktop-switcher` slot of `/d/:desktopId` (W-04). Owner: WS-M.
 //
-// A slim in-flow bar (a `shrink-0` row of the fixed /d frame) (current desktop color dot, name, online dot) that opens the list of the
+// A slim in-flow bar (a `shrink-0` row of the fixed /d frame) (current desktop color dot, name, online dot) with the app nav
+// icons (Desktops, Account, Install, and Search on a phone) right aligned on the same row, because the /d routes have no
+// header of their own. It opens the list of the
 // account's desktops: a bottom sheet under 640 px, a dialog from 640 px (`ResponsiveOverlay`,
 // design-system.md 11). Desktops are sorted by last use; choosing one opens `/d/:id`. "Request
 // access" posts the grant of that one desktop on tap (never for all). The bar is hidden while a
-// blocking link-state layer shows (any of them, including "Requesting access..."), and the last-used order is updated when the page mounts.
+// blocking link-state layer shows (any of them, including "Requesting access..."): the row then keeps only the nav icons, so the
+// way out to /desktops stays. The last-used order is updated when the page mounts.
 import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ensureDevice, useLinkDesktopId, useLinkState } from "@/link";
 import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
+import { AppNav } from "@/ui/AppNav";
 import { Notice } from "@/ui/Notice";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
+import { OfflineBanner } from "@/features/offline";
 import { useAction } from "@/features/settings/useAction";
 import { requestGrantAndRefresh, useDesktopGrants, useDesktops, type DesktopSummary } from "./api";
 import { safeName } from "./format";
@@ -32,6 +37,22 @@ function OnlineDot({ online }: { online: boolean }) {
   );
 }
 
+/** The slim row of the /d frame: the switcher (when there is one) on the left, the app nav right aligned. */
+export function DesktopTopBar({ children }: { children?: ReactNode }) {
+  return (
+    <>
+      <div className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
+        <div className="flex min-h-11 w-full items-center gap-2 pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]">
+          <div className="flex min-w-0 flex-1 items-center">{children}</div>
+          <AppNav className="shrink-0" />
+        </div>
+      </div>
+      {/* The connection banner lives below the row, which already clears the notch (the /d frame has no header). */}
+      <OfflineBanner />
+    </>
+  );
+}
+
 export function DesktopSwitcher() {
   const desktopId = useLinkDesktopId();
   const status = useLinkState((state) => state.status);
@@ -47,7 +68,7 @@ export function DesktopSwitcher() {
   }, [desktopId]);
 
   // Hidden while any blocking layer shows, including "Requesting access...".
-  if (layerShown || isLinkBlocking({ status, blocked })) return null;
+  if (layerShown || isLinkBlocking({ status, blocked })) return <DesktopTopBar />;
 
   const current = desktops.data?.desktops.find((item) => item.id === desktopId);
   const name = safeName(current?.name ?? linkName ?? "", "Desktop");
@@ -55,24 +76,22 @@ export function DesktopSwitcher() {
   const online = presence === null ? (current?.online ?? false) : presence === "online";
 
   return (
-    <div className="shrink-0 border-b border-stroke bg-background">
-      <div className="flex min-h-11 w-full items-center pr-[max(0.75rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]">
-        <button
-          type="button"
-          aria-haspopup="dialog"
-          aria-expanded={open}
-          aria-label={`Switch desktop, current: ${name}`}
-          onClick={() => setOpen(true)}
-          className="flex min-h-11 min-w-0 max-w-full items-center gap-2 rounded-row px-2 text-label font-semibold text-content hover:bg-selection active:opacity-60 pointer-fine:min-h-9"
-        >
-          <ColorDot color={current?.color ?? null} />
-          <span className="min-w-0 truncate">{name}</span>
-          <OnlineDot online={online} />
-          <Icon name="chevronDown" size={16} className="shrink-0 text-faint" />
-        </button>
-      </div>
+    <DesktopTopBar>
+      <button
+        type="button"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-label={`Switch desktop, current: ${name}`}
+        onClick={() => setOpen(true)}
+        className="flex min-h-11 min-w-0 max-w-full items-center gap-2 rounded-row px-2 text-label font-semibold text-content hover:bg-selection active:opacity-60 pointer-fine:min-h-9"
+      >
+        <ColorDot color={current?.color ?? null} />
+        <span className="min-w-0 truncate">{name}</span>
+        <OnlineDot online={online} />
+        <Icon name="chevronDown" size={16} className="shrink-0 text-faint" />
+      </button>
       {open ? <SwitcherSheet currentId={desktopId} onClose={() => setOpen(false)} /> : null}
-    </div>
+    </DesktopTopBar>
   );
 }
 

@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import { useLink } from "@/link/store";
 import { useLinkDataSync } from "@/data/sync";
 import { useDesktops } from "@/features/desktops/api";
+import { DesktopTopBar } from "@/features/desktops/DesktopSwitcher";
 import { rememberDesktop } from "@/features/sessions/lastPlace";
 import { LinkProvider, useLinkState } from "@/link/LinkProvider";
 import { buttonVariants } from "@/ui/button";
@@ -66,7 +67,15 @@ function LinkGuards() {
     void navigate({ to: "/login", search: { redirect: href } as never, replace: true });
   }, [blocked, href, navigate]);
 
-  if (isVersionBlocked(blocked)) return <LinkBlockedScreen reason={blocked} />;
+  // The /d routes have no header, so the blocked screen keeps the nav row (the way out to /desktops).
+  if (isVersionBlocked(blocked)) {
+    return (
+      <>
+        <DesktopTopBar />
+        <LinkBlockedScreen reason={blocked} />
+      </>
+    );
+  }
   return (
     <>
       <Slot name="desktop-switcher" />
@@ -82,6 +91,8 @@ function LinkGuards() {
 /** B-6: a desktop that is no longer in the account has nothing to load; say so and point to the way forward. */
 function DesktopGoneScreen() {
   return (
+    <>
+    <DesktopTopBar />
     <div data-testid="desktop-gone-screen" className="mx-auto flex w-full max-w-[480px] flex-col gap-4 px-5 py-10">
       <Card className="flex flex-col gap-3 p-5">
         <h1 className="text-body font-semibold">This desktop is no longer in your account</h1>
@@ -96,5 +107,6 @@ function DesktopGoneScreen() {
         </div>
       </Card>
     </div>
+    </>
   );
 }

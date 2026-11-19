@@ -22,6 +22,8 @@ import { MONO_SEEN_DB, markMonoSeen, markMonoUnread, resetMonoSeen, loadMonoSeen
 import { Ticker, TICKER_GAP } from "./Ticker";
 import { PROJECT_MASCOTS, projectMascot } from "./projectMascots";
 import { FRAME_MS } from "./ProjectMascot";
+import { emptyWorkspace, openTab, serializeWorkspace, sessionTab } from "@/features/layout/tabs/paneTree";
+import { getWorkspace, resetTabsStore, tabsKey } from "@/features/layout/tabs/tabsStore";
 
 let reduced = false;
 function stubMatchMedia() {
@@ -174,6 +176,45 @@ describe("rename, archive and delete from the card menu (F-25, F-40)", () => {
     const menu = await openCardMenu(user, "sess-local-1");
     for (const name of ["Rename", "Archive", "Delete"]) expect(within(menu).queryByRole("menuitem", { name })).toBeNull();
     expect(within(menu).getByRole("menuitem", { name: "Open" })).toBeInTheDocument();
+  });
+});
+
+describe("session cards and open tabs", () => {
+  const seedTabs = () => {
+    localStorage.setItem(tabsKey(DESKTOP_ID), serializeWorkspace(openTab(openTab(emptyWorkspace(), sessionTab("sess-local-1")), sessionTab("sess-seed-0"))));
+    resetTabsStore();
+  };
+  afterEach(() => resetTabsStore());
+
+  it("closes the tab of a session that is archived", async () => {
+    const user = userEvent.setup();
+    seedTabs();
+    mount("/p/proj-alpha");
+    const menu = await openCardMenu(user, "sess-local-1");
+    await user.click(within(menu).getByRole("menuitem", { name: "Archive" }));
+    const dialog = await screen.findByRole("dialog", { name: "Archive this session?" });
+    await user.click(within(dialog).getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(getWorkspace(DESKTOP_ID).panes.p1?.tabs).toEqual([sessionTab("sess-seed-0")]));
+  });
+
+  it("closes the tab of a session that is deleted", async () => {
+    const user = userEvent.setup();
+    seedTabs();
+    mount("/p/proj-alpha");
+    const menu = await openCardMenu(user, "sess-local-1");
+    await user.click(within(menu).getByRole("menuitem", { name: "Delete" }));
+    const dialog = await screen.findByRole("dialog", { name: "Delete this session?" });
+    await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+    await waitFor(() => expect(getWorkspace(DESKTOP_ID).panes.p1?.tabs).toEqual([sessionTab("sess-seed-0")]));
+  });
+
+  it("adapts to a narrow list with a container query: the model name and the Working text give way, the rest ellipsizes", async () => {
+    mount("/p/proj-alpha");
+    await screen.findAllByTestId("session-card");
+    const first = card("sess-local-1");
+    expect(first).toHaveClass("@container");
+    // From 18rem the card is unchanged; under it only the model text hides (the harness mark stays).
+    expect(first.querySelector("[class*=\"@max-[18rem]:max-w-none\"]")).not.toBeNull();
   });
 });
 

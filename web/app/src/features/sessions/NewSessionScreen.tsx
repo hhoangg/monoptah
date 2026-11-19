@@ -8,7 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
 import { SessionStartTargetSchema, type ParamsOf } from "@monoptah/protocol";
 import { catalogKey, useCatalog, useLinkMutation } from "@/data";
-import { BACKGROUND_CONTAINER_CLASS, EmptySessionBackground } from "@/features/backgrounds";
+import { BACKGROUND_CONTAINER_CLASS, ChatBackground } from "@/features/backgrounds";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
 import { Composer } from "@/features/composer/Composer";
@@ -44,8 +44,8 @@ function targetKind(target: unknown): { kind: string } | null {
 }
 
 /**
- * `embedded` is the wide layout of F-18: the page sits beside the sessions list inside the project screen, so it
- * has no header (the project screen owns the only h1 and the way back) and fills its pane instead of the viewport.
+ * `embedded` is the wide layout of F-18: from 1024 px the page is the chat pane, beside the session-list sidebar, so it
+ * has no header (the sidebar owns the only h1 and the way back) and fills the pane edge to edge, with no card.
  */
 export function NewSessionScreen({ desktopId, projectId, embedded = false }: { desktopId: string; projectId: string; embedded?: boolean }) {
   const keyboardInset = useKeyboardInset();
@@ -154,11 +154,9 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
     <div
       data-testid="new-session-screen"
       data-embedded={embedded ? "true" : undefined}
-      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col ${
-        embedded ? "min-h-[28rem] overflow-hidden rounded-[22px] border border-stroke" : ""
-      }`}
+      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col ${embedded ? "overflow-hidden" : ""}`}
     >
-      <EmptySessionBackground projectId={projectId} />
+      <ChatBackground projectId={projectId} />
       {embedded ? null : (
       <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link

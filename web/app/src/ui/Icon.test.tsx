@@ -6,7 +6,7 @@ describe("Icon", () => {
   const names = Object.keys(ICONS) as IconName[];
 
   it("maps the mobile names and the web-only names of design-system.md section 7", () => {
-    expect(names).toHaveLength(71);
+    expect(names).toHaveLength(73);
   });
 
   it.each(names)("renders %s as an svg with the default size and stroke", (name) => {

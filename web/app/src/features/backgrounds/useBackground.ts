@@ -58,6 +58,15 @@ export function useAllBackgrounds(): BackgroundRecord[] {
   return records;
 }
 
+/**
+ * The background a chat tied to several projects (a Mono) shows: that of the first of `projectIds`, in their order,
+ * that has one; null when none has (or there are no projects).
+ */
+export function useFirstBackgroundProject(projectIds: readonly string[] | undefined): string | null {
+  const records = useAllBackgrounds();
+  return projectIds?.find((id) => records.some((record) => record.projectId === id)) ?? null;
+}
+
 export interface BackgroundActions {
   busy: boolean;
   error: string | null;

@@ -5,6 +5,7 @@
 import { useState } from "react";
 import type { SessionCard } from "@monoptah/protocol";
 import { useLinkMutation } from "@/data";
+import { useCloseSessionTab } from "@/features/layout/tabs/useCloseSessionTab";
 import { useRefreshSessions } from "@/features/sessions/SessionActionDialogs";
 import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
@@ -33,6 +34,7 @@ function LocalArchiveDialog({ desktopId, session, open, onOpenChange }: ArchiveD
   const canControl = useCanControl();
   const archive = useLinkMutation("session.archive");
   const refresh = useRefreshSessions(desktopId);
+  const closeTab = useCloseSessionTab(desktopId);
   return (
     <ContainClicks>
       <ConfirmDialog
@@ -51,6 +53,7 @@ function LocalArchiveDialog({ desktopId, session, open, onOpenChange }: ArchiveD
             {
               onSuccess: () => {
                 refresh();
+                closeTab(session);
                 onOpenChange(false);
               },
             },
@@ -65,6 +68,7 @@ function CloudChoiceDialog({ desktopId, session, open, onOpenChange }: ArchiveDi
   const canControl = useCanControl();
   const archive = useLinkMutation("session.archive");
   const refresh = useRefreshSessions(desktopId);
+  const closeTab = useCloseSessionTab(desktopId);
   const [choice, setChoice] = useState<"keep" | "stop">("stop");
   const run = () => {
     if (!canControl) return;
@@ -73,6 +77,7 @@ function CloudChoiceDialog({ desktopId, session, open, onOpenChange }: ArchiveDi
       {
         onSuccess: () => {
           refresh();
+          closeTab(session);
           onOpenChange(false);
         },
       },

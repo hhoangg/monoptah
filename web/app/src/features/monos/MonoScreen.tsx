@@ -3,15 +3,18 @@
 // composer (no model controls: a Mono's model is edited on its profile) and the Mono's empty state. Opening the
 // chat marks the Mono seen (F-17). The Mono's own header cards, chips and documents render through the WS-T
 // transcript components (F-43, F-72).
+import { BACKGROUND_CONTAINER_CLASS, ChatBackground, useFirstBackgroundProject } from "@/features/backgrounds";
 import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useCatalog, useConversation } from "@/data";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
+import { readChatDraft, writeChatDraft } from "@/features/composer/chatDraft";
 import { Composer } from "@/features/composer/Composer";
 import { SessionQuestionCard, SessionUsageCard, useLinkReady } from "@/features/composer/SessionComposer";
 import { useGuardedReplies, useSendGuard } from "@/features/composer/useSendGuard";
+import { PaneHeading } from "@/features/layout/tabs/PaneContext";
 import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
@@ -53,9 +56,12 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const conversationId = monoConversationId(monoId);
   const conversation = useConversation(conversationId);
   const state = conversation.state;
+  const [initialText] = useState(() => readChatDraft(desktopId, conversationId));
+  const rememberText = useCallback((text: string) => writeChatDraft(desktopId, conversationId, text), [desktopId, conversationId]);
   const older = useOlderTurns(conversationId, state?.turns ?? [], state?.older ?? false);
   const cancel = useLinkMutation("session.cancel");
   const accentStyle = useMonoAccentStyle(desktopId, monoId);
+  const monoBackgroundProject = useFirstBackgroundProject(mono?.projectIds);
   const requestControl = useRequestControl(desktopId);
   // F-71: the message being replied to; the reply is sent with it quoted.
   const [replyTo, setReplyTo] = useState<HeldMessage | null>(null);
@@ -97,6 +103,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
     setReplyTo(null);
     replies.clearError();
     void send(quoted, wire.length > 0 ? wire : undefined);
+    // Same as the session composer: a composer that unmounted meanwhile cannot clear the draft itself.
+    if (readChatDraft(desktopId, conversationId).trim() === text.trim()) writeChatDraft(desktopId, conversationId, "");
   };
 
   const name = mono?.name ?? "Mono";
@@ -111,9 +119,11 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
       data-testid="route-stub"
       data-route="/d/:desktopId/monos/:monoId"
       style={accentStyle}
-      className="flex h-full min-h-0 flex-1 flex-col"
+      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col`}
     >
-      <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
+      {/* A Mono works across projects (`projectIds`) and has no background of its own: its chat shows the background of the first of its projects that has one. */}
+      <ChatBackground projectId={monoBackgroundProject} />
+      <header className="flex w-full shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
           to="/d/$desktopId"
           params={{ desktopId }}
@@ -124,7 +134,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
         </Link>
         <MonoMascot monoId={monoId} mascot={mono?.mascot} color={mono?.color} working={working} size={32} />
         <div className="min-w-0 flex-1">
-          <h1 className="truncate text-h font-semibold">{name}</h1>
+          <PaneHeading className="truncate text-h font-semibold">{name}</PaneHeading>
           {working ? <p className="truncate text-meta text-muted-text">Working</p> : null}
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -218,6 +228,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
         }
       >
         <Composer
+          initialText={initialText}
+          onTextChange={rememberText}
           onSubmit={submit}
           busy={state?.busy ?? false}
           onStop={async () => {

@@ -1,5 +1,6 @@
 // `/d/:desktopId/s/:sessionId` (W-07): the header (back, title, the `session-header-chip` slot host), the
 // transcript of the conversation and the composer region (Task 5 mounts the composer there).
+import { BACKGROUND_CONTAINER_CLASS, ChatBackground } from "@/features/backgrounds";
 import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
@@ -18,6 +19,7 @@ import { Glass } from "@/ui/Glass";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { ComposerRegion } from "./ComposerRegion";
+import { PaneHeading } from "@/features/layout/tabs/PaneContext";
 import { useRememberPlace } from "./lastPlace";
 import { SessionHeaderMenu } from "./SessionHeaderMenu";
 import { SessionHeaderChipSlot } from "./slots";
@@ -72,19 +74,24 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
     <div
       data-testid="route-stub"
       data-route="/d/:desktopId/s/:sessionId"
-      className="flex h-full min-h-0 flex-1 flex-col"
+      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col`}
     >
-      <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
+      {/* The project's background sits behind the whole chat, like on the New session page. */}
+      <ChatBackground projectId={projectId} />
+      {/* The header spans the chat pane; the transcript and composer keep their own 768 px column. */}
+      <header className="flex w-full shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
           to={projectId ? "/d/$desktopId/p/$projectId" : "/d/$desktopId"}
           params={projectId ? { desktopId, projectId } : { desktopId }}
           aria-label="Back"
-          className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection"
+          // From 1024 px the project's session list is beside the chat, so there is nothing to go back to.
+          className={`inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection ${projectId ? "lg:hidden" : ""}`}
         >
           <Icon name="chevronDown" size={20} className="rotate-90" />
         </Link>
-        <h1 className="min-w-0 flex-1 truncate text-h font-semibold">{title}</h1>
-        <div className="flex shrink-0 items-center gap-2">
+        <PaneHeading className="min-w-0 flex-1 truncate text-h font-semibold">{title}</PaneHeading>
+        {/* The chip gives way (ellipsis) before the title does: the group never takes more than 55% of the header. */}
+        <div className="flex max-w-[55%] min-w-0 shrink items-center gap-2">
           {readOnly ? (
             <Glass className="flex min-h-9 items-center rounded-pill px-3">
               <Badge variant="outline" className="border-0 px-0 text-meta" data-testid="read-only-chip">

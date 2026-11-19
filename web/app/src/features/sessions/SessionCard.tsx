@@ -2,9 +2,15 @@
 // mobile/src/features/sessions/SessionCard.tsx, `detailed`): the title with the time or "Working..." on
 // its right, then the branch with the model and its provider's mark on its right. The card links to the
 // session; its menu offers the actions the `session-capabilities` predicate allows for its target.
+//
+// The card adapts to its own width with a container query (the session list sidebar is 240-560px, the phone page is
+// the full width): under 18rem (a list under 320px) the model name gives way to the harness mark and "Working..." loses its dots,
+// so the title, the branch and the target chip keep their room and truncate with an ellipsis. From 18rem, which
+// includes the default 320px list, the phone page and tablet, the card shows the model and the status.
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import type { SessionCard as SessionCardData } from "@monoptah/protocol";
+import { useCloseSessionTab } from "@/features/layout/tabs/useCloseSessionTab";
 import { useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
 import { cn } from "@/lib/utils";
@@ -41,7 +47,7 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
   const working = !!session.busy;
   const waiting = !!session.waiting;
   return (
-    <div className="relative py-1" data-testid="session-card" data-session-id={session.id}>
+    <div className="@container relative py-1" data-testid="session-card" data-session-id={session.id}>
       <Link
         to="/d/$desktopId/s/$sessionId"
         params={{ desktopId, sessionId: session.id }}
@@ -60,7 +66,8 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
           ) : working ? (
             <span className="flex shrink-0 items-center gap-1 text-meta text-brand-text">
               <TerminalSpinner />
-              Working...
+              <span className="@max-[18rem]:hidden">Working...</span>
+              <span className="hidden @max-[18rem]:inline">Working</span>
             </span>
           ) : (
             <span className="shrink-0 text-meta tabular text-muted-text">{relativeTime(session.updatedAt, now)}</span>
@@ -69,11 +76,13 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
         <span className="flex items-center gap-2 text-meta text-muted-text">
           <span className="flex min-w-0 flex-1 items-center gap-1.5">
             <Icon name="branch" size={13} className="shrink-0 text-faint" />
-            <span className={cn("truncate", !session.branch && "text-muted-text")}>{session.branch || "No branch"}</span>
-            <SessionCardBadgeSlot desktopId={desktopId} session={session} />
+            <span className={cn("min-w-0 shrink truncate", !session.branch && "text-muted-text")}>{session.branch || "No branch"}</span>
+            <span className="flex min-w-0 shrink">
+              <SessionCardBadgeSlot desktopId={desktopId} session={session} />
+            </span>
           </span>
-          <span className="flex max-w-[50%] shrink items-center gap-1.5">
-            {model ? <span className="truncate">{model}</span> : null}
+          <span className="flex max-w-[50%] shrink items-center gap-1.5 @max-[18rem]:max-w-none" title={model || undefined}>
+            {model ? <span className="truncate @max-[18rem]:hidden">{model}</span> : null}
             <HarnessIcon harness={session.harness} className="size-3.5 shrink-0" />
           </span>
         </span>
@@ -95,9 +104,11 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
   const [archiving, setArchiving] = useState(false);
   const remove = useLinkMutation("session.delete");
   const refresh = useRefreshSessions(desktopId);
+  const closeTab = useCloseSessionTab(desktopId);
   const afterDelete = () => {
     setConfirming(false);
     refresh();
+    closeTab(session);
   };
   const params = { desktopId, projectId: session.projectId };
 
