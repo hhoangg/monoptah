@@ -9,6 +9,7 @@
 //   to=/d/<id>/...        the first route (default: `/d/<DESKTOP_ID>`); DESKTOP_ID is in dev/mockLink.ts
 //   theme=light|dark      the colour scheme (default light)
 //   permission=read       the device is read-only (default control)
+//   picker=1              show the first-run projects picker (hidden by default)
 //   empty=1               an empty workspace (the F-14 empty state)
 //   sessions=N&working=N  how many extra sessions the seed adds (default 45) and how many of them work (default 2)
 //   turns=N&tail=N        the long conversation `sess-long` (open it with ?to=/d/<id>/s/sess-long): N turns (default 200),
@@ -25,6 +26,7 @@ import { MotionConfig } from "motion/react";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { installMockApi } from "@/features/accounts/mock";
+import { pickerSeenKey } from "@/features/settings/desktopLink";
 import "@/styles/index.css";
 import { seedLongSession } from "./longSession";
 import { DESKTOP_ID, connectMockDesktop, emptyWorkspace, seedWorkspace } from "./mockLink";
@@ -35,6 +37,9 @@ const count = (name: string, fallback: number) => {
   const value = Number(params.get(name));
   return params.has(name) && Number.isFinite(value) ? value : fallback;
 };
+
+// The first-run picker (a modal) would cover the screen under preview: count it as seen unless `picker=1` asks for it.
+if (params.get("picker") !== "1") localStorage.setItem(pickerSeenKey(DESKTOP_ID), "1");
 
 // The signed-in mock account, before the router asks `/api/me`.
 sessionStorage.setItem("monoptah.mock.signedIn", "1");
@@ -59,6 +64,16 @@ window.history.replaceState(null, "", target && target.startsWith("/") && !targe
 async function start() {
   const { useAppearance } = await import("@/lib/appearance");
   useAppearance.getState().setAppearance(theme);
+  // The same slot registrations as src/main.tsx, so the preview shows the real shell (sidebar, desktop switcher, panels).
+  await Promise.all([
+    import("@/features/cloud/register"),
+    import("@/features/desktops/register"),
+    import("@/features/layout/register"),
+    import("@/features/monos/register"),
+    import("@/features/offline/register"),
+    import("@/features/push/register"),
+    import("@/features/settings/register"),
+  ]);
   const [{ router }, { queryClient }, { installSessionExpiryHandler }, { Toaster }] = await Promise.all([
     import("@/router"),
     import("@/lib/queryClient"),
