@@ -183,7 +183,12 @@ test.describe("html preview on the web app", () => {
         },
       );
     }
-    await context.addCookies([{ name: session!.name, value: session!.value, domain: new URL(origin()).hostname, path: "/", httpOnly: true, secure: true }]);
+    // The session cookie is `__Host-` + Secure. WebKit on Linux sends a Secure cookie on http://localhost fetches but
+    // not on the ws:// relay handshake (CI trace: every GET /relay/device had no Cookie header and got 401, so the
+    // page sat on "Reconnecting..."). The browser's own cookie rules cannot be changed here, so for WebKit the cookie
+    // is stored without the Secure flag (set through the test API, which skips the prefix check) and rides on ws://
+    // too. Chromium keeps the real flags: it rejects a non-Secure cookie and sends it on ws://localhost.
+    await context.addCookies([{ name: session!.name, value: session!.value, domain: new URL(origin()).hostname, path: "/", httpOnly: true, secure: !webkit }]);
     page = await context.newPage();
     await page.goto("/");
     await page.evaluate((id) => window.localStorage.setItem(`monoptah.pickerSeen.${id}`, "1"), desktopId);
