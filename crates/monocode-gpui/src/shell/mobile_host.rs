@@ -14,7 +14,7 @@ use monocode_core::{
     agent::{AccessMode, Settings, TurnInfo},
     mobile::{
         DeviceContext, DeviceKind, Event, Invite, MobileHost, Push, Request, Status, WatchStart,
-        audit, denylist::DenyList, notify, policy, watch, web_link,
+        audit, denylist::DenyList, folders, notify, policy, watch, web_link,
     },
     transcript::Row,
 };
@@ -64,6 +64,8 @@ pub(super) struct Mobile {
     watches: HashMap<String, Watch>,
     push_scheduled: bool,
     publishing: bool,
+    /// A publish was asked for while one ran: that one read the shell before the change, so another follows.
+    republish: bool,
     /// Persisted session IDs, which stay stable for paired phones.
     ids: HashMap<i64, String>,
     /// Sessions whose current turn a phone started: their approvals,
@@ -765,23 +767,35 @@ impl Shell {
             .collect()
     }
 
+    /// Whether a publish may start now. While one runs, the ask is kept so it runs again after.
+    fn claim_publish(&mut self) -> bool {
+        if self.mobile.publishing {
+            self.mobile.republish = true;
+            return false;
+        }
+        self.mobile.publishing = true;
+        true
+    }
+
     fn publish_mobile_catalog(&mut self, cx: &mut Context<Self>) {
         let Some(host) = self.mobile.host.clone() else {
             return;
         };
-        if self.mobile.publishing || !host.enabled() {
+        if !host.enabled() || !self.claim_publish() {
             return;
         }
-        self.mobile.publishing = true;
         let work = self.mobile_catalog_work(cx);
         cx.spawn(async move |this, cx| {
             let result = work.await;
-            let _ = this.update(cx, |this, _| {
+            let _ = this.update(cx, |this, cx| {
                 this.mobile.publishing = false;
                 if let Ok((catalog, ids, previews)) = result {
                     this.mobile.ids = ids;
                     this.mobile.mono_previews = previews;
                     let _ = host.publish(catalog);
+                }
+                if std::mem::take(&mut this.mobile.republish) {
+                    this.publish_mobile_catalog(cx);
                 }
             });
         })
@@ -832,6 +846,17 @@ impl Shell {
                     cloud::mark_web_only(&mut project, path);
                 }
                 project
+            })
+            .collect();
+        // Each rail project's folders, in the sidebar's order; web devices get them.
+        let project_folders: Vec<(String, monocode_core::session_groups::Folder)> = paths
+            .iter()
+            .flat_map(|path| {
+                let id = project_id(path);
+                self.groups_of_project(path)
+                    .folders
+                    .into_iter()
+                    .map(move |folder| (id.clone(), folder))
             })
             .collect();
         let monos: Vec<(monocode_core::mono::Mono, Option<Value>)> = self
@@ -924,6 +949,11 @@ impl Shell {
                 sessions.push(card);
             }
             sessions.sort_by_key(|s| std::cmp::Reverse(s["updatedAt"].as_u64()));
+            // The host cuts each folder to the sessions a device sees.
+            let folders: Vec<Value> = project_folders
+                .iter()
+                .map(|(project, folder)| folders::folder_card(project, folder, |id| ids.get(&id).cloned()))
+                .collect();
             let monos: Vec<Value> = monos
                 .into_iter()
                 .map(|(mono, live)| {
@@ -966,7 +996,7 @@ impl Shell {
                 // and its phones hide them. `push`: it notifies phones through
                 // Expo, so they no longer post their own alerts. `monoFiles`:
                 // it reads and saves a Mono's soul and memory for the phone.
-                json!({"projects": projects, "monos": monos, "sessions": sessions, "monoTools": true, "push": true, "monoFiles": true}),
+                json!({"projects": projects, "monos": monos, "sessions": sessions, "folders": folders, "monoTools": true, "push": true, "monoFiles": true}),
                 ids,
                 previews,
             ))
@@ -2116,6 +2146,18 @@ impl Shell {
             method if method.starts_with("cloud.") => {
                 cloud::dispatch_request(self, request, finish, cx)
             }
+            method if folders::METHODS.contains(&method) => {
+                let result = self.mobile_folder_command(
+                    &request.device,
+                    &request.method,
+                    &request.params,
+                    cx,
+                );
+                if result.is_ok() {
+                    self.publish_mobile_catalog(cx);
+                }
+                finish(self, request, result);
+            }
             _ => {
                 let result = self.mobile_session_command(
                     &request.device,
@@ -2127,6 +2169,100 @@ impl Shell {
                 finish(self, request, result);
             }
         }
+    }
+
+    /// The folders the sidebar keeps for a project path (matched like the
+    /// catalog matches a session's folder: by path key).
+    pub(super) fn groups_of_project(&self, path: &str) -> monocode_core::session_groups::Groups {
+        self.groups_key_of_project(path)
+            .and_then(|key| self.groups.get(&key).cloned())
+            .unwrap_or_default()
+    }
+
+    fn groups_key_of_project(&self, path: &str) -> Option<String> {
+        // The key the sidebar saves under, else the smallest key of the same path.
+        if self.groups.contains_key(path) {
+            return Some(path.to_owned());
+        }
+        let key = monocode_core::files::path_key(path);
+        self.groups
+            .keys()
+            .filter(|candidate| monocode_core::files::path_key(candidate) == key)
+            .min()
+            .cloned()
+    }
+
+    /// `folder.create`, `folder.rename`, `folder.move` and `folder.delete`: the
+    /// sidebar's own folder edits (`Groups`), applied to the project the device
+    /// names. The project and every session must be in the device's selection
+    /// and the sessions must belong to that project. The change is applied and
+    /// saved through the queue the sidebar uses, so the desktop list refreshes
+    /// and a later desktop save cannot overwrite it.
+    fn mobile_folder_command(
+        &mut self,
+        device: &DeviceContext,
+        method: &str,
+        params: &Value,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, Failure> {
+        let request = folders::parse(method, params)?;
+        let path = self.mobile_project_path(&request.project_id, device, cx)?;
+        // Only sessions the catalog lists are the device's to file: not archived or hidden ones.
+        let listed: HashSet<i64> = self
+            .mobile_catalog_sessions(&self.mobile_projects(cx), cx)
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        let session_of = |this: &Self, conversation: &str| -> Result<i64, Failure> {
+            let session = match this.mobile_target(conversation, device, cx)? {
+                Target::Session(id) => id,
+                Target::Mono(_) => return Err(policy::Code::UnsupportedTarget.failure()),
+            };
+            if this.mobile_session_project(session, cx).as_deref() != Some(&request.project_id) {
+                return Err("Session is not in this project".into());
+            }
+            if !listed.contains(&session) {
+                return Err("Session is no longer available".into());
+            }
+            Ok(session)
+        };
+        let op = match &request.kind {
+            folders::Kind::Create {
+                conversation_ids,
+                name,
+            } => folders::Op::Create {
+                sessions: conversation_ids
+                    .iter()
+                    .map(|id| session_of(self, id))
+                    .collect::<Result<_, _>>()?,
+                name: name.clone(),
+                id: monocode_core::mono::new_id(),
+            },
+            folders::Kind::Rename { folder_id, name } => folders::Op::Rename {
+                folder: folder_id.clone(),
+                name: name.clone(),
+            },
+            folders::Kind::Move {
+                conversation_id,
+                folder_id,
+            } => folders::Op::Move {
+                session: session_of(self, conversation_id)?,
+                folder: folder_id.clone(),
+            },
+            folders::Kind::Delete { folder_id } => folders::Op::Delete {
+                folder: folder_id.clone(),
+            },
+        };
+        let key = self.groups_key_of_project(&path).unwrap_or(path);
+        let mut groups = self.groups.get(&key).cloned().unwrap_or_default();
+        let reply = folders::apply(&mut groups, op)?;
+        self.groups.insert(key.clone(), groups.clone());
+        self.store_write("save folders", cx, move |store| {
+            store.save_groups(&key, &groups)
+        });
+        self.invalidate_chrome(cx);
+        cx.notify();
+        Ok(reply)
     }
 
     fn mobile_session_command(
@@ -3603,6 +3739,242 @@ mod tests {
             projects,
             monos,
         }
+    }
+
+    #[gpui::test]
+    fn web_devices_edit_the_folders_of_shared_projects_through_the_sidebars_groups(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, a, b) = super::super::tests::window(cx);
+        let (path, folder) = window
+            .update(cx, |shell, _, cx| {
+                let project_of = |shell: &Shell, id: i64| {
+                    let key = monocode_core::files::path_key(&shell.session_summaries[&id].cwd);
+                    shell
+                        .mobile_projects(cx)
+                        .into_iter()
+                        .find(|p| monocode_core::files::path_key(p) == key)
+                        .unwrap()
+                };
+                let (path, other) = (project_of(shell, a), project_of(shell, b));
+                let (project, other_project) = (project_id(&path), project_id(&other));
+                let other_project_id = other_project.clone();
+                let (wire_a, wire_b) = (shell.mobile_session_id(a), shell.mobile_session_id(b));
+                let device = web(None, None);
+                let run = |shell: &mut Shell,
+                           device: &DeviceContext,
+                           method: &str,
+                           params: Value,
+                           cx: &mut Context<Shell>| {
+                    shell.mobile_folder_command(device, method, &params, cx)
+                };
+
+                // Create: the sidebar's groups change, with the given name.
+                let reply = run(
+                    shell,
+                    &device,
+                    "folder.create",
+                    json!({"projectId": project, "conversationIds": [wire_a], "name": "Docs"}),
+                    cx,
+                )
+                .unwrap();
+                let folder = reply["folderId"].as_str().unwrap().to_owned();
+                let groups = shell.groups_of_project(&path);
+                assert_eq!(groups.folder(&folder).unwrap().name, "Docs");
+                assert_eq!(groups.folder_of(a).unwrap().id, folder);
+
+                // The published catalog carries it, scoped like the sessions.
+                let work = shell.mobile_catalog_work(cx);
+                let (catalog, _, _) = cx
+                    .foreground_executor()
+                    .block_test(work)
+                    .expect("the catalog builds");
+                let mut visible = catalog.clone();
+                policy::filter_reply(&device, "workspace.list", &mut visible);
+                let wire = visible["folders"][0].clone();
+                assert_eq!(wire["name"], "Docs");
+                assert_eq!(wire["projectId"], project);
+                assert_eq!(wire["sessionIds"], json!([wire_a]));
+                assert_eq!(wire["collapsed"], false);
+                let mut other_device = catalog.clone();
+                policy::filter_reply(
+                    &web(Some(vec![other_project.clone()]), None),
+                    "workspace.list",
+                    &mut other_device,
+                );
+                assert!(other_device["folders"].as_array().unwrap().is_empty());
+                let mut phone_view = catalog;
+                policy::filter_reply(&phone(), "workspace.list", &mut phone_view);
+                assert!(phone_view.get("folders").is_none());
+
+                // Rename, move out and in, and ungroup.
+                run(
+                    shell,
+                    &device,
+                    "folder.rename",
+                    json!({"projectId": project, "folderId": folder, "name": "Specs"}),
+                    cx,
+                )
+                .unwrap();
+                assert_eq!(
+                    shell.groups_of_project(&path).folder(&folder).unwrap().name,
+                    "Specs"
+                );
+                run(
+                    shell,
+                    &device,
+                    "folder.move",
+                    json!({"projectId": project, "conversationId": wire_a, "folderId": null}),
+                    cx,
+                )
+                .unwrap();
+                assert!(shell.groups_of_project(&path).folders.is_empty());
+                run(
+                    shell,
+                    &device,
+                    "folder.create",
+                    json!({"projectId": project, "conversationIds": [wire_a]}),
+                    cx,
+                )
+                .unwrap();
+                let second = shell.groups_of_project(&path).folders[0].id.clone();
+                assert_eq!(shell.groups_of_project(&path).folders[0].name, "New folder");
+                run(
+                    shell,
+                    &device,
+                    "folder.delete",
+                    json!({"projectId": project, "folderId": second}),
+                    cx,
+                )
+                .unwrap();
+                assert!(shell.groups_of_project(&path).folders.is_empty());
+                run(
+                    shell,
+                    &device,
+                    "folder.create",
+                    json!({"projectId": project, "conversationIds": [wire_a], "name": "Keep"}),
+                    cx,
+                )
+                .unwrap();
+
+                // Refusals: a folder that is not there, invalid input, a session of
+                // another project, and a project the device does not share.
+                let missing = run(
+                    shell,
+                    &device,
+                    "folder.delete",
+                    json!({"projectId": project, "folderId": "nope"}),
+                    cx,
+                );
+                assert_eq!(missing, Err(Failure::from("Folder not found")));
+                assert!(
+                    run(
+                        shell,
+                        &device,
+                        "folder.rename",
+                        json!({"projectId": project, "folderId": "x", "name": " "}),
+                        cx
+                    )
+                    .is_err()
+                );
+                let foreign = run(
+                    shell,
+                    &device,
+                    "folder.create",
+                    json!({"projectId": project, "conversationIds": [wire_b]}),
+                    cx,
+                );
+                assert_eq!(
+                    foreign,
+                    Err(Failure::from("Session is not in this project"))
+                );
+                let denied = Err(policy::Code::NotSelected.failure());
+                let narrowed = web(Some(vec![other_project]), None);
+                let by_project = json!({"projectId": project, "conversationIds": [wire_a]});
+                assert_eq!(
+                    run(shell, &narrowed, "folder.create", by_project, cx),
+                    denied
+                );
+                assert_eq!(
+                    run(
+                        shell,
+                        &narrowed,
+                        "folder.delete",
+                        json!({"projectId": project, "folderId": "x"}),
+                        cx
+                    ),
+                    denied
+                );
+                // A session that is not in the catalog (no messages yet) is not the device's to file.
+                let unlisted = run(
+                    shell,
+                    &device,
+                    "folder.create",
+                    json!({"projectId": other_project_id, "conversationIds": [wire_b]}),
+                    cx,
+                );
+                assert_eq!(
+                    unlisted,
+                    Err(Failure::from("Session is no longer available"))
+                );
+
+                // A folder of another shared project is not found under this one.
+                shell
+                    .groups
+                    .entry(other.clone())
+                    .or_default()
+                    .create_folder(&[b], "f2".into());
+                let before = shell.groups_of_project(&other);
+                for (method, params) in [
+                    (
+                        "folder.rename",
+                        json!({"projectId": project, "folderId": "f2", "name": "X"}),
+                    ),
+                    (
+                        "folder.delete",
+                        json!({"projectId": project, "folderId": "f2"}),
+                    ),
+                    (
+                        "folder.move",
+                        json!({"projectId": project, "conversationId": wire_a, "folderId": "f2"}),
+                    ),
+                ] {
+                    let answer = run(shell, &device, method, params, cx);
+                    assert_eq!(answer, Err(Failure::from("Folder not found")), "{method}");
+                }
+                assert_eq!(shell.groups_of_project(&other), before);
+                shell.groups.remove(&other);
+                let folder = shell.groups_of_project(&path).folders[0].id.clone();
+                (path, folder)
+            })
+            .unwrap();
+        // The change was saved through the sidebar's write queue.
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| {
+                let saved = locked(&shell.store).unwrap().groups(&path).unwrap();
+                assert_eq!(saved, shell.groups_of_project(&path));
+                assert_eq!(saved.folder(&folder).unwrap().name, "Keep");
+                assert_eq!(saved.folder(&folder).unwrap().session_ids, [a]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_publish_asked_for_during_another_is_kept_for_after(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, _, _| {
+                assert!(shell.claim_publish());
+                assert!(!shell.mobile.republish);
+                // Asked for while the first runs: refused now, remembered.
+                assert!(!shell.claim_publish());
+                assert!(shell.mobile.republish);
+                shell.mobile.publishing = false;
+                assert!(std::mem::take(&mut shell.mobile.republish));
+                assert!(shell.claim_publish());
+            })
+            .unwrap();
     }
 
     #[gpui::test]

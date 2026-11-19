@@ -5,6 +5,7 @@ pub mod audit;
 pub mod catalog;
 pub mod cloud_policy;
 pub mod denylist;
+pub mod folders;
 pub mod host;
 pub(crate) mod identity_store;
 pub mod mentioned_file;

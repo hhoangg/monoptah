@@ -371,6 +371,10 @@ pub const METHODS: &[Entry] = &[
     app("session.rename", Class::Control),
     app("session.delete", Class::Control),
     app("session.archive", Class::Control),
+    app("folder.create", Class::Control),
+    app("folder.rename", Class::Control),
+    app("folder.move", Class::Control),
+    app("folder.delete", Class::Control),
     app("mono.document", Class::Read),
     app("mono.profile", Class::Read),
     app("mono.update", Class::Control),
@@ -587,6 +591,9 @@ pub fn filter_reply(device: &DeviceContext, method: &str, reply: &mut Value) {
         narrow_catalog(device, reply);
     }
     cloud_policy::scope_catalog(device, reply);
+    if method == "workspace.list" {
+        super::folders::scope(reply);
+    }
 }
 
 fn narrow_catalog(device: &DeviceContext, reply: &mut Value) {
@@ -598,6 +605,11 @@ fn narrow_catalog(device: &DeviceContext, reply: &mut Value) {
     if device.projects.is_some() {
         if let Some(list) = reply.get_mut("projects").and_then(Value::as_array_mut) {
             list.retain(|p| selected(&device.projects, p["id"].as_str()));
+        }
+    }
+    if device.projects.is_some() {
+        if let Some(list) = reply.get_mut("folders").and_then(Value::as_array_mut) {
+            list.retain(|f| selected(&device.projects, f["projectId"].as_str()));
         }
     }
     // Mono sessions that belong to an unselected Mono.
