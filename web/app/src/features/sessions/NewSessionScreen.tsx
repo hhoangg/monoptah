@@ -44,8 +44,8 @@ function targetKind(target: unknown): { kind: string } | null {
 }
 
 /**
- * `embedded` is the wide layout of F-18: the page sits beside the sessions list inside the project screen, so it
- * has no header (the project screen owns the only h1 and the way back) and fills its pane instead of the viewport.
+ * `embedded` is the wide layout of F-18: from 1024 px the page is the chat pane, beside the session-list sidebar, so it
+ * has no header (the sidebar owns the only h1 and the way back) and fills the pane edge to edge, with no card.
  */
 export function NewSessionScreen({ desktopId, projectId, embedded = false }: { desktopId: string; projectId: string; embedded?: boolean }) {
   const keyboardInset = useKeyboardInset();
@@ -154,9 +154,7 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
     <div
       data-testid="new-session-screen"
       data-embedded={embedded ? "true" : undefined}
-      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col ${
-        embedded ? "min-h-[28rem] overflow-hidden rounded-[22px] border border-stroke" : ""
-      }`}
+      className={`${BACKGROUND_CONTAINER_CLASS} flex h-full min-h-0 flex-1 flex-col ${embedded ? "overflow-hidden" : ""}`}
     >
       <EmptySessionBackground projectId={projectId} />
       {embedded ? null : (

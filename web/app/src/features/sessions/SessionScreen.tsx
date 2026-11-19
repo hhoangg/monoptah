@@ -74,12 +74,14 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
       data-route="/d/:desktopId/s/:sessionId"
       className="flex h-full min-h-0 flex-1 flex-col"
     >
-      <header className="mx-auto flex w-full max-w-[768px] shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
+      {/* The header spans the chat pane; the transcript and composer keep their own 768 px column. */}
+      <header className="flex w-full shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
         <Link
           to={projectId ? "/d/$desktopId/p/$projectId" : "/d/$desktopId"}
           params={projectId ? { desktopId, projectId } : { desktopId }}
           aria-label="Back"
-          className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection"
+          // From 1024 px the project's session list is beside the chat, so there is nothing to go back to.
+          className={`inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection ${projectId ? "lg:hidden" : ""}`}
         >
           <Icon name="chevronDown" size={20} className="rotate-90" />
         </Link>

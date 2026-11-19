@@ -666,9 +666,10 @@ Information architecture, as in mobile (`ScenePager.tsx`, `WorkspaceDrawer.tsx`)
 
 | | Mobile (<640) | Tablet (640-1024) | Desktop (>=1024) |
 |---|---|---|---|
-| Desktop list / switcher | top of the drawer as a desktop switcher (sheet); manage screen under settings | persistent narrow rail (icons, 64px) or top of the sidebar | top of the sidebar (collapsible group per desktop) |
-| Session list | off-canvas drawer (swipe from edge, width `min(82vw, 330px)`), also home when no session is open | persistent sidebar 300px (collapsible with button) | persistent sidebar 320-360px (resizable, remembered) |
-| Transcript | full screen, one pane at a time | main pane, flex | main pane, content max-width 760px centered |
+| Desktop list / switcher | one slim row at the top of the `/d` frame: the desktop switcher (sheet) on the left, the app nav icons (Search on a phone, Desktops, Account, Install) right aligned; there is no separate header row on `/d` routes | same row | same row |
+| Workspace list (Monos, projects, Cloud, settings) | off-canvas drawer (swipe from edge, width `min(82vw, 330px)`), also home when no session is open | persistent sidebar 300px (collapsible with button) | persistent sidebar 320-360px (resizable, remembered) |
+| Session list of a project | the project page (its own screen) | the project page (its own screen) | a second sidebar beside the workspace sidebar, 240-560px, default 320 (resizable, `monoptah.layout.sessionListWidth`), shown on every screen of a project (project routes, a session, Files, Changes, Git); the native classic layout has the same column (260 default, 200-560) |
+| Transcript | full screen, one pane at a time | main pane, flex | chat pane: fills the rest of the width edge to edge (no card, no border, no centering of the pane); the transcript text column inside keeps max-width 768px centered |
 | Composer | bottom, floating glass pill | same | same, max-width aligned with the transcript column |
 | Side panels (files, changes, git, usage) | full-screen sheet (vaul, 92dvh) pushed over the transcript | right panel 360px overlay (slides over, dismissable) | right panel 380-480px docked, resizable, can stay open beside the transcript |
 | Navigation | drawer + horizontal page pager between scenes, header glass buttons | sidebar + header | sidebar + header, keyboard shortcuts, no pager |
@@ -677,6 +678,10 @@ Information architecture, as in mobile (`ScenePager.tsx`, `WorkspaceDrawer.tsx`)
 | Settings | full-screen routes, drawer-level entry | two-pane (list left, detail right) in a modal dialog 720px | two-pane in a dialog 800px or a full route |
 | Desktop manager, admin | full-screen routes | two-pane | table-like list with detail panel |
 | Pointer model | touch, swipe gestures | touch + pointer | pointer first, hover states, context menus, tooltips |
+
+The desktop layout mirrors the native classic layout: workspace sidebar | session list sidebar | chat pane (`ChatPane`, `features/layout/ChatPane.tsx`, the one place for a future tab strip and split panes) | optional docked right panel. A docked panel is sized as if the session list were at its 240px minimum and the list shrinks to make room (the stored width is untouched), so the chat pane never drops below 320px; where 380px does not fit, the panel is the overlay. The project routes (`/p/:projectId`, `/p/:projectId/new`) show the New session page in the chat pane, and the session list names the project (it holds the page's only h1; on a session or tool screen the chat holds the h1 and the list heading is an h2). Below 1024px there is no session list column: the project page and `/new` are separate pages as before.
+
+The pages outside a desktop (`/desktops`, `/settings`, `/admin`, `/install`) keep the 44px header (a glass pill with the brand link and the same nav icons); the sign-in pages and the public `/install` show the brand only. A chat view (New session, a session, a Mono chat) draws the project's background behind everything, under a scrim of the page background colour at 50% so text keeps its contrast in light and dark; a Mono chat uses the background of the first of its projects that has one.
 
 Rules:
 

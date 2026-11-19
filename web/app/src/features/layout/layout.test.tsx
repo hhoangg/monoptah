@@ -2,7 +2,7 @@
 // shortcuts and the command palette, against the real router and the mock desktop.
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -20,8 +20,9 @@ import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLinkOptions } f
 import { resetSessionActivity } from "@/features/sessions/activityStore";
 import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
+import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { AppShell } from "./AppShell";
-import { PANEL_WIDTH_KEY, SIDEBAR_COLLAPSED_KEY, SIDEBAR_WIDTH_KEY, dockedPanelMax, reloadLayoutPrefs, useLayoutPrefs } from "./layoutPrefs";
+import { PANEL_WIDTH_KEY, SESSION_LIST_WIDTH, SESSION_LIST_WIDTH_KEY, SIDEBAR_COLLAPSED_KEY, SIDEBAR_WIDTH_KEY, dockedPanelMax, reloadLayoutPrefs, useLayoutPrefs } from "./layoutPrefs";
 import { closeCommandPalette, isCommandPaletteOpen, openCommandPalette } from "./palette";
 import { clearPanels, closePanel, openPanel, registerPanel, usePanels } from "./panels";
 import { clearCreateMonoRequest } from "@/features/monos/createRequest";
@@ -31,12 +32,13 @@ import { clearShortcuts, isMod, registerShortcut } from "./shortcuts";
 const mediaListeners = new Set<() => void>();
 let viewportWidth = 1280;
 
-/** matchMedia for a viewport `width` px wide: every `(min-width: Npx)` query matches when width >= N. */
+/** matchMedia for a viewport `width` px wide: every `(min-width: N px|rem)` query matches when width >= N (1rem = 16px). */
 function stubViewport(width: number) {
   viewportWidth = width;
   Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: width });
   window.matchMedia = ((query: string) => {
-    const min = /min-width:\s*(\d+)px/.exec(query);
+    const found = /min-width:\s*([\d.]+)(px|rem)/.exec(query);
+    const min = found ? [found[0], String(Number(found[1]) * (found[2] === "rem" ? 16 : 1))] : null;
     const listeners = new Map<EventListener, () => void>();
     return {
       get matches() {
@@ -91,6 +93,9 @@ beforeEach(() => {
   registerSlot("app-shell", AppShell);
 });
 afterEach(() => {
+  // Unmount before the viewport goes back to 1280: a still-mounted project screen would re-render in the split layout
+  // (its 64rem query now matches) and open a link connection that leaks into the next test.
+  cleanup();
   resetLinkConnections();
   clearLinkStores();
   registerPersistAdapter(previous);
@@ -143,7 +148,9 @@ describe("sidebar", () => {
     expect(within(screen.getByTestId("app-sidebar")).getByRole("navigation", { name: "Workspace" })).toBeInTheDocument();
   });
 
-  it("has a Search button in the header below 640px that opens the palette, and none from 640px up", async () => {
+  it("has a Search button in the switcher row below 640px that opens the palette, and none from 640px up", async () => {
+    // The /d routes have no header: the phone Search button and the nav live in the desktop switcher row.
+    registerSlot("desktop-switcher", DesktopSwitcher);
     const user = userEvent.setup();
     mount(390, ALPHA);
     await screen.findByTestId("app-shell");
@@ -218,6 +225,96 @@ describe("sidebar", () => {
   });
 });
 
+describe("classic layout: session list sidebar and chat pane (>= 1024)", () => {
+  it("shows the project's session list between the sidebar and the chat pane on a project screen", async () => {
+    mount(1280, ALPHA);
+    const list = await screen.findByTestId("session-list-pane");
+    const shell = screen.getByTestId("app-shell");
+    expect(shell).toHaveAttribute("data-layout", "desktop");
+    // Left sidebar, then the session list, then the chat pane, in that order.
+    const order = [screen.getByTestId("app-sidebar"), list, screen.getByTestId("chat-pane")];
+    expect(order.map((node) => node.parentElement)).toEqual([shell, shell, shell]);
+    expect(order[0]!.compareDocumentPosition(order[1]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(order[1]!.compareDocumentPosition(order[2]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(list).toHaveStyle({ width: "320px" });
+    expect(await within(list).findByRole("heading", { level: 1, name: "Example Alpha" })).toBeInTheDocument();
+    expect(within(list).getByRole("searchbox", { name: "Search sessions" })).toBeInTheDocument();
+    expect(await within(list).findByTestId("sessions-list")).toBeInTheDocument();
+    expect(within(list).getByRole("link", { name: "New session" })).toHaveAttribute("href", expect.stringContaining("/p/proj-alpha/new"));
+    // No project route heading twice: the chat pane (the New session page) has no title of its own.
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
+  it("fills the chat pane edge to edge with the New session page, with no card", async () => {
+    mount(1700, ALPHA);
+    const pane = await screen.findByTestId("chat-pane");
+    const screenEl = await within(pane).findByTestId("new-session-screen");
+    expect(screenEl).toHaveAttribute("data-embedded", "true");
+    for (const node of [pane, screenEl]) {
+      expect(node.className).not.toMatch(/rounded|border|max-w-/);
+    }
+    // The composer's own column keeps a readable width, centered.
+    expect(within(pane).getByRole("textbox", { name: "Message" })).toBeInTheDocument();
+  });
+
+  it("keeps the session list on a session screen, for that session's project, with the chat beside it", async () => {
+    mount(1280, "/s/sess-local-1");
+    const list = await screen.findByTestId("session-list-pane");
+    expect(await within(list).findByRole("heading", { level: 2, name: "Example Alpha" })).toBeInTheDocument();
+    const pane = screen.getByTestId("chat-pane");
+    expect(await within(pane).findByRole("heading", { level: 1 })).toBeInTheDocument();
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    // The session list already is the way back.
+    expect(within(pane).getByRole("link", { name: "Back" }).className).toContain("lg:hidden");
+  });
+
+  it("has no session list on screens without a project, at tablet width and on a phone", async () => {
+    mount(1280, "/settings");
+    await screen.findByTestId("app-sidebar");
+    expect(screen.queryByTestId("session-list-pane")).toBeNull();
+    resizeViewport(768);
+    await waitFor(() => expect(screen.getByTestId("app-shell")).toHaveAttribute("data-layout", "tablet"));
+    expect(screen.queryByTestId("session-list-pane")).toBeNull();
+  });
+
+  it("shows no session list below 1024 even on a project screen", async () => {
+    mount(768, ALPHA);
+    await screen.findByTestId("app-sidebar");
+    expect(screen.queryByTestId("session-list-pane")).toBeNull();
+    resizeViewport(390);
+    await waitFor(() => expect(screen.getByTestId("app-shell")).toHaveAttribute("data-layout", "mobile"));
+    expect(screen.queryByTestId("session-list-pane")).toBeNull();
+    resizeViewport(1280);
+    expect(await screen.findByTestId("session-list-pane")).toBeInTheDocument();
+  });
+
+  it("is resizable: the splitter clamps to 240-560 and remembers the width", async () => {
+    const user = userEvent.setup();
+    mount(1700, ALPHA);
+    await screen.findByTestId("session-list-pane");
+    const splitter = screen.getByRole("separator", { name: "Resize session list" });
+    expect(splitter).toHaveAttribute("aria-valuemin", "240");
+    expect(splitter).toHaveAttribute("aria-valuemax", "560");
+    splitter.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(screen.getByTestId("session-list-pane")).toHaveStyle({ width: "336px" });
+    expect(localStorage.getItem(SESSION_LIST_WIDTH_KEY)).toBe("336");
+    await user.keyboard("{Home}");
+    expect(screen.getByTestId("session-list-pane")).toHaveStyle({ width: "240px" });
+    await user.keyboard("{End}");
+    expect(screen.getByTestId("session-list-pane")).toHaveStyle({ width: "560px" });
+  });
+
+  it("restores a stored width, clamped, and keeps 320px for the chat", async () => {
+    localStorage.setItem(SESSION_LIST_WIDTH_KEY, "900");
+    reloadLayoutPrefs();
+    expect(useLayoutPrefs.getState().sessionListWidth).toBe(560);
+    mount(1100, ALPHA);
+    // 1100 - 320 (sidebar) - 320 (chat) = 460.
+    expect(await screen.findByTestId("session-list-pane")).toHaveStyle({ width: "460px" });
+  });
+});
+
 describe("right panel host", () => {
   beforeEach(() => registerPanel("files", { title: "Files", component: FilesPanel }));
 
@@ -243,9 +340,9 @@ describe("right panel host", () => {
     expect(usePanels.getState().open).toBeNull();
   });
 
-  it("is docked and resizable at 1280, clamped to 380-480", async () => {
+  it("is docked and resizable at 1600, clamped to 380-480", async () => {
     const user = userEvent.setup();
-    mount(1280, ALPHA);
+    mount(1600, ALPHA);
     await screen.findByTestId("app-shell");
     act(() => void openPanel("files", target, local));
     const docked = await screen.findByTestId("panel-docked");
@@ -337,19 +434,35 @@ describe("right panel host, per project", () => {
     expect(usePanels.getState().open?.kind).toBe("files");
   });
 
-  it("keeps 320px for the main pane: narrows the docked panel at 1024, falls back to the overlay when 380 does not fit", async () => {
+  it("keeps 320px for the chat pane: narrows the docked panel, falls back to the overlay when 380 does not fit", async () => {
     expect(dockedPanelMax(1024, 320)).toBe(384);
     expect(dockedPanelMax(1024, 360)).toBeNull();
     expect(dockedPanelMax(1100, 320)).toBe(460);
     expect(dockedPanelMax(1280, 320)).toBe(480);
     expect(dockedPanelMax(1280, 360)).toBe(480);
+    // A project's screen also has the session list (240 at its narrowest): 320 + 240 + 380 + 320 = 1260.
+    expect(dockedPanelMax(1259, 320 + SESSION_LIST_WIDTH.min)).toBeNull();
+    expect(dockedPanelMax(1280, 320 + SESSION_LIST_WIDTH.min)).toBe(400);
 
-    mount(1024, ALPHA); // WorkspaceFrame draws its own 320px sidebar here
+    mount(1100, ALPHA);
     await screen.findByTestId("app-shell");
     act(() => void openPanel("files", target, local));
-    const docked = await screen.findByTestId("panel-docked");
-    expect(docked).toHaveStyle({ width: "384px" });
-    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute("aria-valuemax", "384");
+    expect(await screen.findByTestId("panel-overlay")).toBeInTheDocument();
+    expect(screen.queryByTestId("panel-docked")).toBeNull();
+  });
+
+  it("docks the panel at 1280 on a project screen by shrinking the session list to its minimum", async () => {
+    mount(1280, ALPHA);
+    await screen.findByTestId("app-shell");
+    expect(screen.getByTestId("session-list-pane")).toHaveStyle({ width: "320px" });
+    act(() => void openPanel("files", target, local));
+    expect(await screen.findByTestId("panel-docked")).toHaveStyle({ width: "400px" });
+    expect(screen.getByTestId("session-list-pane")).toHaveStyle({ width: "240px" });
+    expect(screen.getByRole("separator", { name: "Resize panel" })).toHaveAttribute("aria-valuemax", "400");
+    // The stored preference is untouched: the list comes back when the panel closes.
+    expect(useLayoutPrefs.getState().sessionListWidth).toBe(320);
+    act(() => closePanel());
+    await waitFor(() => expect(screen.getByTestId("session-list-pane")).toHaveStyle({ width: "320px" }));
   });
 
   it("opens as the overlay at 1024 when a 360px sidebar leaves too little room", async () => {
@@ -401,11 +514,13 @@ describe("persisted layout", () => {
     for (const bad of ["abc", "", "-5", "NaN", "1e3", "Infinity"]) {
       localStorage.setItem(SIDEBAR_WIDTH_KEY, bad);
       localStorage.setItem(PANEL_WIDTH_KEY, bad);
+      localStorage.setItem(SESSION_LIST_WIDTH_KEY, bad);
       localStorage.setItem(SIDEBAR_COLLAPSED_KEY, bad);
       reloadLayoutPrefs();
       const state = useLayoutPrefs.getState();
       expect(state.sidebarWidth, bad).toBe(320);
       expect(state.panelWidth, bad).toBe(420);
+      expect(state.sessionListWidth, bad).toBe(320);
       expect(state.sidebarCollapsed, bad).toBe(false);
     }
   });
@@ -413,7 +528,9 @@ describe("persisted layout", () => {
   it("clamps out-of-range numbers", () => {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, "10");
     localStorage.setItem(PANEL_WIDTH_KEY, "9000");
+    localStorage.setItem(SESSION_LIST_WIDTH_KEY, "10");
     reloadLayoutPrefs();
+    expect(useLayoutPrefs.getState().sessionListWidth).toBe(240);
     expect(useLayoutPrefs.getState().sidebarWidth).toBe(320);
     expect(useLayoutPrefs.getState().panelWidth).toBe(480);
   });

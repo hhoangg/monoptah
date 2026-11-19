@@ -3,15 +3,19 @@
 //                open as a sheet.
 //   640-1024px   persistent 300px sidebar, collapsible to a rail (monoptah.layout.sidebarCollapsed).
 //                Right panels slide over as a 360px overlay.
-//   >= 1024px    persistent 320-360px sidebar with a splitter (monoptah.layout.sidebarWidth). Right panels
-//                dock beside the main pane, 380-480px with a splitter (monoptah.layout.panelWidth), never
-//                squeezing the main pane below 320px: the panel narrows to fit, and where even 380px does
-//                not fit it opens as the overlay instead.
+//   >= 1024px    the classic layout, like the native app: the 320-360px workspace sidebar with a splitter
+//                (monoptah.layout.sidebarWidth), then, on the screens of a project, the project's session
+//                list as a second sidebar, 240-560px with a splitter (monoptah.layout.sessionListWidth,
+//                320 by default), then the chat pane filling the rest edge to edge (ChatPane). Right panels
+//                dock beside the chat pane, 380-480px with a splitter (monoptah.layout.panelWidth), never
+//                squeezing the chat pane below 320px: the panel narrows to fit, and where even 380px does
+//                not fit it opens as the overlay instead. The session list gives way first (it shrinks to
+//                keep the chat pane at 320px).
 // A right panel belongs to a project: it shows only on that project's screens (`p/$projectId/...` and the
 // sessions of that project).
 // The shell also mounts the global shortcuts (shortcuts.ts), the command palette (F-15), the project bar (from
 // 640px, in the sidebar foot: toggles Files, Changes and Git and opens the background picker) and the background dialog.
-import { useParams } from "@tanstack/react-router";
+import { useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { useCatalog } from "@/data";
 import { WorkspaceNav } from "@/features/sessions/WorkspaceNav";
@@ -20,11 +24,13 @@ import { IconTip } from "@/ui/tooltip";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import { BackgroundDialog } from "./BackgroundDialog";
 import { CommandPalette } from "./CommandPalette";
-import { SIDEBAR_WIDTH, TABLET_SIDEBAR_WIDTH, dockedPanelMax, useLayoutPrefs } from "./layoutPrefs";
+import { SessionListPane } from "@/features/sessions/SessionListPane";
+import { ChatPane } from "./ChatPane";
+import { PANEL_WIDTH, SESSION_LIST_WIDTH, SIDEBAR_WIDTH, TABLET_SIDEBAR_WIDTH, dockedPanelMax, sessionListMax, useLayoutPrefs } from "./layoutPrefs";
 import { openCommandPalette } from "./palette";
 import { setPanelScope } from "./panels";
 import { ProjectBar } from "./ProjectBar";
-import { RightPanel, type PanelMode } from "./RightPanel";
+import { RightPanel, useVisiblePanel, type PanelMode } from "./RightPanel";
 import { isMac, useGlobalShortcuts } from "./shortcuts";
 import { Splitter } from "./Splitter";
 
@@ -136,7 +142,14 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
   const desktop = useMediaQuery(DESKTOP_QUERY);
   const viewport = useViewportWidth();
   const sidebarWidth = useLayoutPrefs((state) => state.sidebarWidth);
+  const listPref = useLayoutPrefs((state) => state.sessionListWidth);
+  const setListWidth = useLayoutPrefs((state) => state.setSessionListWidth);
+  const persistListWidth = useLayoutPrefs((state) => state.persistSessionListWidth);
+  const panelPref = useLayoutPrefs((state) => state.panelWidth);
   const { projectId, targetKind } = useCurrentScope();
+  const visiblePanel = useVisiblePanel(desktopId, projectId);
+  // The project routes have no title in the chat pane (the New session page), so the session list names the project (h1).
+  const projectRoute = useRouterState({ select: (state) => /\/p\/[^/]+(\/new)?\/?$/.test(state.location.pathname) });
   useGlobalShortcuts();
 
   useEffect(() => {
@@ -144,16 +157,26 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
     return () => setPanelScope(null);
   }, [desktopId, projectId, targetKind]);
 
-  const dockMax = desktop ? dockedPanelMax(viewport, sidebarWidth) : null;
+  // The session list is the second sidebar of the classic layout: only from 1024 px, only for a project's screens.
+  const listShown = desktop && projectId !== null;
+  // A docked panel is sized as if the list were at its minimum, then the list shrinks to make room for it.
+  const dockMax = desktop ? dockedPanelMax(viewport, sidebarWidth + (listShown ? SESSION_LIST_WIDTH.min : 0)) : null;
   const mode: PanelMode = !wide ? "sheet" : dockMax !== null ? "docked" : "overlay";
+  const dockedWidth = mode === "docked" && dockMax !== null && visiblePanel ? Math.min(panelPref, Math.max(PANEL_WIDTH.min, Math.min(PANEL_WIDTH.max, dockMax))) : 0;
+  const listMax = sessionListMax(viewport, sidebarWidth + dockedWidth);
+  const listWidth = Math.min(listPref, listMax);
 
   return (
     <>
       <div data-testid="app-shell" data-layout={!wide ? "mobile" : desktop ? "desktop" : "tablet"} className="flex min-h-0 w-full flex-1 pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
         {wide ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
-        <div className="@container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
-          {children}
-        </div>
+        {listShown ? (
+          <>
+            <SessionListPane desktopId={desktopId} projectId={projectId} width={listWidth} heading={projectRoute ? "h1" : "h2"} />
+            <Splitter label="Resize session list" value={listWidth} min={SESSION_LIST_WIDTH.min} max={listMax} onChange={setListWidth} onCommit={persistListWidth} grow={1} />
+          </>
+        ) : null}
+        <ChatPane>{children}</ChatPane>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}
       </div>
       {mode === "docked" ? null : <RightPanel mode={mode} desktopId={desktopId} projectId={projectId} />}
