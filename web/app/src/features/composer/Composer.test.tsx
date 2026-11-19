@@ -4,6 +4,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Composer, DESKTOP_LAYOUT_QUERY, OFFLINE_PLACEHOLDER, READ_ONLY_REASON, STOP_RETRY_MS, UNKNOWN_ERROR_SENTENCE, type ComposerProps } from "./Composer";
+import { Dialog, DialogContent, DialogTitle } from "@/ui/dialog";
 import { SendCancelled } from "./useSendGuard";
 
 function setMedia(desktop: boolean) {
@@ -262,73 +263,213 @@ describe("send", () => {
     expect(onStop).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the card until a press elsewhere ends, so the content under the pointer does not shift before its click", async () => {
+  it("keeps the card after the empty field blurs on its own (WebKit blurs it on a tap on a chip), with no timer involved", () => {
+    const { field } = renderWithOutside(vi.fn());
+    const shape = () => field.closest("[data-shape]");
+    act(() => field.focus());
+    act(() => field.blur());
+    expect(shape()).toHaveAttribute("data-shape", "card");
+  });
+
+  it("keeps the card when focus moves from the field to a chip inside it, and the chip works on that first tap", async () => {
+    const user = userEvent.setup();
+    const onPick = vi.fn();
+    render(<Composer onSubmit={() => Promise.resolve()} toolbar={<button type="button" onClick={onPick}>Model chip</button>} />);
+    const field = screen.getByRole("textbox");
+    const shape = () => field.closest("[data-shape]");
+    act(() => field.focus());
+    const chip = screen.getByRole("button", { name: "Model chip" });
+    // A finger tap: the field loses focus before the click arrives.
+    fireEvent.pointerDown(chip, { pointerType: "touch" });
+    act(() => field.blur());
+    fireEvent.pointerUp(chip, { pointerType: "touch" });
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    await user.click(chip);
+    expect(onPick).toHaveBeenCalledTimes(1);
+    expect(shape()).toHaveAttribute("data-shape", "card");
+  });
+
+  it("collapses on a press outside the composer", async () => {
     const user = userEvent.setup();
     const onOutside = vi.fn();
     const { field } = renderWithOutside(onOutside);
     const shape = () => field.closest("[data-shape]");
     act(() => field.focus());
     expect(shape()).toHaveAttribute("data-shape", "card");
-    const outside = screen.getByRole("button", { name: "Outside" });
-    await user.pointer({ keys: "[MouseLeft>]", target: outside });
-    // The press blurred the field, yet the layout must still be the card the pointer went down on.
-    expect(field).not.toHaveFocus();
-    expect(shape()).toHaveAttribute("data-shape", "card");
-    await user.pointer({ keys: "[/MouseLeft]", target: outside });
+    await user.click(screen.getByRole("button", { name: "Outside" }));
     expect(onOutside).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"));
+    expect(shape()).toHaveAttribute("data-shape", "pill");
   });
 
-  it("keeps the card through a finger tap elsewhere until its click, because WebKit blurs the field on the mousedown after pointerup", async () => {
+  it("collapses when a finger press lands outside, even after the field was already blurred", () => {
+    const { field } = renderWithOutside(vi.fn());
+    const shape = () => field.closest("[data-shape]");
+    act(() => field.focus());
+    act(() => field.blur());
+    const outside = screen.getByRole("button", { name: "Outside" });
+    fireEvent.pointerDown(outside, { pointerType: "touch" });
+    fireEvent.pointerUp(outside, { pointerType: "touch" });
+    // The card is held until the tap's click has been dispatched.
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    fireEvent.click(outside);
+    expect(shape()).toHaveAttribute("data-shape", "pill");
+  });
+
+  it("collapses a touch press outside that turns into a scroll (pointercancel, no click)", () => {
+    const { field } = renderWithOutside(vi.fn());
+    act(() => field.focus());
+    const outside = screen.getByRole("button", { name: "Outside" });
+    fireEvent.pointerDown(outside, { pointerType: "touch" });
+    fireEvent.pointerCancel(outside, { pointerType: "touch" });
+    expect(field.closest("[data-shape]")).toHaveAttribute("data-shape", "pill");
+  });
+
+  it("keeps the card while a mouse press outside is down (focus moves to what was pressed) and collapses once it is released", async () => {
+    const user = userEvent.setup();
     const onOutside = vi.fn();
     const { field } = renderWithOutside(onOutside);
     const shape = () => field.closest("[data-shape]");
     act(() => field.focus());
-    expect(shape()).toHaveAttribute("data-shape", "card");
     const outside = screen.getByRole("button", { name: "Outside" });
-    // The order of a tap: pointerdown, pointerup, then the compatibility mousedown (focus moves), mouseup and click.
-    fireEvent.pointerDown(outside, { pointerType: "touch" });
-    fireEvent.pointerUp(outside, { pointerType: "touch" });
-    await act(() => new Promise((resolve) => setTimeout(resolve, 10)));
-    act(() => field.blur());
-    await act(() => new Promise((resolve) => setTimeout(resolve, 10)));
+    await user.pointer({ keys: "[MouseLeft>]", target: outside });
+    // The press moved focus to the pressed button, yet the layout under the pointer must not shift before its click.
     expect(field).not.toHaveFocus();
     expect(shape()).toHaveAttribute("data-shape", "card");
-    fireEvent.click(outside);
+    await user.pointer({ keys: "[/MouseLeft]", target: outside });
     expect(onOutside).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"));
+    expect(shape()).toHaveAttribute("data-shape", "pill");
   });
 
-  it("collapses a card held for a finger tap even when no click follows (a drag)", async () => {
-    const { field } = renderWithOutside(vi.fn());
+  it("collapses on an outside click that a handler stops from propagating, and leaves no press pending", () => {
+    render(
+      <>
+        <button type="button" onClick={(event) => event.stopPropagation()}>
+          Stopper
+        </button>
+        <button type="button">Elsewhere</button>
+        <Composer onSubmit={() => Promise.resolve()} />
+      </>,
+    );
+    const field = screen.getByRole("textbox");
     const shape = () => field.closest("[data-shape]");
     act(() => field.focus());
-    const outside = screen.getByRole("button", { name: "Outside" });
-    fireEvent.pointerDown(outside, { pointerType: "touch" });
-    fireEvent.pointerUp(outside, { pointerType: "touch" });
+    const stopper = screen.getByRole("button", { name: "Stopper" });
+    fireEvent.pointerDown(stopper, { pointerType: "touch" });
+    fireEvent.pointerUp(stopper, { pointerType: "touch" });
+    fireEvent.click(stopper);
+    expect(shape()).toHaveAttribute("data-shape", "pill");
     act(() => field.blur());
-    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"), { timeout: 2000 });
-  });
-
-  it("a leftover wait of an earlier finger tap does not release the next press early", async () => {
-    const { field } = renderWithOutside(vi.fn());
-    const shape = () => field.closest("[data-shape]");
-    const outside = screen.getByRole("button", { name: "Outside" });
     act(() => field.focus());
-    // Tap 1 ends without a click: its 500 ms wait is left running.
-    fireEvent.pointerDown(outside, { pointerType: "touch" });
-    fireEvent.pointerUp(outside, { pointerType: "touch" });
-    await act(() => new Promise((resolve) => setTimeout(resolve, 300)));
-    // Tap 2 starts and ends later; tap 1's timer would fire in the middle of it.
-    act(() => field.focus());
-    fireEvent.pointerDown(outside, { pointerType: "touch" });
-    fireEvent.pointerUp(outside, { pointerType: "touch" });
-    await act(() => new Promise((resolve) => setTimeout(resolve, 300)));
-    act(() => field.blur());
-    // 600 ms after tap 1 (past its timer), 300 ms after tap 2: the card is still held for tap 2's click.
     expect(shape()).toHaveAttribute("data-shape", "card");
-    fireEvent.click(outside);
-    await waitFor(() => expect(shape()).toHaveAttribute("data-shape", "pill"));
+    act(() => screen.getByRole("button", { name: "Elsewhere" }).focus());
+    expect(shape()).toHaveAttribute("data-shape", "pill");
+  });
+
+  it("forgets a finished press inside: scripted focus outside later still collapses", () => {
+    render(
+      <>
+        <main tabIndex={-1} data-testid="page">
+          <Composer onSubmit={() => Promise.resolve()} toolbar={<button type="button">Model chip</button>} />
+        </main>
+        <button type="button">Elsewhere</button>
+      </>,
+    );
+    const field = screen.getByRole("textbox");
+    act(() => field.focus());
+    const chip = screen.getByRole("button", { name: "Model chip" });
+    fireEvent.pointerDown(chip, { pointerType: "touch" });
+    fireEvent.pointerUp(chip, { pointerType: "touch" });
+    act(() => screen.getByTestId("page").focus());
+    fireEvent.click(chip);
+    expect(field.closest("[data-shape]")).toHaveAttribute("data-shape", "card");
+    act(() => screen.getByRole("button", { name: "Elsewhere" }).focus());
+    expect(field.closest("[data-shape]")).toHaveAttribute("data-shape", "pill");
+  });
+
+  it("collapses when focus moves to an element outside the composer", () => {
+    const { field } = renderWithOutside(vi.fn());
+    const shape = () => field.closest("[data-shape]");
+    act(() => field.focus());
+    act(() => screen.getByRole("button", { name: "Outside" }).focus());
+    expect(shape()).toHaveAttribute("data-shape", "pill");
+  });
+
+  it("keeps the card when the page takes focus right after a press on a chip (iOS does not focus a tapped button)", () => {
+    render(
+      <>
+        <main tabIndex={-1} data-testid="page">
+          <Composer onSubmit={() => Promise.resolve()} toolbar={<button type="button">Model chip</button>} />
+        </main>
+      </>,
+    );
+    const field = screen.getByRole("textbox");
+    act(() => field.focus());
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Model chip" }), { pointerType: "touch" });
+    act(() => screen.getByTestId("page").focus());
+    expect(field.closest("[data-shape]")).toHaveAttribute("data-shape", "card");
+  });
+
+  it("collapses on Escape in the empty field", async () => {
+    const user = userEvent.setup();
+    const { field } = renderWithOutside(vi.fn());
+    act(() => field.focus());
+    await user.keyboard("{Escape}");
+    expect(field.closest("[data-shape]")).toHaveAttribute("data-shape", "pill");
+    expect(field).not.toHaveFocus();
+  });
+
+  it("counts an overlay opened from the composer as inside, but not an unrelated one", () => {
+    render(
+      <>
+        <Composer
+          onSubmit={() => Promise.resolve()}
+          toolbar={
+            <Dialog open modal={false}>
+              <DialogContent>
+                <DialogTitle>Own</DialogTitle>
+                <button type="button">Own option</button>
+              </DialogContent>
+            </Dialog>
+          }
+        />
+        <Dialog open modal={false}>
+          <DialogContent>
+            <DialogTitle>Other</DialogTitle>
+            <button type="button">Other option</button>
+          </DialogContent>
+        </Dialog>
+      </>,
+    );
+    const shape = () => screen.getByTestId("composer").querySelector("[data-shape]")!;
+    act(() => screen.getByRole("textbox", { hidden: true }).focus());
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    const own = screen.getByRole("button", { name: "Own option", hidden: true });
+    fireEvent.pointerDown(own, { pointerType: "touch" });
+    fireEvent.pointerUp(own, { pointerType: "touch" });
+    fireEvent.click(own);
+    expect(shape()).toHaveAttribute("data-shape", "card");
+    const other = screen.getByRole("button", { name: "Other option", hidden: true });
+    fireEvent.pointerDown(other, { pointerType: "touch" });
+    fireEvent.pointerUp(other, { pointerType: "touch" });
+    fireEvent.click(other);
+    expect(shape()).toHaveAttribute("data-shape", "pill");
+  });
+
+  it("a press on the resting pill, away from its buttons, opens the card", () => {
+    render(<Composer onSubmit={() => Promise.resolve()} />);
+    const shape = screen.getByTestId("composer").querySelector<HTMLElement>("[data-shape]")!;
+    expect(shape).toHaveAttribute("data-shape", "pill");
+    fireEvent.pointerDown(shape, { pointerType: "touch" });
+    expect(shape).toHaveAttribute("data-shape", "card");
+  });
+
+  it("a phone closes the card after a send", async () => {
+    setMedia(false);
+    const user = userEvent.setup();
+    const { field } = setup();
+    await user.type(field, "hi");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(field.closest("[data-shape]")).toHaveAttribute("data-shape", "pill"));
   });
 
   it("keeps the card when Stop is pressed while the empty field has focus", async () => {

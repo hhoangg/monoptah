@@ -1,6 +1,7 @@
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui";
 import type { ComponentProps } from "react";
 import { cn } from "@/lib/utils";
+import { useOverlayOwnerAttr } from "./overlayOwner";
 
 // Dropdown menu for `pointer: fine` (design-system.md section 8): bg sheet, menu-card radius,
 // rows min 44 (36 on pointer: fine), highlight = selection, destructive = deletions, no shadow.
@@ -14,9 +15,11 @@ export function DropdownMenuContent({
   sideOffset = 6,
   ...props
 }: ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+  const owner = useOverlayOwnerAttr();
   return (
     <DropdownMenuPrimitive.Portal>
       <DropdownMenuPrimitive.Content
+        {...owner}
         data-slot="dropdown-menu-content"
         sideOffset={sideOffset}
         className={cn(
