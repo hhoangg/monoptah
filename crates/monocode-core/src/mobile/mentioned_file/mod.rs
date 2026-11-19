@@ -34,6 +34,8 @@ pub mod cost;
 pub mod evidence;
 pub mod html;
 pub mod mentions;
+pub mod prepass;
+pub mod sandbox;
 
 use std::{
     borrow::Cow,
@@ -86,6 +88,10 @@ pub const MAX_SCAN_WORK: u64 = 1_000_000_000;
 /// inlining copies a declaration into every element it matches, so this bounds the time and
 /// memory of the worst case (measured: about 30 bytes of memory per unit, so about 200 MB).
 pub const MAX_COPY_WORK: u64 = 6_000_000;
+/// Selector checks (with the walks of descendant, sibling and `:has(` selectors, see [`cost`])
+/// an HTML document may cost, whatever its declarations. A pre-filter: the transform is bounded
+/// by its child process (see [`sandbox`]).
+pub const MAX_MATCH_WORK: u64 = 2_000_000_000;
 /// Longest `path` or `asset`, in characters.
 pub const MAX_PATH_CHARS: usize = 1024;
 /// One linked stylesheet, and all of them together, in bytes.
@@ -1302,21 +1308,47 @@ fn html_document(
     }
     let raw = read_at(file, 0, metadata.len() as usize)?;
     let source = String::from_utf8_lossy(&raw).into_owned();
-    let census = Arc::new(cost::Census::of(&source));
-    let (style, copy) = cost::inline_styles(&source, &census);
-    if census.elements.saturating_mul(style) > MAX_SCAN_WORK || copy > MAX_COPY_WORK {
-        return Err(Code::TooLarge.failure());
-    }
+    // The true shape of the tree the parser builds (clones of formatting elements included):
+    // a document with too many elements, or nested too deep, is refused before any transform.
+    let shape = prepass::scan(&source).map_err(|_| sandbox::too_complex())?;
+    // The sheets are read here, with the folder and deny-list checks, in the order the inliner
+    // asks for them (sorted, once each); the transform gets their text and opens no file.
     let folder = canonical.parent().unwrap_or(canonical).to_path_buf();
-    let sheets = Arc::new(FolderSheets {
+    let folder_sheets = FolderSheets {
         folder,
         guard: env.guard.clone(),
         used: AtomicU64::new(0),
-        census,
-        style: AtomicU64::new(style),
-        copy: AtomicU64::new(copy),
-    });
-    let document = html::transform(&source, sheets);
+    };
+    let mut hrefs = shape.stylesheets.clone();
+    hrefs.sort_unstable();
+    hrefs.dedup();
+    let sheets: Vec<(String, String)> = hrefs
+        .into_iter()
+        .filter_map(|href| {
+            let text = html::Sheets::load(&folder_sheets, &href)?;
+            Some((href, text))
+        })
+        .collect();
+    // The style the inliner parses: every `<style>`, then the sheets, joined with newlines.
+    let css: String = shape
+        .styles
+        .iter()
+        .map(String::as_str)
+        .chain(sheets.iter().map(|(_, text)| text.as_str()))
+        .flat_map(|part| [part, "\n"])
+        .collect();
+    let census = cost::Census::from_shape(&shape);
+    let work = cost::assess(&css, &census);
+    if census.elements.saturating_mul(css.len() as u64) > MAX_SCAN_WORK
+        || work.copy > MAX_COPY_WORK
+        || work.matching > MAX_MATCH_WORK
+    {
+        return Err(Code::TooLarge.failure());
+    }
+    let document = sandbox::transformer().run(sandbox::Input {
+        html: source,
+        sheets,
+    })?;
     if document.html.len() as u64 > MENTIONED_FILE_MAX_BYTES {
         return Err(Code::TooLarge.failure());
     }
@@ -1457,11 +1489,6 @@ struct FolderSheets {
     folder: PathBuf,
     guard: Guard,
     used: AtomicU64,
-    /// The document's census, and the style bytes and copy cost so far (its own plus the sheets
-    /// taken), which the inliner's work and output grow with (see [`cost`]).
-    census: Arc<cost::Census>,
-    style: AtomicU64,
-    copy: AtomicU64,
 }
 
 impl html::Sheets for FolderSheets {
@@ -1489,17 +1516,7 @@ impl html::Sheets for FolderSheets {
         }
         let mut text = Vec::new();
         file.read_to_end(&mut text).ok()?;
-        let text = String::from_utf8_lossy(&text).into_owned();
-        let style = self.style.fetch_add(text.len() as u64, Ordering::SeqCst) + text.len() as u64;
-        let added = cost::copy_cost(&text, &self.census);
-        let copy = self
-            .copy
-            .fetch_add(added, Ordering::SeqCst)
-            .saturating_add(added);
-        if self.census.elements.saturating_mul(style) > MAX_SCAN_WORK || copy > MAX_COPY_WORK {
-            return None;
-        }
-        Some(text)
+        Some(String::from_utf8_lossy(&text).into_owned())
     }
 }
 

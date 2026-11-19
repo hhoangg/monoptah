@@ -1363,6 +1363,9 @@ fn run_check_vectors(path: &Path, out: &mut dyn Write, err: &mut dyn Write) -> i
 }
 
 fn main() {
+    // The HTML transform of `chat.mentionedFile` runs in a child of this executable, like the app.
+    monocode_core::mobile::mentioned_file::sandbox::maybe_run_child();
+    monocode_core::mobile::mentioned_file::sandbox::enable_subprocess();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();

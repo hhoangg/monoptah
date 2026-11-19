@@ -1117,6 +1117,73 @@ fn one_rule_with_a_huge_declaration_block_is_too_large() {
     assert!(run(&["`ok.html`"], &fx.root, &params("ok.html")).is_ok());
 }
 
+// ---- the transform is bounded by structure, not by estimates ----
+
+#[test]
+fn a_deeply_nested_page_is_refused_not_a_stack_overflow() {
+    let fx = Fx::new();
+    // 10 KB, no CSS: aborted the whole process on the 512 KB stack of a background thread.
+    fx.write("deep.html", "<div>".repeat(2000));
+    let result = run(&["`deep.html`"], &fx.root, &params("deep.html"));
+    assert_eq!(code(&result), Some(Code::TooLarge));
+}
+
+#[test]
+fn cloned_formatting_elements_are_counted_and_refused_fast() {
+    let fx = Fx::new();
+    // 43 KB of source that html5ever turns into millions of elements.
+    let opening: String = (0..200).map(|n| format!("<b class=c{n}>")).collect();
+    let bomb = format!("<p>{opening}x</p>{}", "<p>x".repeat(10_000));
+    fx.write("bomb.html", &bomb);
+    fx.write(
+        "bomb-css.html",
+        format!("<style>.c1{{color:red}}</style>{bomb}"),
+    );
+    for name in ["bomb.html", "bomb-css.html"] {
+        let started = std::time::Instant::now();
+        let result = run(&[&format!("`{name}`")], &fx.root, &params(name));
+        assert_eq!(code(&result), Some(Code::TooLarge), "{name}");
+        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+    }
+}
+
+#[test]
+fn walking_selectors_without_declarations_are_too_costly() {
+    let fx = Fx::new();
+    let nest = "<div>".repeat(200);
+    let rules = "div div div div div div div div{}div~div~div~div{}";
+    fx.write(
+        "walk.html",
+        format!(
+            "<style>{rules}</style>{nest}{}",
+            "<div>x</div>".repeat(3000)
+        ),
+    );
+    let result = run(&["`walk.html`"], &fx.root, &params("walk.html"));
+    assert_eq!(code(&result), Some(Code::TooLarge));
+}
+
+#[test]
+fn a_realistic_report_is_still_served() {
+    let fx = Fx::new();
+    // 3000 elements, 200 KB of class rules (some with a descendant), nested about 20 deep.
+    let rules: String = (0..3000)
+        .map(|n| format!(".c{n}{{color:#123456;margin:1px}}.t .c{n}{{padding:2px}}"))
+        .collect();
+    let rows: String = (0..1000)
+        .map(|n| format!("<tr class=\"c{n}\"><td class=\"c{n}\">v&amp;{n}</td></tr>"))
+        .collect();
+    let nest = format!(
+        "{}<table class=t>{rows}</table>{}",
+        "<div>".repeat(18),
+        "</div>".repeat(18)
+    );
+    assert!(rules.len() > 100_000);
+    fx.write("report.html", format!("<style>{rules}</style>{nest}"));
+    let reply = run(&["`report.html`"], &fx.root, &params("report.html")).unwrap();
+    assert!(reply.data.contains("#123456"));
+}
+
 #[test]
 fn a_device_has_one_transform_in_flight_and_the_slot_is_freed() {
     let first = Flight::enter("flight-test-device").unwrap();

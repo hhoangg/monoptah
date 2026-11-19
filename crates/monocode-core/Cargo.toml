@@ -50,6 +50,8 @@ yaml-rust2 = { version = "0.13", default-features = false }
 # Sanitizes and inlines a mentioned HTML file for the web preview (chat.mentionedFile).
 ammonia = "4"
 css-inline = { version = "0.14", default-features = false }
+# The same HTML parser the two above use, for the shape pre-pass of the HTML transform (true element count).
+html5ever = "0.40"
 # Finds the file mentions in an assistant message (chat.mentionedFile).
 pulldown-cmark = { version = "0.13.5", default-features = false }
 

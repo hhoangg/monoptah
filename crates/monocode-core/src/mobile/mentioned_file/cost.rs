@@ -14,6 +14,18 @@
 //!   pseudo class, an escape) can match every element. A source with numeric character
 //!   references (which can spell a class name without writing it) counts every rule as matching
 //!   every element.
+//!
+//! This is a fast pre-filter, not the guarantee: the transform runs in an isolated child process
+//! with a time, output and memory limit (see [`super::sandbox`]). The document's census comes
+//! from the real parse ([`super::prepass`]: clones included, entities decoded), and the style text
+//! is the concatenation of every `<style>` and linked sheet in the order `css-inline` joins them.
+//!
+//! Matching cost: a rule costs one check per element plus, for each element its rightmost
+//! compound can reach, the work of the rest of the selector. A descendant combinator walks the
+//! ancestors (up to the depth of the document, and backtracks), `~`, `:nth-*` and `*-of-type`
+//! walk the siblings (up to the widest node), and `:has(` walks the descendants (up to every
+//! element); each such feature in a selector (also inside `:not(`, `:is(`, `:where(`) multiplies
+//! the reach by that bound. A rule with no declarations costs matching all the same.
 use std::collections::HashMap;
 
 /// Most distinct words remembered; a word past the limit counts as "everywhere".
@@ -33,6 +45,9 @@ const CONTAINERS: &[&str] = &[
 #[derive(Debug, Default)]
 pub struct Census {
     pub elements: u64,
+    /// Bounds of the ancestors and the siblings a combinator can walk.
+    pub depth: u64,
+    pub siblings: u64,
     words: HashMap<String, u64>,
     /// Some word could not be counted: every rule may match every element.
     opaque: bool,
@@ -48,13 +63,18 @@ impl Census {
     pub fn of(source: &str) -> Self {
         let bytes = source.as_bytes();
         let mut census = Self {
+            // Without a parse the walk bounds are the element count.
+            depth: 0,
+            siblings: 0,
             elements: bytes
                 .windows(2)
                 .filter(|pair| pair[0] == b'<' && pair[1].is_ascii_alphabetic())
                 .count() as u64,
-            opaque: bytes.windows(2).any(|pair| pair == b"&#"),
+            opaque: entity_in_a_tag(bytes),
             ..Self::default()
         };
+        census.depth = census.elements;
+        census.siblings = census.elements;
         let mut at = 0;
         while at < bytes.len() {
             if !word_byte(bytes[at]) {
@@ -75,6 +95,17 @@ impl Census {
             }
         }
         census
+    }
+
+    /// The census of a parsed document: every count is the true one, entities decoded.
+    pub fn from_shape(shape: &super::prepass::Shape) -> Self {
+        Self {
+            elements: shape.elements,
+            depth: shape.max_depth.max(1),
+            siblings: shape.max_children.max(1),
+            words: shape.words.clone(),
+            opaque: shape.opaque,
+        }
     }
 
     fn count(&self, word: &str) -> u64 {
@@ -139,26 +170,122 @@ impl Census {
         }
     }
 
-    /// An upper bound of the elements a rule with this selector list can match.
+    /// An upper bound of the elements a rule with this selector list can match. The list is cut
+    /// at EVERY comma, also inside parentheses, like `css-inline` does (an over-count at worst).
     fn reach_list(&self, prelude: &str) -> u64 {
-        let mut total = 0u64;
-        let mut depth = 0i32;
-        let mut start = 0;
-        let bytes = prelude.as_bytes();
-        for (at, byte) in bytes.iter().enumerate() {
-            match byte {
-                b'(' | b'[' => depth += 1,
-                b')' | b']' => depth -= 1,
-                b',' if depth <= 0 => {
-                    total = total.saturating_add(self.reach(&prelude[start..at]));
-                    start = at + 1;
-                }
-                _ => {}
-            }
-        }
-        total = total.saturating_add(self.reach(&prelude[start..]));
-        total.min(self.elements)
+        let total = prelude
+            .split(',')
+            .fold(0u64, |total, piece| total.saturating_add(self.reach(piece)));
+        total
+            .min(
+                self.elements
+                    .saturating_mul(prelude.matches(',').count() as u64 + 1),
+            )
+            .min(self.elements)
     }
+
+    /// The matching cost of a rule with this selector list (see the module docs).
+    fn match_list(&self, prelude: &str) -> u64 {
+        prelude.split(',').fold(0u64, |total, piece| {
+            let walk = (0..walks(piece, WalkKind::Ancestors))
+                .fold(1u64, |a, _| a.saturating_mul(self.depth.max(1)))
+                .saturating_mul(
+                    (0..walks(piece, WalkKind::Siblings))
+                        .fold(1u64, |a, _| a.saturating_mul(self.siblings.max(1))),
+                )
+                .saturating_mul(
+                    (0..walks(piece, WalkKind::Descendants))
+                        .fold(1u64, |a, _| a.saturating_mul(self.elements.max(1))),
+                );
+            total
+                .saturating_add(self.elements)
+                .saturating_add(self.reach(piece).saturating_mul(walk))
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WalkKind {
+    Ancestors,
+    Siblings,
+    Descendants,
+}
+
+/// How many walks of `kind` one selector piece makes.
+fn walks(piece: &str, kind: WalkKind) -> u32 {
+    let lower = piece.to_ascii_lowercase();
+    match kind {
+        WalkKind::Descendants => lower.matches(":has(").count() as u32,
+        WalkKind::Siblings => {
+            (lower.matches('~').count()
+                + lower.matches(":nth-").count()
+                + lower.matches("-of-type").count()) as u32
+        }
+        WalkKind::Ancestors => {
+            let bytes = lower.as_bytes();
+            let mut count = 0;
+            let mut at = 0;
+            let mut square = 0i32;
+            while at < bytes.len() {
+                match bytes[at] {
+                    b'[' => square += 1,
+                    b']' => square -= 1,
+                    b'"' | b'\'' => {
+                        at = skip_string(bytes, at);
+                        continue;
+                    }
+                    byte if byte.is_ascii_whitespace() && square <= 0 => {
+                        let before = bytes[..at].iter().rev().find(|b| !b.is_ascii_whitespace());
+                        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                            at += 1;
+                        }
+                        let after = bytes.get(at);
+                        let joins = |b: Option<&u8>| {
+                            b.is_none_or(|b| matches!(b, b'>' | b'+' | b'~' | b'(' | b')' | b','))
+                        };
+                        if !(joins(before) || joins(after)) {
+                            count += 1;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+            // Child combinators (`>`) walk one step but chain like the others.
+            count + lower.matches('>').count() as u32
+        }
+    }
+}
+
+/// An entity (`&` followed by a letter, a digit or `#`) inside a tag, where it can spell a class
+/// name, an id or a tag name without writing it. Quotes are not tracked: any quote opens a quoted
+/// stretch, so the scan stays inside a tag at least as long as the parser does.
+fn entity_in_a_tag(bytes: &[u8]) -> bool {
+    let (mut in_tag, mut quote) = (false, 0u8);
+    for (at, byte) in bytes.iter().enumerate() {
+        if !in_tag {
+            in_tag = *byte == b'<' && bytes.get(at + 1).is_some_and(u8::is_ascii_alphabetic);
+            continue;
+        }
+        if *byte == b'&'
+            && bytes
+                .get(at + 1)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == b'#')
+        {
+            return true;
+        }
+        if quote != 0 {
+            if *byte == quote {
+                quote = 0;
+            }
+        } else if matches!(byte, b'"' | b'\'') {
+            quote = *byte;
+        } else if *byte == b'>' {
+            in_tag = false;
+        }
+    }
+    false
 }
 
 /// The index just past the group opened at `at` (nesting counted), or the end.
@@ -196,13 +323,34 @@ fn rightmost_compound(selector: &str) -> &str {
     &trimmed[last..]
 }
 
-/// Declaration bytes times the elements they can reach, summed over the rules of `css`. Comments
-/// and strings are skipped like a CSS parser does; at-rules that do not hold rules for elements
-/// (`@font-face`, `@keyframes`, ...) cost nothing and a nested rule is counted as reaching every
-/// element.
+/// What inlining a stylesheet costs, in abstract units (see the module docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cost {
+    /// Declaration bytes times the elements they can reach.
+    pub copy: u64,
+    /// Selector checks, with the walks of combinators and structural pseudo classes.
+    pub matching: u64,
+}
+
+impl Cost {
+    fn add(&mut self, other: Cost) {
+        self.copy = self.copy.saturating_add(other.copy);
+        self.matching = self.matching.saturating_add(other.matching);
+    }
+}
+
+/// The copy cost of `css` (see [`assess`]).
 pub fn copy_cost(css: &str, census: &Census) -> u64 {
+    assess(css, census).copy
+}
+
+/// Declaration bytes times the elements they can reach, and the matching cost, summed over the
+/// rules of `css`. Comments and strings are skipped like a CSS parser does; at-rules that do not
+/// hold rules for elements (`@font-face`, `@keyframes`, ...) cost nothing and a nested rule is
+/// counted as reaching every element.
+pub fn assess(css: &str, census: &Census) -> Cost {
     let bytes = css.as_bytes();
-    let mut total = 0u64;
+    let mut total = Cost::default();
     let mut prelude_start = 0;
     let mut at = 0;
     while at < bytes.len() {
@@ -229,15 +377,18 @@ pub fn copy_cost(css: &str, census: &Census) -> u64 {
                         .unwrap_or("")
                         .to_ascii_lowercase();
                     if CONTAINERS.contains(&name.as_str()) {
-                        total = total.saturating_add(copy_cost(inner, census));
+                        total.add(assess(inner, census));
                     }
                 } else if inner.contains('{') {
-                    total =
-                        total.saturating_add((inner.len() as u64).saturating_mul(census.elements));
+                    total.add(Cost {
+                        copy: (inner.len() as u64).saturating_mul(census.elements),
+                        matching: census.elements.saturating_mul(census.elements),
+                    });
                 } else {
-                    total = total.saturating_add(
-                        (inner.len() as u64).saturating_mul(census.reach_list(prelude)),
-                    );
+                    total.add(Cost {
+                        copy: (inner.len() as u64).saturating_mul(census.reach_list(prelude)),
+                        matching: census.match_list(prelude),
+                    });
                 }
                 at = end;
                 prelude_start = at;
@@ -312,39 +463,6 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
-/// The bytes of every `<style>` region of `source` (the text up to the next `</style`, or the
-/// end), and the copy cost of those regions. A decoy opener (`<!--<style>-->`, `<styled>`) only
-/// makes the regions larger.
-pub fn inline_styles(source: &str, census: &Census) -> (u64, u64) {
-    let bytes = source.as_bytes();
-    let (mut size, mut copy) = (0u64, 0u64);
-    let mut at = 0;
-    while let Some(found) = find_ignore_case(&bytes[at..], b"<style") {
-        let start = at + found + b"<style".len();
-        let end =
-            find_ignore_case(&bytes[start..], b"</style").map_or(bytes.len(), |end| start + end);
-        // Region text starts after the opening tag's `>` when there is one.
-        let from = bytes[start..end]
-            .iter()
-            .position(|b| *b == b'>')
-            .map_or(start, |open| start + open + 1);
-        size += (end - start) as u64;
-        // Cut on character boundaries: the slice bounds come from ASCII matches.
-        copy = copy.saturating_add(copy_cost(&source[from..end], census));
-        at = end;
-        if at >= bytes.len() {
-            break;
-        }
-    }
-    (size, copy)
-}
-
-pub fn find_ignore_case(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +493,41 @@ mod tests {
         // 3 elements; `.a` reaches 2, `i` reaches 3; the font-face costs nothing.
         let css = ".a{x:1}@media print{i{y:22}}@font-face{font-family:q}";
         assert_eq!(copy_cost(css, &census), 3 * 2 + 4 * 3);
+    }
+
+    #[test]
+    fn every_comma_splits_a_selector_list_like_the_inliner_does() {
+        let census = Census::of("<p class=a>x</p><p class=b>y</p><p>z</p>");
+        // `:is(.a, p)` is cut into `p:is(.a` and `p)`: the second reaches every `p`.
+        assert_eq!(census.reach_list("i:is(.a, p)"), 3);
+        assert_eq!(census.reach_list(".a, .b"), 2);
+    }
+
+    #[test]
+    fn an_entity_inside_a_tag_hides_names_but_one_in_text_does_not() {
+        let hidden = Census::of("<p class=&Aacute;x>x</p><i>");
+        assert_eq!(hidden.reach(".y"), 2);
+        let named = Census::of("<p class='a&#98;'>x</p><i>");
+        assert_eq!(named.reach(".b"), 2);
+        let text = Census::of("<p class=a>AT&T &amp; co</p><i>");
+        assert_eq!(text.reach(".b"), 0);
+    }
+
+    #[test]
+    fn walking_selectors_cost_more_than_plain_ones_even_without_declarations() {
+        let mut census = Census::of(&"<i>x</i>".repeat(1000));
+        census.depth = 100;
+        census.siblings = 500;
+        let plain = assess("i{}", &census).matching;
+        let descendant = assess("i i{}", &census).matching;
+        let sibling = assess("i ~ i{}", &census).matching;
+        let nth = assess("i:nth-child(2n){}", &census).matching;
+        let has = assess("i:has(b){}", &census).matching;
+        assert!(descendant >= 100 * plain / 2, "{descendant} {plain}");
+        assert!(sibling >= 500 * plain / 2);
+        assert!(nth >= 500 * plain / 2);
+        assert!(has >= 1000 * plain / 2);
+        // Chained walks multiply.
+        assert!(assess("i i i i{}", &census).matching > 100 * descendant);
     }
 }
