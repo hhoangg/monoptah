@@ -56,6 +56,8 @@ export const STOP_ARM_DELAY_MS = 500;
 /** How long after a resolved cancel request Stop may be pressed again while the turn still runs. */
 export const STOP_RETRY_MS = 4000;
 export const UNKNOWN_ERROR_SENTENCE = "Something went wrong. Try again, or check the desktop.";
+/** How long a finger press is held while waiting for its click (the compatibility mouse events and click follow at once). */
+const TOUCH_CLICK_WAIT_MS = 500;
 const INPUT_MIN_PX = 64;
 const INPUT_MAX_PX = 160;
 /** The resting pill: a one-line field with fully round ends. */
@@ -138,22 +140,42 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   const [detailsOpen, setDetailsOpen] = useState(false);
   const reducedMotion = useReducedMotion();
   const [focusWithin, setFocusWithin] = useState(false);
-  // A press elsewhere on the page blurs the field, and collapsing the card then shrinks the composer and shifts the
-  // transcript under the pointer, so the press lands on something else and its click is lost. The collapse waits
-  // until the press ends (after the click has been dispatched).
+  // A press elsewhere on the page blurs the field, and collapsing the card then shrinks the composer (its chips become
+  // 0x0 in the pill), so the press lands on something else and its click is lost (only the chips that open on click, the
+  // model and the target, lost the tap: the access and workspace menus open on pointerdown). The collapse
+  // waits until the press ends (after the click has been dispatched). With a mouse the blur comes on pointerdown. With
+  // a finger WebKit moves the focus only on the compatibility `mousedown` that follows `pointerup` and `touchend`, so the
+  // press is held until the `click` (or a short timeout when none comes, e.g. the finger moved).
   const pressed = useRef(false);
   const collapseTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
-    const down = () => {
-      pressed.current = true;
+    let clickTimer: number | undefined;
+    const stopWaiting = () => {
+      window.clearTimeout(clickTimer);
+      window.removeEventListener("click", settle, true);
     };
-    const up = () => {
-      if (!pressed.current) return;
+    const settle = () => {
+      stopWaiting();
       pressed.current = false;
       window.clearTimeout(collapseTimer.current);
       collapseTimer.current = window.setTimeout(() => {
         if (!area.current?.closest("[data-shape]")?.contains(document.activeElement)) setFocusWithin(false);
       }, 0);
+    };
+    const down = () => {
+      // A new press ends the wait of the earlier finger tap, so its leftover timer cannot release this press early.
+      stopWaiting();
+      pressed.current = true;
+    };
+    const up = (event: PointerEvent) => {
+      if (!pressed.current) return;
+      if (event.type === "pointerup" && (event.pointerType === "touch" || event.pointerType === "pen")) {
+        stopWaiting();
+        window.addEventListener("click", settle, true);
+        clickTimer = window.setTimeout(settle, TOUCH_CLICK_WAIT_MS);
+        return;
+      }
+      settle();
     };
     window.addEventListener("pointerdown", down, true);
     window.addEventListener("pointerup", up, true);
@@ -162,6 +184,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
       window.removeEventListener("pointerdown", down, true);
       window.removeEventListener("pointerup", up, true);
       window.removeEventListener("pointercancel", up, true);
+      stopWaiting();
       window.clearTimeout(collapseTimer.current);
     };
   }, []);

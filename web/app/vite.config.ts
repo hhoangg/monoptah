@@ -12,6 +12,10 @@ import { staticLibraryCss } from "./vite-plugins/staticLibraryCss.ts";
 // @cloudflare/vite-plugin, which reads the Worker config one level up (web/wrangler.jsonc).
 // `vite build` writes the SPA to web/app/dist/client, the Worker assets directory (web/wrangler.jsonc),
 // and the Worker bundle to web/app/dist/monoptah_web (never served). headersPlugin writes the `_headers`.
+// An e2e spec that serves the dev preview next to the harness's own `wrangler dev` sets MONOPTAH_PREVIEW_STATE to a
+// temp dir: its Miniflare then keeps its state there (not under web/app/.wrangler) and opens no inspector port.
+const previewState = process.env["MONOPTAH_PREVIEW_STATE"];
+
 export default defineConfig({
   plugins: [
     // Must come before the React plugin. Generates src/routeTree.gen.ts (committed).
@@ -23,7 +27,7 @@ export default defineConfig({
     }),
     react(),
     tailwindcss(),
-    cloudflare({ configPath: "../wrangler.jsonc" }),
+    cloudflare({ configPath: "../wrangler.jsonc", ...(previewState ? { persistState: { path: previewState }, inspectorPort: false as const } : {}) }),
     headersPlugin("../wrangler.jsonc"),
     // S-08: Sonner and vaul must not append a runtime <style> (blocked by style-src 'self'); see staticLibraryCss.ts.
     staticLibraryCss(),
