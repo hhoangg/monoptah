@@ -10,13 +10,28 @@
 //   Mod+Alt+Shift+arrows   focus the next or previous pane (native: Mod+Alt+arrows)
 //
 // Keys are matched by `event.code`, because Option on a Mac types another character.
+//
+// AltGr: Windows reports AltGr as Ctrl+Alt, so a Mod+Alt chord could swallow the characters an AltGr layout types
+// ({ [ ] | \ # ^ and so on). An event that reports the AltGraph modifier is never a shortcut, and off the Mac the Mod+Alt
+// chords are left alone while the focus is in a text field.
 import { useEffect } from "react";
-import { isMod, otherOverlayOpen } from "../shortcuts";
+import { isMac, isMod, otherOverlayOpen } from "../shortcuts";
 import type { TabActions } from "./useTabActions";
+
+/** True when the event comes from somewhere text is typed: an input, a textarea, a select or contenteditable content. */
+function inEditable(event: KeyboardEvent): boolean {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || target.closest("input, textarea, select, [contenteditable]:not([contenteditable=false])") !== null;
+}
 
 /** Runs the tab shortcut of `event`; true when it was one (the browser's own action is cancelled). */
 export function handleTabKeydown(event: KeyboardEvent, actions: TabActions): boolean {
   if (event.defaultPrevented || event.isComposing || event.keyCode === 229 || !isMod(event)) return false;
+  // AltGr (reported as Ctrl+Alt on Windows) types characters: never a shortcut.
+  if (event.getModifierState?.("AltGraph")) return false;
+  // Off the Mac, Ctrl+Alt is also how some layouts type characters: leave the Mod+Alt chords to a focused field.
+  if (event.altKey && !isMac() && inEditable(event)) return false;
   const run = (action: () => void) => {
     event.preventDefault();
     // Under a dialog or menu the key is still taken (the browser must not bookmark or close), but nothing runs.
