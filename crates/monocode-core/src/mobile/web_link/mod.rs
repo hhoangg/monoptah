@@ -62,7 +62,24 @@ pub struct WebStatus {
     pub requests: Vec<PermissionRequest>,
     /// The paired web devices (rows of the desktop's own list).
     pub devices: Vec<Device>,
+    /// The last widenings of a device's selection, oldest first (at most 20).
+    pub access_changes: Vec<AccessChange>,
 }
+
+/// A web device widened what it may see: it is shown to the owner in Settings
+/// and as a notification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessChange {
+    /// Unix seconds.
+    pub at: u64,
+    pub device_id: String,
+    pub device_name: String,
+    /// "<device> now has access to <names>".
+    pub text: String,
+}
+
+/// How many access changes are kept.
+const MAX_ACCESS_CHANGES: usize = 20;
 
 /// A device waiting for the desktop's confirmation. `name` is cleaned text
 /// from an untrusted source.
@@ -166,6 +183,7 @@ struct Shared {
     /// The running loop's command channel, tagged with its generation.
     commands: Mutex<Option<(u64, UnboundedSender<LinkCommand>)>>,
     requests: Mutex<Vec<PermissionRequest>>,
+    access_changes: Mutex<Vec<AccessChange>>,
     /// Requests the user denied, by device row id, with the permission that
     /// was asked: they stay hidden until the server asks for something else.
     hidden: Mutex<HashMap<String, Permission>>,
@@ -218,7 +236,16 @@ impl WebLink {
             pending,
             requests: lock(&self.shared.requests).clone(),
             devices,
+            access_changes: lock(&self.shared.access_changes).clone(),
         }
+    }
+
+    /// Keeps a widening for Settings and the notification, newest last.
+    pub(crate) fn record_access_change(&self, change: AccessChange) {
+        let mut list = lock(&self.shared.access_changes);
+        list.push(change);
+        let extra = list.len().saturating_sub(MAX_ACCESS_CHANGES);
+        list.drain(..extra);
     }
 
     /// Remembers what Settings shows of a sealed identity.
@@ -239,6 +266,7 @@ impl WebLink {
         *lock(&self.shared.pairing) = None;
         lock(&self.shared.live).clear();
         lock(&self.shared.requests).clear();
+        lock(&self.shared.access_changes).clear();
         lock(&self.shared.hidden).clear();
         self.shared.pending.clear();
     }

@@ -8,7 +8,7 @@ use crate::{
     },
     theme::*,
 };
-use gpui::{AnyElement, Context, FontWeight, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Context, FontWeight, Role, SharedString, div, prelude::*, px};
 use monocode_core::mobile::{DeviceKind, Permission, WebStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,17 @@ pub(in crate::settings) fn last_seen_text(last_seen: Option<u64>, now: u64) -> S
         60..=3599 => format!("Last seen {} min ago", ago / 60),
         3600..=86_399 => format!("Last seen {} h ago", ago / 3600),
         _ => format!("Last seen {} d ago", ago / 86_400),
+    }
+}
+
+/// "5 min ago", for an access change.
+pub(in crate::settings) fn ago_text(at: u64, now: u64) -> String {
+    let ago = now.saturating_sub(at);
+    match ago {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", ago / 60),
+        3600..=86_399 => format!("{} h ago", ago / 3600),
+        _ => format!("{} d ago", ago / 86_400),
     }
 }
 
@@ -254,6 +265,46 @@ impl SettingsView {
                 .collect();
             page.push(list(rows));
         }
+        if !status.access_changes.is_empty() {
+            page.push(heading("Recent access changes"));
+            let now = unix_now();
+            let rows = status
+                .access_changes
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(ix, change)| {
+                    row_base()
+                        .debug_selector(move || format!("web-access-change-{ix}"))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(change.device_name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_size(px(12.))
+                                        .text_color(content(0.5))
+                                        .child(change.text.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(content(0.5))
+                                .child(ago_text(change.at, now)),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            page.push(list(rows));
+        }
         page.push(heading("Web devices"));
         let devices: Vec<_> = status
             .devices
@@ -285,7 +336,9 @@ impl SettingsView {
                     "read"
                 };
                 let change_id = id.clone();
-                row_base()
+                let projects_open = self.web_app.projects_open.as_deref() == Some(id.as_str());
+                let projects = projects_open.then(|| self.web_device_projects(device, cx));
+                let row = row_base()
                     .debug_selector({
                         let id = id.clone();
                         move || format!("web-device-{id}")
@@ -315,6 +368,28 @@ impl SettingsView {
                     ))
                     .child(
                         secondary_button(
+                            SharedString::from(format!("web-projects-{id}")),
+                            "Projects",
+                            false,
+                            false,
+                        )
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("web-projects-{id}")
+                        })
+                        .child("Projects")
+                        .on_click({
+                            let id = id.clone();
+                            cx.listener(move |this, _, _, cx| {
+                                this.web_app.projects_open =
+                                    (this.web_app.projects_open.as_deref() != Some(id.as_str()))
+                                        .then(|| id.clone());
+                                cx.notify();
+                            })
+                        }),
+                    )
+                    .child(
+                        secondary_button(
                             SharedString::from(format!("web-revoke-{id}")),
                             "Revoke",
                             true,
@@ -329,11 +404,149 @@ impl SettingsView {
                             this.web_app.revoking = Some(revoke.clone());
                             cx.notify();
                         })),
-                    )
-                    .into_any_element()
+                    );
+                div().child(row).children(projects).into_any_element()
             })
             .collect();
         page.push(list(rows));
         page
     }
+
+    /// The projects and Monos a web device may see, as two checklists. A
+    /// device with no saved selection (`None`) has everything ticked; ticking
+    /// everything again goes back to `None`, so it keeps seeing new items.
+    fn web_device_projects(
+        &self,
+        device: &monocode_core::mobile::host::Device,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let projects = self.web_checklist(device, false, cx);
+        let monos = self.web_checklist(device, true, cx);
+        div()
+            .id(SharedString::from(format!(
+                "web-project-list-{}",
+                device.id
+            )))
+            .role(Role::Group)
+            .aria_label("Projects and Monos this web device can see")
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .border_t_1()
+            .border_color(content(0.1))
+            .bg(content(0.03))
+            .px_4()
+            .py_3()
+            .text_size(px(13.))
+            .child(projects)
+            .child(monos)
+            .into_any_element()
+    }
+
+    fn web_checklist(
+        &self,
+        device: &monocode_core::mobile::host::Device,
+        monos: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (choices, selected, prefix, title, empty) = if monos {
+            (
+                self.ctx.web_monos.clone(),
+                device.monos.clone(),
+                "web-mono",
+                "Monos",
+                "No Monos to choose from.",
+            )
+        } else {
+            (
+                self.ctx.web_projects.clone(),
+                device.projects.clone(),
+                "web-project",
+                "Projects",
+                "No projects to choose from.",
+            )
+        };
+        let ticked: Vec<String> = match &selected {
+            None => choices.iter().map(|(id, _)| id.clone()).collect(),
+            Some(selected) => selected.clone(),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(div().text_color(content(0.5)).child(title))
+            .when(choices.is_empty(), |d| {
+                d.text_color(content(0.5)).child(empty)
+            })
+            .children(choices.iter().map(|(item, label)| {
+                let on = ticked.contains(item);
+                let (device_id, item) = (device.id.clone(), item.clone());
+                let (all, selected) = (choices.clone(), selected.clone());
+                let (projects, device_monos) = (device.projects.clone(), device.monos.clone());
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        crate::settings::widgets::checkbox(
+                            SharedString::from(format!("{prefix}-{device_id}-{item}")),
+                            label.clone(),
+                            on,
+                            false,
+                        )
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let next = toggle_selection(&all, &selected, &item, !on);
+                            let (projects, monos) = if monos {
+                                (projects.clone(), next)
+                            } else {
+                                (next, device_monos.clone())
+                            };
+                            cx.emit(SettingsEvent::WebSetSelection {
+                                device_id: device_id.clone(),
+                                projects,
+                                monos,
+                            });
+                        })),
+                    )
+                    .child(div().min_w_0().truncate().child(label.clone()))
+            }))
+            .into_any_element()
+    }
+}
+
+/// The selection after `toggled` is set to `on`: the catalog items that stay
+/// ticked, then the ids the device has that the catalog no longer lists
+/// (kept, never dropped by a toggle). `None` (all, including new ones) only
+/// when every catalog item is ticked and nothing else is kept.
+fn toggle_selection(
+    catalog: &[(String, String)],
+    selected: &Option<Vec<String>>,
+    toggled: &str,
+    on: bool,
+) -> Option<Vec<String>> {
+    let ticked = |id: &str| {
+        if id == toggled {
+            on
+        } else {
+            selected
+                .as_ref()
+                .is_none_or(|list| list.iter().any(|v| v == id))
+        }
+    };
+    let mut next: Vec<String> = catalog
+        .iter()
+        .map(|(id, _)| id.clone())
+        .filter(|id| ticked(id))
+        .collect();
+    let extras: Vec<String> = selected
+        .iter()
+        .flatten()
+        .filter(|id| !catalog.iter().any(|(known, _)| known == *id))
+        .cloned()
+        .collect();
+    if next.len() == catalog.len() && extras.is_empty() {
+        return None;
+    }
+    next.extend(extras);
+    Some(next)
 }

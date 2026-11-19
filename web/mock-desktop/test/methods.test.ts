@@ -117,20 +117,53 @@ describe("permissions", () => {
     expect((await s.client.request("accounts.usage", { provider: "claude" })).ok).toBe(true);
     expect(await s.client.request("accounts.usage", { provider: "claude", refresh: true })).toMatchObject({ code: "read_only" });
     expect((await s.client.request("device.selection", {})).ok).toBe(true);
-    expect(await s.client.request("device.selection", { projects: ["proj-alpha"] })).toMatchObject({ code: "read_only" });
+    // device.selection is always "read"; the handler refuses a widening by a read device, and narrowing is fine.
+    expect((await s.client.request("device.selection", { projects: ["proj-alpha"] })).ok).toBe(true);
   });
 });
 
 describe("device selection", () => {
-  it("narrows and never widens, and filters the catalog", async () => {
+  const refOf = (list: { ref: string; name: string }[], name: string): string => list.find((item) => item.name === name)?.ref ?? "";
+
+  it("lists every project and Mono with shared state; an unshared one has a name and a ref but no id", async () => {
     const s = await setup();
-    expect(await s.client.call("device.selection", {})).toEqual({ projects: null, monos: null });
-    expect(await s.client.call("device.selection", { projects: ["proj-alpha"] })).toEqual({ projects: ["proj-alpha"], monos: null });
-    await expect(s.client.call("device.selection", { projects: ["proj-alpha", "proj-beta"] })).rejects.toMatchObject({ code: "forbidden" });
-    await expect(s.client.call("device.selection", { projects: null })).rejects.toMatchObject({ code: "forbidden" });
+    const all = await s.client.call("device.selection", {});
+    expect(all).toMatchObject({ projects: null, monos: null, canWiden: true });
+    expect(all.available?.projects.map((p) => [p.name, p.shared, p.id])).toEqual([["Example Alpha", true, "proj-alpha"], ["Example Beta", true, "proj-beta"]]);
+    const narrowed = await s.client.call("device.selection", { projects: ["proj-alpha"], monos: [] });
+    const beta = narrowed.available?.projects.find((p) => p.name === "Example Beta");
+    expect(beta).toEqual({ ref: expect.any(String), name: "Example Beta", shared: false });
+    expect(JSON.stringify(beta)).not.toContain("proj-beta");
+    expect(JSON.stringify(beta)).not.toContain("/example");
+    expect(narrowed.available?.monos[0]).toMatchObject({ name: "Example Mono", shared: false });
     const list = await s.client.call("workspace.list");
     expect(list.projects.map((p) => p.id)).toEqual(["proj-alpha"]);
+    expect(list.monos).toEqual([]);
     expect(list.sessions.every((x) => x.projectId === "proj-alpha")).toBe(true);
+  });
+
+  it("narrows without a ticket; widening needs a ticket (fresh_required) and then adds the ref", async () => {
+    const s = await setup();
+    await s.client.call("device.selection", { projects: ["proj-alpha"] });
+    const beta = refOf((await s.client.call("device.selection", {})).available?.projects ?? [], "Example Beta");
+    await expect(s.client.call("device.selection", { addProjects: [beta] })).rejects.toMatchObject({ code: "fresh_required" });
+    await expect(s.client.call("device.selection", { projects: null })).rejects.toMatchObject({ code: "fresh_required" });
+    await expect(s.client.call("device.selection", { addProjects: ["nope"], ticket: "t" })).rejects.toMatchObject({ code: "not_found" });
+    const after = await s.client.call("device.selection", { projects: ["proj-alpha"], addProjects: [beta], ticket: "ticket-1" });
+    expect(after.projects).toEqual(["proj-alpha", "proj-beta"]);
+    expect(after.available?.projects.every((p) => p.shared && p.id !== undefined)).toBe(true);
+    // null = all, including new ones, is a widening too and takes a ticket.
+    await s.client.call("device.selection", { projects: ["proj-alpha"] });
+    expect(await s.client.call("device.selection", { projects: null, ticket: "ticket-2" })).toMatchObject({ projects: null });
+  });
+
+  it("a read device may narrow but not widen (read_only), and canWiden is false", async () => {
+    const s = await setup({ permission: "read" });
+    expect(await s.client.call("device.selection", {})).toMatchObject({ canWiden: false });
+    await s.client.call("device.selection", { projects: ["proj-alpha"] });
+    const beta = refOf((await s.client.call("device.selection", {})).available?.projects ?? [], "Example Beta");
+    await expect(s.client.call("device.selection", { addProjects: [beta], ticket: "t" })).rejects.toMatchObject({ code: "read_only" });
+    expect((await s.client.call("device.selection", {})).projects).toEqual(["proj-alpha"]);
   });
 });
 

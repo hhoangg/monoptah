@@ -4,6 +4,8 @@
 import type { Handler } from "hono";
 import {
   DesktopGrantStateBody,
+  DesktopSelectionTicketBody,
+  SelectionTicketResponse,
   DesktopGrantsResponse,
   GrantResponse,
   GrantsResponse,
@@ -11,10 +13,13 @@ import {
   RequestGrantBody,
 } from "@monoptah/protocol";
 import { apiError, respond, type AppContext, type AppEnv } from "../../http.ts";
+import { randomToken, sha256Hex } from "../../lib/crypto.ts";
+import { identifierHash } from "../../lib/ip.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth, requireFresh } from "../../middleware/auth.ts";
 import { notifyGrants, revokeInRooms, setGrantStateInRooms } from "../../relay/rooms.ts";
 import { auditStatement, PREVIOUS_CHANGED } from "../audit/audit.ts";
+import { auditBreach, consume, LIMITS, rateLimitKey } from "../ratelimit/index.ts";
 import { requireDesktopToken } from "../desktops/token.ts";
 
 const REVOKED = 4003;
@@ -223,5 +228,69 @@ export const desktopGrantState: Handler<AppEnv> = async (c) => {
   if (changed?.meta.changes === 0) return apiError(c, 409, "conflict", "Grant is revoked on the server");
   if (state === "revoked") await revokeInRooms(c.env, [auth.desktopId], { deviceId }, REVOKED);
   else await setGrantStateInRooms(c.env, auth.desktopId, deviceId, state);
+  return c.json({ ok: true as const });
+};
+
+/** Lifetime of a selection ticket, seconds. The desktop verifies it right after the web sends it. */
+export const SELECTION_TICKET_TTL_SECONDS = 120;
+/** The device must belong to the caller and not be revoked, and its grant on this desktop must be confirmed with Control. */
+export const CONTROL_GRANT_SQL =
+  "SELECT 1 AS ok FROM device_grants g JOIN devices dv ON dv.id = g.device_id WHERE g.desktop_id = ? AND g.device_id = ? AND dv.user_id = ? AND dv.revoked_at IS NULL AND g.state = 'confirmed' AND g.permission = 'control'";
+export const INSERT_SELECTION_TICKET_SQL =
+  "INSERT INTO selection_tickets (token_hash, user_id, desktop_id, device_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)";
+/** Single use: only one caller changes the row, and only for the desktop and device it was made for. */
+export const CONSUME_SELECTION_TICKET_SQL =
+  "UPDATE selection_tickets SET used_at = ?1 WHERE token_hash = ?2 AND desktop_id = ?3 AND device_id = ?4 AND used_at IS NULL AND expires_at >= ?1 AND EXISTS (SELECT 1 FROM device_grants g JOIN devices dv ON dv.id = g.device_id WHERE g.desktop_id = selection_tickets.desktop_id AND g.device_id = selection_tickets.device_id AND dv.revoked_at IS NULL AND g.state = 'confirmed' AND g.permission = 'control')";
+/**
+ * How recent the passkey re-auth must be to mint a ticket, seconds. The general "fresh" window is 5 minutes, which
+ * would let a hijacked tab mint right after any other re-auth; a minute makes the web prompt for the passkey just
+ * before widening.
+ */
+export const SELECTION_TICKET_REAUTH_SECONDS = 60;
+
+/**
+ * `POST /api/desktops/:id/grants/:deviceId/selection-ticket` (fresh session): a single-use ticket that proves a
+ * passkey re-auth to the desktop, so a Control web device can widen its selection. Only the SHA-256 is stored.
+ * 10 per user per hour.
+ */
+export const createSelectionTicket: Handler<AppEnv> = async (c) => {
+  const { user, session } = requireAuth(c);
+  const desktopId = c.req.param("id") ?? "";
+  const deviceId = c.req.param("deviceId") ?? "";
+  if (session.reauthAt === null || session.reauthAt < nowSeconds() - SELECTION_TICKET_REAUTH_SECONDS) return apiError(c, 403, "fresh_required", "Re-authentication required");
+  if (!(await ownsDesktop(c, desktopId, user.id))) return notFound(c);
+  if ((await c.env.DB.prepare(CONTROL_GRANT_SQL).bind(desktopId, deviceId, user.id).first()) === null) return apiError(c, 403, "forbidden", "This device does not have Control access to this desktop");
+
+  const limit = await consume(c.env, rateLimitKey("selection-ticket", "user", await identifierHash(c.env, "user", user.id)), LIMITS["selection-ticket"].limit, LIMITS["selection-ticket"].windowSeconds);
+  if (!limit.ok) {
+    if (limit.firstBreach) await auditBreach(c, "selection-ticket", LIMITS["selection-ticket"], user.id);
+    c.header("Retry-After", String(limit.retryAfter));
+    return apiError(c, 429, "rate_limited", "Too many requests");
+  }
+
+  const ticket = randomToken(32);
+  const now = nowSeconds();
+  const expiresAt = now + SELECTION_TICKET_TTL_SECONDS;
+  await c.env.DB.batch([
+    c.env.DB.prepare(INSERT_SELECTION_TICKET_SQL).bind(await sha256Hex(ticket), user.id, desktopId, deviceId, now, expiresAt),
+    auditStatement(c.env, { action: "selection.ticket", actorUserId: user.id, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId } }),
+  ]);
+  return respond(c, SelectionTicketResponse, { ticket, expiresAt });
+};
+
+/**
+ * `POST /api/desktop/grants/:deviceId/selection-ticket` (token `grants`): the desktop asks whether a ticket the web
+ * sent is valid for this desktop and device, and consumes it. 200 once; a missing, expired, used or foreign ticket is 404.
+ */
+export const consumeSelectionTicket: Handler<AppEnv> = async (c) => {
+  const auth = await requireDesktopToken(c, "grants");
+  if (auth instanceof Response) return auth;
+  const deviceId = c.req.param("deviceId") ?? "";
+  const body = DesktopSelectionTicketBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return apiError(c, 400, "invalid", "Invalid ticket");
+  const now = nowSeconds();
+  const used = await c.env.DB.prepare(CONSUME_SELECTION_TICKET_SQL).bind(now, await sha256Hex(body.data.ticket), auth.desktopId, deviceId).run();
+  if (used.meta.changes !== 1) return apiError(c, 404, "not_found", "Ticket not found");
+  await auditStatement(c.env, { action: "selection.widen", actorKind: "desktop", actorUserId: auth.userId, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId: auth.desktopId } }).run();
   return c.json({ ok: true as const });
 };

@@ -94,6 +94,12 @@ pub enum Lifecycle {
     Connect,
     Disconnect,
     PermissionChange,
+    /// A web device widened its own project or Mono selection.
+    SelectionWiden,
+    /// A web device narrowed its own project or Mono selection.
+    SelectionNarrow,
+    /// A web device asked to widen and was refused for its ticket or the rate.
+    SelectionWidenRefused,
 }
 
 impl Lifecycle {
@@ -107,6 +113,9 @@ impl Lifecycle {
             Lifecycle::Connect => "connect",
             Lifecycle::Disconnect => "disconnect",
             Lifecycle::PermissionChange => "permission",
+            Lifecycle::SelectionWiden => "selection_widen",
+            Lifecycle::SelectionNarrow => "selection_narrow",
+            Lifecycle::SelectionWidenRefused => "selection_widen_refused",
         }
     }
 }
@@ -951,6 +960,9 @@ mod tests {
             (Lifecycle::Connect, "connect"),
             (Lifecycle::Disconnect, "disconnect"),
             (Lifecycle::PermissionChange, "permission"),
+            (Lifecycle::SelectionWiden, "selection_widen"),
+            (Lifecycle::SelectionNarrow, "selection_narrow"),
+            (Lifecycle::SelectionWidenRefused, "selection_widen_refused"),
         ];
         for (kind, _) in kinds {
             log.record_lifecycle(kind, "dev-1", "abcdef0123456789", Transport::Web, None);

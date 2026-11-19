@@ -311,6 +311,7 @@ impl Shell {
                 | SettingsEvent::WebRevokeDevice(_)
                 | SettingsEvent::WebConfirmDevice { .. }
                 | SettingsEvent::PhoneSetProjects { .. }
+                | SettingsEvent::WebSetSelection { .. }
                 | SettingsEvent::WebSetPolicyFlag { .. }
                 | SettingsEvent::WebAnswerRequest { .. } => this.web_settings_event(event, cx),
             },

@@ -29,6 +29,8 @@ export interface FakeServer {
   /** Paths answered with 409 `conflict`. */
   conflicts: Set<string>;
   reauths: number;
+  /** Tickets handed out by the selection-ticket route, in order. */
+  tickets: string[];
 }
 
 export const FP_A = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
@@ -65,6 +67,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
     calls: [],
     conflicts: new Set(),
     reauths: 0,
+    tickets: [],
     transport: async (url, init) => {
       const method = init.method ?? "GET";
       const path = url.split("?")[0] ?? url;
@@ -129,6 +132,16 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
           const created = grant({ deviceId, state: "pending", permission: null, confirmedAt: null });
           list.push(created);
           return json(200, { grant: created });
+        }
+        if (parts.length === 6 && parts[5] === "selection-ticket" && method === "POST") {
+          // Like the real route: fresh, and only for a confirmed Control grant.
+          const blocked = gate();
+          if (blocked) return blocked;
+          const current = list.find((item) => item.deviceId === parts[4]);
+          if (!current || current.state !== "confirmed" || current.permission !== "control") return error(403, "forbidden");
+          const ticket = `ticket-${server.tickets.length + 1}`;
+          server.tickets.push(ticket);
+          return json(200, { ticket, expiresAt: 1_900_000_000 });
         }
         if (parts.length === 5 && method === "PUT") {
           const current = list.find((item) => item.deviceId === parts[4]);

@@ -7,7 +7,7 @@ use crate::notifications::platform;
 use crate::settings::{SettingsEvent, WebPolicyFlag};
 use gpui::{Global, Task};
 use monocode_core::mobile::{
-    DeviceKind, WebStatus,
+    AccessChange, DeviceKind, WebStatus,
     host::MobileHost,
     policy::{self, PolicyFlags},
     web_link::{PairPoll, PairTicket, PendingDevice, attached_host},
@@ -31,6 +31,8 @@ struct WebBridge {
     watcher: Option<Task<()>>,
     /// Fingerprints already announced, so each one raises one notification.
     seen: HashSet<String>,
+    /// Access changes already announced, by (time, device id, text).
+    seen_changes: HashSet<(u64, String, String)>,
     /// Devices and requests waiting for the user, for the Connections badge.
     badge: usize,
     /// Bumped whenever a pairing is cancelled or Settings closes, so a ticket
@@ -58,6 +60,45 @@ fn fresh_pending<'a>(seen: &HashSet<String>, status: &'a WebStatus) -> Vec<&'a P
         .iter()
         .filter(|device| !seen.contains(&device.fingerprint))
         .collect()
+}
+
+/// The access changes that were not announced yet.
+fn fresh_changes<'a>(
+    seen: &HashSet<(u64, String, String)>,
+    status: &'a WebStatus,
+) -> Vec<&'a AccessChange> {
+    status
+        .access_changes
+        .iter()
+        .filter(|change| !seen.contains(&change_key(change)))
+        .collect()
+}
+
+fn change_key(change: &AccessChange) -> (u64, String, String) {
+    (change.at, change.device_id.clone(), change.text.clone())
+}
+
+/// (pending devices, access changes) that may raise a system notification.
+/// A pending device is announced only while Settings is closed; an access
+/// change also while it is open, since the owner did not make it. Both follow
+/// the notifications preference.
+fn notify_gates(settings_open: bool, notifications: bool) -> (bool, bool) {
+    (!settings_open && notifications, notifications)
+}
+
+/// The notification text of an access change.
+fn access_change_body(change: &AccessChange) -> String {
+    format!("Web app: {}", change.text)
+}
+
+/// Takes the access changes of one reading: returns the ones to announce.
+fn take_changes(bridge: &mut WebBridge, status: &WebStatus) -> Vec<AccessChange> {
+    let fresh = fresh_changes(&bridge.seen_changes, status)
+        .into_iter()
+        .cloned()
+        .collect();
+    bridge.seen_changes = status.access_changes.iter().map(change_key).collect();
+    fresh
 }
 
 /// Takes one watcher reading into the bridge. Returns the devices to announce
@@ -126,11 +167,26 @@ impl Shell {
     /// One watcher tick: one system notification per new pending device
     /// while Settings is closed, and the badge count.
     fn web_status_watched(&mut self, status: &WebStatus, cx: &mut Context<Self>) {
-        let notify = self.settings.is_none() && self.workspace.preferences.notifications;
+        let (notify, notify_changes) = notify_gates(
+            self.settings.is_some(),
+            self.workspace.preferences.notifications,
+        );
         let sounds = self.workspace.preferences.sounds;
         let (fresh, changed) = take_reading(cx.default_global::<WebBridge>(), status);
-        if changed {
+        let widened = take_changes(cx.default_global::<WebBridge>(), status);
+        if changed || !widened.is_empty() {
             cx.notify();
+        }
+        if notify_changes {
+            for change in widened {
+                let tag: String = change.device_id.chars().take(16).collect();
+                let _ = platform::show(platform::Notification {
+                    tag: format!("web-access-{tag}-{}", change.at),
+                    subtitle: "Web app".into(),
+                    body: access_change_body(&change),
+                    sound: sounds,
+                });
+            }
         }
         if !notify {
             return;
@@ -247,6 +303,30 @@ impl Shell {
                         device.permission,
                         projects,
                         device.monos,
+                    )
+                    .map(|_| ())
+                });
+            }
+            SettingsEvent::WebSetSelection {
+                device_id,
+                projects,
+                monos,
+            } => {
+                let (device_id, projects, monos) =
+                    (device_id.clone(), projects.clone(), monos.clone());
+                self.web_action("Projects", cx, move |host| {
+                    let device = host
+                        .web_status()
+                        .devices
+                        .into_iter()
+                        .find(|device| device.id == device_id && device.kind == DeviceKind::Web)
+                        .ok_or("That device is no longer paired")?;
+                    host.set_device_access(
+                        &device_id,
+                        DeviceKind::Web,
+                        device.permission,
+                        projects,
+                        monos,
                     )
                     .map(|_| ())
                 });
@@ -639,6 +719,43 @@ mod tests {
             .unwrap();
         policy::install_settings(Default::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_access_change_notifies_with_settings_open_but_not_when_notifications_are_off() {
+        assert_eq!(notify_gates(true, true), (false, true));
+        assert_eq!(notify_gates(false, true), (true, true));
+        assert_eq!(notify_gates(true, false), (false, false));
+        assert_eq!(notify_gates(false, false), (false, false));
+    }
+
+    #[test]
+    fn each_access_change_is_announced_once_with_its_text() {
+        let change = |at: u64, text: &str| AccessChange {
+            at,
+            device_id: "dev".into(),
+            device_name: "Work laptop".into(),
+            text: text.into(),
+        };
+        let mut bridge = WebBridge::default();
+        let mut status = WebStatus {
+            access_changes: vec![change(1, "Work laptop now has access to Alpha")],
+            ..Default::default()
+        };
+        let first = take_changes(&mut bridge, &status);
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            access_change_body(&first[0]),
+            "Web app: Work laptop now has access to Alpha"
+        );
+        assert!(take_changes(&mut bridge, &status).is_empty());
+        status.access_changes.push(change(
+            2,
+            "Work laptop now has access to all projects, including new ones",
+        ));
+        let next = take_changes(&mut bridge, &status);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].at, 2);
     }
 
     #[test]

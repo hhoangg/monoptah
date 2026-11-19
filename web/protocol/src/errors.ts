@@ -27,6 +27,10 @@ export const DESKTOP_ERROR_CODES = [
   "not_pending",
   "needs_desktop",
   "wake_required",
+  /** Widening the selection needs a passkey re-auth ticket the desktop could not verify. */
+  "fresh_required",
+  /** Too many selection widening attempts for this device. */
+  "rate_limited",
 ] as const;
 export type DesktopErrorCode = (typeof DESKTOP_ERROR_CODES)[number];
 export const DesktopErrorCodeSchema = z.enum(DESKTOP_ERROR_CODES);

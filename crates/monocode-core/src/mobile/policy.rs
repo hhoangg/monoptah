@@ -200,6 +200,8 @@ codes! {
     NotPending => "not_pending",
     NeedsDesktop => "needs_desktop",
     WakeRequired => "wake_required",
+    FreshRequired => "fresh_required",
+    RateLimited => "rate_limited",
 }
 
 impl Code {
@@ -229,6 +231,8 @@ impl Code {
             Code::NotPending => "Approval is no longer pending",
             Code::NeedsDesktop => "Answer this request on the desktop",
             Code::WakeRequired => "Sending wakes the stopped cloud instance; confirm to continue",
+            Code::FreshRequired => "Confirm with your passkey again to add projects",
+            Code::RateLimited => "Too many attempts to add projects; try again later",
         }
     }
 }
@@ -457,12 +461,9 @@ pub fn classify(method: &str, params: &Value) -> Option<Access> {
         Class::Param => match method {
             "accounts.usage" if params["refresh"] == true => Access::Control,
             "accounts.usage" => Access::Read,
-            // Selection edits are only recognised by the field they carry.
-            "device.selection"
-                if params.get("projects").is_some() || params.get("monos").is_some() =>
-            {
-                Access::Control
-            }
+            // The host's selection handler enforces who may narrow and who may
+            // widen (it knows the device kind and the change), so the call
+            // itself is a read for every parameter.
             "device.selection" => Access::Read,
             "session.start" if full_access(params) => Access::DeniedForRemote,
             "session.start" if !params["target"].is_null() => {
@@ -662,13 +663,13 @@ pub struct SelectionAnswer {
 }
 
 /// A requested selection field: left alone, set to all, or set to a list.
-enum Requested {
+pub(crate) enum Requested {
     Keep,
     All,
     List(Vec<String>),
 }
 
-fn requested(params: &Value, key: &str) -> Result<Requested, String> {
+pub(crate) fn requested(params: &Value, key: &str) -> Result<Requested, String> {
     const INVALID: &str = "Invalid mobile parameters";
     match params.get(key) {
         None => Ok(Requested::Keep),
@@ -709,9 +710,10 @@ fn narrowed_field(
 }
 
 /// Answers `device.selection`. Without `projects` or `monos` it reports the
-/// current selection. With them, a device may only narrow its selection;
-/// widening it needs the desktop owner to confirm on the desktop, so it is
-/// refused here as `forbidden`.
+/// current selection. With them, a phone may only narrow its selection;
+/// widening is refused here as `forbidden`. A web device goes through the
+/// host's own selection handler instead, where a control device may widen
+/// with a server ticket.
 pub fn device_selection(
     device: &DeviceContext,
     params: &Value,
@@ -849,9 +851,15 @@ mod tests {
             Access::DeniedForWeb
         );
         assert_eq!(c("device.selection", json!({})), Access::Read);
+        // Who may narrow or widen is decided by the host's selection handler,
+        // so the call is a read for every parameter.
+        assert_eq!(c("device.selection", json!({"projects": []})), Access::Read);
         assert_eq!(
-            c("device.selection", json!({"projects": []})),
-            Access::Control
+            c(
+                "device.selection",
+                json!({"addProjects": ["r"], "ticket": "t"})
+            ),
+            Access::Read
         );
         assert_eq!(c("session.start", json!({})), Access::Control);
         assert_eq!(
@@ -1375,11 +1383,12 @@ mod tests {
                 "{params}"
             );
         }
-        // A read device cannot set a selection at all.
+        // The policy lets every device reach the handler, which decides who
+        // may narrow (web: read and control) or widen (see `selection.rs`).
         let reader = ctx(DeviceKind::Web, Permission::Read);
         assert_eq!(
             call(&reader, "device.selection", json!({"projects": []}), &ON),
-            Some(Code::ReadOnly)
+            None
         );
         assert_eq!(call(&reader, "device.selection", json!({}), &ON), None);
     }

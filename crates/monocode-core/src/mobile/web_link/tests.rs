@@ -2135,6 +2135,38 @@ mod seam {
         assert!(report(500, "revoked").is_err());
     }
 
+    #[test]
+    fn a_selection_ticket_counts_only_when_the_server_answers_200() {
+        let verify = |status: u16, device: &str| {
+            let handler: Handler = Arc::new(move |_| (status, r#"{"ok":true}"#.into()));
+            let stub = world(handler, false);
+            let base = format!("http://127.0.0.1:{}", stub.hub.port);
+            let accepted = desktop_api::verify_selection_ticket(&base, TOKEN, device, "tkt");
+            let sent = stub.hub.requests(
+                "POST",
+                &format!("/api/desktop/grants/{device}/selection-ticket"),
+            );
+            (accepted, sent)
+        };
+        let (accepted, sent) = verify(200, "dev-1");
+        assert!(accepted);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].auth, bearer());
+        assert_eq!(sent[0].body["ticket"], "tkt");
+        assert!(!verify(404, "dev-1").0);
+        assert!(!verify(500, "dev-1").0);
+        // A device id that is not a plain id never reaches the network.
+        let (accepted, _) = verify(200, "../x");
+        assert!(!accepted);
+        // Nothing listens on port 1: no answer is a refusal.
+        assert!(!desktop_api::verify_selection_ticket(
+            "http://127.0.0.1:1",
+            TOKEN,
+            "dev-1",
+            "tkt"
+        ));
+    }
+
     #[tokio::test]
     async fn a_web_device_that_leaves_is_revoked_and_never_comes_back_as_pending() {
         use crate::mobile::web_link::desktop_api::ServerGrant;

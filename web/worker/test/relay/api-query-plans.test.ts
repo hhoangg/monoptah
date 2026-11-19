@@ -30,6 +30,9 @@ import {
 import { CLEANUP_QUERIES as GRANT_CLEANUP } from "../../src/modules/grants/cleanup.ts";
 import {
   CONFIRM_GRANT_SQL,
+  CONSUME_SELECTION_TICKET_SQL,
+  CONTROL_GRANT_SQL,
+  INSERT_SELECTION_TICKET_SQL,
   DESKTOP_GRANT_STATE_SQL,
   DESKTOP_GRANTS_SQL,
   GET_GRANT_SQL,
@@ -117,6 +120,9 @@ const CASES: PlanCase[] = [
   { name: "desktop/grants: state of one", sql: DESKTOP_GRANT_STATE_SQL, bind: [s, s] },
   { name: "desktop/grants: confirm", sql: CONFIRM_GRANT_SQL, bind: ["read", 1, s, s] },
   { name: "desktop/grants: pending", sql: PENDING_GRANT_SQL, bind: [1, s, s] },
+  { name: "grants: control grant of own device", sql: CONTROL_GRANT_SQL, bind: [s, s, s] },
+  { name: "grants: insert selection ticket", sql: INSERT_SELECTION_TICKET_SQL, bind: [s, s, s, s, 1, 2] },
+  { name: "desktop/grants: consume selection ticket", sql: CONSUME_SELECTION_TICKET_SQL, bind: [1, s, s, s] },
   { name: "cleanup: pending grants", sql: (GRANT_CLEANUP[0] as { sql: string }).sql, bind: [1] },
 ];
 
@@ -148,6 +154,7 @@ describe("relay API query plans", () => {
     for (const [sql, index] of [
       [(PAIRING_CLEANUP[0] as { sql: string }).sql, "pairing_requests_expires_at_idx"],
       [(GRANT_CLEANUP[0] as { sql: string }).sql, "device_grants_state_updated_at_idx"],
+      [(GRANT_CLEANUP[1] as { sql: string }).sql, "selection_tickets_expires_at_idx"],
     ] as const) {
       const { results } = await env.DB.prepare(`EXPLAIN QUERY PLAN ${sql}`).bind(1).all<{ detail: string }>();
       expect(results.map((r) => r.detail).join(" | ")).toContain(index);

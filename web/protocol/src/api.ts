@@ -297,6 +297,10 @@ export const DesktopGrantSchema = z.object({
   permission: Permission.nullable(),
 });
 export const DesktopGrantsResponse = z.object({ grants: z.array(DesktopGrantSchema) });
+/** `POST /api/desktops/:id/grants/:deviceId/selection-ticket`: a single-use proof of a fresh passkey re-auth, bound to one desktop and device. */
+export const SelectionTicketResponse = z.object({ ticket: z.string().min(1).max(256), expiresAt: z.number() });
+/** `POST /api/desktop/grants/:deviceId/selection-ticket`: the desktop verifies (and consumes) a ticket the web sent it. */
+export const DesktopSelectionTicketBody = z.object({ ticket: z.string().min(1).max(256) });
 /** The desktop reports what it applied. `revoked` calls `room.revoke` for the device. */
 export const DesktopGrantStateBody = z.object({ state: GrantState, permission: Permission.optional() });
 
@@ -523,6 +527,8 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "GET", path: "/api/desktop/me", auth: "token:relay", module: "desktops", request: {}, response: DesktopMeResponse }),
   r({ method: "DELETE", path: "/api/desktop/me", auth: "token:relay", module: "desktops", request: {}, response: Ok }),
   r({ method: "GET", path: "/api/desktop/grants", auth: "token:grants", module: "grants", request: {}, response: DesktopGrantsResponse }),
+  r({ method: "POST", path: "/api/desktops/:id/grants/:deviceId/selection-ticket", auth: "fresh", module: "grants", owner: true, request: { params: desktopDeviceParams }, response: SelectionTicketResponse }),
+  r({ method: "POST", path: "/api/desktop/grants/:deviceId/selection-ticket", auth: "token:grants", module: "grants", request: { params: deviceIdParam, body: DesktopSelectionTicketBody }, response: Ok }),
   r({ method: "POST", path: "/api/desktop/grants/:deviceId/state", auth: "token:grants", module: "grants", request: { params: deviceIdParam, body: DesktopGrantStateBody }, response: Ok }),
 
   r({ method: "GET", path: "/api/push/vapid-key", auth: "public", module: "push", request: {}, response: VapidKeyResponse }),

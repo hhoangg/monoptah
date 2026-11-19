@@ -42,6 +42,8 @@ const AUDIT_TITLES: Record<string, string> = {
   "device.create": "Device added",
   "device.revoke": "Device removed",
   "grant.change": "Device access changed",
+  "selection.ticket": "Passkey confirmed to add projects to a device",
+  "selection.widen": "Selection ticket used",
   "session.logout": "Signed out",
   "session.revoke": "Sessions ended",
   "ratelimit.breach": "Too many requests blocked",
