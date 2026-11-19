@@ -38,4 +38,14 @@ describe("TranscriptJumpToBottom", () => {
     fireEvent.click(screen.getByRole("button", { name: "Jump to latest" }));
     expect(onJump).toHaveBeenCalledTimes(1);
   });
+
+  it("jumps when the press lands on the glass hit slop around the button", () => {
+    const onJump = vi.fn();
+    render(<Harness onJump={onJump} />);
+    act(() => screen.getByText("show").click());
+    const glass = screen.getByRole("button", { name: "Jump to latest" }).parentElement!;
+    // A hit on the ::after hit slop targets the glass element itself.
+    fireEvent.click(glass);
+    expect(onJump).toHaveBeenCalledTimes(1);
+  });
 });

@@ -155,6 +155,77 @@ describe("jump to bottom (F-33)", () => {
   });
 });
 
+describe("jump to bottom while the list is still measuring", () => {
+  const jumpButton = () => screen.queryByRole("button", { name: "Jump to latest" });
+  async function awayFromEnd() {
+    const view = render(<Transcript turns={turns(0, 50)} />);
+    await screen.findByText("Reply number 49");
+    const end = scroller().scrollTop;
+    scrollTo(end - 1000);
+    const jump = await screen.findByRole("button", { name: "Jump to latest" });
+    // A smooth scroll that the test steps by hand.
+    const smooth = vi.fn();
+    scroller().scrollTo = smooth as never;
+    return { ...view, end, jump, smooth };
+  }
+
+  it("keeps following through the smooth scroll and lands at the real end after heights change", async () => {
+    const user = userEvent.setup();
+    const { rerender, end, jump, smooth } = await awayFromEnd();
+    await user.click(jump);
+    expect(smooth).toHaveBeenCalledWith({ top: end, behavior: "smooth" });
+    expect(jumpButton()).toBeNull();
+    // An intermediate scroll event far from the end must not turn following off or bring the button back.
+    scrollTo(end - 600);
+    expect(jumpButton()).toBeNull();
+    // The list grows while the scroll runs: the end moves and the view lands at the new one.
+    rerender(<Transcript turns={turns(0, 53)} />);
+    await screen.findByText("Reply number 52");
+    await waitFor(() => expect(scroller().scrollTop).toBe(scroller().scrollHeight - VIEW));
+    scrollTo(scroller().scrollHeight - VIEW);
+    expect(jumpButton()).toBeNull();
+    // Later output keeps being followed.
+    rerender(<Transcript turns={turns(0, 55)} />);
+    await screen.findByText("Reply number 54");
+    await waitFor(() => expect(scroller().scrollTop).toBe(scroller().scrollHeight - VIEW));
+  });
+
+  it("lands at the end when the smooth scroll stops short", async () => {
+    const user = userEvent.setup();
+    const { end, jump } = await awayFromEnd();
+    await user.click(jump);
+    scrollTo(end - 300);
+    await waitFor(() => expect(scroller().scrollTop).toBe(end));
+    expect(jumpButton()).toBeNull();
+  });
+
+  it("is cancelled by a reader gesture and leaves following off", async () => {
+    const user = userEvent.setup();
+    const { rerender, end, jump } = await awayFromEnd();
+    await user.click(jump);
+    fireEvent.wheel(scroller(), { deltaY: -120 });
+    scrollTo(end - 600);
+    await screen.findByRole("button", { name: "Jump to latest" });
+    const before = scroller().scrollHeight;
+    rerender(<Transcript turns={turns(0, 53)} />);
+    await waitFor(() => expect(scroller().scrollHeight).toBeGreaterThan(before));
+    expect(scroller().scrollTop).toBe(end - 600);
+  });
+
+  it("is not cancelled by a wheel that a nested scroller takes", async () => {
+    const user = userEvent.setup();
+    const { end, jump } = await awayFromEnd();
+    await user.click(jump);
+    const inner = document.querySelector<HTMLElement>('[data-testid="transcript-turn"]')!;
+    inner.style.overflowY = "auto";
+    Object.defineProperty(inner, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(inner, "clientHeight", { configurable: true, value: 100 });
+    fireEvent.wheel(inner, { deltaY: 120 });
+    scrollTo(end - 600);
+    expect(jumpButton()).toBeNull();
+  });
+});
+
 describe("older turns (F-32, N-16)", () => {
   it("asks for the page when the reader reaches the top and keeps their row where it was as the page lands", async () => {
     let release!: () => void;

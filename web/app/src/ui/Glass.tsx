@@ -3,6 +3,8 @@ import { haptic } from "@/lib/haptics";
 import { cn } from "@/lib/utils";
 import { springs } from "./motion";
 
+const INTERACTIVE = 'button:not(:disabled), a[href], [role="button"]';
+
 export interface GlassProps extends HTMLMotionProps<"div"> {
   /** Replaces the wash color (`--glass-tint`). Pass a CSS color or `var(--token)`. */
   tint?: string;
@@ -14,7 +16,7 @@ export interface GlassProps extends HTMLMotionProps<"div"> {
  * Glass surface (design-system.md 4.1): blurred wash of `surface` plus a gradient hairline.
  * Used by floating controls, the composer and pickers. The CSS lives in styles/glass.css.
  */
-export function Glass({ tint, pressable = false, className, style, onPointerDown, ...rest }: GlassProps) {
+export function Glass({ tint, pressable = false, className, style, onPointerDown, onClick, ...rest }: GlassProps) {
   return (
     <motion.div
       {...rest}
@@ -23,6 +25,13 @@ export function Glass({ tint, pressable = false, className, style, onPointerDown
       style={tint ? { ...style, ["--glass-tint" as string]: tint } : style}
       whileTap={pressable ? { scale: 1.05 } : undefined}
       transition={pressable ? springs.press : rest.transition}
+      onClick={(event) => {
+        onClick?.(event);
+        // A press in the hit slop lands on the surface itself: hand it to the control inside.
+        if (pressable && !event.defaultPrevented && event.target === event.currentTarget) {
+          event.currentTarget.querySelector<HTMLElement>(INTERACTIVE)?.click();
+        }
+      }}
       onPointerDown={(event) => {
         if (pressable) haptic("light");
         onPointerDown?.(event);
