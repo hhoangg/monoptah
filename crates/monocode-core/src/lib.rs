@@ -64,3 +64,5 @@ pub mod cli;
 pub mod mcp;
 
 pub mod worktree_management;
+
+// throwaway: native path filter test
