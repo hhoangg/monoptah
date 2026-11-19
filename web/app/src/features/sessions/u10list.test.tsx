@@ -177,6 +177,17 @@ describe("rename, archive and delete from the card menu (F-25, F-40)", () => {
   });
 });
 
+describe("session cards and open tabs", () => {
+  it("adapts to a narrow list with a container query: the model name and the Working text give way, the rest ellipsizes", async () => {
+    mount("/p/proj-alpha");
+    await screen.findAllByTestId("session-card");
+    const first = card("sess-local-1");
+    expect(first).toHaveClass("@container");
+    // Above 20rem the card is unchanged; under it only the model text hides (the harness mark stays).
+    expect(first.querySelector("[class*=\"@max-[20rem]:max-w-none\"]")).not.toBeNull();
+  });
+});
+
 describe("filters (F-23) and worktree scoping (F-22)", () => {
   it("Working now narrows the list, is stored under a monoptah. key and survives a remount", async () => {
     const user = userEvent.setup();

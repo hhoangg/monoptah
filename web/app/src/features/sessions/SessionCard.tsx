@@ -2,6 +2,11 @@
 // mobile/src/features/sessions/SessionCard.tsx, `detailed`): the title with the time or "Working..." on
 // its right, then the branch with the model and its provider's mark on its right. The card links to the
 // session; its menu offers the actions the `session-capabilities` predicate allows for its target.
+//
+// The card adapts to its own width with a container query (the session list sidebar is 240-560px, the phone page is
+// the full width): under 20rem the model name and the "Working..." text give way to the harness mark and the spinner
+// (both stay available to assistive tech), so the title, the branch and the target chip keep their room and truncate
+// with an ellipsis. From 20rem the card looks as before.
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import type { SessionCard as SessionCardData } from "@monoptah/protocol";
@@ -41,7 +46,7 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
   const working = !!session.busy;
   const waiting = !!session.waiting;
   return (
-    <div className="relative py-1" data-testid="session-card" data-session-id={session.id}>
+    <div className="@container relative py-1" data-testid="session-card" data-session-id={session.id}>
       <Link
         to="/d/$desktopId/s/$sessionId"
         params={{ desktopId, sessionId: session.id }}
@@ -60,7 +65,7 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
           ) : working ? (
             <span className="flex shrink-0 items-center gap-1 text-meta text-brand-text">
               <TerminalSpinner />
-              Working...
+              <span className="@max-[20rem]:sr-only">Working...</span>
             </span>
           ) : (
             <span className="shrink-0 text-meta tabular text-muted-text">{relativeTime(session.updatedAt, now)}</span>
@@ -69,11 +74,13 @@ export function SessionCard({ desktopId, session, active = false, readOnly = fal
         <span className="flex items-center gap-2 text-meta text-muted-text">
           <span className="flex min-w-0 flex-1 items-center gap-1.5">
             <Icon name="branch" size={13} className="shrink-0 text-faint" />
-            <span className={cn("truncate", !session.branch && "text-muted-text")}>{session.branch || "No branch"}</span>
-            <SessionCardBadgeSlot desktopId={desktopId} session={session} />
+            <span className={cn("min-w-0 shrink truncate", !session.branch && "text-muted-text")}>{session.branch || "No branch"}</span>
+            <span className="flex min-w-0 shrink">
+              <SessionCardBadgeSlot desktopId={desktopId} session={session} />
+            </span>
           </span>
-          <span className="flex max-w-[50%] shrink items-center gap-1.5">
-            {model ? <span className="truncate">{model}</span> : null}
+          <span className="flex max-w-[50%] shrink items-center gap-1.5 @max-[20rem]:max-w-none" title={model || undefined}>
+            {model ? <span className="truncate @max-[20rem]:hidden">{model}</span> : null}
             <HarnessIcon harness={session.harness} className="size-3.5 shrink-0" />
           </span>
         </span>

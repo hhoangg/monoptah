@@ -15,10 +15,11 @@ export function CloudChip({ placement, className }: { placement: Placement | nul
   if (!placement || !isNonLocalKind(placement.kind)) return null;
   const state = placement.state ? stateLabel(placement.state) : null;
   return (
-    <Badge variant="outline" data-testid="cloud-chip" data-state={placement.state ?? "none"} className={cn("max-w-full gap-1 truncate font-normal", className)}>
-      <span className="truncate">{kindLabel(placement.kind)}</span>
-      {state ? <span aria-hidden="true">-</span> : null}
-      {state ? <span>{state}</span> : null}
+    <Badge variant="outline" data-testid="cloud-chip" data-state={placement.state ?? "none"} className={cn("min-w-0 max-w-full gap-1 overflow-hidden font-normal", className)}>
+      {/* The kind gives way first and ends in an ellipsis; the state and the dash never clip mid-word. */}
+      <span className="min-w-0 truncate">{kindLabel(placement.kind)}</span>
+      {state ? <span aria-hidden="true" className="shrink-0">-</span> : null}
+      {state ? <span className="shrink-0">{state}</span> : null}
     </Badge>
   );
 }
