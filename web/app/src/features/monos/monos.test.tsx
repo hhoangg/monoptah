@@ -343,6 +343,16 @@ describe("message actions on touch, from the keyboard and with the native menu (
     expect(writeText).toHaveBeenCalledWith("Done. This is canned example output.");
   });
 
+  it("keeps the hidden Message actions button out of the layout (only paint classes outside focus-visible)", async () => {
+    mount(`/monos/${MONO}`);
+    const button = await within(await messageOf()).findByRole("button", { name: "Message actions" });
+    // Outside `focus-visible:` the button is exactly sr-only (a 1px clipped box) plus paint and flex alignment. A margin,
+    // padding, size, inset, translate or min-size there pushed its box (24px with padding) past the right edge on
+    // phones and made the whole transcript scroll sideways. A new resting class has to be added here on purpose.
+    const resting = button.className.split(/\s+/).filter((token) => token && !token.includes("focus-visible:"));
+    expect(resting.sort()).toEqual(["bg-fill", "gap-1.5", "items-center", "rounded-pill", "sr-only", "text-muted-text", "text-small"].sort());
+  });
+
   it("opens from Shift+F10 and the Menu key on a focused part of a message", async () => {
     mount(`/monos/${MONO}`);
     const button = await within(await messageOf()).findByRole("button", { name: "Message actions" });

@@ -13,7 +13,6 @@ import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
 import { Composer } from "@/features/composer/Composer";
 import { useLinkReady } from "@/features/composer/SessionComposer";
-import { useKeyboardInset } from "@/features/composer/useKeyboardInset";
 import { useSendGuard } from "@/features/composer/useSendGuard";
 import { ModelControls } from "@/features/models/ModelControls";
 import { startingSelection, useDefaultModels } from "@/features/models/defaultModel";
@@ -48,7 +47,6 @@ function targetKind(target: unknown): { kind: string } | null {
  * has no header (the sidebar owns the only h1 and the way back) and fills the pane edge to edge, with no card.
  */
 export function NewSessionScreen({ desktopId, projectId, embedded = false }: { desktopId: string; projectId: string; embedded?: boolean }) {
-  const keyboardInset = useKeyboardInset();
   const requestControl = useRequestControl(desktopId);
   useRememberPlace();
   const navigate = useNavigate();
@@ -183,7 +181,7 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
         </label>
       </div>
 
-      <div className={`mx-auto w-full max-w-[768px] shrink-0 px-2 min-[24rem]:px-5 ${keyboardInset > 0 ? "" : "pb-[env(safe-area-inset-bottom)]"}`}>
+      <div className="mx-auto w-full max-w-[768px] shrink-0 px-2 min-[24rem]:px-5">
         <Composer
           autoFocus={!embedded}
           initialText={initialDraft.text}
@@ -193,6 +191,7 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
           requestControl={requestControl}
           offline={!ready}
           topRow={topRow}
+          configError={configError}
           toolbar={
             <ModelControls
               projectId={projectId}
@@ -204,11 +203,6 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
             />
           }
         />
-        {configError ? (
-          <p role="alert" className="-mt-2 px-4 pb-2 text-meta text-deletions">
-            {configError}
-          </p>
-        ) : null}
       </div>
       {guard.dialog}
     </div>
