@@ -54,7 +54,7 @@ export function OfflineBanner() {
       role="status"
       aria-live="polite"
       data-testid="connection-banner"
-      className={showing ? "px-2 pt-2 min-[24rem]:px-5" : undefined}
+      className={showing ? "shrink-0 px-2 pt-2 min-[24rem]:px-5" : undefined}
     >
       {showing ? (
         <Glass

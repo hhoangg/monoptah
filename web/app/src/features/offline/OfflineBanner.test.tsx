@@ -8,6 +8,8 @@ import { clearLinkStores } from "@/link/store";
 import { getLinkStore } from "@/link";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
+import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
+import { clearSlots, registerSlot } from "@/ui/slots";
 import { desktopIdFromPath } from "./OfflineBanner";
 
 function setOnline(value: boolean) {
@@ -16,6 +18,8 @@ function setOnline(value: boolean) {
 }
 
 async function renderAt(url: string) {
+  // On a desktop route the banner sits under the switcher row (DesktopTopBar), which the switcher slot renders.
+  registerSlot("desktop-switcher", DesktopSwitcher);
   const queryClient = createQueryClient();
   const router = createAppRouter({ history: createMemoryHistory({ initialEntries: [url] }), queryClient });
   render(
@@ -27,6 +31,7 @@ async function renderAt(url: string) {
 }
 
 afterEach(() => {
+  clearSlots();
   vi.restoreAllMocks();
   clearLinkStores();
 });

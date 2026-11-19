@@ -18,6 +18,7 @@ import { Icon } from "@/ui/Icon";
 import { AppNav } from "@/ui/AppNav";
 import { Notice } from "@/ui/Notice";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
+import { OfflineBanner } from "@/features/offline";
 import { useAction } from "@/features/settings/useAction";
 import { requestGrantAndRefresh, useDesktopGrants, useDesktops, type DesktopSummary } from "./api";
 import { safeName } from "./format";
@@ -39,12 +40,16 @@ function OnlineDot({ online }: { online: boolean }) {
 /** The slim row of the /d frame: the switcher (when there is one) on the left, the app nav right aligned. */
 export function DesktopTopBar({ children }: { children?: ReactNode }) {
   return (
-    <div className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
-      <div className="flex min-h-11 w-full items-center gap-2 pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]">
-        <div className="flex min-w-0 flex-1 items-center">{children}</div>
-        <AppNav className="shrink-0" />
+    <>
+      <div className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
+        <div className="flex min-h-11 w-full items-center gap-2 pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]">
+          <div className="flex min-w-0 flex-1 items-center">{children}</div>
+          <AppNav className="shrink-0" />
+        </div>
       </div>
-    </div>
+      {/* The connection banner lives below the row, which already clears the notch (the /d frame has no header). */}
+      <OfflineBanner />
+    </>
   );
 }
 

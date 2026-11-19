@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { getLinkStore } from "@/link/store";
 import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { mountApp } from "@/features/desktops/testMount";
@@ -75,6 +75,58 @@ describe("app shell frame and navigation", () => {
       // The switcher row is inside the single main landmark.
       expect(screen.getByRole("main")).toContainElement(nav);
     } finally {
+      clearSlots();
+    }
+  });
+
+  it("sits the connection banner under the switcher row on /d routes, where the notch inset already applies", async () => {
+    clearSlots();
+    registerSlot("desktop-switcher", DesktopSwitcher);
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    try {
+      mountApp("/d/dk-frame/settings");
+      const banner = await screen.findByTestId("connection-banner");
+      await within(banner).findByText("You are offline");
+      const nav = screen.getByRole("navigation", { name: "Main" });
+      expect(screen.getAllByTestId("connection-banner")).toHaveLength(1);
+      expect(nav.compareDocumentPosition(banner) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(screen.getByRole("main")).toContainElement(banner);
+    } finally {
+      vi.restoreAllMocks();
+      clearSlots();
+    }
+  });
+
+  it("folds Account and Install into a More menu on a phone, keeping Search and Desktops", async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(max-width: 39.9375rem)",
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+    clearSlots();
+    registerSlot("desktop-switcher", DesktopSwitcher);
+    try {
+      const user = userEvent.setup();
+      mountApp("/d/dk-frame/settings");
+      const nav = await screen.findByRole("navigation", { name: "Main" });
+      expect(within(nav).getByRole("button", { name: "Search" })).toBeInTheDocument();
+      expect(within(nav).getByRole("link", { name: "Desktops" })).toHaveAttribute("href", "/desktops");
+      expect(within(nav).queryByRole("link", { name: "Account" })).toBeNull();
+      expect(within(nav).queryByRole("link", { name: "Install" })).toBeNull();
+      // Every target stays 44px on touch.
+      for (const control of [...within(nav).getAllByRole("link"), ...within(nav).getAllByRole("button")]) expect(control.className).toContain("size-11");
+      await user.click(within(nav).getByRole("button", { name: "More" }));
+      const menu = await screen.findByRole("menu");
+      expect(within(menu).getByRole("menuitem", { name: "Account" })).toHaveAttribute("href", "/settings");
+      expect(within(menu).getByRole("menuitem", { name: "Install" })).toHaveAttribute("href", "/install");
+    } finally {
+      window.matchMedia = original;
       clearSlots();
     }
   });
