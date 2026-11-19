@@ -72,7 +72,7 @@ describe("daily cleanup", () => {
   beforeEach(seed);
 
   it("retention constants follow security.md 10", () => {
-    expect(RETENTION).toEqual({ challenges: 3600, sessions: 7 * 86400, rateLimits: 86400, auditLog: 180 * 86400 });
+    expect(RETENTION).toEqual({ challenges: 3600, sessions: 7 * 86400, rateLimits: 86400, auditLog: 180 * 86400, selectionTickets: 3600 });
   });
 
   it("runCleanups deletes expired rows and keeps fresh ones", async () => {

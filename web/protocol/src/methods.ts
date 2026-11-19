@@ -259,10 +259,21 @@ const MonoSubsessions = z.object({
 
 // --- Device selection (architecture.md 7.1, features.md 3.3) ---
 
+export const SelectionItemSchema = z.object({ ref: z.string(), name: z.string(), shared: z.boolean(), id: z.string().optional() });
+export type SelectionItem = z.infer<typeof SelectionItemSchema>;
+
 /** `null` means all. */
 export const DeviceSelectionSchema = z.object({
   projects: z.array(z.string()).nullable(),
   monos: z.array(z.string()).nullable(),
+  /**
+   * Every project and Mono of the host's catalog, shared or not (web devices of a desktop that knows how to widen;
+   * absent on older desktops). `ref` is an opaque handle valid until the desktop restarts; `id` is present only
+   * when `shared` is true. An unshared item exposes its name only: never an id, a path or any content (security.md G13).
+   */
+  available: z.object({ projects: z.array(SelectionItemSchema), monos: z.array(SelectionItemSchema) }).optional(),
+  /** True when this device may add to its selection (a web device with Control access). */
+  canWiden: z.boolean().optional(),
 });
 export type DeviceSelection = z.infer<typeof DeviceSelectionSchema>;
 
@@ -607,10 +618,20 @@ export const METHODS = {
   /** The Noise-based pairing replaces it; only the QUIC phone invitation still uses it. */
   "device.enroll": method({ class: "denied", transport: "host", quicOnly: true, params: Open, result: Json }),
   "device.selection": method({
-    class: "param", // get: read; set: control, narrowing only
+    class: "param", // always read: the desktop enforces narrow vs widen and the device kind inside the handler
     transport: "host",
-    /** Empty params read the selection; `projects` or `monos` present sets it (may only narrow). */
-    params: z.object({ projects: z.array(z.string()).nullable().optional(), monos: z.array(z.string()).nullable().optional() }),
+    /**
+     * Empty params read the selection. `projects` / `monos` set it (ids; null = all, including new ones),
+     * `addProjects` / `addMonos` add refs from `available`, `ticket` is the single-use proof of a passkey re-auth
+     * (needed only when the change widens).
+     */
+    params: z.object({
+      projects: z.array(z.string()).nullable().optional(),
+      monos: z.array(z.string()).nullable().optional(),
+      addProjects: z.array(z.string().max(64)).max(1000).optional(),
+      addMonos: z.array(z.string().max(64)).max(1000).optional(),
+      ticket: z.string().max(256).optional(),
+    }),
     result: DeviceSelectionSchema,
   }),
 
@@ -693,7 +714,8 @@ export function classify(name: string, params: unknown = {}, flags: ClassifyFlag
     case "accounts.usage":
       return p.refresh === true ? "control" : "read";
     case "device.selection":
-      return "projects" in p || "monos" in p ? "control" : "read";
+      // Narrow vs widen, read vs control device and phone vs web are decided by the desktop's selection handler.
+      return "read";
     case "project.gitAction": {
       const action = p.action;
       if (typeof action !== "string") return "denied";

@@ -76,6 +76,8 @@ describe("error codes", () => {
         "not_pending",
         "needs_desktop",
         "wake_required",
+        "fresh_required",
+        "rate_limited",
       ].sort(),
     );
   });

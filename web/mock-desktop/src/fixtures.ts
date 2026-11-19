@@ -543,6 +543,17 @@ function project(world: MockWorld, projectId: string): void {
   if (!world.projectIds().includes(projectId)) throw new FixtureError(`Unknown project ${projectId}`, "not_selected");
 }
 
+/** An opaque, id-free handle for one catalog item (FNV-1a, 2 rounds), like the real desktop's keyed hash. Mock only. */
+export function selectionRef(kind: "project" | "mono", id: string): string {
+  let out = "";
+  for (const seed of [0x811c9dc5, 0x01000193]) {
+    let hash = seed;
+    for (const char of `${kind}\0${id}`) hash = Math.imul(hash ^ char.charCodeAt(0), 0x01000193) >>> 0;
+    out += hash.toString(16).padStart(8, "0");
+  }
+  return `r${out}`;
+}
+
 function selected(ctx: HandlerContext, projectId: string): boolean {
   return ctx.device.selection.projects === null || ctx.device.selection.projects.includes(projectId);
 }
@@ -706,7 +717,7 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
     const visible = (id: string) => selected(ctx, id);
     return {
       projects: world.projects().filter((p) => visible(p.id)).map((p) => ({ ...p })),
-      monos: world.monos().map((m) => ({ ...m, projectIds: [...m.projectIds] })),
+      monos: world.monos().filter((m) => ctx.device.selection.monos === null || ctx.device.selection.monos.includes(m.id)).map((m) => ({ ...m, projectIds: [...m.projectIds] })),
       sessions: world.visibleSessions().filter((s) => visible(s.projectId)).map((s) => world.card(s)),
       monoTools: true,
       monoFiles: true,
@@ -727,15 +738,49 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
   "device.leave": () => ({}),
   "device.push": () => ({}),
   "device.enroll": () => ({}),
-  "device.selection": (p, { device }) => {
-    const narrows = (next: string[] | null | undefined, current: string[] | null): boolean =>
-      next === undefined || (current === null ? true : next !== null && next.every((id) => current.includes(id)));
-    if (!narrows(p.projects, device.selection.projects) || !narrows(p.monos, device.selection.monos)) {
-      throw new FixtureError("A selection can only be narrowed from the web", "forbidden");
+  "device.selection": (p, { world, device }) => {
+    const current = device.selection;
+    const projectCatalog = world.projects();
+    const monoCatalog = world.monos();
+    // Resolve refs over the whole catalog; an unknown ref fails the call, like the real desktop.
+    const resolve = (kind: "project" | "mono", refs: string[] | undefined, catalog: readonly { id: string }[]): string[] => {
+      const ids = new Map(catalog.map((item) => [selectionRef(kind, item.id), item.id]));
+      return (refs ?? []).map((ref) => {
+        const id = ids.get(ref);
+        if (id === undefined) throw new FixtureError("That item is not on this desktop any more", "not_found");
+        return id;
+      });
+    };
+    const addProjects = resolve("project", p.addProjects, projectCatalog);
+    const addMonos = resolve("mono", p.addMonos, monoCatalog);
+    const merge = (base: string[] | null | undefined, now: string[] | null, add: string[]): string[] | null => {
+      // Like the real desktop: an explicit id list only narrows (it is intersected with the current selection).
+      const start = base === undefined ? now : base === null || now === null ? base : base.filter((id) => now.includes(id));
+      return start === null ? null : [...new Set([...start, ...add])];
+    };
+    const nextProjects = merge(p.projects, current.projects, addProjects);
+    const nextMonos = merge(p.monos, current.monos, addMonos);
+    const widens = (next: string[] | null, now: string[] | null): boolean => now !== null && (next === null || next.some((id) => !now.includes(id)));
+    if (widens(nextProjects, current.projects) || widens(nextMonos, current.monos)) {
+      // A real desktop checks the ticket with the Worker; the mock cannot, so any non-empty ticket passes.
+      if (device.permission === "read") throw new FixtureError("This device can only read", "read_only");
+      if (p.ticket === undefined || p.ticket === "") throw new FixtureError("Confirm with your passkey to add projects", "fresh_required");
     }
-    if (p.projects !== undefined) device.selection.projects = p.projects;
-    if (p.monos !== undefined) device.selection.monos = p.monos;
-    return { projects: device.selection.projects, monos: device.selection.monos };
+    current.projects = nextProjects;
+    current.monos = nextMonos;
+    const entry = (kind: "project" | "mono", item: { id: string; name: string }, list: string[] | null) => {
+      const shared = list === null || list.includes(item.id);
+      return { ref: selectionRef(kind, item.id), name: item.name, shared, ...(shared ? { id: item.id } : {}) };
+    };
+    return {
+      projects: current.projects,
+      monos: current.monos,
+      available: {
+        projects: projectCatalog.map((item) => entry("project", item, current.projects)),
+        monos: monoCatalog.map((item) => entry("mono", item, current.monos)),
+      },
+      canWiden: device.permission === "control",
+    };
   },
 
   "cloud.instances": (_p, { world }) => ({

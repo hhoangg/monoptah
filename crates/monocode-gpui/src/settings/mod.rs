@@ -202,6 +202,13 @@ pub(crate) enum SettingsEvent {
         device_id: String,
         projects: Option<Vec<String>>,
     },
+    /// The projects and Monos a paired web device may see (`None` is all),
+    /// permission kept.
+    WebSetSelection {
+        device_id: String,
+        projects: Option<Vec<String>>,
+        monos: Option<Vec<String>>,
+    },
     /// Switch a remote-action toggle (H-06, H-11) on or off.
     WebSetPolicyFlag {
         flag: WebPolicyFlag,

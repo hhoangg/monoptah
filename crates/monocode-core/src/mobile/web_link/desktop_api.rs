@@ -13,6 +13,24 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the desktop waits for the server to consume a selection ticket.
+const TICKET_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `POST /api/desktop/grants/:deviceId/selection-ticket`: whether the server
+/// accepted the single-use ticket (200) and has now consumed it. Any other
+/// answer, an invalid id or no answer in 5 s is `false`.
+pub fn verify_selection_ticket(base: &str, token: &str, device_id: &str, ticket: &str) -> bool {
+    let Ok(id) = path_id(device_id) else {
+        return false;
+    };
+    let path = format!("/api/desktop/grants/{id}/selection-ticket");
+    let body = json!({"ticket": ticket});
+    matches!(
+        call("POST", base, &path, Some(token), Some(&body), TICKET_TIMEOUT),
+        Ok(answer) if answer.status == 200
+    )
+}
+
 /// `DELETE /api/desktop/me` runs while the user waits for "Unpair".
 pub(crate) const UNPAIR_TIMEOUT: Duration = Duration::from_secs(8);
 /// A web server answer is a small JSON document.

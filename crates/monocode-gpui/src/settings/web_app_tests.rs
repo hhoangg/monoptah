@@ -8,7 +8,7 @@ use gpui::{
 use monocode_core::mobile::{
     DeviceKind, Permission, WebState, WebStatus,
     host::Device,
-    web_link::{PairTicket, PendingDevice, PermissionRequest},
+    web_link::{AccessChange, PairTicket, PendingDevice, PermissionRequest},
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -63,6 +63,11 @@ fn tag(event: &SettingsEvent) -> Option<String> {
             device_id,
             projects,
         } => format!("phone-projects:{device_id}:{projects:?}"),
+        SettingsEvent::WebSetSelection {
+            device_id,
+            projects,
+            monos,
+        } => format!("web-selection:{device_id}:{projects:?}:{monos:?}"),
         SettingsEvent::MobileRevoke(id) => format!("mobile-revoke:{id}"),
         SettingsEvent::MobileConfigure { enabled, .. } => format!("mobile-configure:{enabled}"),
         _ => return None,
@@ -728,6 +733,102 @@ fn a_phone_with_no_selection_shows_all_projects_and_narrowing_emits_the_rest(
         events(&window, visual),
         ["phone-projects:ph1:Some([\"p2\"])"]
     );
+}
+
+#[gpui::test]
+fn a_web_device_row_narrows_its_projects_from_the_desktop(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![device("dev1", Permission::Control)],
+            ..paired()
+        });
+        ctx.web_projects = choices(&["p1", "p2"]);
+    });
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_none());
+    click(visual, "web-projects-dev1");
+    // A device with no saved selection has every project ticked.
+    click(visual, "web-project-dev1-p1");
+    assert_eq!(
+        events(&window, visual),
+        ["web-selection:dev1:Some([\"p2\"]):None"]
+    );
+    click(visual, "web-projects-dev1");
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_none());
+}
+
+#[gpui::test]
+fn a_web_device_row_narrows_its_monos_and_keeps_ids_the_catalog_lost(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        let mut row = device("dev1", Permission::Control);
+        row.projects = Some(vec!["p1".into(), "gone".into()]);
+        row.monos = Some(vec!["m1".into(), "m2".into()]);
+        ctx.web = Some(WebStatus {
+            devices: vec![row],
+            ..paired()
+        });
+        ctx.web_projects = choices(&["p1", "p2"]);
+        ctx.web_monos = choices(&["m1", "m2"]);
+    });
+    click(visual, "web-projects-dev1");
+    click(visual, "web-mono-dev1-m1");
+    assert_eq!(
+        events(&window, visual),
+        ["web-selection:dev1:Some([\"p1\", \"gone\"]):Some([\"m2\"])"]
+    );
+    // Toggling a project keeps the id the catalog no longer lists.
+    click(visual, "web-project-dev1-p2");
+    assert_eq!(
+        events(&window, visual)[1],
+        "web-selection:dev1:Some([\"p1\", \"p2\", \"gone\"]):Some([\"m1\", \"m2\"])"
+    );
+}
+
+#[gpui::test]
+fn recent_access_changes_show_only_when_there_are_some(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![device("dev1", Permission::Control)],
+            ..paired()
+        });
+    });
+    assert!(visual.debug_bounds("web-access-change-0").is_none());
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![device("dev1", Permission::Control)],
+            access_changes: vec![
+                AccessChange {
+                    at: 1,
+                    device_id: "dev1".into(),
+                    device_name: "Work laptop".into(),
+                    text: "Work laptop now has access to Alpha".into(),
+                },
+                AccessChange {
+                    at: 2,
+                    device_id: "dev1".into(),
+                    device_name: "Work laptop".into(),
+                    text: "Work laptop now has access to Beta".into(),
+                },
+            ],
+            ..paired()
+        });
+    });
+    assert!(visual.debug_bounds("web-access-change-0").is_some());
+    assert!(visual.debug_bounds("web-access-change-1").is_some());
+    assert!(visual.debug_bounds("web-access-change-2").is_none());
+}
+
+#[test]
+fn an_access_change_reads_as_a_relative_time() {
+    assert_eq!(web::devices::ago_text(95, 100), "just now");
+    assert_eq!(web::devices::ago_text(0, 600), "10 min ago");
+    assert_eq!(web::devices::ago_text(0, 7200), "2 h ago");
+    assert_eq!(web::devices::ago_text(0, 200_000), "2 d ago");
 }
 
 #[gpui::test]

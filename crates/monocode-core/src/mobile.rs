@@ -11,6 +11,7 @@ pub mod mentioned_file;
 pub mod notify;
 pub mod policy;
 mod router;
+mod selection;
 pub mod watch;
 pub mod web_link;
 
@@ -19,4 +20,4 @@ pub use host::{
 };
 pub use monocode_mobile_link::Address;
 pub use policy::{DeviceContext, DeviceKind, Permission};
-pub use web_link::{WebState, WebStatus};
+pub use web_link::{AccessChange, WebState, WebStatus};

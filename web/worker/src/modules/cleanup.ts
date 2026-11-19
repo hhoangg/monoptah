@@ -22,6 +22,8 @@ export const RETENTION = {
   sessions: 7 * DAY,
   /** `rate_limits`: removed 1 day after the window started. */
   rateLimits: DAY,
+  /** `selection_tickets`: removed 1 hour after they expire (used tickets go with them). */
+  selectionTickets: HOUR,
   /** `audit_log`: 180 days. */
   auditLog: 180 * DAY,
 } as const;

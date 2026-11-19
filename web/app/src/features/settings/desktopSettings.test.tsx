@@ -2,16 +2,25 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type * as KeysModule from "@/link/keys";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport, type ApiTransport } from "@/features/accounts/api";
 import { createMockServer } from "@/features/accounts/mock/transport";
 import { createMockState } from "@/features/accounts/mock/state";
 import { createQueryClient } from "@/lib/queryClient";
+import { REFUSED_COPY } from "./ProjectsPicker";
 import { createAppRouter } from "@/router";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { DesktopLinkError, forgetDesktopLocally, onForgetDesktop, provideDesktopLink, resetDesktopLinks } from "./desktopLink";
 import { FirstRunPicker, pickerSeenKey } from "./FirstRunPicker";
 import { createMockDesktopLink, type MockDesktopLink } from "./mockDesktopLink";
+
+// The widening flow asks for a passkey (re-auth) and for this browser's device id; neither exists in jsdom.
+const webauthn = vi.hoisted(() => ({ createPasskey: vi.fn(), getPasskey: vi.fn() }));
+vi.mock("@/features/accounts/webauthn", () => webauthn);
+const keys = vi.hoisted(() => ({ getDeviceKeyInfo: vi.fn() }));
+vi.mock("@/link/keys", async (importOriginal) => ({ ...(await importOriginal<typeof KeysModule>()), ...keys }));
+const ASSERTION = { status: "ok", response: { id: "cred", rawId: "cred", type: "public-key", response: {}, clientExtensionResults: {} } };
 
 const DESKTOP = "desktop-dev-1";
 const SETTINGS = `/d/${DESKTOP}/settings`;
@@ -21,13 +30,30 @@ let requests: Array<{ method: string; url: string; body: unknown }> = [];
 let links: MockDesktopLink[] = [];
 
 let mockState: ReturnType<typeof createMockState>;
+/** Tickets the fake selection-ticket route handed out, and the answer it gives next (default: a ticket once fresh). */
+let tickets: string[] = [];
+let ticketAnswer: { status: number; code: string } | null = null;
 
 function installApi() {
   mockState = createMockState({ signedIn: true });
   const server = createMockServer({ state: mockState });
-  const transport: ApiTransport = (url, init) => {
+  let fresh = false;
+  tickets = [];
+  ticketAnswer = null;
+  const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  const transport: ApiTransport = async (url, init) => {
     requests.push({ method: init.method ?? "GET", url, body: typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
-    return server.transport(url, init);
+    if (/^\/api\/desktops\/[^/]+\/grants\/[^/]+\/selection-ticket$/.test(url)) {
+      if (ticketAnswer) return reply(ticketAnswer.status, { error: ticketAnswer.code, code: ticketAnswer.code });
+      // Like the real route: a fresh session is needed (the app re-authenticates once and retries).
+      if (!fresh) return reply(403, { error: "fresh_required", code: "fresh_required" });
+      const ticket = `ticket-${tickets.length + 1}`;
+      tickets.push(ticket);
+      return reply(200, { ticket, expiresAt: 1_900_000_000 });
+    }
+    const response = await server.transport(url, init);
+    if (url === "/api/auth/reauth/verify" && response.ok) fresh = true;
+    return response;
   };
   restore = setApiTransport(transport);
 }
@@ -72,6 +98,8 @@ async function openPicker(user: ReturnType<typeof userEvent.setup>) {
 beforeEach(() => {
   requests = [];
   window.localStorage.clear();
+  webauthn.getPasskey.mockResolvedValue(ASSERTION);
+  keys.getDeviceKeyInfo.mockResolvedValue({ deviceId: "dev-this", publicKey: new Uint8Array(32) });
   installApi();
 });
 afterEach(() => {
@@ -182,27 +210,227 @@ describe("projects picker", () => {
     await screen.findByText("1 project, 1 Mono");
   });
 
-  it("shows the desktop's refusal when an item outside the granted selection is checked", async () => {
+  it("lists a project that is not shared as Not shared, with no id and no path", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) device.selection = { projects: ["proj-alpha"], monos: null };
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    const beta = await within(dialog).findByRole("checkbox", { name: /Example Beta/ });
+    expect(beta).not.toBeChecked();
+    expect(beta).toBeEnabled();
+    expect(within(dialog).getByRole("checkbox", { name: /Example Alpha/ })).toBeChecked();
+    expect(within(dialog).getAllByText("Not shared")).toHaveLength(1);
+    expect(within(dialog).getAllByText("Shared").length).toBeGreaterThanOrEqual(2);
+    expect(dialog).not.toHaveTextContent("proj-beta");
+    expect(dialog).not.toHaveTextContent("/example/beta");
+    expect(within(dialog).getByRole("checkbox", { name: "All projects, including new ones" })).not.toBeChecked();
+    expect(within(dialog).getByRole("checkbox", { name: "All Monos, including new ones" })).toBeChecked();
+    expect(dialog).not.toHaveTextContent("never widen");
+  });
+
+  it("narrowing sends no ticket and never opens the passkey prompt", async () => {
     const user = userEvent.setup();
     const link = provideMockLink();
     mount(SETTINGS);
-    // Narrow the Monos to none first: the catalog still lists the Mono, so checking it is a widening.
-    let dialog = await openPicker(user);
-    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Mono/ }));
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
+    expect(within(dialog).getByRole("button", { name: "Save" })).toBeEnabled();
     await user.click(within(dialog).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
-    expect(selectionOf(link)?.monos).toEqual([]);
+    expect(setCalls(link)).toEqual([{ method: "device.selection", params: { projects: ["proj-alpha"] } }]);
+    expect(requests.some((request) => request.url.endsWith("/selection-ticket"))).toBe(false);
+    expect(webauthn.getPasskey).not.toHaveBeenCalled();
+  });
 
-    dialog = await openPicker(user);
-    const mono = await within(dialog).findByRole("checkbox", { name: /Example Mono/ });
-    expect(mono).not.toBeChecked();
-    await user.click(mono);
+  it("widening asks for a ticket through the passkey prompt, then sends the refs with the ticket", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) device.selection = { projects: ["proj-alpha"], monos: null };
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    expect(webauthn.getPasskey).toHaveBeenCalledTimes(1);
+    expect(tickets).toEqual(["ticket-1"]);
+    const ticketRequests = requests.filter((request) => request.url.endsWith("/selection-ticket"));
+    expect(ticketRequests.map((request) => request.url)).toEqual([`/api/desktops/${DESKTOP}/grants/dev-this/selection-ticket`, `/api/desktops/${DESKTOP}/grants/dev-this/selection-ticket`]);
+    const sets = setCalls(link);
+    expect(sets).toHaveLength(1);
+    const params = sets[0]?.params as { projects: string[]; addProjects: string[]; ticket: string };
+    expect(params.projects).toEqual(["proj-alpha"]);
+    expect(params.addProjects).toHaveLength(1);
+    expect(params.ticket).toBe("ticket-1");
+    // The ref is opaque: it must not carry the id or the path.
+    expect(JSON.stringify(params)).not.toContain("proj-beta");
+    expect(selectionOf(link)?.projects).toEqual(["proj-alpha", "proj-beta"]);
+    // The catalog and the settings row follow what the browser now sees.
+    await screen.findByText("2 projects, 1 Mono");
+  });
+
+  it("a browser with read access cannot check an unshared project and is told why", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) {
+      device.permission = "read";
+      device.selection = { projects: ["proj-alpha"], monos: null };
+    }
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    const beta = await within(dialog).findByRole("checkbox", { name: /Example Beta/ });
+    expect(beta).toBeDisabled();
+    expect(within(dialog).getByRole("checkbox", { name: "All projects, including new ones" })).toBeDisabled();
+    expect(dialog).toHaveTextContent("Only a browser with Control access can add projects. You can still remove some.");
+    // Removing still works, without a ticket.
+    await user.click(within(dialog).getByRole("checkbox", { name: /Example Alpha/ }));
     await user.click(within(dialog).getByRole("button", { name: "Save" }));
-    const alert = await within(dialog).findByRole("alert");
-    expect(alert).toHaveTextContent("only lets this browser see fewer");
-    expect(alert).toHaveTextContent("A selection can only be narrowed from the web");
-    expect(selectionOf(link)?.monos).toEqual([]);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(setCalls(link)).toEqual([{ method: "device.selection", params: { projects: [] } }]);
+    expect(webauthn.getPasskey).not.toHaveBeenCalled();
+  });
+
+  it("All projects, including new ones sends projects: null with the ticket", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) device.selection = { projects: ["proj-alpha"], monos: null };
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    const all = await within(dialog).findByRole("checkbox", { name: "All projects, including new ones" });
+    await user.click(all);
+    expect(within(dialog).getByRole("checkbox", { name: /Example Beta/ })).toBeDisabled();
+    await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(setCalls(link)).toEqual([{ method: "device.selection", params: { projects: null, ticket: "ticket-1" } }]);
+    expect(selectionOf(link)?.projects).toBeNull();
+  });
+
+  it("turning All projects off sends the shared list without a ticket", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: "All projects, including new ones" }));
+    await user.click(within(dialog).getByRole("checkbox", { name: /Example Beta/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(setCalls(link)).toEqual([{ method: "device.selection", params: { projects: ["proj-alpha"] } }]);
+    expect(webauthn.getPasskey).not.toHaveBeenCalled();
+  });
+
+  it("stops without sending anything when the passkey prompt is cancelled", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) device.selection = { projects: ["proj-alpha"], monos: null };
+    webauthn.getPasskey.mockResolvedValue({ status: "cancelled" });
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Passkey confirmation was cancelled");
+    expect(setCalls(link)).toHaveLength(0);
+    expect(selectionOf(link)?.projects).toEqual(["proj-alpha"]);
+  });
+
+  it.each([
+    ["fresh_required", "could not confirm your passkey"],
+    ["rate_limited", "Too many attempts to add projects on this desktop"],
+    ["read_only", "Only a browser with Control access can add projects"],
+    ["not_found", "The desktop's list changed. Refresh and try again."],
+    ["forbidden", "The desktop did not allow this change"],
+    ["revoked", "no longer has access to this desktop"],
+  ])("maps the desktop code %s to clear copy", async (code, copy) => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) device.selection = { projects: ["proj-alpha"], monos: null };
+    const original = link.call.bind(link) as (method: string, params?: unknown) => Promise<unknown>;
+    vi.spyOn(link, "call").mockImplementation(((method: string, params?: unknown) =>
+      method === "device.selection" && params && Object.keys(params).length > 0 ? Promise.reject(new DesktopLinkError("desktop said so", code)) : original(method, params)) as never);
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(copy);
     expect(screen.getByRole("dialog", { name: "Projects on this device" })).toBeInTheDocument();
+  });
+
+  it("shows clear copy when the Worker refuses the ticket (429 and 403)", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) device.selection = { projects: ["proj-alpha"], monos: null };
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
+    ticketAnswer = { status: 429, code: "rate_limited" };
+    await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Too many attempts to add projects. Wait a while");
+    ticketAnswer = { status: 403, code: "forbidden" };
+    await user.click(within(dialog).getByRole("button", { name: "Confirm and save" }));
+    await waitFor(() => expect(within(dialog).getByRole("alert")).toHaveTextContent("does not have Control access"));
+    expect(setCalls(link)).toHaveLength(0);
+  });
+
+  it("an older desktop without `available` keeps the narrow-only list and its copy", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const original = link.call.bind(link) as (method: string, params?: unknown) => Promise<unknown>;
+    vi.spyOn(link, "call").mockImplementation((async (method: string, params?: unknown) => {
+      const result = (await original(method, params)) as Record<string, unknown>;
+      if (method !== "device.selection") return result;
+      const { projects, monos } = result;
+      return { projects, monos };
+    }) as never);
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    const beta = await within(dialog).findByRole("checkbox", { name: /Example Beta/ });
+    expect(dialog).toHaveTextContent("never widen it");
+    expect(within(dialog).queryByText("Shared")).toBeNull();
+    expect(within(dialog).queryByRole("checkbox", { name: /including new ones/ })).toBeNull();
+    expect(dialog).toHaveTextContent("/example/beta");
+    await user.click(beta);
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(setCalls(link)).toEqual([{ method: "device.selection", params: { projects: ["proj-alpha"] } }]);
+    expect(webauthn.getPasskey).not.toHaveBeenCalled();
+  });
+
+  it("an older desktop that refuses with forbidden shows the refused copy and its message", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const original = link.call.bind(link) as (method: string, params?: unknown) => Promise<unknown>;
+    vi.spyOn(link, "call").mockImplementation((async (method: string, params?: unknown) => {
+      if (method === "device.selection" && params && Object.keys(params).length > 0) throw new DesktopLinkError("widening is refused", "forbidden");
+      const result = (await original(method, params)) as Record<string, unknown>;
+      if (method !== "device.selection") return result;
+      const { projects, monos } = result;
+      return { projects, monos };
+    }) as never);
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(`${REFUSED_COPY} (Desktop said: widening is refused)`);
+  });
+
+  it("keeps granted ids the desktop no longer lists when narrowing", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    const device = [...link.desktop.devices.values()][0];
+    if (device) device.selection = { projects: ["proj-alpha", "proj-beta", "proj-closed"], monos: null };
+    mount(SETTINGS);
+    const dialog = await openPicker(user);
+    await user.click(await within(dialog).findByRole("checkbox", { name: /Example Beta/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(setCalls(link)).toEqual([{ method: "device.selection", params: { projects: ["proj-alpha", "proj-closed"] } }]);
   });
 
   it("Refresh desktop reloads the catalog without a set call", async () => {

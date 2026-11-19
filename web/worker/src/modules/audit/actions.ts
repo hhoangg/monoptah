@@ -77,6 +77,7 @@ export const RATE_LIMIT_AUDIT_GROUPS = [
   "invite",
   "handle",
   "session",
+  "selection-ticket",
 ] as const;
 
 interface ActionSpec {
@@ -120,6 +121,10 @@ export const AUDIT_ACTIONS = {
     permission: Permission.optional(),
     requestedPermission: Permission.optional(),
   }),
+  /** A web device got a single-use ticket to widen what it may see on a desktop (fresh passkey re-auth). */
+  "selection.ticket": spec(["user"], { deviceId: Id, desktopId: Id }),
+  /** The desktop consumed such a ticket: the widening is going ahead. */
+  "selection.widen": spec(["desktop"], { deviceId: Id, desktopId: Id }),
   // Admin
   "user.block": spec(["admin"], { cascade: z.boolean(), count: Count }),
   "user.unblock": spec(["admin"], { cascade: z.boolean().optional() }),

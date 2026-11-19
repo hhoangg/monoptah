@@ -16,6 +16,7 @@ import {
   PatchDesktopResponse,
   PutGrantBody,
   RequestGrantBody,
+  SelectionTicketResponse,
 } from "@monoptah/protocol";
 import { queryOptions, useQuery, type QueryClient } from "@tanstack/react-query";
 import { apiFetch, endpoint, isApiError } from "@/features/accounts/api";
@@ -46,6 +47,7 @@ export const desktopEndpoints = {
   grants: endpoint("GET", "/api/desktops/:id/grants", GrantsResponse),
   requestGrant: endpoint("POST", "/api/desktops/:id/grants", GrantResponse, RequestGrantBody),
   putGrant: endpoint("PUT", "/api/desktops/:id/grants/:deviceId", GrantResponse, PutGrantBody),
+  selectionTicket: endpoint("POST", "/api/desktops/:id/grants/:deviceId/selection-ticket", SelectionTicketResponse),
 };
 
 // --- Query keys ---
@@ -214,6 +216,17 @@ export async function revokeGrant(queryClient: QueryClient, desktopId: string, d
     queryClient.invalidateQueries({ queryKey: desktopKeys.list, exact: true }),
   ]);
   return grant;
+}
+
+/**
+ * A single-use ticket that proves a fresh passkey re-auth to the desktop, so this browser (a Control device) can widen
+ * its selection there. Fresh route: prompts for the passkey once when the server asks. The ticket is bound to this
+ * desktop and device and lives about two minutes; it is never stored or logged. 403 `forbidden` means the grant is not
+ * Control, 429 `rate_limited` means too many tickets this hour (both `ApiError`).
+ */
+export async function requestSelectionTicket(desktopId: string, deviceId: string): Promise<string> {
+  const { ticket } = await withFreshAuth(() => apiFetch(desktopEndpoints.selectionTicket, { params: { id: desktopId, deviceId } }));
+  return ticket;
 }
 
 /** Every step runs even when an earlier one failed; the first failure is rethrown at the end. */

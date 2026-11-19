@@ -369,6 +369,41 @@ pub struct MobileHost {
     shut_down: Arc<AtomicBool>,
     /// The web link's client task, status and pending grants.
     web: super::web_link::WebLink,
+    /// What `device.selection` needs of a web device: refs, attempts, tickets.
+    selection: Arc<SelectionState>,
+}
+
+/// What `call_from` does once it has looked the device up under the lock.
+enum Locked {
+    /// `device.selection` of a web device, answered with no lock held.
+    Selection,
+    /// A method the app answers, for this device.
+    Forward(DeviceContext),
+}
+
+/// Says whether the server accepted a selection ticket: `(server device id,
+/// ticket)`. Blocking, so it runs on `spawn_blocking`.
+type TicketVerifier = Arc<dyn Fn(String, String) -> bool + Send + Sync>;
+
+struct SelectionState {
+    /// Keys the refs of unshared items; random per host, memory only.
+    secret: [u8; 32],
+    limit: Mutex<super::selection::AttemptLimit>,
+    /// Replaces the HTTP call to the web server (tests).
+    verifier: Mutex<Option<TicketVerifier>>,
+}
+
+impl SelectionState {
+    fn new() -> Self {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::rng().fill_bytes(&mut secret);
+        Self {
+            secret,
+            limit: Mutex::default(),
+            verifier: Mutex::default(),
+        }
+    }
 }
 
 fn unavailable<T>(_: T) -> String {
@@ -458,6 +493,7 @@ impl MobileHost {
             pending: Arc::default(),
             shut_down: Arc::default(),
             web: super::web_link::WebLink::default(),
+            selection: Arc::new(SelectionState::new()),
         };
         // Loading the identity reads the database (and, once, the legacy
         // keychain entry, which can wait on an access prompt), and the app opens
@@ -988,7 +1024,7 @@ impl MobileHost {
         if !params.is_object() {
             return Err("Invalid mobile parameters".into());
         }
-        let device = {
+        let locked = 'locked: {
             let mut inner = self.inner.lock().map_err(unavailable)?;
             check_enabled(&inner, via)?;
             // Pairing is the QUIC phones' own flow. The web transport pairs
@@ -1012,7 +1048,21 @@ impl MobileHost {
                 return Err(unsupported());
             }
             match method {
+                "device.selection" if via == DeviceKind::Web => {
+                    // The ticket check is an HTTP call: it runs after this block,
+                    // with no lock held (and no guard alive across the await).
+                    break 'locked Locked::Selection;
+                }
                 "device.selection" => {
+                    // A phone sets a selection only with Control (the policy
+                    // lets the call through, as a web device may narrow).
+                    if (params.get("projects").is_some() || params.get("monos").is_some())
+                        && context.permission != Permission::Control
+                    {
+                        let denial = policy::Denial::new(policy::Code::ReadOnly);
+                        mark_denied(audited, &denial);
+                        return Err(denial.into());
+                    }
                     let answer = policy::device_selection(&context, &params)?;
                     return Ok(self.answer_selection(&mut inner, peer, answer)?);
                 }
@@ -1096,7 +1146,11 @@ impl MobileHost {
             if !APP_METHODS.contains(&method) {
                 return Err(unsupported());
             }
-            context
+            Locked::Forward(context)
+        };
+        let device = match locked {
+            Locked::Selection => return self.web_selection(peer, &params).await,
+            Locked::Forward(context) => context,
         };
         let command_id = request["id"]
             .as_str()
@@ -1387,19 +1441,205 @@ impl MobileHost {
         answer: policy::SelectionAnswer,
     ) -> Result<Value, String> {
         if let Some(selection) = answer.narrowed {
-            let mut config = inner.config.clone();
-            let device = config
-                .devices
-                .iter_mut()
-                .find(|device| device.fingerprint == peer)
-                .ok_or("Device revoked or not paired")?;
-            device.projects = selection.projects;
-            device.monos = selection.monos;
-            self.save(&config)?;
-            inner.config = config;
-            close_device_watches(inner, peer);
+            self.apply_selection(inner, peer, selection)?;
         }
         Ok(answer.reply)
+    }
+
+    /// Writes `selection` into the row of `peer` and ends its watches.
+    fn apply_selection(
+        &self,
+        inner: &mut Inner,
+        peer: &str,
+        selection: policy::Selection,
+    ) -> Result<(), String> {
+        let mut config = inner.config.clone();
+        let device = config
+            .devices
+            .iter_mut()
+            .find(|device| device.fingerprint == peer)
+            .ok_or("Device revoked or not paired")?;
+        device.projects = selection.projects;
+        device.monos = selection.monos;
+        self.save(&config)?;
+        inner.config = config;
+        close_device_watches(inner, peer);
+        Ok(())
+    }
+
+    /// The published projects and Monos, without the sessions.
+    fn selection_catalog(inner: &Inner) -> Value {
+        json!({"projects": inner.catalog["projects"].clone(), "monos": inner.catalog["monos"].clone()})
+    }
+
+    /// `device.selection` of a web device. A change that only removes is
+    /// applied at once, by a read or a control device. A change that adds
+    /// needs a control device and a fresh single-use ticket that the web
+    /// server confirms; it applies at once and is shown to the owner.
+    async fn web_selection(&self, peer: &str, params: &Value) -> Result<Value, Failure> {
+        let request = super::selection::parse(params)?;
+        let secret = &self.selection.secret;
+        let device = {
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            check_enabled(&inner, DeviceKind::Web)?;
+            let device = find_device(&inner, DeviceKind::Web, peer)?;
+            let catalog = Self::selection_catalog(&inner);
+            let plan =
+                super::selection::plan(&device_context(&device), &request, &catalog, secret)?;
+            let can_widen = device.permission == Permission::Control;
+            if !plan.widens {
+                if plan.changed {
+                    self.apply_selection(&mut inner, peer, plan.selection.clone())?;
+                    audit_device(
+                        audit::Lifecycle::SelectionNarrow,
+                        &device,
+                        Some(&super::selection::narrow_detail(
+                            &device_context(&device),
+                            &plan.selection,
+                        )),
+                    );
+                }
+                return Ok(super::selection::reply(
+                    &plan.selection,
+                    can_widen,
+                    &catalog,
+                    secret,
+                ));
+            }
+            if !can_widen {
+                return Err(policy::Code::ReadOnly.failure());
+            }
+            device
+        };
+        // Widening. The checks come before the server is asked.
+        let refuse = |detail: &str, code: policy::Code| {
+            audit_device(
+                audit::Lifecycle::SelectionWidenRefused,
+                &device,
+                Some(detail),
+            );
+            code.failure()
+        };
+        let Some(ticket) = request.ticket.clone().filter(|ticket| !ticket.is_empty()) else {
+            return Err(refuse("no ticket", policy::Code::FreshRequired));
+        };
+        let Some(server_id) = device.server_device_id.clone() else {
+            return Err(refuse("ticket rejected", policy::Code::FreshRequired));
+        };
+        let admitted = self
+            .selection
+            .limit
+            .lock()
+            .map_err(unavailable)?
+            .admit(&device.id, std::time::Instant::now());
+        if admitted.is_err() {
+            return Err(refuse("rate limited", policy::Code::RateLimited));
+        }
+        if !self.verify_ticket(server_id, ticket).await {
+            return Err(refuse("ticket rejected", policy::Code::FreshRequired));
+        }
+        // The device may have been revoked or lowered, or the selection may
+        // have changed, while the server answered: decide again from now.
+        let (reply, plan) = {
+            let mut inner = self.inner.lock().map_err(unavailable)?;
+            check_enabled(&inner, DeviceKind::Web)?;
+            let device = find_device(&inner, DeviceKind::Web, peer)?;
+            if device.permission != Permission::Control {
+                return Err(policy::Code::ReadOnly.failure());
+            }
+            let catalog = Self::selection_catalog(&inner);
+            let plan =
+                super::selection::plan(&device_context(&device), &request, &catalog, secret)?;
+            if plan.changed {
+                self.apply_selection(&mut inner, peer, plan.selection.clone())?;
+                if !plan.widens {
+                    audit_device(
+                        audit::Lifecycle::SelectionNarrow,
+                        &device,
+                        Some(&super::selection::narrow_detail(
+                            &device_context(&device),
+                            &plan.selection,
+                        )),
+                    );
+                }
+            }
+            (
+                super::selection::reply(&plan.selection, true, &catalog, secret),
+                plan,
+            )
+        };
+        if plan.widens {
+            audit_device(
+                audit::Lifecycle::SelectionWiden,
+                &device,
+                Some(&plan.summary),
+            );
+            self.web
+                .record_access_change(super::web_link::AccessChange {
+                    at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                    device_id: device.id.clone(),
+                    device_name: device.name.clone(),
+                    text: super::selection::change_text(&device.name, &plan.summary),
+                });
+            self.web.command(LinkCommand::Resend {
+                fingerprint: device.fingerprint.clone(),
+            });
+        }
+        Ok(reply)
+    }
+
+    /// Whether the web server accepted (and consumed) `ticket` for the grant
+    /// `server_device_id`. Off the async worker, with no lock held.
+    async fn verify_ticket(&self, server_device_id: String, ticket: String) -> bool {
+        let fake = self
+            .selection
+            .verifier
+            .lock()
+            .ok()
+            .and_then(|verifier| verifier.clone());
+        let host = self.clone();
+        tokio::task::spawn_blocking(move || match fake {
+            Some(verify) => verify(server_device_id, ticket),
+            None => host.verify_ticket_blocking(&server_device_id, &ticket),
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    fn verify_ticket_blocking(&self, server_device_id: &str, ticket: &str) -> bool {
+        // Read the store directly, as `report_async` does.
+        let Ok(database) = self.web_database() else {
+            return false;
+        };
+        let Ok(Some(identity)) =
+            identity_store::load_web(&database, &identity_store::web_account_for(&self.path))
+        else {
+            return false;
+        };
+        let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) else {
+            return false;
+        };
+        desktop_api::verify_selection_ticket(
+            &base,
+            &identity.desktop_token,
+            server_device_id,
+            ticket,
+        )
+    }
+
+    /// Replaces the server call that checks a selection ticket.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_ticket_verifier(
+        &self,
+        verifier: impl Fn(String, String) -> bool + Send + Sync + 'static,
+    ) {
+        *self
+            .selection
+            .verifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(verifier));
     }
 
     fn web_database(&self) -> Result<PathBuf, String> {
@@ -2495,6 +2735,10 @@ fn user_facing_name() -> Option<String> {
 fn user_facing_name() -> Option<String> {
     None
 }
+
+#[cfg(test)]
+#[path = "selection_tests.rs"]
+mod selection_tests;
 
 #[cfg(test)]
 mod tests {

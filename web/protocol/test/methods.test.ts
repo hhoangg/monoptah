@@ -284,10 +284,11 @@ describe("classify (architecture.md 7.1)", () => {
     expect(classify("accounts.usage", { provider: "claude", refresh: false })).toBe("read");
     expect(classify("accounts.usage", { provider: "claude", refresh: true })).toBe("control");
   });
-  it("device.selection: get is read, set is control", () => {
+  it("device.selection: every param combination is read (the desktop enforces narrow vs widen and the device kind)", () => {
     expect(classify("device.selection", {})).toBe("read");
-    expect(classify("device.selection", { projects: ["p1"] })).toBe("control");
-    expect(classify("device.selection", { monos: [] })).toBe("control");
+    expect(classify("device.selection", { projects: ["p1"] })).toBe("read");
+    expect(classify("device.selection", { monos: [] })).toBe("read");
+    expect(classify("device.selection", { projects: null, addProjects: ["r1"], addMonos: ["r2"], ticket: "t" })).toBe("read");
   });
   it("project.gitAction: stage, unstage, generate and a local commit are control", () => {
     for (const action of ["stage", "unstage", "stageAll", "unstageAll", "generate"]) {

@@ -28,6 +28,7 @@ import {
   forgetDevice,
   renameDesktop,
   requestGrant,
+  requestSelectionTicket,
   revokeDesktop,
   revokeGrant,
   setDesktopColor,
@@ -155,6 +156,29 @@ describe("mutations", () => {
     expect(puts[1]?.body).toEqual({ state: "revoked" });
     expect(server.reauths).toBe(1);
     expect(server.grants.d1?.[0]?.state).toBe("revoked");
+  });
+
+  it("requestSelectionTicket re-authenticates once on fresh_required, then returns the ticket", async () => {
+    server.grants.d1 = [grant({ permission: "control" })];
+    await expect(requestSelectionTicket("d1", "dev1")).resolves.toBe("ticket-1");
+    const posts = server.calls.filter((call) => call.path.endsWith("/selection-ticket"));
+    expect(posts.map((call) => `${call.method} ${call.path}`)).toEqual(Array(2).fill("POST /api/desktops/d1/grants/dev1/selection-ticket"));
+    expect(server.reauths).toBe(1);
+    expect(server.tickets).toEqual(["ticket-1"]);
+    // Fresh now: the next ticket needs no prompt.
+    await expect(requestSelectionTicket("d1", "dev1")).resolves.toBe("ticket-2");
+    expect(server.reauths).toBe(1);
+  });
+
+  it("requestSelectionTicket sends nothing more after a cancelled prompt and is refused for a read grant", async () => {
+    server.grants.d1 = [grant({ permission: "control" })];
+    webauthn.getPasskey.mockResolvedValue({ status: "cancelled" });
+    await expect(requestSelectionTicket("d1", "dev1")).rejects.toMatchObject({ name: "ReauthCancelledError" });
+    expect(server.calls.filter((call) => call.path.endsWith("/selection-ticket"))).toHaveLength(1);
+    expect(server.tickets).toEqual([]);
+    webauthn.getPasskey.mockResolvedValue(ASSERTION);
+    server.grants.d1 = [grant({ permission: "read" })];
+    await expect(requestSelectionTicket("d1", "dev1")).rejects.toMatchObject({ code: "forbidden" });
   });
 
   it("revokeGrant surfaces a cancelled passkey prompt and sends nothing more", async () => {
