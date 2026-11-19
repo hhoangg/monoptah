@@ -10,6 +10,7 @@
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import type { SessionCard as SessionCardData } from "@monoptah/protocol";
+import { useCloseSessionTab } from "@/features/layout/tabs/useCloseSessionTab";
 import { useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
 import { cn } from "@/lib/utils";
@@ -102,9 +103,11 @@ function SessionCardMenu({ desktopId, session, readOnly }: { desktopId: string; 
   const [archiving, setArchiving] = useState(false);
   const remove = useLinkMutation("session.delete");
   const refresh = useRefreshSessions(desktopId);
+  const closeTab = useCloseSessionTab(desktopId);
   const afterDelete = () => {
     setConfirming(false);
     refresh();
+    closeTab(session);
   };
   const params = { desktopId, projectId: session.projectId };
 

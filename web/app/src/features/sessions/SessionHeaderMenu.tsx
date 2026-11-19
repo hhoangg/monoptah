@@ -6,6 +6,7 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
 import type { SessionCard } from "@monoptah/protocol";
+import { useCloseSessionTab } from "@/features/layout/tabs/useCloseSessionTab";
 import { useLinkMutation } from "@/data";
 import { useLinkState } from "@/link";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
@@ -27,6 +28,7 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
   const [collapsedCalls, setCollapsedCalls] = useCollapsedToolCalls();
   const remove = useLinkMutation("session.delete");
   const refresh = useRefreshSessions(desktopId);
+  const closeTab = useCloseSessionTab(desktopId);
   const canChanges = sessionCan("changes", { target: session.target ?? null, desktopCapabilities: capabilities });
   // The click of the menu item is the user gesture the clipboard needs.
   const copyId = () => {
@@ -122,6 +124,7 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
               onSuccess: () => {
                 setConfirming(false);
                 refresh();
+                closeTab(session);
                 void navigate({ to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId: session.projectId } });
               },
             },
