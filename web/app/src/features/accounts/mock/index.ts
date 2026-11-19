@@ -18,7 +18,7 @@
 //  - sessionStorage key `monoptah.mock.signedIn` ("1") keeps the mock session across reloads.
 import { setApiTransport } from "../api";
 import { createMockServer } from "./transport";
-import { createMockState, nowSeconds, SEED_HANDLE, SEED_INVITE_CODE, type SeedOptions } from "./state";
+import { createMockState, nowSeconds, SEED_HANDLE, SEED_INVITE_CODE, type MockPushTest, type SeedOptions } from "./state";
 
 /** Unique string that must never appear in a production bundle. */
 export const MOCK_MARKER = "__MONOPTAH_MOCK_API__";
@@ -35,6 +35,8 @@ export interface MockPatch {
   passkeyCount?: number;
   /** Seconds since the last re-auth; null clears the fresh window. */
   reauthAgeSeconds?: number | null;
+  /** What the push test route answers (default `ok`). */
+  pushTest?: MockPushTest;
 }
 
 export interface MockHooks {
@@ -135,6 +137,7 @@ export function installMockApi(): void {
       if (patch.reauthAgeSeconds !== undefined) {
         state.reauthAt = patch.reauthAgeSeconds === null ? null : nowSeconds() - patch.reauthAgeSeconds;
       }
+      if (patch.pushTest !== undefined) state.pushTest = patch.pushTest;
       syncSession();
     },
     snapshot() {

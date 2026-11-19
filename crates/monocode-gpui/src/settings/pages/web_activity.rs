@@ -56,12 +56,32 @@ fn row(line: &Value) -> Row {
         transport: text(line, "transport"),
         what: if event == "call" && !method.is_empty() {
             method
+        } else if event == "webPush" {
+            format!(
+                "push {} {} x{}",
+                text(line, "category"),
+                text(line, "target"),
+                line["devices"].as_u64().unwrap_or(0)
+            )
         } else {
             event
         },
         outcome: text(line, "outcome"),
         path: line["path"].as_str().map(str::to_string),
     }
+}
+
+/// Whether a row is styled as a refusal or failure. A web push row is one only
+/// when the push failed (an http error, a failed retry, a network error), not
+/// for `result=sent(n)`, `skipped=...` or `suppressed=...`.
+fn row_failed(row: &Row) -> bool {
+    if row.what.starts_with("push ") {
+        let outcome = row.outcome.as_str();
+        return outcome.starts_with("result=")
+            && !outcome.starts_with("result=sent(")
+            && !outcome.starts_with("result=retry ok(");
+    }
+    row.outcome != "ok"
 }
 
 fn rows(lines: &[Value]) -> Vec<Row> {
@@ -98,7 +118,7 @@ pub(crate) fn activity_list(lines: &[Value]) -> AnyElement {
         .flex()
         .flex_col()
         .children(shown.into_iter().enumerate().map(|(ix, row)| {
-            let denied = row.outcome != "ok";
+            let denied = row_failed(&row);
             div()
                 .when(ix > 0, |d| d.border_t_1().border_color(content(0.1)))
                 .px_4()
@@ -149,6 +169,42 @@ mod tests {
                 path: Some(".env".into()),
             }
         );
+    }
+
+    #[test]
+    fn a_web_push_line_shows_category_target_and_devices() {
+        let line = json!({"ts": 0, "transport": "web", "event": "webPush",
+            "outcome": "result=sent(1)", "category": "monoMessages",
+            "target": "mono", "devices": 1});
+        let shown = row(&line);
+        assert_eq!(shown.what, "push monoMessages mono x1");
+        assert_eq!(shown.outcome, "result=sent(1)");
+    }
+
+    #[test]
+    fn a_web_push_row_is_failed_only_when_the_push_failed() {
+        let push = |outcome: &str| {
+            row(&json!({"ts": 0, "event": "webPush", "outcome": outcome,
+                "category": "agentFinished", "target": "session", "devices": 1}))
+        };
+        for fine in [
+            "result=sent(1)",
+            "result=retry ok(1)",
+            "skipped=no device selected",
+            "suppressed=watching",
+        ] {
+            assert!(!row_failed(&push(fine)), "{fine}");
+        }
+        for failed in [
+            "result=http 400",
+            "result=retry failed http 500",
+            "result=retry failed network",
+        ] {
+            assert!(row_failed(&push(failed)), "{failed}");
+        }
+        let denied = row(&json!({"ts": 0, "event": "call", "method": "project.file",
+            "outcome": "denied:path_denied"}));
+        assert!(row_failed(&denied));
     }
 
     #[test]

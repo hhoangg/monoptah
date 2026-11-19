@@ -51,7 +51,7 @@ async function plain(w: World, request: SentRequest) {
 }
 
 describe("preferences", () => {
-  it("sends nothing when the category is off, push is disabled or no prefs row exists", async () => {
+  it("sends nothing when the category is off or push is disabled; no prefs row means the defaults (on)", async () => {
     const off = await createWorld({ prefs: { agentFinished: false, agentInput: true, monoMessages: true } });
     const f1 = fakeFetch();
     expect(await notifyWith(off, bodyFor(off), f1)).toEqual({ ok: true, sent: 0 });
@@ -66,8 +66,8 @@ describe("preferences", () => {
 
     const none = await createWorld({ prefs: null });
     const f3 = fakeFetch();
-    expect(await notifyWith(none, bodyFor(none), f3)).toEqual({ ok: true, sent: 0 });
-    expect(f3.sent).toHaveLength(0);
+    expect(await notifyWith(none, bodyFor(none), f3)).toEqual({ ok: true, sent: 1 });
+    expect(f3.sent).toHaveLength(1);
   });
 });
 
@@ -268,6 +268,7 @@ describe("push service answers", () => {
     const vapid = await vapidEnv();
     const result = await runNotify(overlayEnv({ ...Object.fromEntries(Object.entries(vapid.env)), DB: counting.db }), principal(w), bodyFor(w), { fetch: fakeFetch().fetch, nowMs: () => NOW });
     expect(result).toEqual({ ok: true, sent: 1 });
+    // A clean success writes nothing: no subscription statement and no audit row.
     expect(counting.batches).toBe(0);
     expect((await subscriptionRow(w.subscriptionId))?.last_success_at).toBe(recent);
   });
@@ -302,15 +303,16 @@ describe("push service answers", () => {
 
 /** A DB wrapper that counts `batch` calls. */
 function countingDb() {
-  const state = { batches: 0 };
+  const state = { batches: 0, sizes: [] as number[] };
   const db = {
     prepare: (sql: string) => env.DB.prepare(sql),
     batch: (statements: D1PreparedStatement[]) => {
       state.batches++;
+      state.sizes.push(statements.length);
       return env.DB.batch(statements);
     },
   } as unknown as D1Database;
-  return { db, get batches() { return state.batches; } };
+  return { db, get batches() { return state.batches; }, get sizes() { return state.sizes; } };
 }
 
 describe("dedupe per session", () => {

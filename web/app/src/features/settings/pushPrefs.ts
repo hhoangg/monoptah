@@ -1,24 +1,31 @@
 // Account-level "Pause all" and "Resume all" (N-15). The Worker keeps push prefs per user and desktop
-// (`PUT /api/push/prefs/:desktopId`, push_prefs primary key (user_id, desktop_id)) and has no GET and no
-// global pause field, so this browser can only know a desktop's prefs when it saved them or saw the PUT result
-// in this page load. Other devices of the same account can change them too, so nothing is guessed:
-//  - Pause all turns off only the desktops whose prefs are known and on, keeps their categories, and records
+// (`/api/push/prefs/:desktopId`, push_prefs primary key (user_id, desktop_id)) and has no global pause field, so:
+//  - Pause all reads the prefs of every desktop, turns off the ones that are on, keeps their categories, and records
 //    them (features/push/pauseRecord.ts) so that
 //  - Resume all turns back on exactly those desktops with the categories they had, and never a desktop that
-//    was off or unknown. Desktops with unknown prefs are left alone and counted.
+//    was off before. Desktops whose prefs cannot be read are left alone and counted.
 import { PUSH_CATEGORIES } from "@monoptah/protocol";
 import type { QueryClient } from "@tanstack/react-query";
-import { desktopsQuery, savePushPrefs, type PushPrefs } from "@/features/accounts/queries";
+import { desktopsQuery, loadPushPrefs, savePushPrefs, type PushPrefs } from "@/features/accounts/queries";
 import { loadPauseRecord, savePauseRecord } from "@/features/push/pauseRecord";
 
 export const DEFAULT_PREFS: PushPrefs = { enabled: true, categories: Object.fromEntries(PUSH_CATEGORIES.map((key) => [key, true])) as PushPrefs["categories"] };
 
 export const pushPrefsKey = (desktopId: string) => ["settings", "push-prefs", desktopId] as const;
 
+/** The stored prefs of one desktop (defaults when none were saved), kept in the query cache as plain `PushPrefs`. */
+export const pushPrefsQuery = (desktopId: string) => ({
+  queryKey: pushPrefsKey(desktopId),
+  queryFn: async (): Promise<PushPrefs> => {
+    const { enabled, categories } = await loadPushPrefs(desktopId);
+    return { enabled, categories };
+  },
+});
+
 export interface BulkResult {
   /** Desktops this call turned off or on. */
   changed: number;
-  /** Desktops left alone because their saved prefs are unknown here (Pause all) or were not paused by Pause all (Resume all). */
+  /** Desktops left alone because they were already off or unreadable (Pause all), or were not paused by Pause all (Resume all). */
   skipped: number;
   /** Names of desktops whose PUT failed. */
   failed: string[];
@@ -27,7 +34,8 @@ export interface BulkResult {
 export async function pauseAll(queryClient: QueryClient): Promise<BulkResult> {
   const { desktops } = await queryClient.fetchQuery({ ...desktopsQuery, staleTime: 0 });
   const record = loadPauseRecord();
-  const targets = desktops.filter((desktop) => queryClient.getQueryData<PushPrefs | null>(pushPrefsKey(desktop.id))?.enabled === true);
+  const current = await Promise.all(desktops.map((desktop) => queryClient.fetchQuery({ ...pushPrefsQuery(desktop.id), staleTime: 0 }).catch(() => null)));
+  const targets = desktops.filter((_, index) => current[index]?.enabled === true);
   const outcomes = await Promise.allSettled(
     targets.map(async (desktop) => {
       const known = queryClient.getQueryData<PushPrefs>(pushPrefsKey(desktop.id)) ?? DEFAULT_PREFS;

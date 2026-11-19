@@ -51,6 +51,14 @@ export const BACKOFF_RESET_AFTER_READY_MS = 10_000;
 export const BACKOFF_LONG_MS = 60_000;
 /** `store.lastFrameAt` is refreshed at most this often (`connection.lastFrameAt` is exact). */
 export const FRAME_STORE_THROTTLE_MS = 5_000;
+/**
+ * A tab hidden for longer than this has a socket the OS may have killed without a close event (iOS does it
+ * within seconds of a screen lock). Coming back probes the socket (a relay ping, answered by a pong) instead of
+ * waiting for the 75 s silence check; only a failed probe reconnects.
+ */
+export const HIDDEN_STALE_AFTER_MS = 20_000;
+/** A resume after a long hide pings the relay socket and keeps the link `ready` this long while waiting for the pong. */
+export const RESUME_PROBE_TIMEOUT_MS = 1_500;
 
 /** `min(30 s, 0.5 s * 2^n) * random(0.5..1)`. */
 export function backoffDelay(attempt: number, random: () => number = Math.random): number {
@@ -191,6 +199,9 @@ export class LinkConnection {
   /** Invalidates the callbacks of an older attempt or session. */
   #gen = 0;
   #session: LinkSession | null = null;
+  /** The relay socket of `#session`, kept for the liveness probe on resume. */
+  #relay: RelayConnection | null = null;
+  #probing = false;
   #latestState: StateMessage | null = null;
   /** The name the server's directory serves: it follows a rename, the name in a state frame does not. */
   #directoryName: string | null = null;
@@ -206,6 +217,8 @@ export class LinkConnection {
   /** One automatic retry of `desktop_refused` on the next visible transition. */
   #refusedRetried = false;
   #lastStoredFrameAt = 0;
+  /** When the tab went hidden (`now()`), null while visible. */
+  #hiddenAt: number | null = null;
   #retrying = false;
   #sessionCount = 0;
   #needsResync = false;
@@ -319,6 +332,7 @@ export class LinkConnection {
     this.store.setState({ ...initialLinkState(), status: "connecting", watches: this.#watchInfo() }, true);
     globalThis.document?.addEventListener("visibilitychange", this.#onVisibility);
     globalThis.addEventListener?.("online", this.#onOnline);
+    globalThis.addEventListener?.("pageshow", this.#onPageShow);
     void this.#attempt();
   }
 
@@ -327,6 +341,8 @@ export class LinkConnection {
     this.#running = false;
     globalThis.document?.removeEventListener("visibilitychange", this.#onVisibility);
     globalThis.removeEventListener?.("online", this.#onOnline);
+    globalThis.removeEventListener?.("pageshow", this.#onPageShow);
+    this.#hiddenAt = null;
     this.#clearTimers();
     this.#teardown();
     // An attempt that is still awaiting must not block the next `start()`: its callbacks are stale (the
@@ -386,12 +402,19 @@ export class LinkConnection {
     if (this.#isStale(gen)) return;
     this.store.setState({ deviceFingerprint: device.fingerprint });
 
-    // Ensure the grant before the relay is joined: a revoked grant blocks here, a failed check retries.
+    // Ensure the grant before the relay is joined: a revoked grant blocks here, a failed check retries. The grant
+    // check and the directory lookup do not depend on each other, so they run in parallel (a resume pays one
+    // round trip, not two). The relay is still joined only after both, and the grant outcome is handled first.
     const hook = this.#deps.preConnect ?? preConnectHook;
-    if (hook) {
+    const grantPromise: Promise<GrantCheck | void> | null = hook ? Promise.resolve().then(() => hook({ desktopId: this.desktopId, deviceId: device.deviceId })) : null;
+    const directoryPromise = this.#fetchDirectory();
+    // Whichever one is not awaited yet (or no longer matters) must not surface as an unhandled rejection.
+    grantPromise?.catch(() => undefined);
+    directoryPromise.catch(() => undefined);
+    if (grantPromise) {
       let check: GrantCheck | void;
       try {
-        check = await hook({ desktopId: this.desktopId, deviceId: device.deviceId });
+        check = await grantPromise;
       } catch {
         if (this.#isStale(gen)) return;
         return this.#fail({ code: "grant_check" }, { kind: "retry", delay: "backoff" });
@@ -402,7 +425,7 @@ export class LinkConnection {
 
     let directory: Directory;
     try {
-      directory = await this.#fetchDirectory();
+      directory = await directoryPromise;
     } catch (error) {
       if (this.#isStale(gen)) return;
       const status = error instanceof DirectoryError ? error.status : undefined;
@@ -500,6 +523,7 @@ export class LinkConnection {
     }
     this.store.setState({ desktopFingerprint: directory.fingerprint });
     this.#session = session;
+    this.#relay = relay;
     this.#sessionCount += 1;
     if (this.#sessionCount > 1) this.#needsResync = true;
     this.#reactToState();
@@ -697,7 +721,13 @@ export class LinkConnection {
   // --- Reconnect triggers ---
 
   readonly #onVisibility = (): void => {
-    if (!this.#running || globalThis.document?.hidden === true) return;
+    if (!this.#running) return;
+    if (globalThis.document?.hidden === true) {
+      this.#hiddenAt ??= this.#deps.now();
+      return;
+    }
+    const hiddenFor = this.#hiddenAt === null ? 0 : this.#deps.now() - this.#hiddenAt;
+    this.#hiddenAt = null;
     if (this.#stopped) {
       if (this.store.getState().blocked === "desktop_refused" && !this.#refusedRetried) {
         this.#refusedRetried = true;
@@ -707,19 +737,56 @@ export class LinkConnection {
       }
       return;
     }
+    this.#resume(hiddenFor > HIDDEN_STALE_AFTER_MS);
+  };
+
+  /** `pageshow`: a page restored from the back-forward cache keeps its JS state but its socket is long gone. */
+  readonly #onPageShow = (event: Event): void => {
+    if (!this.#running || this.#stopped) return;
+    this.#hiddenAt = null;
+    this.#resume((event as { persisted?: boolean }).persisted === true);
+  };
+
+  readonly #onOnline = (): void => {
+    if (!this.#running || this.#stopped) return;
+    this.#resume(false);
+  };
+
+  /**
+   * The app is back (visible, restored or online again). A pending backoff is cancelled and its exponent reset,
+   * so the first attempt starts in this tick; an attempt already in flight is left alone (no second socket);
+   * a link that looks open but is stale (hidden for long, or silent for 75 s) is replaced at once.
+   */
+  #resume(stale: boolean): void {
+    if (globalThis.document?.hidden === true) return;
     if (this.#waiting || (this.#timer !== null && !this.#longWait)) {
+      this.#failures = 0;
       this.#clearTimer();
       void this.#attempt();
       return;
     }
     if (this.#attempting) return;
-    if (this.#isDead()) this.#reconnectNow();
-  };
+    if (this.#isDead()) return this.#reconnectNow();
+    if (stale) this.#probeThenReconnect();
+  }
 
-  readonly #onOnline = (): void => {
-    if (!this.#running || this.#stopped) return;
-    if (this.#waiting) void this.#attempt();
-  };
+  /**
+   * A link that looks open after a long hide: the status stays `ready` (no indicator, composer and approvals
+   * stay usable) while the relay socket is pinged. A pong in time keeps the session; a closed socket, a missing
+   * pong or a send that throws replaces it at once.
+   */
+  #probeThenReconnect(): void {
+    const relay = this.#relay;
+    if (!relay) return this.#reconnectNow();
+    if (this.#probing) return;
+    this.#probing = true;
+    const gen = this.#gen;
+    void relay.probe(RESUME_PROBE_TIMEOUT_MS).then((alive) => {
+      this.#probing = false;
+      if (alive || this.#isStale(gen) || this.#relay !== relay || this.#attempting) return;
+      this.#reconnectNow();
+    });
+  }
 
   #isDead(): boolean {
     const session = this.#session;
@@ -838,6 +905,7 @@ export class LinkConnection {
     this.#dropWatchHandles();
     const session = this.#session;
     this.#session = null;
+    this.#relay = null;
     this.#latestState = null;
     session?.close();
   }

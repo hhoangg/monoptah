@@ -21,8 +21,7 @@ import { createMockServer } from "@/features/accounts/mock/transport";
 import { createMockState, SEED_USER_ID } from "@/features/accounts/mock/state";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
-import { pushPrefsKey } from "./pushPrefs";
-import { resetPushRotationCheck } from "./usePushOnboarding";
+import { LOST_SUBSCRIPTION_NOTICE, resetPushRotationCheck } from "./usePushOnboarding";
 import { deniedHelp } from "./PushOnboarding";
 import { clearSlots } from "@/ui/slots";
 
@@ -32,9 +31,11 @@ let events: string[] = [];
 let requestPermission: ReturnType<typeof vi.fn<() => Promise<NotificationPermission>>>;
 
 let desktopIds: string[] = [];
+let mockState: ReturnType<typeof createMockState>;
 
 function installApi() {
   const state = createMockState({ signedIn: true });
+  mockState = state;
   desktopIds = state.desktops.map((desktop) => desktop.id);
   const server = createMockServer({ state });
   const transport: ApiTransport = (url, init) => {
@@ -85,6 +86,7 @@ beforeEach(() => {
   events = [];
   window.localStorage.clear();
   push.getSavedPushSubscription.mockResolvedValue(null);
+  push.hasBrowserSubscription.mockResolvedValue(true);
   push.isPushSupported.mockReturnValue(true);
   installApi();
 });
@@ -187,36 +189,35 @@ describe("push onboarding (P-05)", () => {
   });
 
   const CATS = { agentFinished: false, agentInput: true, monoMessages: true };
-  const known = (queryClient: ReturnType<typeof createQueryClient>, id: string, prefs: { enabled: boolean; categories: typeof CATS }) => queryClient.setQueryData(pushPrefsKey(id), prefs);
-
-  it("Pause all with no known prefs changes nothing and says so", async () => {
+  it("Pause all with every desktop already off changes nothing and says so", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
+    for (const id of desktopIds) mockState.prefs.set(id, { enabled: false, categories: CATS });
     mount("/settings");
     await userEvent.click(await screen.findByRole("button", { name: "Pause all" }));
-    await screen.findByText(/Nothing was paused/);
+    await screen.findByText(/Nothing to pause/);
     expect(requests.filter((r) => r.method === "PUT")).toEqual([]);
   });
 
-  it("Pause all turns off only known, enabled desktops (not an already off one) and keeps their categories; Resume all restores exactly those", async () => {
+  it("Pause all reads every desktop, turns off the ones that are on (defaults count) and keeps their categories; Resume all restores exactly those", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
-    const { queryClient } = mount("/settings");
+    mount("/settings");
     expect(desktopIds.length).toBeGreaterThan(1);
     const [a, b] = desktopIds as [string, string];
-    known(queryClient, a, { enabled: true, categories: CATS });
-    known(queryClient, b, { enabled: false, categories: CATS });
+    // `a` has no stored row (the Worker's defaults, all on); `b` was turned off by the user.
+    mockState.prefs.set(b, { enabled: false, categories: CATS });
     await userEvent.click(await screen.findByRole("button", { name: "Pause all" }));
     await screen.findByText(/Notifications are paused for 1 desktop\./);
     let puts = requests.filter((r) => r.method === "PUT");
     expect(puts.map((p) => p.url)).toEqual([`/api/push/prefs/${a}`]);
-    expect(puts[0]?.body).toEqual({ enabled: false, categories: CATS });
-    expect(JSON.parse(window.localStorage.getItem("monoptah.pushPaused") ?? "{}")).toEqual({ [a]: CATS });
+    expect(puts[0]?.body).toEqual({ enabled: false, categories: { agentFinished: true, agentInput: true, monoMessages: true } });
+    expect(JSON.parse(window.localStorage.getItem("monoptah.pushPaused") ?? "{}")).toEqual({ [a]: { agentFinished: true, agentInput: true, monoMessages: true } });
 
     requests = [];
     await userEvent.click(screen.getByRole("button", { name: "Resume all" }));
     await screen.findByText(/Notifications are back on for 1 desktop\./);
     puts = requests.filter((r) => r.method === "PUT");
     expect(puts.map((p) => p.url)).toEqual([`/api/push/prefs/${a}`]);
-    expect(puts[0]?.body).toEqual({ enabled: true, categories: CATS });
+    expect(puts[0]?.body).toEqual({ enabled: true, categories: { agentFinished: true, agentInput: true, monoMessages: true } });
     expect(window.localStorage.getItem("monoptah.pushPaused")).toBeNull();
   });
 
@@ -244,13 +245,14 @@ describe("push onboarding (P-05)", () => {
     expect(push.subscribeToPush).not.toHaveBeenCalled();
   });
 
-  it("re-sends the subscription of the signed-in user once, only while the browser still holds it", async () => {
+  it("does not re-send the subscription when the browser dropped it, and asks to turn notifications on again", async () => {
     stubEnvironment({ standalone: true, permission: "granted" });
     push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: SEED_USER_ID });
     push.hasBrowserSubscription.mockResolvedValue(false);
     mount("/settings");
-    await screen.findByText("Notifications on");
-    await waitFor(() => expect(push.hasBrowserSubscription).toHaveBeenCalled());
+    expect(await screen.findByRole("button", { name: "Enable notifications" })).toBeInTheDocument();
+    expect(await screen.findByText(LOST_SUBSCRIPTION_NOTICE)).toBeInTheDocument();
+    expect(screen.queryByText("Notifications on")).toBeNull();
     expect(push.subscribeToPush).not.toHaveBeenCalled();
   });
 
@@ -272,11 +274,12 @@ describe("push onboarding (P-05)", () => {
     expect(requestPermission).not.toHaveBeenCalled();
   });
 
-  it("the per-desktop categories still save with PUT", async () => {
+  it("the per-desktop categories save with PUT at once", async () => {
     stubEnvironment({ standalone: true, permission: "default" });
     mount("/d/desktop-dev-1/settings");
-    await userEvent.click(await screen.findByRole("switch", { name: "Agent finished" }));
-    await userEvent.click(screen.getByRole("button", { name: "Save these settings" }));
+    const toggle = await screen.findByRole("switch", { name: "Agent finished" });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    await userEvent.click(toggle);
     await waitFor(() => expect(requests.some((r) => r.method === "PUT" && r.url === "/api/push/prefs/desktop-dev-1")).toBe(true));
     const put = requests.find((r) => r.method === "PUT");
     expect(put?.body).toEqual({ enabled: true, categories: { agentFinished: false, agentInput: true, monoMessages: true } });

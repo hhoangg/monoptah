@@ -33,6 +33,8 @@ const SAMPLES: { [A in AuditAction]: Record<string, unknown> } = {
   "admin.invites_grant": { count: 2 },
   "session.logout": {},
   "session.revoke": { all: true, count: 3 },
+  "push.notify": { desktopId: "desk-1", category: "agentFinished", recipients: 2, sent: 1, gone: 1, failed: 0, backoff: 0 },
+  "push.test": { deviceId: "dev-1", recipients: 1, sent: 1, gone: 0, failed: 0, backoff: 0 },
   "ratelimit.breach": { group: "login", limit: 30, windowSeconds: 600, ipHash: HASH },
   "system.deploy": { version: "1.2.3+abc", commit: "0123456789abcdef0123456789abcdef01234567" },
 };
@@ -52,6 +54,8 @@ const SECURITY_MD_10_EVENTS = [
   "user.block", "user.unblock", "admin.settings_change", "admin.invites_grant",
   // rate-limit breach, session revoke and logout, deploy
   "ratelimit.breach", "session.revoke", "session.logout", "system.deploy",
+  // push delivery attempts (notify from a desktop, test from a user)
+  "push.notify", "push.test",
 ];
 
 describe("audit action registry", () => {

@@ -2,7 +2,7 @@
 // query options with `useQuery` and the functions in mutations; every ceremony function returns a
 // `cancelled` result when the user dismisses the browser prompt instead of throwing.
 import { queryOptions, type QueryClient } from "@tanstack/react-query";
-import type { MeResponse, PushPrefsResponse, User } from "@monoptah/protocol";
+import type { MeResponse, PushPrefsResponse, PushPrefsStateResponse, PushTestResponse, User } from "@monoptah/protocol";
 import { forgetAccountSnapshots } from "@/features/offline/snapshots";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
@@ -248,7 +248,21 @@ export async function revokeInvite(queryClient: QueryClient, id: string): Promis
 
 export type PushPrefs = ReturnType<typeof PushPrefsResponse.parse>;
 
-/** Per-desktop notification preferences (W-11). The contract has no GET: keep the PUT result. */
+/** What `GET /api/push/prefs/:desktopId` returns: the prefs, and whether a row was stored (false: defaults). */
+export type PushPrefsState = ReturnType<typeof PushPrefsStateResponse.parse>;
+export type PushTestResult = ReturnType<typeof PushTestResponse.parse>;
+
+/** The stored prefs of one desktop; a desktop that never saved any gets the defaults (all on) with `stored: false`. */
+export function loadPushPrefs(desktopId: string): Promise<PushPrefsState> {
+  return apiFetch(endpoints.getPushPrefs, { params: { desktopId } });
+}
+
+/** Sends a real test push to this browser's subscriptions. `deviceId` is this browser's server device id. */
+export function sendPushTest(deviceId: string): Promise<PushTestResult> {
+  return apiFetch(endpoints.pushTest, { body: { deviceId } });
+}
+
+/** Per-desktop notification preferences (W-11). */
 export function savePushPrefs(desktopId: string, prefs: PushPrefs): Promise<PushPrefs> {
   return apiFetch(endpoints.putPushPrefs, { params: { desktopId }, body: prefs });
 }

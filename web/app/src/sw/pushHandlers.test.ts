@@ -57,6 +57,38 @@ describe("push", () => {
     expect(shown[0]?.options.data).toEqual({ url: "/d/dk1/monos/m7" });
   });
 
+  it("shows the test notification of Settings with its tag and the /settings click target", async () => {
+    const { handlers, shown } = setup();
+    const { event, settle } = pushEvent({ v: 1, t: "Monoptah", b: "Test notification", url: "/settings", tag: "monoptah-test" });
+    handlers.push(event);
+    await settle();
+    expect(shown).toEqual([{ title: "Monoptah", options: { body: "Test notification", icon: "/icons/icon-192.png", badge: "/icons/badge-96.png", tag: "monoptah-test", data: { url: "/settings" } } }]);
+  });
+
+  it("keeps the mono:<id> tag of a Mono chat notification", async () => {
+    const { handlers, shown } = setup();
+    const { event, settle } = pushEvent({ v: 1, t: "Studio Mac", b: "Atlas: New message", url: "/d/dk1/monos/m7", tag: "mono:m7" });
+    handlers.push(event);
+    await settle();
+    expect(shown[0]?.options.tag).toBe("mono:m7");
+    expect(shown[0]?.options.data).toEqual({ url: "/d/dk1/monos/m7" });
+  });
+
+  it.each([
+    ["missing body", { v: 1, t: "a", url: "/d/a/s/b", tag: "b" }],
+    ["numeric title", { v: 1, t: 4, b: "b", url: "/d/a/s/b", tag: "b" }],
+    ["array", [1, 2]],
+    ["string", "plain text"],
+  ])("shows a generic notification with a title and a body for %s", async (_name, payload) => {
+    const { handlers, shown } = setup();
+    const { event, settle } = pushEvent(payload);
+    handlers.push(event);
+    await settle();
+    expect(shown).toHaveLength(1);
+    expect(shown[0]?.title).toBe("Monoptah");
+    expect(shown[0]?.options.body).toBeTruthy();
+  });
+
   it("passes the session URL of a habit run through (the URL rule lives in the Worker)", async () => {
     const { handlers, shown } = setup();
     const { event, settle } = pushEvent({ v: 1, t: "Studio Mac", b: "Atlas: Finished", url: "/d/dk1/s/s9", tag: "s9" });
@@ -109,7 +141,7 @@ describe("notificationclick", () => {
     ["protocol relative", "//evil.example"],
     ["backslash", "/\\evil.example"],
     ["javascript", "javascript:alert(1)"],
-    ["other path", "/settings"],
+    ["other path", "/login"],
   ])("opens the root for a hostile URL (%s)", async (_name, url) => {
     const { handlers, opened } = setup();
     const click = clickEvent({ url });
@@ -145,6 +177,27 @@ describe("notificationclick", () => {
     await click.settle();
     expect(opened).toEqual([]);
     expect(existing.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url: "/d/dk1/s/s9" });
+    expect(existing.focus).toHaveBeenCalledOnce();
+  });
+});
+
+describe("notificationclick targets", () => {
+  it.each(["/d/x/s/y", "/d/x/monos/m", "/settings"])("opens a new window at %s when none is open", async (url) => {
+    const { handlers, opened } = setup();
+    const click = clickEvent({ url });
+    handlers.notificationclick(click.event);
+    await click.settle();
+    expect(opened).toEqual([url]);
+  });
+
+  it.each(["/d/x/s/y", "/d/x/monos/m", "/settings"])("focuses an open window and navigates it to %s", async (url) => {
+    const existing = client(`${ORIGIN}/`);
+    const { handlers, opened } = setup([existing]);
+    const click = clickEvent({ url });
+    handlers.notificationclick(click.event);
+    await click.settle();
+    expect(opened).toEqual([]);
+    expect(existing.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url });
     expect(existing.focus).toHaveBeenCalledOnce();
   });
 });

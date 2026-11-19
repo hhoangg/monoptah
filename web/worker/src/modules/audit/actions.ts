@@ -57,6 +57,7 @@ const Id = z.string().min(1).max(128).regex(/^[A-Za-z0-9_.-]+$/);
  */
 const PasskeyId = z.string().min(1).max(1400).regex(/^[A-Za-z0-9_-]+$/);
 const Count = z.number().int().min(0).max(1_000_000);
+const PushCategory = z.enum(["agentFinished", "agentInput", "monoMessages"]);
 const IpHash = z.string().regex(/^[0-9a-f]{64}$/);
 const Permission = z.enum(["read", "control"]);
 const GrantState = z.enum(["pending", "confirmed", "revoked"]);
@@ -72,6 +73,7 @@ export const RATE_LIMIT_AUDIT_GROUPS = [
   "pair-start",
   "pair-poll",
   "push-notify",
+  "push-test",
   "invite",
   "handle",
   "session",
@@ -126,6 +128,11 @@ export const AUDIT_ACTIONS = {
   // Sessions
   "session.logout": spec(["user"], {}),
   "session.revoke": spec(["user", "admin", "system"], { all: z.boolean(), count: Count }),
+  // Push delivery (metadata only: ids and counts)
+  /** One row per notify attempt that passed the prefs and dedupe checks and reached the recipient stage. */
+  "push.notify": spec(["desktop"], { desktopId: Id, category: PushCategory, recipients: Count, sent: Count, gone: Count, failed: Count, backoff: Count }),
+  /** `POST /api/push/test`: a test notification to one of the caller's own devices. */
+  "push.test": spec(["user"], { deviceId: Id, recipients: Count, sent: Count, gone: Count, failed: Count, backoff: Count }),
   // Abuse and operations
   /** Written once per key per window when the count first exceeds the limit (modules/ratelimit). */
   "ratelimit.breach": spec(["system", "user"], {

@@ -2524,12 +2524,8 @@ impl Shell {
         });
         let is_mono = mono.is_some();
         let watching = self.window_active && self.notice_session_visible(id, cx);
-        if mobile_notice_suppressed(
-            self.mobile.host.is_some(),
-            mono.is_some(),
-            from_phone,
-            watching,
-        ) {
+        if let Some(reason) = mobile_notice_suppressed(mono.is_some(), from_phone, watching) {
+            notify::log_suppressed(category, reason);
             return;
         }
         let body = delivery::clip_body(body);
@@ -3478,16 +3474,24 @@ fn explicit_model(prefs: &crate::settings::Preferences, cwd: &str, kind: Kind) -
         .and_then(|model| monocode_core::store::native_model(&model, kind.id()))
 }
 
-/// Whether a push notice is dropped: no host to send it, a session that is
-/// neither a Mono's nor started from a phone (the desktop's own turns stay
-/// on the desktop), or one the user is looking at in the active window.
+/// Why a notice is dropped before any push: a session that is neither a
+/// Mono's nor started remotely (from a phone or the web; the desktop's own
+/// turns stay on the desktop), or one the user is looking at in the active
+/// window. None means send. Whether a host exists matters only to the phone
+/// push (`send_mobile_notice`), never to the web push: the host is opened at
+/// startup whether or not a phone is paired.
 fn mobile_notice_suppressed(
-    has_host: bool,
     is_mono: bool,
     from_phone: bool,
     watching: bool,
-) -> bool {
-    !has_host || (!is_mono && !from_phone) || watching
+) -> Option<&'static str> {
+    if !is_mono && !from_phone {
+        Some("not started remotely")
+    } else if watching {
+        Some("watching")
+    } else {
+        None
+    }
 }
 
 /// The model a phone-started session gets: the phone's own pick, else the
@@ -3534,34 +3538,32 @@ mod tests {
     #[test]
     fn push_notices_follow_the_visible_session_and_phone_started_rule() {
         let suppressed = mobile_notice_suppressed;
-        // Arguments: has_host, is_mono, from_phone, watching.
-        assert!(
-            !suppressed(true, false, true, false),
-            "a phone-started turn is sent"
+        // Arguments: is_mono, from_phone, watching. A turn started from the
+        // web is recorded in `started` like a phone's, so `from_phone`.
+        assert_eq!(
+            suppressed(false, true, false),
+            None,
+            "a phone or web-started turn is sent"
         );
-        assert!(
-            !suppressed(true, true, false, false),
+        assert_eq!(
+            suppressed(true, false, false),
+            None,
             "a Mono's message is sent"
         );
-        assert!(
-            suppressed(true, false, false, false),
+        assert_eq!(
+            suppressed(false, false, false),
+            Some("not started remotely"),
             "a desktop-started turn is not"
         );
-        assert!(
-            suppressed(true, false, true, true),
+        assert_eq!(
+            suppressed(false, true, true),
+            Some("watching"),
             "a visible session is not"
         );
-        assert!(
-            suppressed(true, true, false, true),
+        assert_eq!(
+            suppressed(true, false, true),
+            Some("watching"),
             "a visible Mono chat is not"
-        );
-        assert!(
-            suppressed(false, false, true, false),
-            "no host, nothing to send"
-        );
-        assert!(
-            suppressed(false, true, true, false),
-            "no host, nothing to send"
         );
     }
 

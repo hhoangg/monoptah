@@ -4,6 +4,7 @@ import { Button } from "@/ui/button";
 import { Notice } from "@/ui/Notice";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { PushOnboarding } from "./PushOnboarding";
+import { PushTest } from "./PushTest";
 import { useDesktops } from "@/features/desktops/api";
 import { safeName } from "@/features/desktops/format";
 import { loadPauseRecord } from "@/features/push/pauseRecord";
@@ -18,10 +19,10 @@ function bulkMessage(enabled: boolean, { changed, skipped }: BulkResult): string
   if (changed === 0) {
     return enabled
       ? "Nothing to resume: Pause all has not turned any desktop off from this browser."
-      : "Nothing was paused. This browser cannot read the saved settings of your desktops until you save them in each desktop's notification settings.";
+      : "Nothing to pause: notifications are already off for your desktops, or their settings could not be read.";
   }
   const done = enabled ? `Notifications are back on for ${plural(changed)}.` : `Notifications are paused for ${plural(changed)}.`;
-  return !enabled && skipped > 0 ? `${done} ${plural(skipped)} left as they are, because this browser cannot read their settings.` : done;
+  return !enabled && skipped > 0 ? `${done} ${plural(skipped)} left as they are, because they were already off or their settings could not be read.` : done;
 }
 
 /** Account level notifications (P-05): enable in this browser, what the three categories mean, Pause all. */
@@ -47,9 +48,10 @@ export function NotificationsCard() {
     <SettingsCard
       title="Notifications"
       aria-label="Notifications"
-      footnote="Pause all and Resume all only touch desktops whose settings this browser knows."
+      footnote="Pause all turns off the desktops that are on. Resume all turns back on only the ones it paused."
     >
       <PushOnboarding />
+      <PushTest />
       <p className="px-1.5 py-1.5 text-small text-muted-text">
         Each desktop sends approvals and questions, finished agents and messages from Monos. Choose which ones in that desktop's settings.
       </p>
@@ -72,7 +74,7 @@ export function NotificationsCard() {
       <SettingsRow
         icon="notifications"
         title="Pause notifications"
-        description="Turn notifications off for the desktops whose settings this browser knows, and back on later with the same choices. Other desktops are left as they are."
+        description="Turn notifications off for every desktop that has them on, and back on later with the same choices."
         trailing={
           <span className="flex gap-2">
             <Button type="button" variant="outline" size="sm" disabled={bulk.busy} aria-busy={bulk.busy} onClick={() => void apply(false)}>

@@ -18,6 +18,9 @@ import {
   PairStartBody,
   PushNotifyBody,
   PushPayloadSchema,
+  PushPrefsStateResponse,
+  PushTestBody,
+  PushTestResponse,
   RecoverBody,
   RegisterOptionsBody,
   RegisterVerifyBody,
@@ -170,6 +173,24 @@ describe("schemas", () => {
     const payload = { v: 1, t: "Studio Mac", b: "app: Finished", url: "/d/d1/s/s1", tag: "s1" };
     expect(PushPayloadSchema.parse(payload)).toEqual(payload);
   });
+
+  it("push notify accepts a Mono target without a session id (the Worker enforces the id rules)", () => {
+    const mono = { category: "monoMessages", project: "Ada", status: "message", monoId: "m1", deviceIds: ["dev1"] };
+    expect(PushNotifyBody.safeParse(mono).success).toBe(true);
+    expect(PushNotifyBody.safeParse({ ...mono, sessionId: "s1" }).success).toBe(true);
+  });
+
+  it("push prefs state, push test and their routes", () => {
+    const all = { agentFinished: true, agentInput: true, monoMessages: true };
+    expect(PushPrefsStateResponse.parse({ enabled: true, categories: all, stored: false })).toEqual({ enabled: true, categories: all, stored: false });
+    expect(PushPrefsStateResponse.safeParse({ enabled: true, categories: all }).success).toBe(false);
+    expect(PushTestBody.safeParse({ deviceId: "d1" }).success).toBe(true);
+    expect(PushTestBody.safeParse({}).success).toBe(false);
+    expect(PushTestResponse.safeParse({ sent: 1, results: [{ outcome: "ok", status: 201 }, { outcome: "failed", status: 0 }] }).success).toBe(true);
+    expect(PushTestResponse.safeParse({ sent: 0, results: [{ outcome: "weird", status: 0 }] }).success).toBe(false);
+    expect(findRoute("GET", "/api/push/prefs/:desktopId")).toMatchObject({ auth: "session", owner: true, module: "push" });
+    expect(findRoute("POST", "/api/push/test")).toMatchObject({ auth: "session", rateLimit: "push-test", module: "push" });
+  });
 });
 
 describe("rate limit groups (security.md 3.5)", () => {
@@ -184,6 +205,7 @@ describe("rate limit groups (security.md 3.5)", () => {
       "POST /api/pair/start": "pair-start",
       "POST /api/pair/poll": "pair-poll",
       "POST /api/push/notify": "push-notify",
+      "POST /api/push/test": "push-test",
     });
   });
 });

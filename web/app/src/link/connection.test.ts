@@ -5,6 +5,7 @@ import { InMemoryRelay, MockDesktop, fingerprint, generateKeyPair, type KeyPair 
 import { base64UrlEncode } from "./base64url.ts";
 import {
   BACKOFF_LONG_MS,
+  RESUME_PROBE_TIMEOUT_MS,
   LinkConnection,
   MAX_WATCH_ENDED_REOPENS,
   backoffDelay,
@@ -1069,5 +1070,261 @@ describe("a watch that ends is reopened with from (fix-up point 6b)", () => {
     expect(opened).toHaveLength(1 + MAX_WATCH_ENDED_REOPENS);
     expect(errors.length).toBeGreaterThan(0);
     expect(errors.every((message) => message === "Watch ended")).toBe(true);
+  });
+});
+
+describe("resume after the app was away", () => {
+  const resumeEvents: Array<[string, () => void]> = [
+    [
+      "visibilitychange",
+      () => {
+        setHidden(true);
+        setHidden(false);
+      },
+    ],
+    ["pageshow (bfcache restore)", () => win.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }))],
+    ["online", () => win.dispatchEvent(new Event("online"))],
+  ];
+
+  /** A link that failed five times in a row: the next attempt is scheduled 8 s out. */
+  async function backedOff() {
+    const attempts: number[] = [];
+    let fail = true;
+    const r = rig({
+      random: () => 1,
+      deps: {
+        openRelay: async () => {
+          attempts.push(Date.now());
+          if (fail) throw new RelayConnectError("down", 1006);
+          return new RelayConnection(r.relay.connectDevice(DEVICE_ID));
+        },
+      },
+    });
+    await settle();
+    await settle(500);
+    await settle(1000);
+    await settle(2000);
+    await settle(4000);
+    expect(attempts).toHaveLength(5);
+    expect(r.state().status).toBe("reconnecting");
+    return { r, attempts, allow: () => (fail = false) };
+  }
+
+  it.each(resumeEvents)("%s starts an attempt in the same tick, not after the 8 s backoff, and connects fast", async (_name, fire) => {
+    const { r, attempts, allow } = await backedOff();
+    // The connection's clock is the rig's `clock`, which timers do not advance.
+    const scheduledIn = (r.state().nextAttemptAt ?? 0) - r.clock.now;
+    expect(scheduledIn).toBe(8000);
+    await settle(1000);
+    allow();
+    const before = attempts.length;
+    const resumedAt = Date.now();
+    fire();
+    await settle(0);
+    expect(attempts.length, "an attempt starts at once (0 ms)").toBe(before + 1);
+    expect(Date.now() - resumedAt).toBe(0);
+    let waited = 0;
+    while (r.state().status !== "ready" && waited < 500) {
+      await settle(1);
+      waited += 1;
+    }
+    expect(r.state().status).toBe("ready");
+    // Fake time to connected after the resume event; the in-memory relay answers without delay.
+    expect(waited, `time to connected after resume: ${waited} ms (fake time)`).toBeLessThan(50);
+  });
+
+  it.each(resumeEvents)("%s resets the backoff: the next failure waits 500 ms again, not 16 s", async (_name, fire) => {
+    const { r } = await backedOff();
+    fire();
+    await settle(0);
+    // The attempt that the event started fails again (fail is still set): the exponent restarted at 0.
+    expect((r.state().nextAttemptAt ?? 0) - r.clock.now).toBe(500);
+  });
+
+  it.each(resumeEvents)("%s does not open a second socket while an attempt is in flight", async (_name, fire) => {
+    let opens = 0;
+    const r = rig({
+      deps: {
+        openRelay: () => {
+          opens += 1;
+          return new Promise<RelayConnection>(() => undefined);
+        },
+      },
+    });
+    await settle();
+    expect(opens).toBe(1);
+    expect(r.state().status).toBe("connecting");
+    fire();
+    fire();
+    await settle(0);
+    expect(opens).toBe(1);
+  });
+
+  /** A ready link whose relay socket can be made to swallow the keepalive `ping` (a socket the OS killed in silence). */
+  async function readyWithKillableSocket() {
+    let opens = 0;
+    const state = { dead: false };
+    const r = rig({
+      deps: {
+        openRelay: async (_desktopId, deviceId) => {
+          opens += 1;
+          const socket = r.relay.connectDevice(deviceId);
+          const send = socket.sendText.bind(socket);
+          socket.sendText = (text: string) => {
+            if (!state.dead) send(text);
+          };
+          return new RelayConnection(socket);
+        },
+      },
+    });
+    await settle();
+    expect(r.state().status).toBe("ready");
+    return { r, state, opens: () => opens };
+  }
+
+  it("a tab hidden for 30 s keeps a socket that answers the probe: no teardown, no second socket, never leaves ready", async () => {
+    const { r, opens } = await readyWithKillableSocket();
+    const fetches = r.fetchCalls();
+    r.clock.now += 30_000;
+    setHidden(true);
+    r.clock.now += 30_000;
+    setHidden(false);
+    await settle(0);
+    expect(r.state().status).toBe("ready");
+    await settle(RESUME_PROBE_TIMEOUT_MS * 2);
+    expect(opens()).toBe(1);
+    expect(r.fetchCalls()).toBe(fetches);
+    expect(r.statuses).toEqual(["connecting", "handshaking", "ready"]);
+  });
+
+  it("a tab hidden for 30 s with a dead socket stays ready during the probe, then reconnects once the pong is missing", async () => {
+    const { r, state, opens } = await readyWithKillableSocket();
+    state.dead = true;
+    setHidden(true);
+    r.clock.now += 30_000;
+    setHidden(false);
+    await settle(RESUME_PROBE_TIMEOUT_MS - 100);
+    expect(r.state().status, "no indicator and no lock while probing").toBe("ready");
+    expect(opens()).toBe(1);
+    state.dead = false;
+    await settle(200);
+    expect(opens()).toBe(2);
+    expect(r.state().status).toBe("ready");
+  });
+
+  it("a tab hidden for less than the stale threshold does not even probe", async () => {
+    const { r, state, opens } = await readyWithKillableSocket();
+    state.dead = true;
+    setHidden(true);
+    r.clock.now += 5_000;
+    setHidden(false);
+    await settle(RESUME_PROBE_TIMEOUT_MS * 2);
+    expect(opens()).toBe(1);
+    expect(r.state().status).toBe("ready");
+  });
+
+  it("a pageshow that is not a bfcache restore keeps a healthy socket", async () => {
+    const r = await ready();
+    win.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: false }));
+    await settle();
+    expect(r.opens()).toBe(1);
+  });
+
+  it("a restored page whose socket is dead reconnects after the probe, one that answers is kept", async () => {
+    const { r, state, opens } = await readyWithKillableSocket();
+    win.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }));
+    await settle(RESUME_PROBE_TIMEOUT_MS * 2);
+    expect(opens()).toBe(1);
+    state.dead = true;
+    win.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }));
+    await settle(RESUME_PROBE_TIMEOUT_MS - 100);
+    state.dead = false;
+    await settle(200);
+    expect(opens()).toBe(2);
+    expect(r.state().status).toBe("ready");
+  });
+});
+
+describe("time to connected with realistic latencies (fake time)", () => {
+  const HTTP_MS = 80;
+  const RELAY_OPEN_MS = 50;
+  const HANDSHAKE_MS = 60;
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  /** A link that cannot open the relay at first, with every step of a connect taking its realistic time. */
+  async function slowLink() {
+    const flags = { fail: true };
+    const state: { r: Rig | null } = { r: null };
+    const r = rig({
+      random: () => 1,
+      deps: {
+        preConnect: async () => {
+          await sleep(HTTP_MS);
+          return "ok";
+        },
+        fetch: (async () => {
+          await sleep(HTTP_MS);
+          const desktop = state.r!.desktop;
+          return new Response(
+            JSON.stringify({
+              id: DESKTOP_ID,
+              name: "Example Desktop",
+              color: null,
+              online: true,
+              pendingCount: 0,
+              os: null,
+              appVersion: null,
+              lastSeenAt: null,
+              publicKey: base64UrlEncode(desktop.publicKey),
+              fingerprint: fingerprint(desktop.publicKey),
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }) as typeof fetch,
+        openRelay: async (_desktopId, deviceId) => {
+          await sleep(RELAY_OPEN_MS);
+          if (flags.fail) throw new RelayConnectError("down", 1006);
+          return new RelayConnection(state.r!.relay.connectDevice(deviceId));
+        },
+        connectSession: async (options) => {
+          await sleep(HANDSHAKE_MS);
+          return LinkSession.connect(options);
+        },
+      },
+    });
+    state.r = r;
+    // The first attempt fails after its steps (grant and directory in parallel, then the relay open), so the next one is backed off.
+    await settle(HTTP_MS + RELAY_OPEN_MS + 1);
+    expect(r.state().status).toBe("reconnecting");
+    expect(r.state().nextAttemptAt).not.toBeNull();
+    flags.fail = false;
+    return r;
+  }
+
+  async function timeToReady(r: Rig): Promise<number> {
+    let elapsed = 0;
+    while (r.state().status !== "ready" && elapsed < 2000) {
+      await settle(1);
+      elapsed += 1;
+    }
+    return elapsed;
+  }
+
+  it.each([
+    ["visibilitychange", () => {
+      setHidden(true);
+      setHidden(false);
+    }],
+    ["pageshow", () => win.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true }))],
+    ["online", () => win.dispatchEvent(new Event("online"))],
+  ] as Array<[string, () => void]>)("%s: connected after the critical path (grant and directory in parallel, relay open, handshake), with no extra wait", async (_name, fire) => {
+    const r = await slowLink();
+    fire();
+    const elapsed = await timeToReady(r);
+    const critical = HTTP_MS + RELAY_OPEN_MS + HANDSHAKE_MS;
+    const serial = 2 * HTTP_MS + RELAY_OPEN_MS + HANDSHAKE_MS;
+    expect(elapsed, `time to connected after resume: ${elapsed} ms (fake time), critical path ${critical} ms, serial would be ${serial} ms`).toBeGreaterThanOrEqual(critical);
+    expect(elapsed, `time to connected after resume: ${elapsed} ms (fake time), critical path ${critical} ms, serial would be ${serial} ms`).toBeLessThanOrEqual(critical + 2);
+    expect(elapsed).toBeLessThan(serial);
   });
 });

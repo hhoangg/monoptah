@@ -372,8 +372,37 @@ pub fn delete_me(base: &str, token: &str, timeout: Duration) -> Result<(), Strin
     .map(|_| ())
 }
 
+/// Why `POST /api/push/notify` failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushError {
+    /// No answer: network error or timeout.
+    Network,
+    /// The server answered with this non-2xx status.
+    Http(u16),
+}
+
+impl PushError {
+    /// Whether trying again can help: a network error, a timeout, a 5xx or a
+    /// 429. Other 4xx answers (invalid body, bad token) would only repeat.
+    pub fn retryable(self) -> bool {
+        match self {
+            PushError::Network => true,
+            PushError::Http(status) => status == 429 || status >= 500,
+        }
+    }
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::Network => f.write_str("network"),
+            PushError::Http(status) => write!(f, "http {status}"),
+        }
+    }
+}
+
 /// `POST /api/push/notify`. Returns how many pushes the server sent.
-pub fn push_notify(base: &str, token: &str, body: &Value) -> Result<u64, String> {
+pub fn push_notify(base: &str, token: &str, body: &Value) -> Result<u64, PushError> {
     let answer = call(
         "POST",
         base,
@@ -381,6 +410,10 @@ pub fn push_notify(base: &str, token: &str, body: &Value) -> Result<u64, String>
         Some(token),
         Some(body),
         TIMEOUT,
-    )?;
-    Ok(ok_body(answer)?["sent"].as_u64().unwrap_or(0))
+    )
+    .map_err(|_| PushError::Network)?;
+    if !(200..300).contains(&answer.status) {
+        return Err(PushError::Http(answer.status));
+    }
+    Ok(answer.body["sent"].as_u64().unwrap_or(0))
 }

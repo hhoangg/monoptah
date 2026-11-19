@@ -21,6 +21,9 @@ import {
   PatchMeResponse,
   PushPrefsBody,
   PushPrefsResponse,
+  PushPrefsStateResponse,
+  PushTestBody,
+  PushTestResponse,
   ReauthOptionsResponse,
   ReauthVerifyBody,
   ReauthVerifyResponse,
@@ -73,5 +76,8 @@ export const endpoints = {
   pairApprove: endpoint("POST", "/api/pair/:userCode/approve", PairApproveResponse, PairApproveBody),
   pairDeny: endpoint("POST", "/api/pair/:userCode/deny", Ok),
 
+  getPushPrefs: endpoint("GET", "/api/push/prefs/:desktopId", PushPrefsStateResponse),
+  /** A real Web Push to this browser's subscriptions (3 per 10 minutes per user). */
+  pushTest: endpoint("POST", "/api/push/test", PushTestResponse, PushTestBody),
   putPushPrefs: endpoint("PUT", "/api/push/prefs/:desktopId", PushPrefsResponse, PushPrefsBody),
 } as const;

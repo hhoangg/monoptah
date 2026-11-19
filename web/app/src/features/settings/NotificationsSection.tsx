@@ -3,12 +3,12 @@ import { useState } from "react";
 import { PUSH_CATEGORIES } from "@monoptah/protocol";
 import { forgetPaused } from "@/features/push/pauseRecord";
 import { savePushPrefs, type PushPrefs } from "@/features/accounts/queries";
-import { Button } from "@/ui/button";
+import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { Switch } from "@/ui/switch";
 import { settingsErrorMessage } from "./copy";
-import { pushPrefsKey } from "./pushPrefs";
+import { pushPrefsKey, pushPrefsQuery } from "./pushPrefs";
 
 type Category = (typeof PUSH_CATEGORIES)[number];
 
@@ -18,32 +18,21 @@ export const CATEGORY_LABELS: Record<Category, { title: string; description: str
   monoMessages: { title: "Messages from Monos", description: "When a Mono writes to you" },
 };
 
-/** The starting point of the draft shown before anything is known. It is never sent without an explicit Save. */
+/** What the switches show while the saved prefs load (the same defaults the Worker applies); they are disabled until then. */
 export const DRAFT_PREFS: PushPrefs = { enabled: true, categories: { agentFinished: true, agentInput: true, monoMessages: true } };
 
-
 /**
- * Notification categories of one desktop (N-15). The contract has no GET for prefs (a gap reported
- * to WS-K/WS-A), so this browser cannot read what is stored. Until a save returns, the switches are
- * a draft with an explicit "Save these settings" button and a note; nothing invented is ever sent
- * as a side effect of flipping one switch. After a save the PUT result is kept in the query cache
- * and each switch saves at once, as before.
+ * Notification categories of one desktop (N-15). The prefs load with `GET /api/push/prefs/:desktopId`; a desktop
+ * that never saved any shows the defaults (all on), which are what the Worker applies too. Each switch saves at once.
  */
 export function NotificationsSection({ desktopId }: { desktopId: string }) {
   const queryClient = useQueryClient();
-  const savedQuery = useQuery<PushPrefs | null>({
-    queryKey: pushPrefsKey(desktopId),
-    queryFn: () => queryClient.getQueryData<PushPrefs>(pushPrefsKey(desktopId)) ?? null,
-    initialData: null,
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  const saved = savedQuery.data;
-  const [draft, setDraft] = useState<PushPrefs>(DRAFT_PREFS);
+  const loaded = useQuery<PushPrefs>({ ...pushPrefsQuery(desktopId), staleTime: 0 });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const prefs = saved ?? draft;
-  const unknown = saved === null;
+  const prefs = loaded.data;
+  // Until the answer arrives the switches show the defaults, disabled.
+  const shown = prefs ?? DRAFT_PREFS;
 
   async function save(next: PushPrefs): Promise<void> {
     if (saving) return;
@@ -61,23 +50,18 @@ export function NotificationsSection({ desktopId }: { desktopId: string }) {
     }
   }
 
-  /** Unknown: only edit the draft. Known: save the change at once. */
-  function change(next: PushPrefs): void {
-    if (unknown) setDraft(next);
-    else void save(next);
-  }
-
   return (
     <SettingsCard title="Notifications" footnote="Saved to your account for this desktop. Permission to show notifications in this browser is asked separately.">
-      {unknown ? (
-        <Notice variant="info" title="Current settings not loaded" className="my-1.5">
-          This browser cannot read the settings saved for this desktop yet. The switches below are not your saved values. Set them the way you want, then press Save: that saves all three categories and the main switch as shown.
+      {loaded.isError ? (
+        <Notice variant="error" className="my-1.5">
+          {settingsErrorMessage(loaded.error)}
         </Notice>
       ) : null}
+      {prefs === undefined && !loaded.isError ? <DelayedSpinner label="Loading notification settings" className="px-1.5 py-2" /> : null}
       <SettingsRow
         icon="notifications"
         title="Notifications from this desktop"
-        trailing={<Switch checked={prefs.enabled} disabled={saving} aria-label="Notifications from this desktop" className={unknown ? "opacity-60" : undefined} onCheckedChange={(enabled) => change({ ...prefs, enabled })} />}
+        trailing={<Switch checked={shown.enabled} disabled={saving || prefs === undefined} aria-label="Notifications from this desktop" onCheckedChange={(enabled) => void save({ ...shown, enabled })} />}
       />
       {PUSH_CATEGORIES.map((category) => (
         <SettingsRow
@@ -87,22 +71,14 @@ export function NotificationsSection({ desktopId }: { desktopId: string }) {
           className="pl-[4.5rem]"
           trailing={
             <Switch
-              checked={prefs.categories[category] ?? true}
-              disabled={saving || !prefs.enabled}
+              checked={shown.categories[category] ?? true}
+              disabled={saving || prefs === undefined || !shown.enabled}
               aria-label={CATEGORY_LABELS[category].title}
-              className={unknown ? "opacity-60" : undefined}
-              onCheckedChange={(on) => change({ ...prefs, categories: { ...prefs.categories, [category]: on } })}
+              onCheckedChange={(on) => void save({ ...shown, categories: { ...shown.categories, [category]: on } })}
             />
           }
         />
       ))}
-      {unknown ? (
-        <div className="px-1.5 py-2">
-          <Button type="button" className="w-full" disabled={saving} aria-busy={saving} onClick={() => void save(draft)}>
-            Save these settings
-          </Button>
-        </div>
-      ) : null}
       {error ? (
         <Notice variant="error" className="my-1.5">
           {error}
