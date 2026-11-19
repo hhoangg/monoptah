@@ -3,10 +3,13 @@ pub(crate) mod burst;
 pub(crate) mod cloud_moved;
 pub(crate) mod cloud_start;
 pub(crate) mod dates;
+mod document_images;
 #[cfg(test)]
 mod document_selection_tests;
 mod drafts;
 pub(crate) mod emoji;
+#[cfg(test)]
+mod file_chip_tests;
 #[cfg(test)]
 mod follow_tests;
 pub(crate) mod git_turns;
@@ -804,6 +807,8 @@ pub(crate) struct TranscriptView {
     work_tiles: HashMap<usize, Entity<crate::phase_tile::PhaseTile>>,
     pub(crate) target_action: Option<(usize, monocode_core::response::TransferKind)>,
     document: bool,
+    /// A document opened from disk draws its `![alt](path)` pictures from `file_link_base`.
+    document_images: bool,
     side_question: bool,
     pub(crate) file_link_base: Option<String>,
     /// A Mono chat's local projects: the folders a relative file link may belong to.
@@ -1034,8 +1039,21 @@ impl TranscriptView {
         self.history_before.is_none()
     }
     pub(crate) fn document(text: String, cx: &mut Context<Self>) -> Self {
+        Self::document_in(text, None, cx)
+    }
+    /// A markdown document that lives in `folder`: its relative links open files there, and its
+    /// `![alt](path)` pictures are drawn from there. Without a folder it is `document`.
+    pub(crate) fn document_in(
+        text: String,
+        folder: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut view = Self::new();
         view.document = true;
+        if let Some(folder) = folder {
+            view.file_link_base = Some(folder.to_string_lossy().into_owned());
+            view.document_images = true;
+        }
         // A document reads from its top. Chat's tail-follow would open it
         // scrolled to the end and keep it pinned there on every rebuild.
         view.list.set_follow_mode(FollowMode::Normal);
@@ -2750,6 +2768,7 @@ impl TranscriptView {
             document: false,
             side_question: false,
             file_link_base: None,
+            document_images: false,
             link_roots: Vec::new(),
             expanded: HashSet::new(),
             agent_panels: Default::default(),
@@ -3567,6 +3586,7 @@ impl TranscriptView {
                         Vec::new(),
                     )
                 });
+            parser.set_images(self.document_images);
             let message = self.messages.len();
             let first = self.rows.len();
             if at >= turn_end {
@@ -5522,6 +5542,8 @@ impl TranscriptView {
                     self.code(fence.clone(), lines.clone(), ix, cx)
                 } else if let Part::Visual { id, caption } = &md.part {
                     self.placed_visual(id, caption, cx)
+                } else if let Part::Image { src, alt } = &md.part {
+                    self.document_image(ix, src, alt)
                 } else {
                     markdown::body_selected(
                         md,

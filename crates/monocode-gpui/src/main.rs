@@ -45,6 +45,7 @@ mod explorer;
 mod file_editor;
 mod file_icons;
 mod file_links;
+mod file_preview;
 mod fix_terminal;
 mod fixtures;
 mod fonts;

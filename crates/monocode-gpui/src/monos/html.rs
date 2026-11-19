@@ -120,6 +120,8 @@ struct FilePage {
     root: std::path::PathBuf,
     /// Identity of the page for the reload check; never changes.
     marker: Arc<str>,
+    /// Whether the page may run JavaScript. A file shown as a preview runs none.
+    scripts: bool,
 }
 pub(crate) struct Html {
     body: String,
@@ -192,8 +194,22 @@ impl Html {
             marker: path.to_string_lossy().into_owned().into(),
             path,
             root,
+            scripts: true,
         }));
         this
+    }
+    /// The page runs no JavaScript at all: a file opened as a preview is shown, not executed.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn without_scripts(mut self) -> Self {
+        if let Some(file) = self.file.as_mut().and_then(Rc::get_mut) {
+            file.scripts = false;
+        }
+        self
+    }
+    /// Whether the page may run JavaScript (always, for generated markup in its sandbox).
+    #[cfg(all(target_os = "macos", test))]
+    pub(crate) fn runs_scripts(&self) -> bool {
+        self.file.as_ref().is_none_or(|file| file.scripts)
     }
     #[cfg(target_os = "macos")]
     fn markup(&mut self) -> Arc<str> {
@@ -317,6 +333,11 @@ impl gpui::Render for Html {
                             config
                                 .preferences()
                                 .setJavaScriptCanOpenWindowsAutomatically(false);
+                            if file.as_ref().is_some_and(|file| !file.scripts) {
+                                config
+                                    .defaultWebpagePreferences()
+                                    .setAllowsContentJavaScript(false);
+                            }
                             config.setWebsiteDataStore(
                                 &WKWebsiteDataStore::nonPersistentDataStore(mtm),
                             );
@@ -384,6 +405,15 @@ impl Drop for Html {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_file_page_runs_scripts_only_until_it_is_made_a_preview() {
+        let page = Html::from_file("/tmp/a.html".into(), "/tmp".into());
+        assert!(page.runs_scripts());
+        assert!(!page.without_scripts().runs_scripts());
+        // Generated markup keeps its own sandbox and is not a file page.
+        assert!(Html::new("<p>".into()).runs_scripts());
+    }
     #[test]
     fn generated_markup_cannot_escape_the_opaque_iframe() {
         let html = sandbox("\"><script>window.top.postMessage('x','*')</script>");
