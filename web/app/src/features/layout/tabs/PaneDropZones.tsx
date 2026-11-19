@@ -39,12 +39,12 @@ export function PaneDropZones({ desktopId, paneId, actions }: { desktopId: strin
   const onDragOver = (event: DragEvent<HTMLElement>) => {
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
-    setZone(zoneAt(event, actions.canSplit));
+    setZone(zoneAt(event, (dir) => actions.canSplit(dir, paneId)));
   };
   const onDrop = (event: DragEvent<HTMLElement>) => {
     event.preventDefault();
     const dragged = getTabDrag();
-    const target = zoneAt(event, actions.canSplit);
+    const target = zoneAt(event, (dir) => actions.canSplit(dir, paneId));
     setZone(null);
     endTabDrag();
     if (!dragged) return;

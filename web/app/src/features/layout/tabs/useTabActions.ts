@@ -33,7 +33,8 @@ export interface TabActions {
   closePane: (paneId: string) => void;
   /** Adds an empty pane beside the focused one and opens the New session page in it. */
   split: (dir: SplitDir) => void;
-  canSplit: (dir: SplitDir) => boolean;
+  /** Whether a split of `paneId` (default: the focused pane) in `dir` would fit. */
+  canSplit: (dir: SplitDir, paneId?: string) => boolean;
   /** Moves a tab into a pane (at an index) or, with `edge`, into a new pane beside it. */
   drop: (key: TabKey, target: { paneId: string; index?: number; edge?: { dir: SplitDir; place: "before" | "after" } }) => void;
   /** The tab `step` places from the active one in the focused pane (wraps). */
@@ -57,22 +58,33 @@ export function useTabActions(desktopId: string, size: Size | null): TabActions 
   return useMemo<TabActions>(() => {
     const urlKey = () => tabOfPath(router.state.location.pathname);
 
-    /** Points the URL at the active tab of the focused pane. When that pane is empty the URL is left alone, except to leave a tab that was just closed. */
-    const sync = (closed?: TabKey) => {
+    /** Points the URL at the active tab of the focused pane (the user chose a tab or a pane). An empty pane leaves the URL alone. */
+    const sync = () => {
       const ws = getWorkspace(desktopId);
       const key = ws.panes[ws.focused]?.active ?? null;
-      if (key) {
-        if (key !== urlKey()) {
-          const location = tabLocation(desktopId, key);
-          if (location) void router.navigate(location);
-        }
+      if (!key || key === urlKey()) return;
+      const location = tabLocation(desktopId, key);
+      if (location) void router.navigate(location);
+    };
+
+    /**
+     * After tabs left the workspace: only when the URL pointed at one of them does it move on, to the focused pane's
+     * active tab, else to the project (or the workspace home). A page that is not a tab (New session, Files, Git...)
+     * stays where it is.
+     */
+    const leaveClosed = (closed: Array<TabKey | undefined>) => {
+      const current = urlKey();
+      if (!current || !closed.includes(current)) return;
+      const ws = getWorkspace(desktopId);
+      const next = ws.panes[ws.focused]?.active ?? null;
+      const location = next ? tabLocation(desktopId, next) : null;
+      if (location) {
+        void router.navigate(location);
         return;
       }
-      if (closed && urlKey() === closed) {
-        const tab = parseTab(closed);
-        const projectId = tab?.kind === "session" ? live.current.catalog?.sessions.find((session) => session.id === tab.id)?.projectId : undefined;
-        void router.navigate(projectId ? { to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId } } : { to: "/d/$desktopId", params: { desktopId } });
-      }
+      const tab = parseTab(current);
+      const projectId = tab?.kind === "session" ? live.current.catalog?.sessions.find((session) => session.id === tab.id)?.projectId : undefined;
+      void router.navigate(projectId ? { to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId } } : { to: "/d/$desktopId", params: { desktopId } });
     };
 
     const update = (change: Parameters<typeof updateWorkspace>[1]) => updateWorkspace(desktopId, change);
@@ -92,14 +104,18 @@ export function useTabActions(desktopId: string, size: Size | null): TabActions 
       },
       close: (paneId, key) => {
         update((ws) => closeTab(ws, paneId, key));
-        sync(key);
+        leaveClosed([key]);
       },
       closePane: (paneId) => {
-        const keys = getWorkspace(desktopId).panes[paneId]?.tabs ?? [];
+        const before = getWorkspace(desktopId);
+        const keys = before.panes[paneId]?.tabs ?? [];
+        // The focused pane shows the page of the URL when it is not a tab: that page goes with the pane.
+        const showedPage = before.focused === paneId && urlKey() === null;
         update((ws) => removePane(ws, paneId));
-        sync(keys.find((key) => key === urlKey()));
+        if (showedPage) sync();
+        else leaveClosed(keys);
       },
-      canSplit: (dir) => canSplit(getWorkspace(desktopId), dir, live.current.size),
+      canSplit: (dir, paneId) => canSplit(getWorkspace(desktopId), dir, live.current.size, paneId),
       split: (dir) => {
         if (!canSplit(getWorkspace(desktopId), dir, live.current.size)) return;
         const active = focusedPane()?.active;
@@ -110,16 +126,20 @@ export function useTabActions(desktopId: string, size: Size | null): TabActions 
         if (projectId) void router.navigate({ to: "/d/$desktopId/p/$projectId/new", params: { desktopId, projectId } });
       },
       drop: (key, { paneId, index, edge }) => {
+        const ownerOf = () => Object.values(getWorkspace(desktopId).panes).find((pane) => pane.tabs.includes(key))?.id;
+        const before = ownerOf();
         if (!edge) {
           update((ws) => moveTab(ws, key, paneId, index));
         } else {
           update((ws) => {
             const split = splitPane(ws, paneId, edge.dir, edge.place);
-            if (split === ws || !canSplit(ws, edge.dir, live.current.size)) return moveTab(ws, key, paneId, index);
+            // The room is measured for the pane the tab is dropped on, not for the focused one.
+            if (split === ws || !canSplit(ws, edge.dir, live.current.size, paneId)) return moveTab(ws, key, paneId, index);
             return moveTab(split, key, split.focused);
           });
         }
-        sync();
+        // A tab that changed pane became the active one there: show it. A reorder inside a pane leaves the page alone.
+        if (ownerOf() !== before) sync();
       },
       cycle: (step) => {
         const pane = focusedPane();

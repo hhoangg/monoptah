@@ -1,7 +1,9 @@
 // The per-desktop store of the session tabs and panes, kept in localStorage as `monoptah.layout.tabs.<desktopId>`
 // (a Workspace of paneTree.ts, wrapped as {v: 1, ws}). The text in localStorage is the source of truth: a snapshot is
 // parsed again only when the stored text changed, so clearing storage (tests, another tab of the browser signing out)
-// starts from an empty workspace. A blocked or full storage keeps the workspace in memory for this page.
+// starts from an empty workspace. A blocked or full storage keeps the workspace in memory for this page. Another
+// browser tab writing the same desktop's workspace fires a `storage` event here: this page adopts that state at once,
+// so two tabs of one desktop do not overwrite each other at some later render.
 import { useSyncExternalStore } from "react";
 import { parseWorkspace, serializeWorkspace, type Workspace } from "./paneTree";
 
@@ -52,6 +54,14 @@ export function updateWorkspace(desktopId: string, change: (ws: Workspace) => Wo
   }
   cache.set(desktopId, { raw, ws: next, persisted: stored });
   for (const listener of [...listeners]) listener();
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    // `key` is null when the whole storage was cleared.
+    if (event.key !== null && !event.key.startsWith(tabsKey(""))) return;
+    for (const listener of [...listeners]) listener();
+  });
 }
 
 function subscribe(listener: () => void): () => void {

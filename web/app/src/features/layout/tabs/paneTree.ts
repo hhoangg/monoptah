@@ -198,13 +198,15 @@ export function splitPane(ws: Workspace, paneId: string, dir: SplitDir, place: "
 
 /**
  * Moves a tab to `toPane` (at `index`, default the end) and makes it active and focused there. Inside one pane it
- * reorders. The source pane closes when it ends up empty and is not the only one.
+ * reorders (with no `index` it stays where it is). The source pane closes when it ends up empty and is not the only one.
  */
 export function moveTab(ws: Workspace, key: TabKey, toPane: string, index?: number): Workspace {
   const from = findTab(ws, key);
   const target = ws.panes[toPane];
   if (!from || !target) return ws;
   if (from === toPane) {
+    // Dropped on its own pane with no place in the strip: nothing moves.
+    if (index === undefined) return ws;
     const without = target.tabs.filter((tab) => tab !== key);
     const at = Math.min(Math.max(index ?? without.length, 0), without.length);
     const tabs = [...without.slice(0, at), key, ...without.slice(at)];
@@ -247,9 +249,9 @@ export function fits(root: PaneNode, size: { width: number; height: number } | n
   return size.width >= need.width && size.height >= need.height;
 }
 
-/** True when a split of the focused pane in `dir` would still fit `size`. */
-export function canSplit(ws: Workspace, dir: SplitDir, size: { width: number; height: number } | null): boolean {
-  const next = splitPane(ws, ws.focused, dir);
+/** True when a split of `paneId` (default: the focused pane) in `dir` would still fit `size`. */
+export function canSplit(ws: Workspace, dir: SplitDir, size: { width: number; height: number } | null, paneId: string = ws.focused): boolean {
+  const next = splitPane(ws, paneId, dir);
   return next !== ws && fits(next.root, size);
 }
 

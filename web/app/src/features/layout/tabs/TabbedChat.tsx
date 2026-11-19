@@ -4,19 +4,25 @@
 // choosing a tab, focusing a pane or closing a tab navigates. A URL that is not a tab (New session, Files, Changes,
 // Git, a Mono profile) shows its page, the route `children`, in the focused pane in place of that pane's active tab.
 // Only the active tab of each pane is mounted, so a long list of tabs holds no live transcripts.
+//
+// A pane keeps its state (the composer draft, scroll, open menus) when the layout around it changes: a split, a closed
+// neighbour or a narrow window that hides the others. Each pane view renders through a portal into a host element of
+// its own that lives as long as the pane is on screen, and the layout tree only decides which slot the host sits in.
 import { useRouterState } from "@tanstack/react-router";
-import { Fragment, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { MonoScreen } from "@/features/monos/MonoScreen";
 import "@/features/sessions/register";
 import { SessionScreen } from "@/features/sessions/SessionScreen";
+import { PaneHosts } from "./paneHosts";
 import { PaneContext } from "./PaneContext";
 import { PaneDivider } from "./PaneDivider";
 import { PaneDropZones } from "./PaneDropZones";
-import { canSplit, fits, openTab, paneOrder, parseTab, type Pane, type PaneNode, type TabKey, type Workspace } from "./paneTree";
+import { canSplit, findTab, fits, openTab, paneOrder, parseTab, type Pane, type PaneNode, type TabKey, type Workspace } from "./paneTree";
 import { TabStrip } from "./TabStrip";
 import { tabOfPath } from "./tabRoutes";
 import { useTabShortcuts } from "./tabShortcuts";
-import { getWorkspace, updateWorkspace, useWorkspace } from "./tabsStore";
+import { getWorkspace, tabsKey, updateWorkspace, useWorkspace } from "./tabsStore";
 import { useTabActions, type Size, type TabActions } from "./useTabActions";
 
 function TabScreen({ desktopId, tabKey }: { desktopId: string; tabKey: TabKey }) {
@@ -85,8 +91,11 @@ function PaneView({ pane, context }: { pane: Pane; context: TreeContext }) {
         className="relative flex min-h-0 min-w-0 flex-1 flex-col"
       >
         {showStrip ? <TabStrip desktopId={desktopId} pane={pane} number={order.indexOf(pane.id) + 1} paneCount={order.length} focused={focused} selected={selected} hiddenPanes={focused ? hiddenPanes : 0} canSplit={splittable} actions={actions} /> : null}
-        <div data-testid="pane-body" className="@container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
-          {showPage ? children : pane.active ? <TabScreen desktopId={desktopId} tabKey={pane.active} /> : multi ? <EmptyPane /> : null}
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+          <div data-testid="pane-body" className="@container relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
+            {showPage ? children : pane.active ? <TabScreen desktopId={desktopId} tabKey={pane.active} /> : multi ? <EmptyPane /> : null}
+          </div>
+          {/* Over the visible pane body (not inside its scroller), below the strip so tabs can still be dropped on it. */}
           <PaneDropZones desktopId={desktopId} paneId={pane.id} actions={actions} />
         </div>
       </div>
@@ -102,11 +111,17 @@ function EmptyPane() {
   );
 }
 
-function Tree({ node, path, context }: { node: PaneNode; path: number[]; context: TreeContext }) {
-  if (node.type === "leaf") {
-    const pane = context.ws.panes[node.id];
-    return pane ? <PaneView pane={pane} context={context} /> : null;
-  }
+/** The place of one pane in the layout: it adopts the pane's host element, which carries the pane view. */
+function PaneSlot({ host }: { host: HTMLElement }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (ref.current && host.parentNode !== ref.current) ref.current.appendChild(host);
+  });
+  return <div ref={ref} className="flex min-h-0 min-w-0 flex-1" />;
+}
+
+function Tree({ node, path, context, hosts }: { node: PaneNode; path: number[]; context: TreeContext; hosts: PaneHosts }) {
+  if (node.type === "leaf") return <PaneSlot host={hosts.of(node.id)} />;
   const row = node.dir === "row";
   return (
     <div data-testid="pane-split" data-dir={node.dir} className={`flex min-h-0 min-w-0 flex-1 ${row ? "flex-row" : "flex-col"}`}>
@@ -122,7 +137,7 @@ function Tree({ node, path, context }: { node: PaneNode; path: number[]; context
             />
           ) : null}
           <div style={{ flex: `${node.sizes[index] ?? 1} 1 0%` }} className="flex min-h-0 min-w-0">
-            <Tree node={child} path={[...path, index]} context={context} />
+            <Tree node={child} path={[...path, index]} context={context} hosts={hosts} />
           </div>
         </Fragment>
       ))}
@@ -134,6 +149,8 @@ export function TabbedChat({ desktopId, children }: { desktopId: string; childre
   const ws = useWorkspace(desktopId);
   const urlKey = useRouterState({ select: (state) => tabOfPath(state.location.pathname) });
   const [ref, size] = useElementSize();
+  // The element a pane view is rendered into: one per pane, so moving the pane in the layout never remounts it.
+  const [hosts] = useState(() => new PaneHosts());
   const actions = useTabActions(desktopId, size);
   useTabShortcuts(actions);
 
@@ -142,14 +159,34 @@ export function TabbedChat({ desktopId, children }: { desktopId: string; childre
     if (urlKey) updateWorkspace(desktopId, (current) => openTab(current, urlKey));
   }, [desktopId, urlKey]);
 
+  // Another browser tab replaced the workspace: the URL's tab must still be in it (it is added once if the other tab did not have it).
+  useLayoutEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== tabsKey(desktopId)) return;
+      if (urlKey && !findTab(getWorkspace(desktopId), urlKey)) updateWorkspace(desktopId, (current) => openTab(current, urlKey));
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [desktopId, urlKey]);
+
   // Too narrow for the panes: only the focused pane shows (the others keep their tabs).
   const all = fits(ws.root, size);
   const root: PaneNode = all ? ws.root : { type: "leaf", id: ws.focused };
   const hiddenPanes = all ? 0 : paneOrder(ws.root).length - 1;
 
+  const visible = paneOrder(root);
+  // The host of a pane that left the workspace, or is only hidden (too narrow), is dropped and made again on return.
+  const visibleIds = visible.join(",");
+  useEffect(() => hosts.retain(visibleIds.split(",")), [hosts, visibleIds]);
+  const context: TreeContext = { desktopId, ws, urlKey, actions, hiddenPanes, canSplit: { row: canSplit(ws, "row", size), column: canSplit(ws, "column", size) }, children };
+
   return (
-    <div ref={ref} data-testid="tabbed-chat" data-panes={paneOrder(root).length} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
-      <Tree node={root} path={[]} context={{ desktopId, ws, urlKey, actions, hiddenPanes, canSplit: { row: canSplit(ws, "row", size), column: canSplit(ws, "column", size) }, children }} />
+    <div ref={ref} data-testid="tabbed-chat" data-panes={visible.length} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
+      <Tree node={root} path={[]} context={context} hosts={hosts} />
+      {visible.map((id) => {
+        const pane = ws.panes[id];
+        return pane ? createPortal(<PaneView pane={pane} context={context} />, hosts.of(id), id) : null;
+      })}
     </div>
   );
 }

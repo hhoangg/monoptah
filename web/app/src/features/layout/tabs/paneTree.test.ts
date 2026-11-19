@@ -163,3 +163,25 @@ describe("persistence format", () => {
     expect(parseWorkspace(JSON.stringify(twice)).panes.p2?.tabs).toEqual([B]);
   });
 });
+
+describe("drops and room", () => {
+  it("a tab dropped on its own pane with no place in the strip stays where it is", () => {
+    const ws = opened(A, B, C);
+    expect(moveTab(ws, A, "p1")).toBe(ws);
+    expect(moveTab(ws, B, "p1")).toBe(ws);
+    // With a place it still reorders.
+    expect(moveTab(ws, A, "p1", 2).panes.p1?.tabs).toEqual([B, C, A]);
+  });
+
+  it("canSplit measures the pane it is asked about, not only the focused one", () => {
+    // A row of p1 and a column of p2 over p3: splitting p2 downwards stacks three, splitting p1 downwards does not.
+    let ws = splitPane(opened(A, B, C), "p1", "row");
+    ws = splitPane(ws, "p2", "column");
+    expect(ws.focused).toBe("p3");
+    const size = { width: 2000, height: 700 };
+    expect(canSplit(ws, "column", size, "p1")).toBe(true);
+    expect(canSplit(ws, "column", size, "p2")).toBe(false);
+    expect(canSplit(ws, "column", size)).toBe(false);
+    expect(canSplit(ws, "column", size, "missing")).toBe(false);
+  });
+});
