@@ -43,6 +43,37 @@ async function wipe(): Promise<void> {
 
 let boundTo: string | null = null;
 
+/** A foreground check at most this often: the key id and the browser subscription rarely change. */
+export const PUSH_REFRESH_MIN_INTERVAL_MS = 60_000;
+let lastPushRefresh = 0;
+let pushRefreshing = false;
+let foregroundListening = false;
+
+/** Re-checks the push subscription (key id, browser subscription) of the bound user. Never throws. */
+function refreshPush(userId: string, force: boolean): void {
+  const now = Date.now();
+  if (pushRefreshing || (!force && now - lastPushRefresh < PUSH_REFRESH_MIN_INTERVAL_MS)) return;
+  pushRefreshing = true;
+  lastPushRefresh = now;
+  // No user gesture here, so iOS may refuse the subscription: the refusal is swallowed and not retried before the
+  // interval is over (`lastPushRefresh` is set before the attempt, whatever its outcome).
+  void resubscribeIfVapidKeyChanged(userId)
+    .catch(() => false)
+    .finally(() => {
+      pushRefreshing = false;
+    });
+}
+
+// Once per page load: when the app comes back to the foreground (an installed PWA stays alive for days), look
+// again. A sign-out clears `boundTo`, which stops the check.
+function listenForeground(): void {
+  if (foregroundListening || typeof document === "undefined") return;
+  foregroundListening = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && boundTo !== null) refreshPush(boundTo, false);
+  });
+}
+
 /** Call with `user.id` of every successful `me`. A repeat for the same user in one page load is a no-op. */
 export async function bindDeviceToUser(userId: string): Promise<void> {
   if (boundTo === userId) return;
@@ -57,7 +88,8 @@ export async function bindDeviceToUser(userId: string): Promise<void> {
     // Same owner: a push state of another account (or of an old build) still has to go.
     const push = await loadPushState().catch(() => null);
     if (push && push.userId !== userId) await forgetPushLocally();
-    else if (push) void resubscribeIfVapidKeyChanged(userId);
+    else if (push) refreshPush(userId, true);
+    listenForeground();
   } catch {
     // Nothing more to do.
   }
@@ -77,4 +109,6 @@ export async function releaseDevice(): Promise<void> {
 /** Test helper: forget the in-memory binding. */
 export function resetDeviceBindingForTests(): void {
   boundTo = null;
+  lastPushRefresh = 0;
+  pushRefreshing = false;
 }

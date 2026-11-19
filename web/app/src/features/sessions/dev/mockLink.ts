@@ -15,6 +15,8 @@ export interface MockLinkOptions {
   capabilities?: string[];
   /** Called with the desktop before it attaches, to seed extra data. */
   seed?: (desktop: MockDesktop) => void;
+  /** The relay never opens: the link stays `connecting` (a cold start whose network has not answered yet). */
+  holdRelay?: boolean;
 }
 
 export interface MockLink {
@@ -53,7 +55,7 @@ export function connectMockDesktop(options: MockLinkOptions = {}): MockLink {
     getDeviceKeyPair: async () => deviceKey,
     fetch: (async () => new Response(JSON.stringify(directory), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof fetch,
     checkPin: async () => "match",
-    openRelay: async (_desktopId, deviceId) => new RelayConnection(relay.connectDevice(deviceId)),
+    openRelay: options.holdRelay ? () => new Promise<RelayConnection>(() => undefined) : async (_desktopId, deviceId) => new RelayConnection(relay.connectDevice(deviceId)),
     random: () => 0.5,
     channel: 7,
   });

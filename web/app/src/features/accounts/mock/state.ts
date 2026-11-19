@@ -88,6 +88,8 @@ export interface MockState {
   prefs: Map<string, MockPrefs>;
   /** Push subscriptions by id (P-04), each with its endpoint; the Worker keys them by endpoint. */
   pushSubscriptions: Map<string, { endpoint: string; deviceId: string }>;
+  /** What `POST /api/push/test` answers for a device that has a subscription (a test hook, see `MockPatch.pushTest`). */
+  pushTest: MockPushTest;
   /** Normalised valid recovery codes. */
   recoveryCodes: Set<string>;
   /** Batch number of the live recovery codes, like `recovery_codes.batch`. */
@@ -292,6 +294,7 @@ export function createMockState(options: SeedOptions = {}): MockState {
     pairings: seedPairings(),
     prefs: new Map(),
     pushSubscriptions: new Map(),
+    pushTest: "ok",
     recoveryCodes: new Set(),
     recoveryBatch: 0,
     challenges: new Map(),
@@ -312,6 +315,8 @@ export function userCount(state: MockState): number {
 export function invitesClosed(state: MockState): boolean {
   return state.invitesPaused || (state.maxUsers > 0 && userCount(state) >= state.maxUsers);
 }
+
+export type MockPushTest = "ok" | "gone" | "refused" | "rate_limited" | "not_configured";
 
 export function defaultPrefs(): MockPrefs {
   return { enabled: true, categories: { agentFinished: true, agentInput: true, monoMessages: true } };

@@ -399,6 +399,21 @@ const handlers: Record<string, Handler> = {
     return { ok: true };
   },
 
+  "GET /api/push/prefs/:desktopId": ({ state, params }) => {
+    const id = params.desktopId ?? "";
+    if (!state.desktops.some((desktop) => desktop.id === id)) throw new MockHttpError(404, "not_found", "Desktop not found");
+    const stored = state.prefs.get(id);
+    return { ...(stored ?? defaultPrefs()), stored: stored !== undefined };
+  },
+  "POST /api/push/test": ({ state, body }) => {
+    const deviceId = expectString(body.deviceId);
+    if (state.pushTest === "rate_limited") throw new MockHttpError(429, "rate_limited", "Too many tests");
+    if (state.pushTest === "not_configured") throw new MockHttpError(503, "internal", "Push is not configured");
+    const own = [...state.pushSubscriptions.values()].filter((row) => row.deviceId === deviceId);
+    if (state.pushTest === "gone") return { sent: 0, results: own.map(() => ({ outcome: "gone", status: 410 })) };
+    if (state.pushTest === "refused") return { sent: 0, results: own.map(() => ({ outcome: "failed", status: 403 })) };
+    return { sent: own.length, results: own.map(() => ({ outcome: "ok", status: 201 })) };
+  },
   "PUT /api/push/prefs/:desktopId": ({ state, params, body }) => {
     const id = params.desktopId ?? "";
     if (!state.desktops.some((desktop) => desktop.id === id)) throw new MockHttpError(404, "not_found", "Desktop not found");

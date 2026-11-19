@@ -48,7 +48,7 @@ export function OfflineBanner() {
   const desktopId = useRouterState({ select: (state) => desktopIdFromPath(state.location.pathname) });
   const connectivity = useDesktopConnectivity(desktopId);
   const showing = connectivity.kind !== "online";
-  const canRetry = desktopId !== null && (connectivity.kind === "reconnecting" || connectivity.kind === "desktop_offline");
+  const canRetry = desktopId !== null && ((connectivity.kind === "desktop_offline" || (connectivity.kind === "reconnecting" && connectivity.connecting !== true)));
   return (
     <div
       role="status"

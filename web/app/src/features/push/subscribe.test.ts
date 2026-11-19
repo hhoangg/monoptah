@@ -155,6 +155,48 @@ describe("mock push routes", () => {
   });
 });
 
+describe("resubscribeIfVapidKeyChanged racing with the user turning push off", () => {
+  it("does not keep a subscription or save state when push is turned off while the browser is subscribing", async () => {
+    let release: (() => void) | undefined;
+    const created = fakeSubscription("https://fcm.googleapis.com/send/late");
+    let current: ReturnType<typeof fakeSubscription> | null = null;
+    const subscribe = vi.fn(
+      () =>
+        new Promise<ReturnType<typeof fakeSubscription>>((resolve) => {
+          release = () => {
+            current = created;
+            resolve(created);
+          };
+        }),
+    );
+    const registration = { pushManager: { getSubscription: () => Promise.resolve(current), subscribe } };
+    Object.defineProperty(navigator, "serviceWorker", { configurable: true, value: { ready: Promise.resolve(registration), getRegistration: () => Promise.resolve(registration) } });
+    vi.stubGlobal("PushManager", class {});
+    vi.stubGlobal("Notification", { permission: "granted" });
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-1", userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
+
+    const running = resubscribeIfVapidKeyChanged("usr-1");
+    await vi.waitFor(() => expect(subscribe).toHaveBeenCalledOnce());
+    // The user turns notifications off while the browser is still creating the subscription.
+    await unsubscribeFromPush();
+    expect(await loadPushState()).toBeNull();
+    release?.();
+    expect(await running).toBe(false);
+    expect(created.unsubscribe, "the late browser subscription is taken back").toHaveBeenCalled();
+    expect(await loadPushState(), "no state is saved against the user's choice").toBeNull();
+  });
+
+  it("does not subscribe at all when push was turned off while the key was being fetched", async () => {
+    const { subscribe } = install(null);
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-1", userId: "usr-1", vapidKeyId: "retired-key" });
+    const running = resubscribeIfVapidKeyChanged("usr-1");
+    await unsubscribeFromPush();
+    expect(await running).toBe(false);
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(await loadPushState()).toBeNull();
+  });
+});
+
 describe("resubscribeIfVapidKeyChanged", () => {
   it("does nothing when this browser never enabled push", async () => {
     const { subscribe } = install(null);
@@ -179,6 +221,25 @@ describe("resubscribeIfVapidKeyChanged", () => {
     expect(stale.unsubscribe).toHaveBeenCalledOnce();
     expect(subscribe).toHaveBeenCalledOnce();
     expect(await loadPushState()).toMatchObject({ deviceId: "dev-1", userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
+  });
+
+  it("subscribes again, without a gesture, when the key is the same but the browser lost its subscription", async () => {
+    const { subscribe } = install(null);
+    const announced = vi.fn();
+    window.addEventListener("monoptah:push-resubscribed", announced);
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-1", userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
+    expect(await resubscribeIfVapidKeyChanged("usr-1")).toBe(true);
+    window.removeEventListener("monoptah:push-resubscribed", announced);
+    expect(announced).toHaveBeenCalledOnce();
+    expect(subscribe).toHaveBeenCalledOnce();
+    expect(await loadPushState()).toMatchObject({ deviceId: "dev-1", userId: "usr-1", vapidKeyId: MOCK_VAPID_KEY_ID });
+  });
+
+  it("does not subscribe again when the permission is not granted", async () => {
+    const { subscribe } = install(null, "default");
+    await savePushState({ deviceId: "dev-1", subscriptionId: "sub-1", userId: "usr-1", vapidKeyId: "retired-key" });
+    expect(await resubscribeIfVapidKeyChanged("usr-1")).toBe(false);
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("treats a state saved without a key id as changed once", async () => {

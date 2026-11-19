@@ -53,4 +53,9 @@ describe("TranscriptOfflineNote (F-42)", () => {
     getLinkStore("dk1").setState({ status: "reconnecting" });
     expect(mount()).toHaveTextContent("Reconnecting to your desktop. Showing the saved conversation.");
   });
+
+  it("says Connecting to your desktop on a cold start (the real screens are covered in offline/coldStart.test.tsx)", () => {
+    getLinkStore("dk1").setState({ status: "connecting" });
+    expect(mount()).toHaveTextContent("Connecting to your desktop. Showing the saved conversation.");
+  });
 });

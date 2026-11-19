@@ -11,6 +11,8 @@ export interface Connectivity {
   label: string | null;
   /** Epoch ms the desktop was last heard from, when `kind` is `desktop_offline`. */
   lastSeenAt: number | null;
+  /** True for a link that is still making its first connection of this page load (`connecting`, `handshaking`) rather than coming back. */
+  connecting?: boolean;
   /** Mutations are refused unless the link is ready (or there is no desktop in play) and the browser is online; never queued (architecture.md 3.6). */
   blocksSending: boolean;
 }
@@ -38,7 +40,7 @@ type LinkSlice = Pick<LinkState, "status" | "presence" | "blocked" | "lastFrameA
  * used when this tab has not heard from the desktop yet (the desktop was offline when the page opened).
  *
  * Sending is blocked in every state but a ready link of an online desktop (architecture.md 3.6: mutations
- * are not queued), including the quiet ones (connecting, handshaking, pending, closed, idle).
+ * are not queued), including the quiet ones (pending, closed, idle). `connecting` and `handshaking` show the small "Connecting..." pill.
  */
 export function describeConnectivity(online: boolean, link: LinkSlice | null, directoryLastSeenAt: number | null = null): Connectivity {
   if (!online) return { kind: "offline", label: "You are offline", lastSeenAt: null, blocksSending: true };
@@ -49,6 +51,9 @@ export function describeConnectivity(online: boolean, link: LinkSlice | null, di
       return { kind: "desktop_offline", label: "Desktop offline", lastSeenAt: link.lastFrameAt ?? directoryLastSeenAt, blocksSending: true };
     }
     if (link.status === "reconnecting") return { kind: "reconnecting", label: "Reconnecting...", lastSeenAt: null, blocksSending: true };
+    // A cold start (iOS killed the page) has the saved data on screen at once: the same small pill as a reconnect,
+    // never a blocking state.
+    if (link.status === "connecting" || link.status === "handshaking") return { kind: "reconnecting", label: "Connecting...", lastSeenAt: null, blocksSending: true, connecting: true };
     if (link.status !== "ready") return { kind: "online", label: null, lastSeenAt: null, blocksSending: true };
   }
   return { kind: "online", label: null, lastSeenAt: null, blocksSending: false };

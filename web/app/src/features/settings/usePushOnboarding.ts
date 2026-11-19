@@ -7,6 +7,7 @@ import { meQuery } from "@/features/accounts/queries";
 import { getSavedPushSubscription, hasBrowserSubscription, isPushSupported, PushUnavailableError, subscribeToPush, unsubscribeFromPush } from "@/features/push";
 import { ensureDevice } from "@/link";
 import { settingsErrorMessage } from "./copy";
+import { PUSH_CHANGED_EVENT, PUSH_RESUBSCRIBED_EVENT } from "@/features/push/subscribe";
 import { useStandalone } from "./standalone";
 
 export type PushOnboardingState =
@@ -31,6 +32,7 @@ export function resetPushRotationCheck(): void {
   rotationChecked = false;
 }
 
+export const LOST_SUBSCRIPTION_NOTICE = "The browser removed this device's notification subscription. Turn notifications on again.";
 export const SIGN_IN_FIRST = "Sign in first, then turn on notifications.";
 
 function hasPushManager(): boolean {
@@ -67,12 +69,17 @@ export function usePushOnboarding() {
           // A subscription saved for another account is not this account's "on" (it is removed when `me` loads).
           const userId = queryClient.getQueryData(meQuery.queryKey)?.user.id ?? null;
           const owned = saved !== null && (userId === null || saved.userId === userId);
-          setSubscribed(owned);
+          // The browser can drop its subscription while the permission stays granted (iOS does). Then the saved state
+          // alone is not "on": the Enable button comes back, with a note.
+          const present = owned && typeof Notification !== "undefined" && Notification.permission === "granted" ? await hasBrowserSubscription() : true;
+          if (!live) return;
+          setSubscribed(owned && present);
+          setNotice((previous) => (owned && !present ? LOST_SUBSCRIPTION_NOTICE : previous === LOST_SUBSCRIPTION_NOTICE ? null : previous));
           // Rotation re-send: only for a signed-in user, for the subscription that user made, with the browser
           // subscription still there. Never silently subscribe again after a removal or a sign-out.
           if (saved && owned && userId !== null && !rotationChecked && typeof Notification !== "undefined" && Notification.permission === "granted") {
             rotationChecked = true;
-            if (await hasBrowserSubscription()) void subscribeToPush(saved.deviceId, userId).catch(() => undefined);
+            if (present) void subscribeToPush(saved.deviceId, userId).catch(() => undefined);
           }
         });
     };
@@ -82,9 +89,11 @@ export function usePushOnboarding() {
       if (document.visibilityState === "visible") refresh();
     };
     document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener(PUSH_RESUBSCRIBED_EVENT, refresh);
     return () => {
       live = false;
       document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener(PUSH_RESUBSCRIBED_EVENT, refresh);
     };
   }, [queryClient]);
 
@@ -115,6 +124,7 @@ export function usePushOnboarding() {
         const { deviceId } = await ensureDevice();
         await subscribeToPush(deviceId, userId);
         setSubscribed(true);
+        window.dispatchEvent(new Event(PUSH_CHANGED_EVENT));
       }
     } catch (caught) {
       setError(describe(caught));
@@ -131,6 +141,7 @@ export function usePushOnboarding() {
     try {
       await unsubscribeFromPush();
       setSubscribed(false);
+      window.dispatchEvent(new Event(PUSH_CHANGED_EVENT));
     } catch (caught) {
       // The browser side and the saved state are gone even when the Worker call failed: this browser is off.
       setSubscribed(false);

@@ -20,8 +20,11 @@ let restore: (() => void) | undefined;
 let requests: Array<{ method: string; url: string; body: unknown }> = [];
 let links: MockDesktopLink[] = [];
 
+let mockState: ReturnType<typeof createMockState>;
+
 function installApi() {
-  const server = createMockServer({ state: createMockState({ signedIn: true }) });
+  mockState = createMockState({ signedIn: true });
+  const server = createMockServer({ state: mockState });
   const transport: ApiTransport = (url, init) => {
     requests.push({ method: init.method ?? "GET", url, body: typeof init.body === "string" ? (JSON.parse(init.body) as unknown) : undefined });
     return server.transport(url, init);
@@ -127,27 +130,37 @@ describe("/d/:desktopId/settings", () => {
 });
 
 describe("notifications", () => {
-  it("shows the switches as not loaded, sends nothing on a flip, and saves all values on an explicit Save", async () => {
+  it("loads the defaults of a desktop that never saved any as real values, and saves a flip at once", async () => {
     const user = userEvent.setup();
     provideMockLink();
     mount(SETTINGS);
     const toggle = await screen.findByRole("switch", { name: "Agent finished" });
-    expect(screen.getByText("Current settings not loaded")).toBeInTheDocument();
-    await user.click(toggle);
-    expect(screen.getByRole("switch", { name: "Agent finished" })).not.toBeChecked();
-    expect(requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(requests.some((request) => request.method === "GET" && request.url === `/api/push/prefs/${DESKTOP}`)).toBe(true);
+    expect(toggle).toBeChecked();
+    expect(screen.queryByText("Current settings not loaded")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save these settings" })).toBeNull();
 
-    await user.click(screen.getByRole("button", { name: "Save these settings" }));
-    await waitFor(() => expect(screen.queryByText("Current settings not loaded")).toBeNull());
+    await user.click(toggle);
+    await waitFor(() => expect(requests.filter((request) => request.method === "PUT")).toHaveLength(1));
     const put = requests.filter((request) => request.method === "PUT");
-    expect(put).toHaveLength(1);
     expect(put[0]?.url).toBe(`/api/push/prefs/${DESKTOP}`);
     expect(put[0]?.body).toEqual({ enabled: true, categories: { agentFinished: false, agentInput: true, monoMessages: true } });
 
-    // Known now: a flip saves at once, from the last saved result.
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Notifications from this desktop" })).toBeEnabled());
     await user.click(screen.getByRole("switch", { name: "Notifications from this desktop" }));
     await waitFor(() => expect(screen.getByRole("switch", { name: "Agent finished" })).toBeDisabled());
     expect(requests.filter((request) => request.method === "PUT")[1]?.body).toEqual({ enabled: false, categories: { agentFinished: false, agentInput: true, monoMessages: true } });
+  });
+
+  it("shows the stored values of a desktop that saved them", async () => {
+    provideMockLink();
+    mockState.prefs.set(DESKTOP, { enabled: true, categories: { agentFinished: false, agentInput: true, monoMessages: false } });
+    mount(SETTINGS);
+    const toggle = await screen.findByRole("switch", { name: "Agent finished" });
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(screen.getByRole("switch", { name: "Messages from Monos" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: "Approvals and questions" })).toBeChecked();
   });
 });
 

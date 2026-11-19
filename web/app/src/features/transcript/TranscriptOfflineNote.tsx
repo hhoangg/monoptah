@@ -11,6 +11,8 @@ const COPY: Record<Exclude<Connectivity["kind"], "online">, string> = {
   reconnecting: "Reconnecting to your desktop. Showing the saved conversation.",
 };
 
+const CONNECTING_COPY = "Connecting to your desktop. Showing the saved conversation.";
+
 /** The pure view, for tests and previews. */
 export function TranscriptOfflineView({ connectivity }: { connectivity: Connectivity }) {
   const kind = connectivity.kind;
@@ -21,7 +23,7 @@ export function TranscriptOfflineView({ connectivity }: { connectivity: Connecti
         <p data-kind={connectivity.kind} className="mx-auto flex w-full max-w-[768px] items-center justify-center gap-2 px-5 py-2 text-center text-small text-muted-text">
           <Icon name={connectivity.kind === "reconnecting" ? "spinner" : "computerOff"} size={16} className="shrink-0" />
           <span>
-            {COPY[kind]}
+            {connectivity.connecting ? CONNECTING_COPY : COPY[kind]}
             {connectivity.lastSeenAt !== null ? ` Last seen ${formatLastSeen(connectivity.lastSeenAt)}.` : ""}
           </span>
         </p>

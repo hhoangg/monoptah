@@ -18,6 +18,12 @@ describe("describeConnectivity", () => {
     expect(describeConnectivity(true, { ...ready, status: "reconnecting" })).toMatchObject({ kind: "reconnecting", label: "Reconnecting...", blocksSending: true });
   });
 
+  it("shows a small Connecting... pill while the first connection of a page load is made, and still blocks sending", () => {
+    for (const status of ["connecting", "handshaking"] as const) {
+      expect(describeConnectivity(true, { ...ready, status, presence: null })).toMatchObject({ kind: "reconnecting", label: "Connecting...", connecting: true, blocksSending: true });
+    }
+  });
+
   it("says Desktop offline with the last seen time when the relay reports the desktop gone", () => {
     expect(describeConnectivity(true, { ...ready, presence: "offline", lastFrameAt: 1000 })).toMatchObject({ kind: "desktop_offline", label: "Desktop offline", lastSeenAt: 1000 });
   });
@@ -34,7 +40,7 @@ describe("describeConnectivity", () => {
   });
 
   it("blocks sending in every link state but ready, without a banner for the quiet ones", () => {
-    for (const status of ["idle", "connecting", "handshaking", "pending", "closed"] as const) {
+    for (const status of ["idle", "pending", "closed"] as const) {
       expect(describeConnectivity(true, { ...ready, status, presence: null })).toMatchObject({ kind: "online", label: null, blocksSending: true });
     }
     expect(describeConnectivity(true, ready).blocksSending).toBe(false);

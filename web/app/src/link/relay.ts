@@ -60,12 +60,15 @@ export class RelayConnection {
   readonly #backlog: Frame[] = [];
   #closed = false;
   #timer: ReturnType<typeof setInterval> | null = null;
+  readonly #probes = new Set<(alive: boolean) => void>();
 
   constructor(socket: RelaySocket, options: RelayConnectionOptions = {}) {
     this.#socket = socket;
     socket.onmessage = (bytes) => this.#onBinary(bytes);
-    // `pong` is the only text the relay sends; it carries no information, and any other text is ignored.
-    socket.ontext = () => undefined;
+    // `pong` is the only text the relay sends. It carries no information, except that the socket is alive (`probe`).
+    socket.ontext = (text) => {
+      if (text === ROOM_QUOTAS.textFramePong) this.#settleProbes(true);
+    };
     socket.onclose = (code, reason) => this.#onClose(code, reason ?? "");
     if (socket.closed) {
       // Already closed before we attached: report it asynchronously like a real socket.
@@ -83,6 +86,33 @@ export class RelayConnection {
   send(frame: { type: Frame["type"]; channel: number; deviceId: string; body?: Uint8Array }): void {
     if (this.#closed) return;
     this.#socket.send(encodeFrame(frame));
+  }
+
+  /**
+   * Liveness check of the socket itself: sends a text `ping` and resolves true on the relay's `pong`, false when
+   * the socket is closed or nothing comes back within `timeoutMs`. A socket the OS killed while the app was
+   * suspended still looks open; this tells it apart in about one round trip.
+   */
+  probe(timeoutMs: number): Promise<boolean> {
+    if (this.#closed || this.#socket.closed) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const done = (alive: boolean) => {
+        clearTimeout(timer);
+        this.#probes.delete(done);
+        resolve(alive);
+      };
+      const timer = setTimeout(() => done(false), timeoutMs);
+      this.#probes.add(done);
+      try {
+        this.#socket.sendText(ROOM_QUOTAS.textFramePing);
+      } catch {
+        done(false);
+      }
+    });
+  }
+
+  #settleProbes(alive: boolean): void {
+    for (const done of [...this.#probes]) done(alive);
   }
 
   /** Closes the socket and stops the keepalive. `onClose` is called once when the socket reports the close. */
@@ -136,6 +166,7 @@ export class RelayConnection {
     if (this.#closed) return;
     this.#closed = true;
     this.#stopTimer();
+    this.#settleProbes(false);
     this.onClose?.(code, reason);
   }
 }
