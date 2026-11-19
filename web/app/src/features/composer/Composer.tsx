@@ -350,7 +350,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   return (
     // The space under the pill is applied once, here: 0.75rem above the on-screen keyboard (lifted by `inset`), and
     // otherwise the home-indicator safe area, never less than 0.75rem (a device without one keeps the small gap).
-    <div data-testid="composer" className={cn("pt-1", inset ? "pb-3" : "pb-[max(env(safe-area-inset-bottom),0.75rem)]", className)} style={inset ? { marginBottom: inset } : undefined}>
+    <div data-testid="composer" className={cn("pt-1", inset ? "pb-3" : "pb-app-inset", className)} style={inset ? { marginBottom: inset } : undefined}>
       <Glass
         className={cn("flex", card ? "flex-col gap-1 px-3 pb-2 pt-3" : "min-h-[50px] flex-row items-center gap-1 px-1.5 py-[3px]")}
         data-shape={card ? "card" : "pill"}

@@ -46,9 +46,13 @@ export interface WorkspaceFrameProps {
   fill?: boolean;
   /** A normal screen of one column: capped at 760 px (design-system 11) instead of the full pane. */
   narrow?: boolean;
+  /** No bottom padding: the screen ends with its own bottom-anchored bar (the project page's now-working pill). */
+  flush?: boolean;
+  /** A one-line title (truncated, full name on hover) instead of wrapping, for headers that also carry a primary action. */
+  compact?: boolean;
 }
 
-export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, testId = "workspace-frame", back, fill = false, narrow = false }: WorkspaceFrameProps) {
+export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, testId = "workspace-frame", back, fill = false, narrow = false, flush = false, compact = false }: WorkspaceFrameProps) {
   useRememberPlace();
   useActivityTracking(desktopId);
   const readOnly = useReadOnly();
@@ -59,8 +63,8 @@ export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, 
 
   return (
     <div className={cn("mx-auto flex w-full", narrow ? "max-w-[760px]" : "max-w-[1280px]", fill ? "h-full min-h-0 flex-1" : "flex-1")} data-testid={testId}>
-      <div className={cn("min-w-0 flex-1 px-4 pt-2 min-[24rem]:px-5", fill ? "flex min-h-0 flex-col pb-2" : "pb-[calc(10rem+env(safe-area-inset-bottom))]")}>
-        <header className="flex shrink-0 items-start gap-3 pb-3">
+      <div className={cn("min-w-0 flex-1 px-4 pt-2 min-[24rem]:px-5", fill ? "flex min-h-0 flex-col pb-2" : flush ? "pb-0" : "pb-[calc(10rem+env(safe-area-inset-bottom))]")}>
+        <header className={cn("flex shrink-0 gap-3 pb-3", compact ? "items-center" : "items-start")}>
           {wide ? null : (
             <DrawerPrimitive.Root direction="left" open={open} onOpenChange={setOpen}>
               <DrawerPrimitive.Trigger asChild>
@@ -93,7 +97,9 @@ export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, 
             </Link>
           ) : null}
           <div className="min-w-0 flex-1">
-            <h1 className="wrap-anywhere text-headline font-semibold">{title}</h1>
+            <h1 className={cn("text-headline font-semibold", compact ? "truncate" : "wrap-anywhere")} title={compact ? title : undefined}>
+              {title}
+            </h1>
             {subtitle ? (
               // A path loses its start, not the folder that tells projects apart: the ellipsis goes on the left.
               <p className="truncate text-left text-small text-muted-text" dir={typeof subtitle === "string" && /^[/~]/.test(subtitle) ? "rtl" : undefined} title={typeof subtitle === "string" ? subtitle : undefined}>

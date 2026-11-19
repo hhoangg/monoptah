@@ -537,7 +537,7 @@ describe("configError", () => {
     expect(pill.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // The bottom space (safe area) is the wrapper's own padding, so nothing renders under the wrapper.
     expect(wrapper.nextElementSibling).toBeNull();
-    expect(wrapper.className).toContain("pb-[max(env(safe-area-inset-bottom),0.75rem)]");
+    expect(wrapper.className).toContain("pb-app-inset");
   });
   it("renders nothing without an error", () => {
     render(<Composer onSubmit={vi.fn()} />);
