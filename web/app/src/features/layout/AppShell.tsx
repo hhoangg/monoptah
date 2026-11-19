@@ -176,7 +176,7 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
             <Splitter label="Resize session list" value={listWidth} min={SESSION_LIST_WIDTH.min} max={listMax} onChange={setListWidth} onCommit={persistListWidth} grow={1} />
           </>
         ) : null}
-        <ChatPane>{children}</ChatPane>
+        <ChatPane desktopId={desktopId}>{children}</ChatPane>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}
       </div>
       {mode === "docked" ? null : <RightPanel mode={mode} desktopId={desktopId} projectId={projectId} />}

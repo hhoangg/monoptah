@@ -13,6 +13,7 @@ import { useRequestControl } from "@/features/composer/useRequestControl";
 import { Composer } from "@/features/composer/Composer";
 import { SessionQuestionCard, SessionUsageCard, useLinkReady } from "@/features/composer/SessionComposer";
 import { useGuardedReplies, useSendGuard } from "@/features/composer/useSendGuard";
+import { PaneHeading } from "@/features/layout/tabs/PaneContext";
 import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
@@ -128,7 +129,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
         </Link>
         <MonoMascot monoId={monoId} mascot={mono?.mascot} color={mono?.color} working={working} size={32} />
         <div className="min-w-0 flex-1">
-          <h1 className="truncate text-h font-semibold">{name}</h1>
+          <PaneHeading className="truncate text-h font-semibold">{name}</PaneHeading>
           {working ? <p className="truncate text-meta text-muted-text">Working</p> : null}
         </div>
         <div className="flex shrink-0 items-center gap-2">

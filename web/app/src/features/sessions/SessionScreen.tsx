@@ -19,6 +19,7 @@ import { Glass } from "@/ui/Glass";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { ComposerRegion } from "./ComposerRegion";
+import { PaneHeading } from "@/features/layout/tabs/PaneContext";
 import { useRememberPlace } from "./lastPlace";
 import { SessionHeaderMenu } from "./SessionHeaderMenu";
 import { SessionHeaderChipSlot } from "./slots";
@@ -88,7 +89,7 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
         >
           <Icon name="chevronDown" size={20} className="rotate-90" />
         </Link>
-        <h1 className="min-w-0 flex-1 truncate text-h font-semibold">{title}</h1>
+        <PaneHeading className="min-w-0 flex-1 truncate text-h font-semibold">{title}</PaneHeading>
         <div className="flex shrink-0 items-center gap-2">
           {readOnly ? (
             <Glass className="flex min-h-9 items-center rounded-pill px-3">

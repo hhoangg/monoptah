@@ -36,6 +36,8 @@ import {
   Layers01Icon,
   LaptopIcon,
   LayoutAlignRightIcon,
+  LayoutTwoColumnIcon,
+  LayoutTwoRowIcon,
   LeftToRightListBulletIcon,
   Link01Icon,
   LinkSquare01Icon,
@@ -148,6 +150,8 @@ export const ICONS = {
   laptop: LaptopIcon,
   success: CheckmarkCircle02Icon,
   account: UserCircleIcon,
+  splitRight: LayoutTwoColumnIcon,
+  splitDown: LayoutTwoRowIcon,
 } as const satisfies Record<string, IconSvgElement>;
 
 export type IconName = keyof typeof ICONS;

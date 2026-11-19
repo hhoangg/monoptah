@@ -29,6 +29,7 @@ import { clearPanels, closePanel, openPanel, registerPanel, usePanels } from "./
 import { clearCreateMonoRequest } from "@/features/monos/createRequest";
 import { closeBackgroundDialog } from "./projectTools";
 import { clearShortcuts, isMod, registerShortcut } from "./shortcuts";
+import { resetTabsStore } from "./tabs/tabsStore";
 
 const mediaListeners = new Set<() => void>();
 let viewportWidth = 1280;
@@ -89,6 +90,7 @@ beforeEach(() => {
 let previous: PersistAdapter;
 beforeEach(() => {
   localStorage.clear();
+  resetTabsStore();
   reloadLayoutPrefs();
   previous = registerPersistAdapter(new MemoryPersistAdapter());
   registerSlot("app-shell", AppShell);
@@ -911,7 +913,8 @@ describe("project tools (project bar and palette)", () => {
     const pane = view.container.querySelector("[data-testid='app-shell'] > .\\@container");
     expect(pane).not.toBeNull();
     expect(pane!.querySelector('[data-testid="project-bar"]')).toBeNull();
-    expect(pane!.firstElementChild).toHaveAttribute("data-testid", "route-stub");
+    // The tab strip is the one new element above the screen (an intended part of the chat pane); the screen is first in the pane body.
+    expect(within(pane as HTMLElement).getByTestId("pane-body").firstElementChild).toHaveAttribute("data-testid", "route-stub");
   });
 
   it("keeps the tools in the sidebar rail as icon buttons when it is collapsed", async () => {
