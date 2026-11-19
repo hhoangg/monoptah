@@ -97,12 +97,8 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
         offline={!ready}
         notice={notice ?? null}
         toolbar={toolbar}
+        configError={configError}
       />
-      {configError ? (
-        <p role="alert" className="-mt-2 px-4 pb-2 text-meta text-deletions">
-          {configError}
-        </p>
-      ) : null}
       {guard.dialog}
     </>
   );

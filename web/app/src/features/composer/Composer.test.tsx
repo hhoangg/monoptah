@@ -435,3 +435,22 @@ describe("dictation (F-49)", () => {
     expect(screen.getByRole("button", { name: "Dictation" })).toBeDisabled();
   });
 });
+
+describe("configError", () => {
+  it("renders inside the padded composer wrapper, after the pill, so the safe area stays below it", () => {
+    render(<Composer onSubmit={vi.fn()} configError="Could not load the models" />);
+    const wrapper = screen.getByTestId("composer");
+    const error = screen.getByTestId("composer-config-error");
+    expect(error).toHaveTextContent("Could not load the models");
+    expect(error.parentElement).toBe(wrapper);
+    const pill = wrapper.querySelector("[data-shape]")!;
+    expect(pill.compareDocumentPosition(error) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // The bottom space (safe area) is the wrapper's own padding, so nothing renders under the wrapper.
+    expect(wrapper.nextElementSibling).toBeNull();
+    expect(wrapper.className).toContain("pb-[max(env(safe-area-inset-bottom),0.75rem)]");
+  });
+  it("renders nothing without an error", () => {
+    render(<Composer onSubmit={vi.fn()} />);
+    expect(screen.queryByTestId("composer-config-error")).toBeNull();
+  });
+});

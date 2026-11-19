@@ -4,7 +4,6 @@
 // host (the approval card and the cloud banners of WS-C, W-08), `above` (for example the question card),
 // then `children`. With nothing passed it is an empty strip, so the transcript fills the screen.
 import type { ReactNode } from "react";
-import { useKeyboardInset } from "@/features/composer/useKeyboardInset";
 import { ComposerTopSlot } from "./slots";
 
 export interface ComposerRegionProps {
@@ -17,10 +16,9 @@ export interface ComposerRegionProps {
 }
 
 export function ComposerRegion({ desktopId, sessionId, above, children }: ComposerRegionProps) {
-  // The safe-area inset is the home-indicator gap; while the keyboard is up the composer sits on the keyboard, not on that gap.
-  const keyboardInset = useKeyboardInset();
+  // The space under the composer (the home-indicator safe area, or the keyboard lift) belongs to the composer itself.
   return (
-    <div data-testid="composer-region" className={`mx-auto w-full max-w-[768px] shrink-0 px-2 min-[24rem]:px-5 ${keyboardInset > 0 ? "" : "pb-[env(safe-area-inset-bottom)]"}`}>
+    <div data-testid="composer-region" className="mx-auto w-full max-w-[768px] shrink-0 px-2 min-[24rem]:px-5">
       <ComposerTopSlot desktopId={desktopId} sessionId={sessionId} />
       {above}
       {children}

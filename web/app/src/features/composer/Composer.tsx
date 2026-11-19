@@ -83,6 +83,8 @@ export interface ComposerProps {
   toolbar?: ReactNode;
   /** Above the field, inside the card (the workspace menu). */
   topRow?: ReactNode;
+  /** A setup error under the pill (a model control failed); inside the padded wrapper, so the safe area stays below it. */
+  configError?: string | null;
   autoFocus?: boolean;
   /** The draft to start from (a page that was unmounted and comes back), and a report of every change to it. */
   initialText?: string;
@@ -111,7 +113,7 @@ function isKeyboardFocus(target: EventTarget): boolean {
   }
 }
 
-export function Composer({ onSubmit, busy = false, onStop, readOnly = false, requestControl, offline = false, notice, toolbar, topRow, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
+export function Composer({ onSubmit, busy = false, onStop, readOnly = false, requestControl, offline = false, notice, toolbar, topRow, configError, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
   const [text, setText] = useState(initialText);
   useEffect(() => {
     onTextChange?.(text);
@@ -317,7 +319,9 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   const describedBy = [readOnly ? reasonId : null, error ? errorId : null].filter(Boolean).join(" ") || undefined;
 
   return (
-    <div data-testid="composer" className={cn("pb-3 pt-1", className)} style={inset ? { marginBottom: inset } : undefined}>
+    // The space under the pill is applied once, here: 0.75rem above the on-screen keyboard (lifted by `inset`), and
+    // otherwise the home-indicator safe area, never less than 0.75rem (a device without one keeps the small gap).
+    <div data-testid="composer" className={cn("pt-1", inset ? "pb-3" : "pb-[max(env(safe-area-inset-bottom),0.75rem)]", className)} style={inset ? { marginBottom: inset } : undefined}>
       <Glass
         className={cn("flex", card ? "flex-col gap-1 px-3 pb-2 pt-3" : "min-h-[50px] flex-row items-center gap-1 px-1.5 py-[3px]")}
         data-shape={card ? "card" : "pill"}
@@ -458,6 +462,11 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           ) : null}
         </div>
       </Glass>
+      {configError ? (
+        <p role="alert" data-testid="composer-config-error" className="px-4 pt-1 text-meta text-deletions">
+          {configError}
+        </p>
+      ) : null}
       {readOnly ? (
         <p id={reasonId} className="px-4 pt-2 text-meta text-muted-text">
           {READ_ONLY_REASON}
