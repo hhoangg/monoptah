@@ -129,6 +129,11 @@ impl Shell {
                 }
             });
         }
+        if archived {
+            // Archive ends the session's agent processes and their helpers,
+            // including a warm idle one, so its worktree can be cleaned up.
+            monocode_core::provider::retire_session(id);
+        }
         self.refresh_session_mark(id, cx);
         if archived && self.workspace.tab_of(id).is_some() {
             self.close_pane(id, window, cx);

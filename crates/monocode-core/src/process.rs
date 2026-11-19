@@ -166,8 +166,14 @@ pub struct Agent {
     /// Birth stamp at spawn; a reused PID no longer matches it.
     pub identity: Option<String>,
 }
-fn active() -> &'static Mutex<HashMap<u32, Option<Agent>>> {
-    static ACTIVE: OnceLock<Mutex<HashMap<u32, Option<Agent>>>> = OnceLock::new();
+/// A registered child. `session` survives going idle so an app session can
+/// still find the warm process it owns; `agent` is only set while it works.
+struct Slot {
+    session: Option<i64>,
+    agent: Option<Agent>,
+}
+fn active() -> &'static Mutex<HashMap<u32, Slot>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<u32, Slot>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 thread_local! {
@@ -190,8 +196,7 @@ pub fn agents() -> Vec<Agent> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
-        .flatten()
-        .cloned()
+        .filter_map(|slot| slot.agent.clone())
         .collect()
 }
 pub(crate) fn owner() -> Option<i64> {
@@ -200,15 +205,18 @@ pub(crate) fn owner() -> Option<i64> {
 pub(crate) fn mark_idle(pid: u32, idle: bool) {
     let mut processes = active().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = processes.get_mut(&pid) {
-        *slot = if idle {
-            None
+        if idle {
+            slot.agent = None;
         } else {
-            OWNER.get().map(|session| Agent {
+            if let Some(session) = OWNER.get() {
+                slot.session = Some(session);
+            }
+            slot.agent = slot.session.map(|session| Agent {
                 session,
                 pid,
                 identity: crate::resources::identity(pid),
-            })
-        };
+            });
+        }
     }
 }
 /// Keeps a pid in the registry `shutdown_all` reaps; unregisters on drop.
@@ -224,10 +232,13 @@ pub(crate) fn register(pid: u32) -> Registration {
         pid,
         identity: crate::resources::identity(pid),
     });
-    active()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(pid, agent);
+    active().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        pid,
+        Slot {
+            session: OWNER.get(),
+            agent,
+        },
+    );
     Registration(pid)
 }
 impl Drop for Registration {
@@ -238,12 +249,143 @@ impl Drop for Registration {
             .remove(&self.0);
     }
 }
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// True once `shutdown_all` ran: nothing may park a process for reuse after it.
+pub(crate) fn quitting() -> bool {
+    QUITTING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn epochs() -> &'static Mutex<HashMap<i64, u64>> {
+    static EPOCHS: OnceLock<Mutex<HashMap<i64, u64>>> = OnceLock::new();
+    EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Generation of an app session's process lifecycle. A process records it when
+/// it starts or is taken for a turn and may be parked for reuse only while it
+/// is unchanged; [`crate::provider::retire_session`] bumps it.
+pub(crate) fn session_epoch(session: Option<i64>) -> u64 {
+    session.map_or(0, |session| {
+        epochs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session)
+            .copied()
+            .unwrap_or(0)
+    })
+}
+thread_local! {
+    static TURN_EPOCH: Cell<Option<u64>> = const { Cell::new(None) };
+}
+/// Ends the turn scope opened by [`begin_turn`].
+pub(crate) struct TurnScope(Option<u64>);
+impl Drop for TurnScope {
+    fn drop(&mut self) {
+        TURN_EPOCH.set(self.0);
+    }
+}
+/// Record the owner's epoch at the very start of a turn, before anything is
+/// spawned, so a spawn that began before an archive can never be parked.
+pub(crate) fn begin_turn() -> TurnScope {
+    TurnScope(TURN_EPOCH.replace(Some(session_epoch(OWNER.get()))))
+}
+/// The epoch a process started or taken by this turn is recorded with.
+pub(crate) fn turn_epoch() -> u64 {
+    TURN_EPOCH
+        .get()
+        .unwrap_or_else(|| session_epoch(OWNER.get()))
+}
+/// True while a process recorded at `epoch` for the current owner may be parked.
+pub(crate) fn may_park(epoch: u64) -> bool {
+    !quitting() && session_epoch(OWNER.get()) == epoch
+}
+
+/// Pids still registered to `session` (running or warm).
+pub(crate) fn session_pids(session: i64) -> Vec<u32> {
+    active()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, slot)| slot.session == Some(session))
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+fn is_registered(pid: u32) -> bool {
+    active()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&pid)
+}
+
+/// Invalidate every process of `session` for parking. Call before sweeping the
+/// pools.
+pub(crate) fn bump_epoch(session: i64) {
+    *epochs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(session)
+        .or_insert(0) += 1;
+}
+
+/// Terminate the `snapshot` pids (taken from `session_pids` right after
+/// `bump_epoch`, so a later turn's process is never in it) on a background
+/// thread, after the pool sweeps.
+/// `already_retiring` are pids whose owner (a dropped pool entry) retires them.
+///
+/// Unix: SIGTERM to the leader, a short grace, then SIGKILL to the whole
+/// process group (MCP helpers such as `visual-mcp` share it). Only pids still
+/// in the registry are signalled (our own children, not yet released by their
+/// owner); a tiny window between reaping and unregistering remains. Windows:
+/// `taskkill /T /F` kills the tree. Elsewhere: no-op.
+pub(crate) fn retire_session_processes(snapshot: Vec<u32>, already_retiring: Vec<u32>) {
+    let pids: Vec<u32> = snapshot
+        .into_iter()
+        .filter(|pid| !already_retiring.contains(pid))
+        .collect();
+    if pids.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        #[cfg(unix)]
+        {
+            for pid in &pids {
+                if is_registered(*pid) {
+                    unsafe { libc::kill(*pid as i32, libc::SIGTERM) };
+                }
+            }
+            let deadline = std::time::Instant::now() + TERM_GRACE;
+            while pids.iter().any(|pid| is_registered(*pid)) && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // The leader may be gone while helpers live on: its owner clears
+            // the group when it reaps it, so only still-registered groups are hit.
+            for pid in &pids {
+                if is_registered(*pid) {
+                    unsafe { libc::kill(-(*pid as i32), libc::SIGKILL) };
+                }
+            }
+        }
+        #[cfg(windows)]
+        for pid in &pids {
+            if is_registered(*pid) {
+                let mut c = Command::new("taskkill");
+                c.args(["/PID", &pid.to_string(), "/T", "/F"]);
+                use std::os::windows::process::CommandExt;
+                c.creation_flags(CREATE_NO_WINDOW);
+                let _ = c.status();
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = pids;
+    });
+}
+
 /// Explicit native-app quit hook. Run off the UI thread and wait briefly for the
 /// workers to reap their children, rather than leaving isolated provider groups.
 ///
 /// Leaders get SIGTERM first so a CLI that is saving a rotated OAuth token
 /// (Claude Code) can finish; only what is still running after that is killed.
 pub fn shutdown_all() {
+    QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
     let registered = || -> Vec<u32> {
         active()
             .lock()

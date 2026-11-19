@@ -1212,6 +1212,8 @@ impl Monos {
                     }
                     if action == "sessions.stop" {
                         view.update(cx, |v, cx| v.stop_if_busy(cx));
+                        // An API stop ends the agent's whole process tree, like the app API.
+                        monocode_core::provider::retire_session(session);
                     } else {
                         let delete = action == "sessions.delete";
                         let owner = self.owner.clone();

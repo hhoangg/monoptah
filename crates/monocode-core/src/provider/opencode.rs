@@ -29,11 +29,23 @@ impl Drop for StreamStop {
 struct Server {
     child: std::process::Child,
     url: String,
+    /// `process::session_epoch` when the turn took this server; see `park`.
+    epoch: u64,
+    /// Set when its session is retired: stop it with SIGTERM and a grace
+    /// period instead of an immediate group kill (unix).
+    graceful: bool,
     _registration: process::Registration,
     _account: crate::accounts::Tracked,
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.graceful {
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
+            // Waits for exit, escalates to SIGTERM again then a group SIGKILL.
+            process::retire_pid(self.child.id(), || {});
+            return;
+        }
         process::terminate(&mut self.child);
     }
 }
@@ -79,6 +91,26 @@ pub(super) fn retire_idle(pids: &std::collections::HashSet<u32>) {
     };
     drop(retired);
 }
+/// Remove the idle servers owned by `session`; returns their pids.
+pub(super) fn retire_session(session: i64) -> Vec<u32> {
+    let mut retired: Vec<Idle> = {
+        let mut pool = idle().lock().unwrap_or_else(|e| e.into_inner());
+        let (gone, kept) = std::mem::take(&mut *pool)
+            .into_iter()
+            .partition(|entry| entry.owner == Some(session));
+        *pool = kept;
+        gone
+    };
+    for entry in &mut retired {
+        entry.server.graceful = true;
+    }
+    let pids = retired.iter().map(|e| e.server.child.id()).collect();
+    if !retired.is_empty() {
+        // `Server::drop` waits for the child, so never on the caller's thread.
+        thread::spawn(move || drop(retired));
+    }
+    pids
+}
 pub(super) fn discard_worktree(cwd: &Path) {
     let retired = {
         let mut pool = idle().lock().unwrap_or_else(|e| e.into_inner());
@@ -119,12 +151,16 @@ pub(super) fn forget_session(provider_id: &str, account_id: &str, cwd: &Path) {
     drop(retired);
 }
 fn park(server: Server, request: &Request, session: String) {
-    if IDLE_LIMIT.load(Ordering::Relaxed) == 0 {
+    if IDLE_LIMIT.load(Ordering::Relaxed) == 0 || !process::may_park(server.epoch) {
         return;
     }
     process::mark_idle(server.child.id(), true);
     {
         let mut pool = idle().lock().unwrap_or_else(|e| e.into_inner());
+        // Checked under the pool lock so `retire_session` cannot miss it.
+        if !process::may_park(server.epoch) {
+            return;
+        }
         pool.push(Idle {
             server,
             session,
@@ -296,7 +332,11 @@ fn connect(
                 .map(|index| pool.remove(index))
         };
         if let Some(mut found) = found {
-            if found.at.elapsed() < Duration::from_secs(3 * 60)
+            if found.server.epoch != process::turn_epoch() {
+                // Parked before its session was retired: never reuse it.
+                found.server.graceful = true;
+                thread::spawn(move || drop(found));
+            } else if found.at.elapsed() < Duration::from_secs(3 * 60)
                 && matches!(found.server.child.try_wait(), Ok(None))
             {
                 process::mark_idle(found.server.child.id(), false);
@@ -341,6 +381,8 @@ fn connect(
     let mut server = Server {
         child,
         url: String::new(),
+        epoch: process::turn_epoch(),
+        graceful: false,
         _registration: registration,
         _account: account,
     };
