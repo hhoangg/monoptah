@@ -1322,7 +1322,15 @@ mod seam {
             body,
             port,
         };
-        let (status, text) = handler(&request);
+        // Handlers are plain blocking code (some wait on the test thread), so
+        // they run off the runtime's workers: blocking a worker would stall the
+        // timers that `wait_for` and the other connections rely on.
+        let (status, text, request) = tokio::task::spawn_blocking(move || {
+            let (status, text) = handler(&request);
+            (status, text, request)
+        })
+        .await
+        .unwrap();
         log.lock().unwrap().push(request);
         let extra = if status == 429 {
             "Retry-After: 2\r\n"
