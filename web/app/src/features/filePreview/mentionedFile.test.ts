@@ -234,12 +234,28 @@ describe("messages", () => {
 
   it("maps each desktop code to its message", () => {
     expect(previewProblem({ code: "path_denied" }).title).toBe("This file is hidden by Monoptah");
-    expect(previewProblem({ code: "forbidden" }).title).toBe("This file is not mentioned in this conversation");
+    expect(previewProblem({ code: "forbidden" })).toMatchObject({ kind: "not_mentioned", title: "This file is outside this conversation" });
     expect(previewProblem({ code: "too_large" }).title).toBe("This file is too large to preview");
     expect(previewProblem({ code: "not_found" }).title).toBe("This file could not be found");
     expect(previewProblem({ code: "busy" })).toMatchObject({ kind: "busy", retry: true });
     expect(previewProblem({ code: "not_selected" }).title).toBe("Not on this device's projects");
     expect(previewProblem(new PreviewLimitError())).toMatchObject({ kind: "too_large", retry: false });
     expect(previewProblem(new Error("x"))).toMatchObject({ kind: "failed", retry: true });
+  });
+
+  it("tells an old desktop's refusal from a real one: forbidden without mentionedFiles2 means update", () => {
+    const update = { kind: "update_desktop", title: "Update Monoptah on your desktop", retry: false };
+    // A desktop that does not advertise `mentionedFiles2` refuses a file made by a command with the same `forbidden`.
+    expect(previewProblem({ code: "forbidden" }, { desktopCurrent: false })).toMatchObject(update);
+    expect(previewProblem({ code: "forbidden" }, { desktopCurrent: true })).toMatchObject({ kind: "not_mentioned" });
+    // A desktop that does not know the method at all.
+    expect(previewProblem({ code: "unsupported" })).toMatchObject(update);
+    // The other reasons never turn into an update notice.
+    for (const code of ["path_denied", "not_found", "too_large"]) {
+      expect(previewProblem({ code }, { desktopCurrent: false }).kind).not.toBe("update_desktop");
+    }
+    // A blocked file is never described as unmentioned or missing: the three short reasons stay apart.
+    expect(previewProblem({ code: "not_found" }).title).toBe("This file could not be found");
+    expect(previewProblem({ code: "path_denied" }).kind).toBe("denied");
   });
 });

@@ -102,7 +102,7 @@ describe("state message", () => {
     state: "confirmed",
     permission: "control",
     proto: 1,
-    capabilities: ["approvals", "cloud", "cloudStart", "cloudMove", "gitPush", "monoTools", "monoFiles", "mentionedFiles"],
+    capabilities: ["approvals", "cloud", "cloudStart", "cloudMove", "gitPush", "monoTools", "monoFiles", "mentionedFiles", "mentionedFiles2"],
     desktop: { name: "Studio Mac", version: "1.4.0" },
   };
   it("parses a confirmed message", () => {

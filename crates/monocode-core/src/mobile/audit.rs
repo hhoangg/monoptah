@@ -169,7 +169,10 @@ pub struct FileRead<'a> {
 
 /// A `chat.mentionedFile` call to record: the conversation, the canonical path
 /// served (or the requested one when refused), the asset asked for, the bytes
-/// of the reply and how it ended.
+/// of the reply, how it ended and, for a refusal, which rule refused it
+/// (`not_mentioned`, `not_exact`, `no_evidence`, `deny_list`, ...: see
+/// `mentioned_file::rule`). The rule is for this log only; the device gets the
+/// short code of the failure.
 #[derive(Clone, Copy)]
 pub struct MentionedFile<'a> {
     pub fingerprint: &'a str,
@@ -177,6 +180,7 @@ pub struct MentionedFile<'a> {
     pub path: &'a str,
     pub asset: Option<&'a str>,
     pub bytes: u64,
+    pub rule: Option<&'a str>,
     pub command_id: Option<&'a str>,
     pub transport: Transport,
     pub outcome: Outcome,
@@ -355,6 +359,7 @@ impl Log {
             path,
             asset,
             bytes,
+            rule,
             command_id,
             transport,
             outcome,
@@ -373,6 +378,7 @@ impl Log {
             "path": capped(path, PATH_CHARS),
             "asset": asset.map(|asset| capped(asset, PATH_CHARS)),
             "bytes": bytes,
+            "rule": rule.map(|rule| capped(rule, ID_CHARS)),
         }));
     }
 
@@ -730,6 +736,7 @@ mod tests {
                     path: "/work/report.html",
                     asset: Some("img/a.png"),
                     bytes,
+                    rule: (bytes == 0).then_some("deny_list"),
                     command_id: Some("c9"),
                     transport: Transport::Web,
                     outcome,
@@ -746,6 +753,8 @@ mod tests {
         assert_eq!(all[0]["asset"], "img/a.png");
         assert_eq!(all[0]["transport"], "web");
         assert_eq!(all[1]["outcome"], "denied:path_denied");
+        assert_eq!(all[0]["rule"], Value::Null);
+        assert_eq!(all[1]["rule"], "deny_list");
     }
 
     #[test]

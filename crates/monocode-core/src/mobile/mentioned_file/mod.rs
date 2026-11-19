@@ -11,13 +11,35 @@
 //!    exists. It is then exact: the requested path and a mention must resolve (as the desktop's
 //!    click resolves them, `files::links::resolve_link`) to the same canonical file, so a
 //!    relative mention authorizes one file, not that name under every root.
-//! 2. **Tool evidence outside the device's projects.** A file outside every project the device
-//!    selected also needs a TOOL row of the conversation naming it (see [`evidence`]): an
-//!    assistant message alone can be provoked by a control device ("reply with `~/x`"). A tool
-//!    row cannot be written by a device.
+//! 2. **Evidence outside the device's projects.** A file outside every project the device
+//!    selected also needs one of these (see [`evidence`]), because an assistant message alone can
+//!    be provoked by a control device ("reply with `~/x`"):
+//!    1. a COMPLETED file tool (Read, Write, Edit, patch) of the conversation named it through a
+//!       structured path parameter;
+//!    2. a COMPLETED shell call (its command line or output) or a COMPLETED subagent call (its
+//!       output) names it. No other tool counts, nor a call that did not complete. This is
+//!       what lets a report a script wrote be opened;
+//!    3. the file was changed after the conversation started (its inode change time, or its
+//!       modification time off unix; a modification time in the future never counts) and lies
+//!       inside the session's own folder: its live Monoptah worktree, else its working folder.
+//!       Only for a session, never for a Mono (its start can be months old). That folder is no
+//!       tree when it is the home folder, a filesystem root or an ancestor of the home folder,
+//!       when it lies in (or is a worktree of) a known project the device did not select, or when
+//!       the home folder is unknown. A file inside a known project the device did not select is
+//!       never fresh, whatever folder the session runs in. A plain working folder that is no
+//!       project (`~/Downloads`) does count. The start is [`Context::started`] (the session's
+//!       creation time), else the earliest plausible send time of the history.
+//!
+//!    Loose evidence comes from shell command lines and outputs and from subagent outputs only
+//!    (see [`evidence`]). A control device can ask the agent to run a shell command that names a
+//!    path (in auto or bypass mode no approval is asked) and shell output can carry injected
+//!    text; and the freshness rule covers anything any process changed in the session's own
+//!    folder since the session began. That residual is accepted: the deny-list (rule 3) and the protected folders
+//!    are the last defence, see security.md section 7.
+//!
 //! 3. **Deny-list** (H-04) on the written path and on the canonical target (symlinks resolved),
 //!    case-insensitively, on every component of the absolute path, with the owning project's own
-//!    patterns when the file lies in a project; plus the app's data folders and the credential
+//!    patterns when the file lies in a project or in the session's worktree of one; plus the app's data folders and the credential
 //!    folders under the home folder, and a hard link to a credential file.
 //! 4. **No directories**, and nothing that is not a regular file. The file is opened without
 //!    following a link and without blocking, and the opened handle must be the checked file.
@@ -26,9 +48,11 @@
 //!    one file at most [`MENTIONED_FILE_MAX_BYTES`], one HTML transform at a time per device.
 //! 6. **Assets** (images an HTML or markdown file shows) are reached only when that file
 //!    references them, relative to its folder, never through `..`, an absolute path, a scheme, a
-//!    backslash or a symlink out of that folder, and only as images.
+//!    backslash or a symlink out of that folder, and only as images. The file itself qualified
+//!    under rules 1 to 5 by whichever evidence; its assets need nothing more.
 //!
-//! The caller audits (rule 5 of the contract) with [`Call`], which carries what the line needs.
+//! The caller audits (rule 5 of the contract) with [`Call`], which carries what the line needs,
+//! including which rule refused ([`rule`]).
 pub mod budget;
 pub mod cost;
 pub mod evidence;
@@ -174,6 +198,14 @@ impl Project {
     }
 }
 
+/// The session's worktree: a folder made by the app for a session of `project`.
+#[derive(Clone, Copy, Debug)]
+pub struct Worktree<'a> {
+    pub path: &'a str,
+    /// The project folder the worktree belongs to (the session's own folder).
+    pub project: &'a str,
+}
+
 /// What the call is judged against.
 pub struct Context<'a> {
     /// The text of every ASSISTANT message of the conversation, older pages included. Ignored
@@ -185,8 +217,19 @@ pub struct Context<'a> {
     pub tool_texts: &'a [String],
     /// Evidence already extracted (and perhaps cached) by the caller, instead of the texts.
     pub evidence: Option<&'a Evidence>,
-    /// The session's working folder (empty for a Mono that has not talked yet).
+    /// The folder a relative mention is resolved against first, as the desktop's click binds
+    /// it: the first local project of a Mono that has some, else the session's folder (its
+    /// worktree when it has one). Empty for a Mono that has not talked yet. For a session it is
+    /// also the tree of the freshness rule (see [`fresh_tree`]).
     pub cwd: &'a str,
+    /// The session's Monoptah worktree of one of [`Context::projects`], when it has a live one.
+    pub worktree: Option<Worktree<'a>>,
+    /// The conversation is a Mono's: the freshness rule never applies to it.
+    pub mono: bool,
+    /// When the conversation began (the session's creation time), for the freshness rule. When
+    /// `None`, the earliest plausible send time of the evidence is used (none: the rule never
+    /// applies).
+    pub started: Option<SystemTime>,
     /// A Mono's local project folders, for a relative mention.
     pub roots: &'a [String],
     pub projects: &'a [Project],
@@ -210,6 +253,9 @@ impl<'a> Context<'a> {
             tool_texts: &[],
             evidence: None,
             cwd,
+            worktree: None,
+            mono: false,
+            started: None,
             roots,
             projects,
             home: default_home(),
@@ -217,6 +263,32 @@ impl<'a> Context<'a> {
             page_bytes: MENTIONED_FILE_PAGE_BYTES,
             max_bytes: MENTIONED_FILE_MAX_BYTES,
         }
+    }
+
+    /// When the conversation began, as far as known.
+    fn started_at(&self, evidence: &Evidence) -> Option<SystemTime> {
+        self.started.or_else(|| {
+            evidence
+                .started_ms
+                .filter(|ms| *ms >= evidence::MIN_PLAUSIBLE_MS)
+                .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
+        })
+    }
+
+    /// The session's worktree (canonical) and the known project that owns it. A worktree whose
+    /// project the desktop does not know is none.
+    fn worktree_owner(&self) -> Option<(PathBuf, &Project)> {
+        let tree = self.worktree?;
+        let path = Path::new(tree.path);
+        if !path.is_absolute() || is_remote(path) {
+            return None;
+        }
+        let real = path.canonicalize().ok()?;
+        let owner = Path::new(tree.project)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(tree.project));
+        let project = self.projects.iter().find(|p| p.canonical == owner)?;
+        Some((real, project))
     }
 
     fn evidence(&self) -> Cow<'_, Evidence> {
@@ -303,9 +375,62 @@ impl Reply {
     }
 }
 
+/// Which rule refused a call, for the audit line only (the device gets the short code of the
+/// failure, never this: it must not tell what exists).
+pub mod rule {
+    pub const BAD_REQUEST: &str = "bad_request";
+    pub const BUDGET: &str = "budget";
+    pub const NOT_MENTIONED: &str = "not_mentioned";
+    pub const NOT_EXACT: &str = "not_exact";
+    pub const NO_EVIDENCE: &str = "no_evidence";
+    pub const DENY_LIST: &str = "deny_list";
+    pub const PROTECTED_DIR: &str = "protected_dir";
+    pub const HARD_LINK: &str = "hard_link";
+    pub const NOT_REGULAR: &str = "not_regular";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const TOO_LARGE: &str = "too_large";
+    pub const BUSY: &str = "busy";
+    pub const ASSET: &str = "asset";
+    pub const FAILED: &str = "failed";
+}
+
+/// A refused call: the failure the device gets and the rule behind it, for the audit.
+#[derive(Debug)]
+pub struct Refusal {
+    pub failure: Failure,
+    pub rule: &'static str,
+}
+
+impl Refusal {
+    fn new(failure: Failure, rule: &'static str) -> Self {
+        Self { failure, rule }
+    }
+
+    /// A refusal from a later stage, named by its code.
+    fn of_code(failure: Failure) -> Self {
+        let rule = match super::policy::code_of_failure(&failure) {
+            Some(Code::NotFound) => rule::NOT_FOUND,
+            Some(Code::TooLarge) => rule::TOO_LARGE,
+            Some(Code::PathDenied) => rule::DENY_LIST,
+            Some(Code::Busy) => rule::BUSY,
+            Some(Code::Forbidden) => rule::ASSET,
+            _ => rule::FAILED,
+        };
+        Self { failure, rule }
+    }
+}
+
+impl From<Failure> for Refusal {
+    fn from(failure: Failure) -> Self {
+        Self::of_code(failure)
+    }
+}
+
 /// One call, answered: the result and what its audit line needs.
 pub struct Call {
     pub result: Result<Value, Failure>,
+    /// The rule that refused the call, when it was refused.
+    pub rule: Option<&'static str>,
     /// The canonical path served, or the path as requested when refused.
     pub path: String,
     pub asset: Option<String>,
@@ -323,9 +448,10 @@ impl Call {
     }
 
     /// A refusal of the call described by `params`, with nothing served.
-    pub fn refused(params: &Value, failure: Failure) -> Self {
+    pub fn refused(params: &Value, failure: Failure, rule: &'static str) -> Self {
         Self {
             result: Err(failure),
+            rule: Some(rule),
             path: params["path"].as_str().unwrap_or_default().to_owned(),
             asset: params["asset"].as_str().map(str::to_owned),
             bytes: 0,
@@ -338,7 +464,7 @@ impl Call {
 /// a device over budget) and calls [`handle_admitted`].
 pub fn handle(device: &str, params: &Value, ctx: &Context) -> Call {
     if let Err(code) = budget::admit(device) {
-        return Call::refused(params, code.failure());
+        return Call::refused(params, code.failure(), rule::BUDGET);
     }
     handle_admitted(device, params, ctx)
 }
@@ -348,19 +474,20 @@ pub fn handle_admitted(device: &str, params: &Value, ctx: &Context) -> Call {
     let asset = params["asset"].as_str().map(str::to_owned);
     let parsed = match Params::from_json(params) {
         Ok(parsed) => parsed,
-        Err(failure) => return Call::refused(params, failure),
+        Err(failure) => return Call::refused(params, failure, rule::BAD_REQUEST),
     };
-    match serve_as(device, &parsed, ctx) {
+    match serve_ruled(device, &parsed, ctx) {
         Ok(reply) => {
             budget::served(device, reply.served);
             Call {
                 path: reply.path.clone(),
                 asset,
                 bytes: reply.served,
+                rule: None,
                 result: Ok(reply.to_json()),
             }
         }
-        Err(failure) => Call::refused(params, failure),
+        Err(refusal) => Call::refused(params, refusal.failure, refusal.rule),
     }
 }
 
@@ -448,12 +575,21 @@ impl Guard {
                 protect(&dir);
             }
         }
+        let mut projects: Vec<(PathBuf, PathBuf, DenyList)> = ctx
+            .projects
+            .iter()
+            .map(|p| (p.root.clone(), p.canonical.clone(), p.deny.clone()))
+            .collect();
+        // The session's worktree is judged with its project's own patterns.
+        if let Some((real, owner)) = ctx.worktree_owner() {
+            projects.push((
+                PathBuf::from(ctx.worktree.map_or("", |w| w.path)),
+                real,
+                owner.deny.clone(),
+            ));
+        }
         Self {
-            projects: ctx
-                .projects
-                .iter()
-                .map(|p| (p.root.clone(), p.canonical.clone(), p.deny.clone()))
-                .collect(),
+            projects,
             default: DenyList::default(),
             protected,
             home: ctx.home.clone(),
@@ -470,13 +606,19 @@ impl Guard {
 
     /// Whether `path` (absolute, written or canonical) may not be served.
     fn denied(&self, path: &Path) -> bool {
+        self.denial(path).is_some()
+    }
+
+    /// Which list refuses `path` (absolute, written or canonical), if any.
+    fn denial(&self, path: &Path) -> Option<&'static str> {
         if self.list_for(path).is_denied_rel(&lossy(path)) {
-            return true;
+            return Some(rule::DENY_LIST);
         }
         let parts = lower_components(path);
         self.protected
             .iter()
             .any(|prefix| parts.starts_with(prefix))
+            .then_some(rule::PROTECTED_DIR)
     }
 
     /// Whether a file with several names is one of the credential files (the same inode as a
@@ -568,7 +710,7 @@ fn tool_evidence(ctx: &Context, evidence: &Evidence, canonical: &Path, written: 
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase());
     let mut disk_checks = 0;
-    for token in &evidence.tool {
+    for token in evidence.tool_tokens() {
         for candidate in link_candidates(token, ctx.cwd, ctx.roots) {
             if !candidate.is_absolute() || is_remote(&candidate) {
                 continue;
@@ -600,24 +742,117 @@ fn in_selected_project(ctx: &Context, canonical: &Path) -> bool {
         .any(|p| p.selected && canonical.starts_with(&p.canonical))
 }
 
+/// Whether `tree` (canonical) may be a tree of the freshness rule: not a filesystem root, and
+/// neither the home folder nor an ancestor of it (those hold everything the user has).
+fn usable_tree(tree: &Path, home: &Path) -> bool {
+    let real_home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    tree.parent().is_some() && !home.starts_with(tree) && !real_home.starts_with(tree)
+}
+
+/// The one folder the freshness rule trusts: the session's own (its live worktree, else its
+/// working folder), for a session and never for a Mono, when it is local, exists, is no
+/// filesystem root and neither the home folder nor an ancestor of it, and does not lie in (nor
+/// is a worktree of) a known project the device did not select. None at all when the home
+/// folder is unknown. A project the device selected needs no freshness: rule 2 passes there.
+fn fresh_tree(ctx: &Context) -> Option<PathBuf> {
+    let home = ctx.home.as_ref()?;
+    if ctx.mono {
+        return None;
+    }
+    let tree = if ctx.worktree.is_some() {
+        // A worktree is trusted only through its known project.
+        let (worktree, owner) = ctx.worktree_owner()?;
+        owner.selected.then_some(worktree)?
+    } else {
+        let cwd = Path::new(ctx.cwd);
+        if ctx.cwd.is_empty() || !cwd.is_absolute() || is_remote(cwd) {
+            return None;
+        }
+        cwd.canonicalize().ok()?
+    };
+    if !usable_tree(&tree, home) {
+        return None;
+    }
+    // A plain folder inside a project is that project's: it must be the device's.
+    let owner = ctx
+        .projects
+        .iter()
+        .filter(|p| tree.starts_with(&p.canonical))
+        .max_by_key(|p| p.canonical.as_os_str().len());
+    if owner.is_some_and(|p| !p.selected) {
+        return None;
+    }
+    Some(tree)
+}
+
+/// How far ahead of now a modification time may be before it is a forgery, not a clock skew.
+const FUTURE_SLACK: Duration = Duration::from_secs(60);
+
+/// Whether the file's metadata says it changed at or after `started`. On unix the inode change
+/// time decides (a process cannot set it, unlike the modification time, which a command can
+/// backdate or push forward); elsewhere the modification time. A modification time ahead of now
+/// never counts.
+fn changed_since(meta: &Metadata, started: SystemTime) -> bool {
+    let now = SystemTime::now();
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    if modified > now + FUTURE_SLACK {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(secs) = u64::try_from(meta.ctime()) else {
+            return false;
+        };
+        let changed = SystemTime::UNIX_EPOCH + Duration::new(secs, meta.ctime_nsec() as u32);
+        changed >= started
+    }
+    #[cfg(not(unix))]
+    {
+        modified >= started
+    }
+}
+
+/// Rule 2.3: the file changed after the conversation started, lies inside [`fresh_tree`], and
+/// in no known project the device did not select (the folder may be an ancestor of one).
+fn fresh_in_tree(ctx: &Context, evidence: &Evidence, canonical: &Path) -> bool {
+    let Some(started) = ctx.started_at(evidence) else {
+        return false;
+    };
+    let Some(tree) = fresh_tree(ctx) else {
+        return false;
+    };
+    canonical.starts_with(&tree)
+        && !ctx
+            .projects
+            .iter()
+            .any(|p| !p.selected && canonical.starts_with(&p.canonical))
+        && canonical
+            .metadata()
+            .is_ok_and(|meta| changed_since(&meta, started))
+}
+
 /// Rules 1 to 3 for a requested path: the canonical file it names, when an assistant message
-/// mentions exactly that file (and, outside the device's projects, a tool row names it too) and
-/// the deny-list lets it through.
+/// mentions exactly that file (and, outside the device's projects, a tool row names it too or it
+/// is fresh in the session's folder) and the deny-list lets it through.
 fn authorize(
     ctx: &Context,
     guard: &Guard,
     evidence: &Evidence,
     requested: &str,
-) -> Result<PathBuf, Failure> {
+) -> Result<PathBuf, Refusal> {
     // 1. The lexical mention check, before the disk is touched.
     let hits = lexical_hits(ctx, evidence, requested);
     if hits.is_empty() {
-        return Err(forbidden());
+        return Err(Refusal::new(forbidden(), rule::NOT_MENTIONED));
     }
     // 3. The written path against the deny-list, still without the disk.
-    let written = literal(ctx, requested).ok_or_else(forbidden)?;
-    if guard.denied(&written) {
-        return Err(denied());
+    let written =
+        literal(ctx, requested).ok_or_else(|| Refusal::new(forbidden(), rule::NOT_MENTIONED))?;
+    if let Some(by) = guard.denial(&written) {
+        return Err(Refusal::new(denied(), by));
     }
     // The file the desktop's click would open, with symlinks resolved. A path that does not
     // exist is `not_found` only when the single mentioned file it names is itself missing and
@@ -625,9 +860,9 @@ fn authorize(
     // not authorized, so the answer never tells whether an unauthorized name exists.
     let Ok(canonical) = written.canonicalize() else {
         return Err(if missing_but_authorized(ctx, evidence, &written, &hits) {
-            not_found()
+            Refusal::new(not_found(), rule::NOT_FOUND)
         } else {
-            forbidden()
+            Refusal::new(forbidden(), rule::NOT_EXACT)
         });
     };
     // 1. Exactly one of the mentioned files: a different spelling of the same name under
@@ -637,16 +872,18 @@ fn authorize(
             .is_some_and(|path| path.canonicalize().is_ok_and(|real| real == canonical))
     });
     if !exact {
-        return Err(forbidden());
+        return Err(Refusal::new(forbidden(), rule::NOT_EXACT));
     }
-    // 2. Outside the device's projects the agent must also have run a tool on it.
-    if !in_selected_project(ctx, &canonical) && !tool_evidence(ctx, evidence, &canonical, &written)
+    // 2. Outside the device's projects the conversation must also show the file was worked on.
+    if !in_selected_project(ctx, &canonical)
+        && !tool_evidence(ctx, evidence, &canonical, &written)
+        && !fresh_in_tree(ctx, evidence, &canonical)
     {
-        return Err(forbidden());
+        return Err(Refusal::new(forbidden(), rule::NO_EVIDENCE));
     }
     // 3. Authorized: now the deny-list on what the link really leads to.
-    if guard.denied(&canonical) {
-        return Err(denied());
+    if let Some(by) = guard.denial(&canonical) {
+        return Err(Refusal::new(denied(), by));
     }
     if let Some(project) = ctx
         .projects
@@ -656,7 +893,16 @@ fn authorize(
         project
             .deny
             .check(&project.canonical, &canonical)
-            .map_err(|_| denied())?;
+            .map_err(|_| Refusal::new(denied(), rule::DENY_LIST))?;
+    }
+    // A file of the session's worktree answers to its project's patterns too.
+    if let Some((worktree, owner)) = ctx.worktree_owner() {
+        if canonical.starts_with(&worktree) {
+            owner
+                .deny
+                .check(&worktree, &canonical)
+                .map_err(|_| Refusal::new(denied(), rule::DENY_LIST))?;
+        }
     }
     Ok(canonical)
 }
@@ -683,7 +929,7 @@ fn missing_but_authorized(
 /// Whether some tool token spells `written` (compared lexically).
 fn tool_names_missing(ctx: &Context, evidence: &Evidence, written: &Path) -> bool {
     let wanted = path_key(&lossy(written));
-    evidence.tool.iter().any(|token| {
+    evidence.tool_tokens().any(|token| {
         link_candidates(token, ctx.cwd, ctx.roots)
             .into_iter()
             .any(|path| path_key(&lossy(&path)) == wanted)
@@ -706,8 +952,10 @@ fn inside_by_ancestor(ctx: &Context, written: &Path) -> bool {
 
 /// Whether the evidence gathered so far is enough to decide the call, so a long history need not
 /// be read further: an assistant message mentions the requested path (lexically) and either the
-/// path lies in a project the device selected or a tool row names it. A call that stays
-/// undecided is decided by the whole history. Nothing here touches the disk.
+/// path lies in a project the device selected, or a tool row names it, or it changed since the
+/// conversation started inside the session's own folder. A call that stays undecided is decided
+/// by the whole history. Like the call itself it looks at the disk, for the requested file only
+/// (its canonical path and its times), and only once a mention names it.
 pub fn sufficient(ctx: &Context, params: &Params) -> bool {
     Sufficiency::new(ctx, params).check(ctx, &ctx.evidence())
 }
@@ -722,6 +970,7 @@ pub struct Sufficiency {
     wanted: HashSet<String>,
     assistant_seen: usize,
     tool_seen: usize,
+    loose_seen: usize,
     mentioned: bool,
     tooled: bool,
     /// The requested path as written and what it canonicalizes to (`None` when missing), worked
@@ -743,6 +992,7 @@ impl Sufficiency {
                 .collect(),
             assistant_seen: 0,
             tool_seen: 0,
+            loose_seen: 0,
             mentioned: false,
             tooled: false,
             target: None,
@@ -784,7 +1034,9 @@ impl Sufficiency {
             return false;
         }
         let inside = match &self.target {
-            Some(Some((_, Some(real)))) => in_selected_project(ctx, real),
+            Some(Some((_, Some(real)))) => {
+                in_selected_project(ctx, real) || fresh_in_tree(ctx, evidence, real)
+            }
             Some(Some((written, None))) => inside_by_ancestor(ctx, written),
             _ => false,
         };
@@ -793,8 +1045,10 @@ impl Sufficiency {
         }
         if !self.tooled {
             let from = self.tool_seen.min(evidence.tool.len());
+            let from_loose = self.loose_seen.min(evidence.loose.len());
             let named = evidence.tool[from..]
                 .iter()
+                .chain(&evidence.loose[from_loose..])
                 .any(|text| names_it(&self.wanted, text));
             if named {
                 // A lexical hit is final only when the real rule agrees.
@@ -807,6 +1061,7 @@ impl Sufficiency {
             }
         }
         self.tool_seen = evidence.tool.len();
+        self.loose_seen = evidence.loose.len();
         self.tooled
     }
 }
@@ -859,6 +1114,11 @@ fn open_plain(path: &Path) -> std::io::Result<File> {
 /// Answers one call for `device`. See the module docs for the rules, in the order they are
 /// applied.
 pub fn serve_as(device: &str, params: &Params, ctx: &Context) -> Result<Reply, Failure> {
+    serve_ruled(device, params, ctx).map_err(|refusal| refusal.failure)
+}
+
+/// [`serve_as`], with the rule that refused a refused call, for the audit line.
+pub fn serve_ruled(device: &str, params: &Params, ctx: &Context) -> Result<Reply, Refusal> {
     let guard = Guard::new(ctx);
     let evidence = ctx.evidence();
     let canonical = authorize(ctx, &guard, &evidence, &params.path)?;
@@ -869,14 +1129,26 @@ pub fn serve_as(device: &str, params: &Params, ctx: &Context) -> Result<Reply, F
         page: ctx.page_bytes.max(MIN_PAGE_BYTES),
     };
     // 4. Never a directory, nor a device or pipe; opened without blocking and without links.
-    let (mut file, metadata) = open_regular(&canonical)?;
+    let (mut file, metadata) = open_regular(&canonical).map_err(not_regular_or_found)?;
     if guard.hard_link_denied(&metadata, in_selected_project(ctx, &canonical)) {
-        return Err(denied());
+        return Err(Refusal::new(denied(), rule::HARD_LINK));
     }
     match &params.asset {
-        None => serve_file(&env, &mut file, &canonical, &metadata, params),
+        None => {
+            serve_file(&env, &mut file, &canonical, &metadata, params).map_err(Refusal::of_code)
+        }
         Some(asset) => serve_asset(&env, &mut file, &canonical, &metadata, asset, params),
     }
+}
+
+/// The refusal of [`open_regular`]: a missing file, or one that is not a regular file.
+fn not_regular_or_found(failure: Failure) -> Refusal {
+    let rule = if super::policy::code_of_failure(&failure) == Some(Code::NotFound) {
+        rule::NOT_FOUND
+    } else {
+        rule::NOT_REGULAR
+    };
+    Refusal::new(failure, rule)
 }
 
 fn file_name(path: &Path) -> String {
@@ -1447,44 +1719,44 @@ fn serve_asset(
     parent_meta: &Metadata,
     asset: &str,
     params: &Params,
-) -> Result<Reply, Failure> {
+) -> Result<Reply, Refusal> {
     let (ctx, guard) = (env.ctx, env.guard);
     // Only a page that shows images has assets.
     if !matches!(
         kind_by_extension(&file_name(parent)),
         Some(Kind::Html | Kind::Markdown)
     ) {
-        return Err(forbidden());
+        return Err(forbidden().into());
     }
     let lower = asset.to_ascii_lowercase();
     if ["%2e", "%2f", "%5c", "%00"]
         .iter()
         .any(|bad| lower.contains(bad))
     {
-        return Err(forbidden());
+        return Err(forbidden().into());
     }
     let relative = html::normalize_asset(asset).ok_or_else(forbidden)?;
     // The file must reference it: otherwise the folder's images could be probed one by one.
     // Decided from the mentioned file alone, before the asset's path is looked at.
     let referenced = references(env, parent_file, parent, parent_meta)?;
     if !referenced.assets.contains(&relative) {
-        return Err(forbidden());
+        return Err(forbidden().into());
     }
     let folder = parent.parent().ok_or_else(forbidden)?;
     let joined = folder.join(&relative);
-    if guard.denied(&joined) {
-        return Err(denied());
+    if let Some(by) = guard.denial(&joined) {
+        return Err(Refusal::new(denied(), by));
     }
     let canonical = joined.canonicalize().map_err(|_| not_found())?;
     if !canonical.starts_with(folder) {
-        return Err(forbidden());
+        return Err(forbidden().into());
     }
-    if guard.denied(&canonical) {
-        return Err(denied());
+    if let Some(by) = guard.denial(&canonical) {
+        return Err(Refusal::new(denied(), by));
     }
-    let (mut file, metadata) = open_regular(&canonical)?;
+    let (mut file, metadata) = open_regular(&canonical).map_err(not_regular_or_found)?;
     if guard.hard_link_denied(&metadata, in_selected_project(ctx, &canonical)) {
-        return Err(denied());
+        return Err(Refusal::new(denied(), rule::HARD_LINK));
     }
     let name = file_name(&canonical);
     // The extension of the canonical target decides, so a link named `a.png` cannot serve a
@@ -1493,7 +1765,7 @@ fn serve_asset(
         .and_then(|e| mime_of(&e))
         .ok_or_else(forbidden)?;
     if metadata.len() > ctx.max_bytes {
-        return Err(Code::TooLarge.failure());
+        return Err(Code::TooLarge.failure().into());
     }
     let mut reply = Reply {
         path: lossy(&canonical),

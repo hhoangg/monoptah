@@ -879,14 +879,17 @@ mod tests {
             msgs[0]["capabilities"].clone()
         };
         policy::set_flags(policy::PolicyFlags::default());
-        assert_eq!(capabilities(&mut h()), json!(["cloud", "mentionedFiles"]));
+        assert_eq!(
+            capabilities(&mut h()),
+            json!(["cloud", "mentionedFiles", "mentionedFiles2"])
+        );
         policy::set_flags(policy::PolicyFlags {
             remote_cloud_start: true,
             ..Default::default()
         });
         assert_eq!(
             capabilities(&mut h()),
-            json!(["cloud", "cloudStart", "mentionedFiles"])
+            json!(["cloud", "cloudStart", "mentionedFiles", "mentionedFiles2"])
         );
         policy::set_flags(before);
     }
@@ -906,7 +909,7 @@ mod tests {
         policy::set_flags(PolicyFlags::default());
         assert_eq!(
             h.table.state_message(&mode)["capabilities"],
-            json!(["cloud", "mentionedFiles"])
+            json!(["cloud", "mentionedFiles", "mentionedFiles2"])
         );
         policy::set_flags(PolicyFlags {
             remote_approvals: true,
@@ -914,7 +917,7 @@ mod tests {
         });
         assert_eq!(
             h.table.state_message(&mode)["capabilities"],
-            json!(["cloud", "approvals", "mentionedFiles"])
+            json!(["cloud", "approvals", "mentionedFiles", "mentionedFiles2"])
         );
         policy::set_flags(before);
     }
@@ -935,7 +938,7 @@ mod tests {
                 "state": "confirmed",
                 "permission": "read",
                 "proto": 1,
-                "capabilities": ["cloud", "mentionedFiles"],
+                "capabilities": ["cloud", "mentionedFiles", "mentionedFiles2"],
                 "desktop": {"name": "Test Desktop", "version": "1.2.3"},
             })]
         );
@@ -967,12 +970,12 @@ mod tests {
         let pending = Mode::Pending { since: 0 };
         assert_eq!(
             h.table.state_message_with(&pending, &flags)["capabilities"],
-            json!(["cloud", "gitPush", "mentionedFiles"])
+            json!(["cloud", "gitPush", "mentionedFiles", "mentionedFiles2"])
         );
         assert_eq!(
             h.table
                 .state_message_with(&pending, &PolicyFlags::default())["capabilities"],
-            json!(["cloud", "mentionedFiles"])
+            json!(["cloud", "mentionedFiles", "mentionedFiles2"])
         );
     }
 

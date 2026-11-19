@@ -6,12 +6,28 @@
 //!   user message never counts, a control device can type any path into one.
 //! * **Tool paths**: the STRUCTURED path parameters of the TOOL rows of tools that operate on
 //!   files that COMPLETED (`file_path`, `path`, `notebook_path`, `filename`, `output_path`, `paths[]`, the
-//!   headers of a patch). Outputs, free-text command lines and question tools never count: a
-//!   control device can make a shell command echo a path or type one as the answer to a
-//!   question. A file outside every project the device selected needs both kinds (see
-//!   [`super::serve`]), so asking the assistant to "reply with `~/x`" does not make `~/x`
-//!   readable. Residual: an agent prompted (or prompt-injected) into reading or writing a file
-//!   with a file tool makes that file readable.
+//!   headers of a patch).
+//! * **Loose tool paths**: path-like words in the COMPLETED calls of two families of tools only
+//!   (an allow-list, [`ToolFamily`]). A SHELL tool (Bash, Codex `commandExecution`, ...): its
+//!   command line and its output. A SUBAGENT tool (Task, Agent, Codex collab calls): its OUTPUT
+//!   only (its prompt is text the parent agent wrote from what a device said). A report written
+//!   by a script never goes through a file tool, but the command that wrote it, or the output
+//!   that announced it, names it. Every other tool (todo lists, web fetch, MCP tools, a file
+//!   tool's description or output, question tools) gives nothing: their text is typed by a
+//!   device or comes from a third party. A call that did not complete never counts. Scanning is
+//!   bounded per row ([`MAX_LOOSE_SCAN_BYTES`], [`MAX_ROW_ENTRIES`]) and per conversation
+//!   ([`MAX_ENTRIES`]); when the conversation cap is reached the NEWER rows win (rows are read
+//!   newest first, see [`Evidence::absorb_rows`]), so an old huge `find` cannot hide a later
+//!   report.
+//!
+//! A file outside every project the device selected needs a mention and one of the tool kinds
+//! (or the freshness rule, see [`super::serve`]). Residual: an agent prompted into running a
+//! shell command that names a file (a control device can ask for it; in auto or bypass mode no
+//! approval is asked), or whose output carries injected text (`cat` of an untrusted file), makes
+//! that file readable; the deny-list and the protected folders are the last defence.
+//!
+//! The earliest plausible send time of the rows seen is kept too ([`Evidence::started_ms`]), the
+//! fallback start of the conversation for the freshness rule.
 //!
 //! Extraction is the expensive part of a call on a long conversation, so [`Evidence`] is built
 //! once and kept for a short time per conversation ([`cached`] and [`remember`]).
@@ -27,19 +43,34 @@ use super::mentions::{self, extract_mentions};
 use crate::transcript::Row;
 
 /// Mentions or tool paths kept at most, so one huge conversation cannot grow the set unbounded.
+#[cfg(not(test))]
 const MAX_ENTRIES: usize = 100_000;
+#[cfg(test)]
+const MAX_ENTRIES: usize = 200;
+/// Loose tokens kept from one tool row, a tenth of the conversation's, so one row cannot fill it.
+const MAX_ROW_ENTRIES: usize = MAX_ENTRIES / 10;
+/// Send times before this (2020-01-01 UTC, in milliseconds) are not real: they are ignored.
+pub const MIN_PLAUSIBLE_MS: u64 = 1_577_836_800_000;
 /// Longest token kept, in characters.
 const MAX_TOKEN_CHARS: usize = 1024;
+/// Bytes of one tool call's input, and of its output, searched for loose paths.
+pub const MAX_LOOSE_SCAN_BYTES: usize = 256 * 1024;
 
 /// The file mentions of assistant messages and the path tokens of tool rows.
 #[derive(Clone, Debug, Default)]
 pub struct Evidence {
     /// Mentions as written, in order of discovery, without duplicates.
     pub assistant: Vec<String>,
-    /// Path-like tokens of tool rows, without duplicates.
+    /// Path-like tokens of the structured file parameters of tool rows, without duplicates.
     pub tool: Vec<String>,
+    /// Path-like words of the input and output of completed tool calls, without duplicates.
+    pub loose: Vec<String>,
+    /// The earliest send time (Unix milliseconds) of any row absorbed: when the conversation
+    /// began, as far as the history read tells.
+    pub started_ms: Option<u64>,
     seen_assistant: HashSet<String>,
     seen_tool: HashSet<String>,
+    seen_loose: HashSet<String>,
 }
 
 impl Evidence {
@@ -64,14 +95,47 @@ impl Evidence {
 
     /// Adds what `rows` say. Only an `assistant` row makes mentions and only a `tool` row makes
     /// tool paths; every other role (a user message, a Mono system prompt) is ignored.
+    ///
+    /// A message the transcript cut into several rows (a continuation row has `first == false`)
+    /// is read whole, so a table or a link is not torn apart at a row boundary. `rows` run oldest
+    /// to newest; the messages are read newest first, and a caller with several pages reads the
+    /// newest page first, so the entry cap drops the oldest evidence, not the newest.
     pub fn absorb_rows<'a>(&mut self, rows: impl IntoIterator<Item = &'a Row>) {
+        let mut messages: Vec<(&str, String)> = Vec::new();
         for row in rows {
-            match row.role.as_str() {
-                "assistant" if !row.text.is_empty() => self.add_assistant(&row.text),
-                "tool" if !row.text.is_empty() => self.add_tool(&row.text),
-                _ => {}
+            if let Some(at) = row.sent_at {
+                self.note_started(at);
+            }
+            match messages.last_mut() {
+                Some((role, text)) if !row.first && *role == row.role => text.push_str(&row.text),
+                _ => messages.push((row.role.as_str(), row.text.clone())),
             }
         }
+        for (role, text) in messages.iter().rev() {
+            self.add_message(role, text);
+        }
+    }
+
+    fn add_message(&mut self, role: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match role {
+            "assistant" => self.add_assistant(text),
+            "tool" => self.add_tool(text),
+            _ => {}
+        }
+    }
+
+    /// Records a send time: the earliest one seen is when the conversation began.
+    pub fn note_started(&mut self, sent_at_ms: u64) {
+        if sent_at_ms < MIN_PLAUSIBLE_MS {
+            return;
+        }
+        self.started_ms = Some(
+            self.started_ms
+                .map_or(sent_at_ms, |known| known.min(sent_at_ms)),
+        );
     }
 
     fn add_assistant(&mut self, text: &str) {
@@ -83,12 +147,217 @@ impl Evidence {
     }
 
     fn add_tool(&mut self, row_text: &str) {
-        for token in tool_paths(row_text) {
+        let Some(call) = completed_call(row_text) else {
+            return;
+        };
+        for token in tool_paths_of(&call) {
             if self.tool.len() < MAX_ENTRIES && self.seen_tool.insert(token.clone()) {
                 self.tool.push(token);
             }
         }
+        for token in loose_paths_of(&call) {
+            if self.loose.len() < MAX_ENTRIES && self.seen_loose.insert(token.clone()) {
+                self.loose.push(token);
+            }
+        }
     }
+
+    /// Every tool token, structured first: what a tool row of the conversation names.
+    pub fn tool_tokens(&self) -> impl Iterator<Item = &String> {
+        self.tool.iter().chain(self.loose.iter())
+    }
+}
+
+/// The tool call a row holds, when it COMPLETED. A call the user denied, that failed, was
+/// cancelled or still runs did not touch anything, and a row that is not a tool call is no
+/// evidence. The whole row is parsed: a cut would lose the `file_path` of a big Write that is
+/// stored before its content.
+fn completed_call(row_text: &str) -> Option<crate::tool::ToolCall> {
+    let call = serde_json::from_str::<crate::tool::ToolCall>(row_text).ok()?;
+    (call.state == crate::tool::ToolState::Completed).then_some(call)
+}
+
+/// The families of tools whose calls give loose evidence (an allow-list: any other tool, a
+/// question tool included, gives none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolFamily {
+    /// Runs a command: the command line and the output are scanned.
+    Shell,
+    /// Runs a subagent: only the output is scanned.
+    Subagent,
+}
+
+/// The family of the tool `name`, by the names the providers use: Claude (`Bash`, `Task`,
+/// `Agent`), Codex (`commandExecution`, `exec_command`, `local_shell`, `collabAgentToolCall`),
+/// OpenCode and editors (`bash`, `shell`, `run_terminal_cmd`, `execute`, `terminal`) and the
+/// Mono import of a `kind: execute` call (`Bash`).
+fn tool_family(name: &str) -> Option<ToolFamily> {
+    const SHELL: &[&str] = &[
+        "bash",
+        "bashoutput",
+        "shell",
+        "local_shell",
+        "shell_command",
+        "exec_command",
+        "commandexecution",
+        "run_terminal_cmd",
+        "run_shell_command",
+        "execute",
+        "execute_bash",
+        "terminal",
+    ];
+    const SUBAGENT: &[&str] = &[
+        "task",
+        "agent",
+        "subagent",
+        "subagentactivity",
+        "collabagenttoolcall",
+        "spawn_agent",
+        "delegate_task",
+    ];
+    let name = name.to_ascii_lowercase();
+    if SHELL.contains(&name.as_str()) {
+        Some(ToolFamily::Shell)
+    } else if SUBAGENT.contains(&name.as_str()) {
+        Some(ToolFamily::Subagent)
+    } else {
+        None
+    }
+}
+
+/// Input fields that hold the command line of a shell tool.
+const COMMAND_KEYS: &[&str] = &["command", "cmd", "script", "commands"];
+
+/// The path-like words of a completed shell or subagent call (see the module docs). Any other
+/// tool, a call that did not complete and a row that is not a tool call give nothing.
+#[cfg(test)]
+pub fn loose_paths(row_text: &str) -> Vec<String> {
+    completed_call(row_text).map_or_else(Vec::new, |call| loose_paths_of(&call))
+}
+
+fn loose_paths_of(call: &crate::tool::ToolCall) -> Vec<String> {
+    // ACP providers (Gemini, Cursor, ...) put a prose title in the name; the semantic kind of
+    // the call says it runs a command.
+    let acp_shell = call
+        .display
+        .as_ref()
+        .and_then(|display| display["kind"].as_str())
+        .is_some_and(|kind| matches!(kind, "execute" | "shell" | "bash"));
+    let Some(family) = tool_family(&call.name).or(acp_shell.then_some(ToolFamily::Shell)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if family == ToolFamily::Shell {
+        let mut budget = MAX_LOOSE_SCAN_BYTES;
+        match serde_json::from_str::<Value>(&call.input) {
+            Ok(Value::Object(map)) => {
+                for key in COMMAND_KEYS {
+                    if let Some(value) = map.get(*key) {
+                        scan_command(value, &mut budget, &mut out, &mut seen);
+                    }
+                }
+            }
+            // A bare command line, or a JSON string or argv array.
+            Ok(value @ (Value::String(_) | Value::Array(_))) => {
+                scan_command(&value, &mut budget, &mut out, &mut seen);
+            }
+            _ => scan_text(&call.input, &mut budget, &mut out, &mut seen),
+        }
+    }
+    let mut budget = MAX_LOOSE_SCAN_BYTES;
+    scan_text(&call.output, &mut budget, &mut out, &mut seen);
+    out
+}
+
+/// A command given as a string or as an argv array of strings.
+fn scan_command(
+    value: &Value,
+    budget: &mut usize,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        Value::String(text) => scan_text(text, budget, out, seen),
+        Value::Array(items) => {
+            for item in items {
+                if let Value::String(text) = item {
+                    scan_text(text, budget, out, seen);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Characters that end a path-like word in a command line or an output.
+fn is_separator(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\''
+                | '`'
+                | '='
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | ','
+                | ';'
+                | '|'
+                | '&'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+        )
+}
+
+fn scan_text(text: &str, budget: &mut usize, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    let mut end = text.len().min(*budget);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    *budget -= end;
+    for word in text[..end].split(is_separator) {
+        if out.len() >= MAX_ROW_ENTRIES {
+            return;
+        }
+        if let Some(token) = loose_token(word) {
+            if seen.insert(token.clone()) {
+                out.push(token);
+            }
+        }
+    }
+}
+
+/// A word that looks like a file path: a `/`, or a file extension, or a well-known bare name.
+/// `$HOME/x` reads as `~/x`. Loose on purpose: a token is only ever compared with the file
+/// that was requested.
+fn loose_token(word: &str) -> Option<String> {
+    let word = word.trim();
+    if word.is_empty()
+        || word.starts_with('-')
+        || (word.contains("://") && !word.starts_with("file://"))
+    {
+        return None;
+    }
+    let word = ["${HOME}/", "$HOME/"]
+        .iter()
+        .find_map(|prefix| word.strip_prefix(prefix).map(|rest| format!("~/{rest}")))
+        .unwrap_or_else(|| word.to_owned());
+    let token = mentions::clean_path(&word)?;
+    if token.chars().count() > MAX_TOKEN_CHARS {
+        return None;
+    }
+    let name = token.rsplit('/').next().unwrap_or(&token);
+    let has_extension = name.rsplit_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty()
+            && extension.len() <= 12
+            && extension.starts_with(|c: char| c.is_ascii_alphabetic())
+            && extension.chars().all(|c| c.is_ascii_alphanumeric())
+    });
+    (token.contains('/') || has_extension || mentions::is_known_name(name)).then_some(token)
 }
 
 /// The file paths one tool row names through STRUCTURED parameters: the `file_path`, `path`,
@@ -98,13 +367,11 @@ impl Evidence {
 /// device can make the agent echo or be answered with any text, but it cannot choose which
 /// parameter of a file tool the agent fills in. A row that is not a tool call gives nothing.
 pub fn tool_paths(row_text: &str) -> Vec<String> {
-    // The whole row is parsed: a cut would lose the `file_path` of a big Write that is stored
-    // before its content.
-    let Ok(call) = serde_json::from_str::<crate::tool::ToolCall>(row_text) else {
-        return Vec::new();
-    };
-    // A call the user denied, that failed, was cancelled or still runs did not touch the file.
-    if call.state != crate::tool::ToolState::Completed || !is_file_tool(&call.name) {
+    completed_call(row_text).map_or_else(Vec::new, |call| tool_paths_of(&call))
+}
+
+fn tool_paths_of(call: &crate::tool::ToolCall) -> Vec<String> {
+    if !is_file_tool(&call.name) {
         return Vec::new();
     }
     let patch_tool = call.name.to_ascii_lowercase().contains("patch");
@@ -295,7 +562,8 @@ mod tests {
             tool_row("Write", r#"{"file_path":"/tmp/out/c.md"}"#, ""),
             row("assistant", "also /tmp/out/c.md"),
         ]);
-        assert_eq!(evidence.assistant, ["a.md", "/tmp/out/c.md"]);
+        // Messages are read newest first.
+        assert_eq!(evidence.assistant, ["/tmp/out/c.md", "a.md"]);
         assert_eq!(evidence.tool, ["/tmp/out/c.md"]);
     }
 
@@ -338,30 +606,202 @@ mod tests {
     }
 
     #[test]
-    fn command_lines_outputs_and_other_free_text_do_not_count() {
+    fn shell_command_lines_and_outputs_and_subagent_outputs_are_loose_evidence() {
         let evidence = Evidence::from_rows(&[
             tool_row(
                 "Bash",
-                r#"{"command":"echo ~/x/c.html && cat docs/a.md"}"#,
+                r#"{"command":"echo ~/x/c.html && cat docs/a.md > $HOME/out/b.html"}"#,
                 "",
             ),
             tool_row(
                 "Bash",
                 "{}",
-                "wrote /tmp/shot.png (12 KB)\nsee notes.md:12\nupdated Makefile and LICENSE\n",
+                "wrote /tmp/shot.png (12 KB)\nsee notes.md:12\nupdated Makefile and LICENSE 1.5 v2\n",
+            ),
+            tool_row(
+                "commandExecution",
+                r#"{"command":"python3 gen.py > ~/r/codex.html","cwd":"/ignored/cwd.txt"}"#,
+                "",
+            ),
+            tool_row("exec_command", r#"{"cmd":["sh","-c","cp a.md ~/r/argv.md"]}"#, ""),
+            tool_row(
+                "Task",
+                r#"{"prompt":"look at ~/p/prompt.md"}"#,
+                "The subagent wrote ~/s/answer.html.",
+            ),
+        ]);
+        // Structured evidence is another thing: none of this is a file tool.
+        assert!(evidence.tool.is_empty(), "{:?}", evidence.tool);
+        for expected in [
+            "~/x/c.html",
+            "docs/a.md",
+            "~/out/b.html",
+            "/tmp/shot.png",
+            "notes.md",
+            "Makefile",
+            "LICENSE",
+            "~/r/codex.html",
+            "~/r/argv.md",
+            "~/s/answer.html",
+        ] {
+            assert!(
+                evidence.loose.iter().any(|t| t == expected),
+                "{expected} missing from {:?}",
+                evidence.loose
+            );
+        }
+        // Not paths, not a URL, not a field that is no command, not a subagent's prompt.
+        for unwanted in [
+            "1.5",
+            "v2",
+            "echo",
+            "&&",
+            "/ignored/cwd.txt",
+            "~/p/prompt.md",
+        ] {
+            assert!(
+                !evidence.loose.iter().any(|t| t == unwanted),
+                "{unwanted} in {:?}",
+                evidence.loose
+            );
+        }
+    }
+
+    #[test]
+    fn an_acp_call_with_a_prose_title_is_a_shell_when_its_kind_says_execute() {
+        let call_with = |kind: &str| {
+            let mut call = ToolCall::new("1", "Run the report script");
+            call.state = crate::tool::ToolState::Completed;
+            call.input = r#"{"command":"python3 gen.py > ~/r/acp.html"}"#.into();
+            call.output = "wrote ~/r/out.html".into();
+            call.display = Some(serde_json::json!({ "kind": kind }));
+            serde_json::to_string(&call).unwrap()
+        };
+        let evidence = Evidence::from_rows(&[row("tool", &call_with("execute"))]);
+        assert!(evidence.loose.iter().any(|t| t == "~/r/acp.html"));
+        assert!(evidence.loose.iter().any(|t| t == "~/r/out.html"));
+        // Another kind (a fetch, a read, an edit) is no shell.
+        for kind in ["fetch", "read", "edit", "other"] {
+            let evidence = Evidence::from_rows(&[row("tool", &call_with(kind))]);
+            assert!(evidence.loose.is_empty(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn no_other_tool_gives_loose_evidence() {
+        // A todo list, a fetched page, an MCP tool, a Read's output and a Write's description
+        // carry text a device typed or a third party wrote.
+        let evidence = Evidence::from_rows(&[
+            tool_row(
+                "TodoWrite",
+                r#"{"todos":[{"content":"send /Users/me/tax.pdf"}]}"#,
+                "",
             ),
             tool_row(
                 "WebFetch",
                 r#"{"url":"https://example.com/a.html","prompt":"~/y.md"}"#,
                 "read ~/z.md",
             ),
+            tool_row("mcp__srv__lookup", r#"{"q":"~/m1.md"}"#, "found ~/m2.md"),
+            tool_row("srv:tool", r#"{"q":"~/m3.md"}"#, "found ~/m4.md"),
+            tool_row("Read", r#"{"file_path":"/tmp/a.txt"}"#, "see ~/r1.md"),
             tool_row(
                 "Write",
                 r#"{"content":"/etc/hosts","description":"~/w.md"}"#,
-                "",
+                "ok ~/w2.md",
             ),
+            tool_row("update_plan", r#"{"plan":"~/plan.md"}"#, ""),
         ]);
-        assert!(evidence.tool.is_empty(), "{:?}", evidence.tool);
+        assert!(evidence.loose.is_empty(), "{:?}", evidence.loose);
+        // Structured evidence of the Write and the Read is unchanged.
+        assert_eq!(evidence.tool, ["/tmp/a.txt"]);
+    }
+
+    #[test]
+    fn loose_evidence_skips_question_tools_and_calls_that_did_not_complete() {
+        for name in [
+            "AskUserQuestion",
+            "item/tool/requestUserInput",
+            "cursor/ask_question",
+            "_x.ai/ask_user_question",
+        ] {
+            let evidence =
+                Evidence::from_rows(&[tool_row(name, r#"{"q":"~/x/a.md"}"#, "~/x/b.md")]);
+            assert!(evidence.loose.is_empty(), "{name}: {:?}", evidence.loose);
+        }
+        for state in [
+            crate::tool::ToolState::Running,
+            crate::tool::ToolState::Failed,
+            crate::tool::ToolState::Cancelled,
+        ] {
+            let mut call = ToolCall::new("1", "Bash");
+            call.input = r#"{"command":"cat ~/x/a.md"}"#.into();
+            call.output = "~/x/b.md".into();
+            call.state = state.clone();
+            let text = serde_json::to_string(&call).unwrap();
+            assert!(loose_paths(&text).is_empty(), "{state:?}");
+        }
+        assert!(loose_paths("created /tmp/x/y.md").is_empty());
+    }
+
+    #[test]
+    fn loose_scanning_is_bounded_per_row() {
+        let filler = "x ".repeat(MAX_LOOSE_SCAN_BYTES);
+        let output = format!("{filler}\n/tmp/late/report.html");
+        let evidence = Evidence::from_rows(&[tool_row("Bash", "{}", &output)]);
+        assert!(evidence.loose.is_empty(), "{:?}", evidence.loose);
+        let early = format!("/tmp/early/report.html\n{filler}");
+        let evidence = Evidence::from_rows(&[tool_row("Bash", "{}", &early)]);
+        assert_eq!(evidence.loose, ["/tmp/early/report.html"]);
+        // A command with thousands of distinct words keeps only the row's share.
+        let many: String = (0..MAX_ENTRIES * 2)
+            .map(|i| format!("/tmp/f/{i}.txt "))
+            .collect();
+        let evidence = Evidence::from_rows(&[tool_row("Bash", "{}", &many)]);
+        assert_eq!(evidence.loose.len(), MAX_ROW_ENTRIES);
+    }
+
+    #[test]
+    fn when_the_cap_is_reached_newer_rows_win_over_older_ones() {
+        // An old `find` fills the cap; a later report must still be known.
+        let mut rows: Vec<Row> = Vec::new();
+        for chunk in 0..(MAX_ENTRIES / MAX_ROW_ENTRIES + 3) {
+            let listing: String = (0..MAX_ROW_ENTRIES)
+                .map(|i| format!("/old/{chunk}/{i}.txt\n"))
+                .collect();
+            rows.push(tool_row("Bash", r#"{"command":"find /old"}"#, &listing));
+        }
+        rows.push(tool_row(
+            "Bash",
+            r#"{"command":"python3 gen.py"}"#,
+            "wrote /new/report.html",
+        ));
+        let evidence = Evidence::from_rows(&rows);
+        assert!(evidence.loose.len() <= MAX_ENTRIES);
+        assert!(evidence.loose.iter().any(|t| t == "/new/report.html"));
+        // The oldest listing is what was dropped.
+        assert!(!evidence.loose.iter().any(|t| t == "/old/0/0.txt"));
+        // Older pages read later do not push the newer evidence out either.
+        let mut paged = Evidence::from_rows(&rows[rows.len() - 1..]);
+        paged.absorb_rows(&rows[..rows.len() - 1]);
+        assert!(paged.loose.iter().any(|t| t == "/new/report.html"));
+        assert!(paged.loose.len() <= MAX_ENTRIES);
+    }
+
+    #[test]
+    fn the_earliest_plausible_send_time_and_continuation_rows_are_kept() {
+        let mut first = row("user", "hi");
+        first.sent_at = Some(1_700_000_005_000);
+        let mut later = row("assistant", "see [a](");
+        later.sent_at = Some(1_700_000_009_000);
+        let mut bogus = row("user", "x");
+        bogus.sent_at = Some(5);
+        let mut rest = row("assistant", "casium/reports/a.html)");
+        rest.first = false;
+        let evidence = Evidence::from_rows(&[later, rest, bogus, first]);
+        assert_eq!(evidence.started_ms, Some(1_700_000_005_000));
+        // The link cut at a row boundary is one mention.
+        assert_eq!(evidence.assistant, ["casium/reports/a.html"]);
     }
 
     #[test]

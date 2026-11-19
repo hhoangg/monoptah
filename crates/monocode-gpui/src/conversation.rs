@@ -2020,14 +2020,8 @@ impl Conversation {
         cx.emit(SessionChanged);
         cx.notify();
     }
-    fn execution_cwd(&self) -> &str {
-        if self.settings.worktree_removed {
-            return &self.summary.cwd;
-        }
-        self.settings
-            .worktree_cwd
-            .as_deref()
-            .unwrap_or(&self.summary.cwd)
+    pub(crate) fn execution_cwd(&self) -> &str {
+        self.settings.execution_cwd(&self.summary.cwd)
     }
     /// A Mono's chat runs in the home folder, which is no place for its file links: they name
     /// files of the projects it works on. The links are bound to its first local project, and

@@ -51,6 +51,16 @@
 //!                                          same text as the assistant message, as if the agent read every file it names.
 //!                                          Set it to the empty string for a conversation without any tool row (a file
 //!                                          outside the projects is then `forbidden`)
+//! WEB_LINK_HEADLESS_MENTION_ROOT=<folder>  optional: a local project folder of a Mono (a root for relative mentions,
+//!                                          never a project of the device, so a file in it is outside the projects)
+//! WEB_LINK_HEADLESS_MENTION_BASH_TEXT=<text>  optional: one COMPLETED `Bash` call whose command line is this text (`{dir}`
+//!                                          is replaced as above): every path it names is evidence, like a report a
+//!                                          script wrote
+//! WEB_LINK_HEADLESS_HIDE_CAPABILITIES=<a,b>  optional: capabilities the desktop does not advertise (for example
+//!                                          `mentionedFiles2`, as in the 0.54.1 release)
+//! WEB_LINK_HEADLESS_MENTION_OLD_RULES=1    optional: the 0.54.1 rules, a shell command does not count as evidence
+//! WEB_LINK_HEADLESS_MENTION_LEGACY_FLAG=<file>  optional: while this file exists the desktop answers `unsupported`, as
+//!                                          a desktop older than `chat.mentionedFile` does
 //! ```
 //!
 //! Seeding a Mono (environment of the `serve` process):
@@ -645,6 +655,14 @@ struct MentionSeed {
     /// `Some("")` is no tool row at all; `None` is the default (the assistant's text). Every file
     /// it mentions becomes a completed `Read` call.
     tool_text: Option<String>,
+    /// A Mono project folder: a root for relative mentions, not a project of the device.
+    root: Option<String>,
+    /// The command line of one completed `Bash` call.
+    bash_text: Option<String>,
+    /// The 0.54.1 rules: only structured file-tool evidence counts outside the projects.
+    old_rules: bool,
+    /// While this file exists the desktop answers as one that lacks the method.
+    legacy_flag: Option<std::path::PathBuf>,
 }
 
 fn mention_seed() -> Option<&'static MentionSeed> {
@@ -658,10 +676,29 @@ fn mention_seed() -> Option<&'static MentionSeed> {
         let tool_text = std::env::var("WEB_LINK_HEADLESS_MENTION_TOOL_TEXT")
             .ok()
             .map(|text| text.replace("{dir}", &dir.to_string_lossy()));
+        let replaced = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|text| text.replace("{dir}", &dir.to_string_lossy()))
+        };
+        let root = std::env::var("WEB_LINK_HEADLESS_MENTION_ROOT")
+            .ok()
+            .and_then(|root| std::fs::canonicalize(root).ok())
+            .map(|root| root.to_string_lossy().into_owned());
+        let bash_text = replaced("WEB_LINK_HEADLESS_MENTION_BASH_TEXT");
+        let legacy_flag = std::env::var("WEB_LINK_HEADLESS_MENTION_LEGACY_FLAG")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let old_rules =
+            std::env::var("WEB_LINK_HEADLESS_MENTION_OLD_RULES").is_ok_and(|v| v == "1");
         Some(MentionSeed {
+            old_rules,
             dir,
             text,
             tool_text,
+            root,
+            bash_text,
+            legacy_flag,
         })
     })
     .as_ref()
@@ -696,6 +733,12 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
             "The E2E desktop does not serve this method",
         ));
     };
+    if seed.legacy_flag.as_ref().is_some_and(|flag| flag.exists()) {
+        return Err(Failure::coded(
+            "unsupported",
+            "The E2E desktop does not serve this method",
+        ));
+    }
     if request.params["conversationId"].as_str() != Some(SESSION_ID) {
         return Err(Failure::from("Unknown conversation"));
     }
@@ -703,7 +746,7 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
     let tool = seed.tool_text.clone().unwrap_or_else(|| assistant.clone());
     let texts = vec![assistant];
     // Structured evidence: one completed `Read` call per file the tool text mentions.
-    let tool_texts: Vec<String> = mention::mentions::extract_mentions(&tool)
+    let mut tool_texts: Vec<String> = mention::mentions::extract_mentions(&tool)
         .into_iter()
         .map(|path| {
             let mut call = monocode_core::tool::ToolCall::new("e2e-read", "Read");
@@ -712,6 +755,13 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
             serde_json::to_string(&call).unwrap_or_default()
         })
         .collect();
+    // Loose evidence: a completed shell command that names files (a script that wrote a report).
+    if let Some(command) = seed.bash_text.as_ref().filter(|_| !seed.old_rules) {
+        let mut call = monocode_core::tool::ToolCall::new("e2e-bash", "Bash");
+        call.state = monocode_core::tool::ToolState::Completed;
+        call.input = json!({ "command": command }).to_string();
+        tool_texts.push(serde_json::to_string(&call).unwrap_or_default());
+    }
     let id = PROJECT_ID.to_owned();
     let selected = request
         .device
@@ -725,7 +775,8 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
         monocode_core::mobile::denylist::DenyList::default(),
     )];
     let cwd = seed.dir.to_string_lossy().into_owned();
-    let mut ctx = mention::Context::new(&texts, &cwd, &[], &projects);
+    let roots: Vec<String> = seed.root.iter().cloned().collect();
+    let mut ctx = mention::Context::new(&texts, &cwd, &roots, &projects);
     ctx.tool_texts = &tool_texts;
     mention::handle(&request.device.id, &request.params, &ctx).result
 }
@@ -1407,6 +1458,16 @@ fn main() {
     // The HTML transform of `chat.mentionedFile` runs in a child of this executable, like the app.
     monocode_core::mobile::mentioned_file::sandbox::maybe_run_child();
     monocode_core::mobile::mentioned_file::sandbox::enable_subprocess();
+    // An E2E desktop that behaves like an older release: it does not advertise these.
+    if let Ok(hidden) = std::env::var("WEB_LINK_HEADLESS_HIDE_CAPABILITIES") {
+        let names: Vec<String> = hidden
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect();
+        monocode_core::mobile::policy::hide_capabilities(&names);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();

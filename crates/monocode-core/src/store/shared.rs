@@ -617,6 +617,18 @@ impl Store {
             .optional())?;
         Ok(Surface::from_stored(stored.flatten().as_deref()))
     }
+    /// When the session was created (Unix milliseconds), for a session of the shared database.
+    pub(super) fn shared_created_at(&self, id: i64) -> Result<Option<u64>, String> {
+        let created: Option<Option<i64>> = sql(self
+            .conn
+            .query_row(
+                "SELECT created_at FROM sessions WHERE id=?1",
+                [self.persisted_session_id(id)?],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(created.flatten().and_then(|at| u64::try_from(at).ok()))
+    }
     pub(super) fn shared_create(
         &self,
         provider: &str,

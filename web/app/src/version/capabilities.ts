@@ -13,6 +13,7 @@ export const FEATURES: Readonly<Record<KnownCapability, string>> = {
   monoTools: "Mono tools",
   monoFiles: "Mono files",
   mentionedFiles: "File previews",
+  mentionedFiles2: "File previews of files made by commands",
 };
 
 export type { KnownCapability };

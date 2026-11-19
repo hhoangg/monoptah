@@ -885,14 +885,13 @@ fn outside_a_project_the_assistant_alone_does_not_authorize_a_file() {
     assert_eq!(code(&result), Some(Code::Forbidden));
     // A tool row that wrote it does.
     let write = write_row(&path);
-    // Echoing the path in a command, or in the output of a tool, is not a tool run on it.
+    // A command that names the path counts since the widened rule 2 (see the Bash tests below).
     let echo = tool_row_of(
         "Bash",
         &json!({ "command": format!("echo {path}") }).to_string(),
         &path,
     );
-    let result = run_evidence(&said, &[&echo], &fx.root, &[], &params(&path));
-    assert_eq!(code(&result), Some(Code::Forbidden));
+    assert!(run_evidence(&said, &[&echo], &fx.root, &[], &params(&path)).is_ok());
     // Neither is the answer a control device typed to a question.
     let answer = tool_row_of(
         "AskUserQuestion",
@@ -1538,4 +1537,675 @@ fn a_first_hit_that_names_another_file_does_not_end_the_history_scan() {
         sent_at: None,
     }]);
     assert!(enough.check(&ctx, &evidence));
+}
+
+// ---- Widened rule 2: shell commands, their output, and files made during the conversation ----
+
+/// A completed Bash row with `command` and `output`.
+#[cfg(unix)]
+fn bash_row(command: &str, output: &str) -> String {
+    tool_row_of("Bash", &json!({ "command": command }).to_string(), output)
+}
+
+/// The text of a Bash row in the given state.
+#[cfg(unix)]
+fn bash_row_in(state: crate::tool::ToolState, command: &str) -> String {
+    let mut call = crate::tool::ToolCall::new("1", "Bash");
+    call.state = state;
+    call.input = json!({ "command": command }).to_string();
+    serde_json::to_string(&call).unwrap()
+}
+
+/// One call judged with the rule that decided it. Nothing is a selected project unless
+/// `projects` says so; `tune` adjusts the context (home folder, start time).
+#[cfg(unix)]
+fn judge(
+    assistant: &[&str],
+    tool: &[String],
+    cwd: &Path,
+    roots: &[String],
+    projects: &[Project],
+    request: &Params,
+    tune: impl FnOnce(&mut Context),
+) -> Result<Reply, Refusal> {
+    let assistant: Vec<String> = assistant.iter().map(|t| (*t).to_owned()).collect();
+    let cwd = cwd.to_string_lossy().into_owned();
+    let mut ctx = Context::new(&assistant, &cwd, roots, projects);
+    ctx.tool_texts = tool;
+    ctx.home = None;
+    tune(&mut ctx);
+    serve_ruled("", request, &ctx)
+}
+
+/// The code and rule of a refused call.
+#[cfg(unix)]
+fn why(result: &Result<Reply, Refusal>) -> Option<(Option<Code>, &'static str)> {
+    result
+        .as_ref()
+        .err()
+        .map(|r| (super::super::policy::code_of_failure(&r.failure), r.rule))
+}
+
+#[cfg(unix)]
+const REPORT: &str = "casium/reports/868mmrmbv-removed-staff-thread-access.html";
+
+/// The table of the report: one file as a link, one as a code span, and prose whose path ends
+/// with a full stop.
+#[cfg(unix)]
+const TABLE: &str = "| Report | File |\n|---|---|\n| Removed staff | [868mmrmbv-removed-staff-thread-access.html](casium/reports/868mmrmbv-removed-staff-thread-access.html) |\n| Other | `casium/reports/other.html` |\n\nAlso see ./casium/reports/third.html.";
+
+#[cfg(unix)]
+#[test]
+fn a_relative_mention_in_a_table_of_a_mono_is_served_when_a_script_wrote_it() {
+    let fx = Fx::new();
+    // The Mono's chat runs in the home folder; its project holds the reports.
+    let home = fx.path("home");
+    fs::create_dir_all(&home).unwrap();
+    let project = fx.path("work/casium-app");
+    for name in ["868mmrmbv-removed-staff-thread-access", "other", "third"] {
+        fx.write(
+            &format!("work/casium-app/casium/reports/{name}.html"),
+            format!("<h1>{name}</h1>"),
+        );
+    }
+    let roots = vec![project.to_string_lossy().into_owned()];
+    // The reports came from a script: no Write or Edit row exists, only the Bash rows.
+    let tool = vec![
+        bash_row(
+            "python3 build.py > casium/reports/868mmrmbv-removed-staff-thread-access.html",
+            "",
+        ),
+        bash_row("python3 build.py", "wrote casium/reports/other.html"),
+        bash_row(
+            "python3 build.py",
+            "Report saved to casium/reports/third.html.",
+        ),
+    ];
+    let tune = |ctx: &mut Context| ctx.home = Some(home.clone());
+    for (path, name) in [
+        (REPORT, "868mmrmbv-removed-staff-thread-access.html"),
+        ("casium/reports/other.html", "other.html"),
+        ("casium/reports/third.html", "third.html"),
+    ] {
+        let result = judge(&[TABLE], &tool, &home, &roots, &[], &params(path), tune);
+        let reply = result.unwrap_or_else(|r| panic!("{path}: {:?} {}", r.failure, r.rule));
+        assert_eq!(reply.name, name);
+        assert_eq!(reply.kind, Kind::Html);
+        assert_eq!(
+            reply.path,
+            project.join("casium/reports").join(name).to_string_lossy()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mention_with_no_tool_row_at_all_is_still_refused_outside_the_projects() {
+    let fx = Fx::new();
+    let home = fx.path("home");
+    fs::create_dir_all(&home).unwrap();
+    fx.write("work/casium-app/casium/reports/other.html", "x");
+    let roots = vec![fx.text("work/casium-app")];
+    let tune = |ctx: &mut Context| ctx.home = Some(home.clone());
+    let result = judge(
+        &[TABLE],
+        &[],
+        &home,
+        &roots,
+        &[],
+        &params("casium/reports/other.html"),
+        tune,
+    );
+    assert_eq!(
+        why(&result),
+        Some((Some(Code::Forbidden), rule::NO_EVIDENCE))
+    );
+    // A Bash row about another file does not help.
+    let tool = vec![bash_row("ls casium/reports/unrelated.html", "")];
+    let result = judge(
+        &[TABLE],
+        &tool,
+        &home,
+        &roots,
+        &[],
+        &params("casium/reports/other.html"),
+        tune,
+    );
+    assert_eq!(
+        why(&result),
+        Some((Some(Code::Forbidden), rule::NO_EVIDENCE))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_paths_in_a_command_or_its_output_count_and_a_trailing_full_stop_is_ignored() {
+    let fx = Fx::new();
+    let work = fx.path("work");
+    let one = fx.write("work/out/one.html", "1");
+    let two = fx.write("work/out/two.html", "2");
+    let (one, two) = (
+        one.to_string_lossy().into_owned(),
+        two.to_string_lossy().into_owned(),
+    );
+    let said = format!("I wrote {one}. And also `{two}`.");
+    let tool = vec![
+        bash_row(&format!("cat > {one} <<'EOF'\n<p>1</p>\nEOF"), ""),
+        bash_row("python3 gen.py", &format!("done: {two}.\n")),
+    ];
+    for path in [&one, &two] {
+        let result = judge(&[&said], &tool, &work, &[], &[], &params(path), |_| {});
+        assert!(result.is_ok(), "{path}: {:?}", why(&result));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_call_that_did_not_complete_and_a_question_tool_give_no_evidence() {
+    let fx = Fx::new();
+    let work = fx.path("work");
+    let file = fx.write("work/r.html", "x");
+    let path = file.to_string_lossy().into_owned();
+    let said = format!("`{path}`");
+    for state in [
+        crate::tool::ToolState::Running,
+        crate::tool::ToolState::Failed,
+        crate::tool::ToolState::Cancelled,
+    ] {
+        let tool = vec![bash_row_in(state.clone(), &format!("cat > {path}"))];
+        let result = judge(&[&said], &tool, &work, &[], &[], &params(&path), |_| {});
+        assert_eq!(
+            why(&result),
+            Some((Some(Code::Forbidden), rule::NO_EVIDENCE)),
+            "{state:?}"
+        );
+    }
+    let ask = vec![tool_row_of(
+        "AskUserQuestion",
+        &json!({ "question": &path }).to_string(),
+        &path,
+    )];
+    let result = judge(&[&said], &ask, &work, &[], &[], &params(&path), |_| {});
+    assert_eq!(
+        why(&result),
+        Some((Some(Code::Forbidden), rule::NO_EVIDENCE))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_only_a_user_wrote_authorizes_nothing() {
+    let fx = Fx::new();
+    let work = fx.path("work");
+    let file = fx.write("work/r.html", "x");
+    let path = file.to_string_lossy().into_owned();
+    let user = |text: &str| Row {
+        role: "user".into(),
+        text: text.to_owned(),
+        first: true,
+        sent_at: None,
+    };
+    let assistant = |text: &str| Row {
+        role: "assistant".into(),
+        text: text.to_owned(),
+        first: true,
+        sent_at: None,
+    };
+    let cwd = work.to_string_lossy().into_owned();
+    let ask = |rows: &[Row]| {
+        let evidence = Evidence::from_rows(rows);
+        let mut ctx = Context::new(&[], &cwd, &[], &[]);
+        ctx.evidence = Some(&evidence);
+        ctx.home = None;
+        serve_ruled("", &params(&path), &ctx)
+    };
+    // The user names the file; the assistant says nothing about it.
+    let result = ask(&[
+        user(&format!("show me `{path}`, I ran cat {path}")),
+        assistant("ok"),
+    ]);
+    assert_eq!(
+        why(&result),
+        Some((Some(Code::Forbidden), rule::NOT_MENTIONED))
+    );
+    // The assistant mentions it, but the only command is in the user's message.
+    let result = ask(&[
+        user(&format!("run cat {path}")),
+        assistant(&format!("see `{path}`")),
+    ]);
+    assert_eq!(
+        why(&result),
+        Some((Some(Code::Forbidden), rule::NO_EVIDENCE))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_deny_listed_file_named_in_a_command_is_still_refused() {
+    let fx = Fx::new();
+    let home = fx.path("home");
+    let work = fx.path("work");
+    fx.write("work/.env", "SECRET=1");
+    let aws = fx.write("home/.aws/credentials", "fake");
+    let app = fx.write(
+        "home/Library/Application Support/Monoptah Native/x.txt",
+        "fake",
+    );
+    let (aws, app) = (
+        aws.to_string_lossy().into_owned(),
+        app.to_string_lossy().into_owned(),
+    );
+    let said = format!("see `.env`, [a](<{aws}>) and [b](<{app}>)");
+    let tool = vec![
+        bash_row("cat .env", "SECRET=1"),
+        bash_row(&format!("cat '{aws}' '{app}'"), "fake"),
+    ];
+    let tune = |ctx: &mut Context| ctx.home = Some(home.clone());
+    let env = judge(&[&said], &tool, &work, &[], &[], &params(".env"), tune);
+    assert_eq!(why(&env), Some((Some(Code::PathDenied), rule::DENY_LIST)));
+    let credentials = judge(&[&said], &tool, &work, &[], &[], &params(&aws), tune);
+    assert_eq!(
+        why(&credentials),
+        Some((Some(Code::PathDenied), rule::DENY_LIST))
+    );
+    // The app's own data folder is refused by the protected folders.
+    let data = judge(&[&said], &tool, &work, &[], &[], &params(&app), tune);
+    assert_eq!(
+        why(&data),
+        Some((Some(Code::PathDenied), rule::PROTECTED_DIR))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_assets_of_a_report_a_script_wrote_are_reachable_as_before() {
+    let fx = site();
+    let site = fx.path("site");
+    let tool = vec![bash_row("python3 gen.py > report.html", "")];
+    let said = ["`report.html`"];
+    let ask = |request: &Params| judge(&said, &tool, &site, &[], &[], request, |_| {});
+    let reply = ask(&asset("report.html", "img/a.png")).unwrap();
+    assert_eq!(STANDARD.decode(&reply.data).unwrap(), [1, 2, 3, 4, 5]);
+    // Not referenced by the file, outside its folder, or not an image: refused as ever.
+    for bad in ["img/none.png", "../outside.png", ".git/x.png", "notes.txt"] {
+        assert!(ask(&asset("report.html", bad)).is_err(), "{bad}");
+    }
+}
+
+/// Files changed during the conversation: a mention, no tool row, and `started` an hour ago
+/// (the files of the test are written now, so their change time is after it).
+#[cfg(unix)]
+struct Fresh {
+    fx: Fx,
+    started: SystemTime,
+}
+
+#[cfg(unix)]
+impl Fresh {
+    fn new() -> Self {
+        let fresh = Self {
+            fx: Fx::new(),
+            started: SystemTime::now() - Duration::from_secs(3600),
+        };
+        fs::create_dir_all(fresh.fx.path("home")).unwrap();
+        fresh
+    }
+
+    fn file(&self, relative: &str) -> String {
+        self.fx
+            .write(relative, "<p>x</p>")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A known project at `relative`, selected by the device or not.
+    fn project(&self, relative: &str, selected: bool) -> Project {
+        Project::new("p", &self.fx.path(relative), selected, DenyList::default())
+    }
+
+    /// `path` asked for in a session that runs in `cwd`, with the known `projects`, with the
+    /// conversation started at `started`; `tune` adjusts the context.
+    fn ask_with(
+        &self,
+        path: &str,
+        cwd: &Path,
+        projects: &[Project],
+        started: Option<SystemTime>,
+        tune: impl FnOnce(&mut Context),
+    ) -> Result<Reply, Refusal> {
+        let said = format!("`{path}`");
+        let home = self.fx.path("home");
+        judge(&[&said], &[], cwd, &[], projects, &params(path), |ctx| {
+            ctx.home = Some(home);
+            ctx.started = started;
+            tune(ctx);
+        })
+    }
+
+    fn ask(&self, path: &str, cwd: &Path, projects: &[Project]) -> Result<Reply, Refusal> {
+        self.ask_with(path, cwd, projects, Some(self.started), |_| {})
+    }
+}
+
+#[cfg(unix)]
+fn no_evidence() -> Option<(Option<Code>, &'static str)> {
+    Some((Some(Code::Forbidden), rule::NO_EVIDENCE))
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_changed_during_the_conversation_inside_the_session_folder_is_served_without_a_tool_row() {
+    let t = Fresh::new();
+    let work = t.fx.path("work");
+    // A plain working folder that is no project (`~/Downloads`) is the session's tree.
+    let made = t.file("work/out/new.html");
+    assert!(t.ask(&made, &work, &[]).is_ok());
+    // The conversation started after the file last changed: not fresh. (The change time of a
+    // file cannot be set, so the start moves instead.)
+    let later = Some(SystemTime::now() + Duration::from_secs(3600));
+    assert_eq!(
+        why(&t.ask_with(&made, &work, &[], later, |_| {})),
+        no_evidence()
+    );
+    // Outside the session's folder: no.
+    let elsewhere = t.file("other/new.html");
+    assert_eq!(why(&t.ask(&elsewhere, &work, &[])), no_evidence());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_file_of_a_project_the_device_did_not_select_is_refused() {
+    let t = Fresh::new();
+    let work = t.fx.path("work");
+    let made = t.file("work/out/new.html");
+    // The session folder lies in an unselected project.
+    let unselected = [t.project("work", false)];
+    assert_eq!(why(&t.ask(&made, &work, &unselected)), no_evidence());
+    // The session folder is an ancestor of an unselected project: its files stay out.
+    let secret = t.file("work/hidden-project/new.html");
+    let nested = [t.project("work/hidden-project", false)];
+    assert_eq!(why(&t.ask(&secret, &work, &nested)), no_evidence());
+    assert!(t.ask(&made, &work, &nested).is_ok());
+    // A selected project needs no freshness: the mention is enough there.
+    let selected = [t.project("work", true)];
+    assert!(t.ask_with(&made, &work, &selected, None, |_| {}).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fresh_file_named_in_a_mono_chat_is_refused() {
+    let t = Fresh::new();
+    let work = t.fx.path("work");
+    let made = t.file("work/out/new.html");
+    let result = t.ask_with(&made, &work, &[], Some(t.started), |ctx| ctx.mono = true);
+    assert_eq!(why(&result), no_evidence());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_modification_time_neither_grants_nor_denies_freshness() {
+    let t = Fresh::new();
+    let work = t.fx.path("work");
+    let set = |path: &str, at: SystemTime| {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    // A forged future modification time never counts, whatever the change time says.
+    let future = t.file("work/future.html");
+    set(&future, SystemTime::now() + Duration::from_secs(7200));
+    assert_eq!(why(&t.ask(&future, &work, &[])), no_evidence());
+    // A backdated one does not hide a change: the change time is the file's own.
+    let backdated = t.file("work/backdated.html");
+    set(
+        &backdated,
+        SystemTime::now() - Duration::from_secs(10 * 365 * 86400),
+    );
+    assert!(t.ask(&backdated, &work, &[]).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_home_folder_a_root_or_an_ancestor_of_home_is_no_tree_for_the_freshness_rule() {
+    let t = Fresh::new();
+    let home = t.fx.path("home");
+    let new = t.file("home/Documents/new.html");
+    for tree in [home.clone(), t.fx.root.clone(), PathBuf::from("/")] {
+        assert_eq!(why(&t.ask(&new, &tree, &[])), no_evidence(), "{tree:?}");
+    }
+    // A folder inside home is a tree.
+    let inner = t.file("home/proj/new.html");
+    let proj = home.join("proj");
+    assert!(t.ask(&inner, &proj, &[]).is_ok());
+    // Without a known home folder the rule never applies.
+    let result = t.ask_with(&inner, &proj, &[], Some(t.started), |ctx| ctx.home = None);
+    assert_eq!(why(&result), no_evidence());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_worktree_of_a_selected_project_is_the_tree_and_answers_to_the_projects_deny_list() {
+    let t = Fresh::new();
+    let home = t.fx.path("home");
+    fs::create_dir_all(t.fx.path("repo")).unwrap();
+    let repo = t.fx.text("repo");
+    let tree = t.fx.text("repo-worktrees/feature");
+    let new = t.file("repo-worktrees/feature/out/new.html");
+    let secret = t.file("repo-worktrees/feature/plans-only/plan.txt");
+    let said = format!("`{new}` `{secret}`");
+    let project = |selected: bool| {
+        [Project::new(
+            "p",
+            &t.fx.path("repo"),
+            selected,
+            DenyList::new(&["plans-only/**".to_owned()]),
+        )]
+    };
+    let judged = |path: &str, projects: &[Project]| {
+        let assistant = vec![said.clone()];
+        let mut ctx = Context::new(&assistant, &tree, &[], projects);
+        ctx.home = Some(home.clone());
+        ctx.started = Some(t.started);
+        ctx.worktree = Some(Worktree {
+            path: &tree,
+            project: &repo,
+        });
+        serve_ruled("", &params(path), &ctx)
+    };
+    let served = judged(&new, &project(true));
+    assert!(served.is_ok(), "{:?}", why(&served));
+    // The project's own patterns apply to the files of its worktree.
+    assert_eq!(
+        why(&judged(&secret, &project(true))),
+        Some((Some(Code::PathDenied), rule::DENY_LIST))
+    );
+    // A worktree of a project the device did not select, or of an unknown one, is no tree.
+    assert_eq!(why(&judged(&new, &project(false))), no_evidence());
+    assert_eq!(why(&judged(&new, &[])), no_evidence());
+}
+
+#[cfg(unix)]
+#[test]
+fn without_a_start_time_the_freshness_rule_never_applies_and_the_history_gives_a_plausible_one() {
+    let t = Fresh::new();
+    let work = t.fx.path("work");
+    let path = t.file("work/new.html");
+    assert_eq!(
+        why(&t.ask_with(&path, &work, &[], None, |_| {})),
+        no_evidence()
+    );
+    // The earliest send time of the rows read is the start when the context has none.
+    let said = format!("`{path}`");
+    let ms = |at: SystemTime| {
+        at.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    };
+    let row = |role: &str, text: &str, sent_at: Option<u64>| Row {
+        role: role.into(),
+        text: text.to_owned(),
+        first: true,
+        sent_at,
+    };
+    let cwd = work.to_string_lossy().into_owned();
+    let ask = |first: Option<u64>| {
+        let mut evidence = Evidence::default();
+        evidence.absorb_rows(&[row("user", "hi", first), row("assistant", &said, None)]);
+        let mut ctx = Context::new(&[], &cwd, &[], &[]);
+        ctx.evidence = Some(&evidence);
+        ctx.home = Some(t.fx.path("home"));
+        serve_ruled("", &params(&path), &ctx)
+    };
+    assert!(ask(Some(ms(t.started))).is_ok());
+    // An implausible send time (before 2020) is ignored, so there is no start at all.
+    assert_eq!(why(&ask(Some(1000))), no_evidence());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_history_scan_stops_on_command_evidence_and_on_a_fresh_file() {
+    let t = Fresh::new();
+    let home = t.fx.path("home");
+    let work = t.fx.path("work");
+    let path = t.file("work/new.html");
+    let cwd = work.to_string_lossy().into_owned();
+    let said = vec![format!("`{path}`")];
+    // Mentioned only: keep reading older turns.
+    let mut ctx = Context::new(&said, &cwd, &[], &[]);
+    ctx.home = Some(home.clone());
+    assert!(!sufficient(&ctx, &params(&path)));
+    // A Bash command that names it decides the call.
+    let tool = vec![bash_row(&format!("cat > {path}"), "")];
+    ctx.tool_texts = &tool;
+    assert!(sufficient(&ctx, &params(&path)));
+    // So does a start time that the file changed after.
+    let mut ctx = Context::new(&said, &cwd, &[], &[]);
+    ctx.home = Some(home.clone());
+    ctx.started = Some(t.started);
+    assert!(sufficient(&ctx, &params(&path)));
+    // A conversation that started after the file changed is not decided by that.
+    ctx.started = Some(SystemTime::now() + Duration::from_secs(3600));
+    assert!(!sufficient(&ctx, &params(&path)));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_mono_resolves_a_relative_mention_against_its_first_project_not_the_home_folder() {
+    let fx = Fx::new();
+    let home = fx.path("home");
+    let project = fx.path("work/p");
+    fx.write("home/notes.md", "# home");
+    fx.write("work/p/notes.md", "# project");
+    let roots = vec![project.to_string_lossy().into_owned()];
+    let tool = vec![bash_row("cat notes.md", "")];
+    let tune = |ctx: &mut Context| ctx.home = Some(home.clone());
+    // The host passes the first root as the base, as the desktop's click binds the link.
+    let reply = judge(
+        &["`notes.md`"],
+        &tool,
+        &project,
+        &roots,
+        &[],
+        &params("notes.md"),
+        tune,
+    )
+    .unwrap();
+    assert_eq!(reply.path, project.join("notes.md").to_string_lossy());
+    assert_eq!(reply.data, "# project");
+    // The other file of the same name is not the mentioned one.
+    let other = home.join("notes.md").to_string_lossy().into_owned();
+    let result = judge(
+        &["`notes.md`"],
+        &tool,
+        &project,
+        &roots,
+        &[],
+        &params(&other),
+        tune,
+    );
+    assert_eq!(
+        why(&result),
+        Some((Some(Code::Forbidden), rule::NOT_MENTIONED))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn every_refusal_names_its_rule_for_the_audit_and_the_device_gets_only_the_code() {
+    let fx = Fx::new();
+    let work = fx.path("work");
+    let home = fx.path("home");
+    let file = fx.write("work/a.md", "# a");
+    let secret = fx.write("work/.env", "x");
+    fx.write("work/big.txt", "123456789");
+    let (file, secret) = (
+        file.to_string_lossy().into_owned(),
+        secret.to_string_lossy().into_owned(),
+    );
+    let said = [format!(
+        "`{file}` `{secret}` `{}` `big.txt` `gone.md` `./a.md`",
+        fx.text("work/other.md")
+    )];
+    let said: Vec<&str> = said.iter().map(String::as_str).collect();
+    let tool = vec![bash_row(
+        &format!("cat {file} {secret} big.txt gone.md"),
+        "",
+    )];
+    let ask = |path: &str, tune: &dyn Fn(&mut Context)| {
+        judge(&said, &tool, &work, &[], &[], &params(path), |ctx| {
+            ctx.home = Some(home.clone());
+            tune(ctx);
+        })
+    };
+    assert_eq!(
+        why(&ask("never-said.md", &|_| {})),
+        Some((Some(Code::Forbidden), rule::NOT_MENTIONED))
+    );
+    assert_eq!(
+        why(&ask(&secret, &|_| {})),
+        Some((Some(Code::PathDenied), rule::DENY_LIST))
+    );
+    assert_eq!(
+        why(&ask("gone.md", &|_| {})),
+        Some((Some(Code::NotFound), rule::NOT_FOUND))
+    );
+    assert_eq!(
+        why(&ask("big.txt", &|ctx| ctx.max_bytes = 3)),
+        Some((Some(Code::TooLarge), rule::TOO_LARGE))
+    );
+    // Mentioned (as `other.md`) and present, but no tool row names it.
+    fx.write("work/other.md", "x");
+    assert_eq!(
+        why(&ask(&fx.text("work/other.md"), &|_| {})),
+        Some((Some(Code::Forbidden), rule::NO_EVIDENCE))
+    );
+    assert!(ask(&file, &|_| {}).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_call_carries_its_rule_to_the_audit_line() {
+    let fx = Fx::new();
+    fx.write("a.md", "# a");
+    let cwd = fx.text("");
+    let assistant = vec!["`a.md`".to_owned()];
+    let tool = vec![bash_row("cat a.md", "")];
+    let mut ctx = Context::new(&assistant, &cwd, &[], &[]);
+    ctx.tool_texts = &tool;
+    ctx.home = None;
+    let device = "rule-audit-device";
+    let ok = handle(device, &json!({"path": "a.md"}), &ctx);
+    assert_eq!(ok.rule, None);
+    let refused = handle(device, &json!({"path": "zz.md"}), &ctx);
+    assert_eq!(refused.rule, Some(rule::NOT_MENTIONED));
+    let malformed = handle(device, &json!({"path": 1}), &ctx);
+    assert_eq!(malformed.rule, Some(rule::BAD_REQUEST));
+    let mut last = None;
+    for _ in 0..budget::CALLS_PER_WINDOW {
+        last = Some(handle(device, &json!({"path": "a.md"}), &ctx));
+    }
+    assert_eq!(last.unwrap().rule, Some(rule::BUDGET));
 }
