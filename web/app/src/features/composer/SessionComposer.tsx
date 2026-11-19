@@ -63,6 +63,9 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
       send(text, wire.length > 0 ? wire : undefined, options),
     );
     if (!result.sent && result.error === "wake_required") throw new Error(sendErrorMessage(result.error));
+    // The composer may have unmounted while the send was in flight (a tab switch): its own clearing never ran, so the
+    // draft would come back and be sent twice. Drop it when it still is the sent text.
+    if (readChatDraft(desktopId, sessionId).trim() === text.trim()) writeChatDraft(desktopId, sessionId, "");
   };
 
   const toolbar = (

@@ -103,6 +103,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
     setReplyTo(null);
     replies.clearError();
     void send(quoted, wire.length > 0 ? wire : undefined);
+    // Same as the session composer: a composer that unmounted meanwhile cannot clear the draft itself.
+    if (readChatDraft(desktopId, conversationId).trim() === text.trim()) writeChatDraft(desktopId, conversationId, "");
   };
 
   const name = mono?.name ?? "Mono";
