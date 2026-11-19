@@ -395,6 +395,20 @@ describe("tab strip structure and keyboard", () => {
     await waitFor(() => expect(tabKeys()).toHaveLength(2));
   });
 
+  it("does not close tabs on a held key or with a modifier (holding Backspace must not close them all)", async () => {
+    await openThree();
+    const tab = screen.getAllByRole("tab")[2]!;
+    tab.focus();
+    fireEvent.keyDown(tab, { key: "Backspace", repeat: true });
+    fireEvent.keyDown(tab, { key: "Delete", repeat: true });
+    fireEvent.keyDown(tab, { key: "Backspace", ctrlKey: true });
+    fireEvent.keyDown(tab, { key: "Delete", metaKey: true });
+    fireEvent.keyDown(tab, { key: "Delete", altKey: true });
+    expect(tabKeys()).toHaveLength(3);
+    fireEvent.keyDown(tab, { key: "Delete" });
+    await waitFor(() => expect(tabKeys()).toHaveLength(2));
+  });
+
   it("scrolls the selected tab back into view when the strip is resized or moved (the observer fires)", async () => {
     // Only the observers of the tab strip (the virtualized transcript has its own).
     const callbacks: Array<() => void> = [];

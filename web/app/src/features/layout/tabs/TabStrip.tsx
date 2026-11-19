@@ -120,7 +120,8 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
     else if (event.key === "Home") target = 0;
     else if (event.key === "End") target = buttons.length - 1;
     else if (event.key === "Delete" || event.key === "Backspace") {
-      // Backspace too: the Mac Delete key reports it.
+      // Backspace too: the Mac Delete key reports it. Held down or with a modifier it is not a close (holding it would close every tab).
+      if (event.repeat || event.metaKey || event.ctrlKey || event.altKey) return;
       event.preventDefault();
       actions.close(pane.id, key);
       // The tab that takes its place (the right neighbour, else the left one) keeps the keyboard focus.
