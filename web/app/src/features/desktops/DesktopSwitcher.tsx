@@ -1,8 +1,9 @@
 // The `desktop-switcher` slot of `/d/:desktopId` (W-04). Owner: WS-M.
 //
 // A slim in-flow bar (a `shrink-0` row of the fixed /d frame) (current desktop color dot, name, online dot) with the app nav
-// icons (Desktops, Account, Install, and Search on a phone) right aligned on the same row, because the /d routes have no
-// header of their own. It opens the list of the
+// (the avatar menu, and Search on a phone) right aligned on the same row, because the /d routes have no
+// header of their own. From 640 px the activity rail of the app shell (features/layout/ActivityRail.tsx) replaces
+// the bar: the desktop switcher renders only the connection banner there. It opens the list of the
 // account's desktops: a bottom sheet under 640 px, a dialog from 640 px (`ResponsiveOverlay`,
 // design-system.md 11). Desktops are sorted by last use; choosing one opens `/d/:id`. "Request
 // access" posts the grant of that one desktop on tap (never for all). The bar is hidden while a
@@ -17,6 +18,7 @@ import { Button, buttonVariants } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
 import { AppNav } from "@/ui/AppNav";
 import { Notice } from "@/ui/Notice";
+import { useMediaQuery } from "@/ui/useMediaQuery";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
 import { OfflineBanner } from "@/features/offline";
 import { useAction } from "@/features/settings/useAction";
@@ -37,8 +39,24 @@ function OnlineDot({ online }: { online: boolean }) {
   );
 }
 
-/** The slim row of the /d frame: the switcher (when there is one) on the left, the app nav right aligned. */
-export function DesktopTopBar({ children }: { children?: ReactNode }) {
+/** From this width the app shell shows the activity rail and the top bar goes away. */
+const RAIL_QUERY = "(min-width: 640px)";
+
+/**
+ * The slim row of the /d frame: the switcher (when there is one) on the left, the app nav right aligned.
+ * `railReplaces` is for the callers under the app shell: from 640 px the rail takes over and only the connection
+ * banner stays (below the top safe-area inset, which the bar used to clear).
+ */
+export function DesktopTopBar({ children, railReplaces = false }: { children?: ReactNode; railReplaces?: boolean }) {
+  const wide = useMediaQuery(RAIL_QUERY);
+  if (railReplaces && wide) {
+    return (
+      <>
+        <div className="shrink-0 bg-background pt-[env(safe-area-inset-top)]" />
+        <OfflineBanner />
+      </>
+    );
+  }
   return (
     <>
       <div data-testid="desktop-top-bar" className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
@@ -68,7 +86,7 @@ export function DesktopSwitcher() {
   }, [desktopId]);
 
   // Hidden while any blocking layer shows, including "Requesting access...".
-  if (layerShown || isLinkBlocking({ status, blocked })) return <DesktopTopBar />;
+  if (layerShown || isLinkBlocking({ status, blocked })) return <DesktopTopBar railReplaces />;
 
   const current = desktops.data?.desktops.find((item) => item.id === desktopId);
   const name = safeName(current?.name ?? linkName ?? "", "Desktop");
@@ -76,7 +94,7 @@ export function DesktopSwitcher() {
   const online = presence === null ? (current?.online ?? false) : presence === "online";
 
   return (
-    <DesktopTopBar>
+    <DesktopTopBar railReplaces>
       <button
         type="button"
         aria-haspopup="dialog"

@@ -42,19 +42,26 @@ describe("app shell landmarks", () => {
 });
 
 describe("app shell frame and navigation", () => {
-  it("names the account entry Account and keeps Desktops and Install in the header nav", async () => {
+  it("shows only the Account avatar in the header nav, with All desktops and Install app inside its menu", async () => {
     mountApp("/desktops");
     const nav = await screen.findByRole("navigation", { name: "Main" });
-    expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("href", "/settings");
-    expect(within(nav).getByRole("link", { name: "Desktops" })).toHaveAttribute("aria-current", "page");
-    expect(within(nav).getByRole("link", { name: "Install" })).toBeInTheDocument();
-    expect(within(nav).queryByRole("link", { name: "Settings" })).toBeNull();
+    // No Desktops (monitor) or Install (download) icon beside the avatar.
+    expect(within(nav).queryAllByRole("link")).toEqual([]);
+    expect(within(nav).queryByRole("link", { name: "Desktops" })).toBeNull();
+    expect(within(nav).queryByRole("link", { name: "Install" })).toBeNull();
+    expect(nav.querySelector('[data-icon="computer"], [data-icon="download"]')).toBeNull();
+    const user = userEvent.setup();
+    await user.click(within(nav).getByRole("button", { name: "Account" }));
+    const menu = await screen.findByRole("menu");
+    expect(within(menu).getByRole("menuitem", { name: "Account settings" })).toHaveAttribute("href", "/settings");
+    expect(within(menu).getByRole("menuitem", { name: "All desktops" })).toHaveAttribute("href", "/desktops");
+    expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/install");
   });
 
-  it("marks Account as current on /admin", async () => {
+  it("marks the Account avatar as current on /admin", async () => {
     mountApp("/admin");
     const nav = await screen.findByRole("navigation", { name: "Main" });
-    expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("data-current", "true");
+    expect(within(nav).getByRole("button", { name: "Account" })).toHaveAttribute("data-current", "true");
   });
 
   it("has no header row on /d routes: the nav icons share the desktop switcher row, right aligned", async () => {
@@ -70,8 +77,7 @@ describe("app shell frame and navigation", () => {
       const row = nav.parentElement as HTMLElement;
       expect(row).toContainElement(switcher);
       expect(row.lastElementChild).toBe(nav);
-      expect(within(nav).getByRole("link", { name: "Desktops" })).toHaveAttribute("href", "/desktops");
-      expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("href", "/settings");
+      expect(within(nav).getByRole("button", { name: "Account" })).toBeInTheDocument();
       // The switcher row is inside the single main landmark.
       expect(screen.getByRole("main")).toContainElement(nav);
     } finally {
@@ -97,7 +103,7 @@ describe("app shell frame and navigation", () => {
     }
   });
 
-  it("folds Account and Install into a More menu on a phone, keeping Search and Desktops", async () => {
+  it("keeps only Search and the Account avatar on a phone, with All desktops and Install app in the avatar menu", async () => {
     const original = window.matchMedia;
     window.matchMedia = ((query: string) => ({
       matches: query === "(max-width: 39.9375rem)",
@@ -116,15 +122,14 @@ describe("app shell frame and navigation", () => {
       mountApp("/d/dk-frame/settings");
       const nav = await screen.findByRole("navigation", { name: "Main" });
       expect(within(nav).getByRole("button", { name: "Search" })).toBeInTheDocument();
-      expect(within(nav).getByRole("link", { name: "Desktops" })).toHaveAttribute("href", "/desktops");
-      expect(within(nav).queryByRole("link", { name: "Account" })).toBeNull();
-      expect(within(nav).queryByRole("link", { name: "Install" })).toBeNull();
+      expect(within(nav).queryAllByRole("link")).toEqual([]);
+      expect(within(nav).queryByRole("button", { name: "More" })).toBeNull();
       // Every target stays 44px on touch.
-      for (const control of [...within(nav).getAllByRole("link"), ...within(nav).getAllByRole("button")]) expect(control.className).toContain("size-11");
-      await user.click(within(nav).getByRole("button", { name: "More" }));
+      for (const control of within(nav).getAllByRole("button")) expect(control.className).toContain("size-11");
+      await user.click(within(nav).getByRole("button", { name: "Account" }));
       const menu = await screen.findByRole("menu");
-      expect(within(menu).getByRole("menuitem", { name: "Account" })).toHaveAttribute("href", "/settings");
-      expect(within(menu).getByRole("menuitem", { name: "Install" })).toHaveAttribute("href", "/install");
+      expect(within(menu).getByRole("menuitem", { name: "All desktops" })).toHaveAttribute("href", "/desktops");
+      expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/install");
     } finally {
       window.matchMedia = original;
       clearSlots();

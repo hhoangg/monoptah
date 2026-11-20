@@ -100,6 +100,12 @@
 :root[data-accent="violet"][data-scheme="dark"] { --accent-color: #9d87f5; }
 :root[data-accent="violet"][data-scheme="light"] { --accent-color: #6a4fd6; }
 
+/* Text on a desktop swatch (design-system.md 1.5): the swatches are the same in both schemes, so these are too. */
+:root {
+  --on-swatch-dark: #0c0c0c;
+  --on-swatch-light: #ffffff;
+}
+
 /* Derived tokens, declared once */
 :root {
   --accent-text: var(--accent-color); /* light override below (section 9) */

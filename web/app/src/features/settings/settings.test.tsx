@@ -417,7 +417,7 @@ describe("/install", () => {
     await waitFor(() => expect(calls.filter((c) => c.url === "/api/me").length).toBeGreaterThan(0));
     await waitFor(() => expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull());
     expect(screen.getByRole("link", { name: "Monoptah" })).toBeInTheDocument();
-    expect(screen.queryByRole("link", { name: "Account" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Account" })).toBeNull();
     expect(screen.queryByRole("heading", { name: /sign in/i })).toBeNull();
   });
 
@@ -427,8 +427,8 @@ describe("/install", () => {
     mount("/install");
     await screen.findByRole("heading", { level: 1, name: "Install Monoptah" });
     const nav = await screen.findByRole("navigation", { name: "Main" });
-    expect(within(nav).getByRole("link", { name: "Account" })).toHaveAttribute("href", "/settings");
-    expect(within(nav).getByRole("link", { name: "Desktops" })).toBeInTheDocument();
+    expect(within(nav).getByRole("button", { name: "Account" })).toBeInTheDocument();
+    expect(within(nav).queryByRole("link", { name: "Desktops" })).toBeNull();
   });
 
   it("shows the Installed state in standalone display mode", async () => {

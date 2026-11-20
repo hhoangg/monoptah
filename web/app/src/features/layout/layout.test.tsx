@@ -151,7 +151,45 @@ describe("sidebar", () => {
     expect(within(screen.getByTestId("app-sidebar")).getByRole("navigation", { name: "Workspace" })).toBeInTheDocument();
   });
 
-  it("has a Search button in the switcher row below 640px that opens the palette, and none from 640px up", async () => {
+  it.each([768, 1280])("has the activity rail beside the sidebar at %ipx, with Desktop settings and the avatar there and not in the sidebar", async (width) => {
+    registerSlot("desktop-switcher", DesktopSwitcher);
+    mount(width);
+    const rail = await screen.findByTestId("activity-rail");
+    const sidebar = await screen.findByTestId("app-sidebar");
+    // The rail is the first column of the shell, right before the sidebar.
+    expect(rail.nextElementSibling).toBe(sidebar);
+    expect(within(rail).getByRole("link", { name: "Desktop settings" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/settings`);
+    expect(within(rail).getByRole("button", { name: "Account" })).toBeInTheDocument();
+    expect(await within(rail).findByRole("link", { name: /current desktop/ })).toBeInTheDocument();
+    // No duplicates in the sidebar.
+    for (const name of ["All desktops", "Desktop settings", "Cloud"]) expect(within(sidebar).queryByRole("link", { name })).toBeNull();
+    // The top bar is gone: no desktop switcher button and no Main nav.
+    expect(screen.queryByRole("button", { name: /Switch desktop/ })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+    // Search stays reachable in the sidebar.
+    expect(within(sidebar).getByRole("button", { name: "Search" })).toBeInTheDocument();
+  });
+
+  it("keeps the rail next to the collapsed sidebar on a tablet", async () => {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, "1");
+    reloadLayoutPrefs();
+    mount(768);
+    const sidebar = await screen.findByTestId("app-sidebar");
+    expect(sidebar).toHaveAttribute("data-state", "collapsed");
+    expect(screen.getByTestId("activity-rail").nextElementSibling).toBe(sidebar);
+  });
+
+  it("has no rail on a phone: the top bar keeps the switcher, Search and the avatar, and the drawer keeps its entries", async () => {
+    registerSlot("desktop-switcher", DesktopSwitcher);
+    mount(390);
+    await screen.findByTestId("app-shell");
+    expect(screen.queryByTestId("activity-rail")).toBeNull();
+    expect(await screen.findByRole("button", { name: /Switch desktop/ })).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Main" });
+    expect(within(nav).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Search", "Account"]);
+  });
+
+  it("has a Search button in the switcher row below 640px that opens the palette, and the rail takes over from 640px up", async () => {
     // The /d routes have no header: the phone Search button and the nav live in the desktop switcher row.
     registerSlot("desktop-switcher", DesktopSwitcher);
     const user = userEvent.setup();
@@ -163,7 +201,9 @@ describe("sidebar", () => {
     expect(await screen.findByTestId("command-palette")).toBeInTheDocument();
     closeCommandPalette();
     resizeViewport(768);
-    await waitFor(() => expect(within(screen.getByRole("navigation", { name: "Main" })).queryByRole("button", { name: "Search" })).toBeNull());
+    // From 640px the activity rail replaces the top bar: no Main nav, no Search icon there (the sidebar has Search).
+    await waitFor(() => expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull());
+    expect(screen.getByTestId("activity-rail")).toBeInTheDocument();
   });
 
   it("is a persistent 300px sidebar at 768 that collapses to a rail and remembers it", async () => {
