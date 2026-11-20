@@ -10,6 +10,7 @@ import { EmptyState } from "@/ui/EmptyState";
 import { Icon } from "@/ui/Icon";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import { Notice } from "@/ui/Notice";
+import { IconTip } from "@/ui/tooltip";
 import { SessionCard } from "./SessionCard";
 import { useCatalogUnreadMonos } from "./monoSeen";
 import { MonoRow, ProjectRow } from "./WorkspaceNav";
@@ -170,18 +171,24 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
   const project = catalog.data?.projects.find((candidate) => candidate.id === projectId);
   const missing = !!catalog.data && !project;
 
+  // Icon only: the accessible name and the tooltip (fine pointers) say "New session"; 44 px on touch.
   const newSession = readOnly ? (
-    <Button type="button" size="pill" disabled title="This device is read-only">
-      <Icon name="compose" size={18} />
-      New session
-    </Button>
+    // A disabled button gets no hover: the span carries the tooltip.
+    <IconTip label="New session is off: this device is read-only">
+      <span className="inline-flex">
+        <Button type="button" size="circle" disabled aria-label="New session">
+          <Icon name="compose" size={20} />
+        </Button>
+      </span>
+    </IconTip>
   ) : (
-    <Button asChild size="pill">
-      <Link to="/d/$desktopId/p/$projectId/new" params={{ desktopId, projectId }}>
-        <Icon name="compose" size={18} />
-        New session
-      </Link>
-    </Button>
+    <IconTip label="New session">
+      <Button asChild size="circle">
+        <Link to="/d/$desktopId/p/$projectId/new" params={{ desktopId, projectId }} aria-label="New session">
+          <Icon name="compose" size={20} />
+        </Link>
+      </Button>
+    </IconTip>
   );
 
   return (

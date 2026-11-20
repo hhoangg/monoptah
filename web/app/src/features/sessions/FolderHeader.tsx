@@ -52,7 +52,7 @@ export function FolderHeader({ desktopId, folder, count, open, onToggle, readOnl
                 aria-label={`Actions for folder ${folder.name}`}
                 className="absolute top-1/2 right-1.5 inline-flex size-11 -translate-y-1/2 items-center justify-center rounded-pill text-muted-text hover:bg-selection pointer-fine:size-9"
               >
-                <Icon name="more" size={18} />
+                <Icon name="moreVertical" size={18} />
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">

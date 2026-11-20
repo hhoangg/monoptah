@@ -7,6 +7,7 @@ import { useCatalog } from "@/data";
 import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
+import { IconTip } from "@/ui/tooltip";
 import { SessionListBody } from "./SessionListBody";
 import { useActivityTracking, useReadOnly } from "./WorkspaceFrame";
 
@@ -46,15 +47,21 @@ export function SessionListPane({ desktopId, projectId, width, heading, newSessi
           ) : null}
         </div>
         {missing || newSessionOpen ? null : readOnly ? (
-          <Button type="button" size="circle" variant="secondary" disabled aria-label="New session" title="This device is read-only">
-            <Icon name="compose" size={18} />
-          </Button>
+          <IconTip label="New session is off: this device is read-only">
+            <span className="inline-flex">
+              <Button type="button" size="circle" variant="secondary" disabled aria-label="New session">
+                <Icon name="compose" size={18} />
+              </Button>
+            </span>
+          </IconTip>
         ) : (
-          <Button asChild size="circle" variant="secondary">
-            <Link to="/d/$desktopId/p/$projectId/new" params={{ desktopId, projectId }} aria-label="New session" title="New session">
-              <Icon name="compose" size={18} />
-            </Link>
-          </Button>
+          <IconTip label="New session">
+            <Button asChild size="circle" variant="secondary">
+              <Link to="/d/$desktopId/p/$projectId/new" params={{ desktopId, projectId }} aria-label="New session">
+                <Icon name="compose" size={18} />
+              </Link>
+            </Button>
+          </IconTip>
         )}
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">

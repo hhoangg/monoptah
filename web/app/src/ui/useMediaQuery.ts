@@ -13,3 +13,6 @@ export function useMediaQuery(query: string, fallback = false): boolean {
     () => fallback,
   );
 }
+
+/** A touch layout: the primary pointer is a finger (phone, tablet). A mouse or a trackpad layout is `(pointer: fine)`. */
+export const COARSE_POINTER_QUERY = "(pointer: coarse)";
