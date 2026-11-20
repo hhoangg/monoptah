@@ -125,26 +125,20 @@ describe("Mono chat (F-69)", () => {
   });
 });
 
-describe("Mono menu (F-70)", () => {
-  it("has one details button and no menu on a phone", async () => {
+describe("Mono header (F-70)", () => {
+  const phone = () => { window.matchMedia = ((query: string) => ({ matches: false, media: query, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => false })) as never; };
+  const wideScreen = () => { window.matchMedia = ((query: string) => ({ matches: /min-width/.test(query), media: query, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => false })) as never; };
+
+  it.each([["a phone", phone], ["a wide screen", wideScreen]])("has one details link, no actions menu and no reset or delete on %s", async (_name, setScreen) => {
+    setScreen();
     mount(`/monos/${MONO}`);
     expect(await screen.findByRole("link", { name: "Mono profile" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/monos/${MONO}/profile`);
     expect(screen.queryByRole("button", { name: "Mono actions" })).toBeNull();
-  });
-
-  it("offers Details only: reset and delete are never shown, and Settings is not the action", async () => {
-    const user = userEvent.setup();
-    window.matchMedia = ((query: string) => ({ matches: /min-width/.test(query), media: query, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => false })) as never;
-    mount(`/monos/${MONO}`);
-    await user.click(await screen.findByRole("button", { name: "Mono actions" }));
-    const menu = await screen.findByRole("menu");
-    expect(within(menu).getByRole("menuitem", { name: "View details" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/monos/${MONO}/profile`);
-    expect(within(menu).getAllByRole("menuitem")).toHaveLength(1);
     noReset();
     expect(screen.queryByText("Settings", { selector: "a" })).toBeNull();
   });
 
-  it("shows a Settings action instead of the menu when monoTools is off", async () => {
+  it("shows a Settings action instead of the profile link when monoTools is off", async () => {
     const handler = FIXTURE_HANDLERS["workspace.list"] as (p: never, c: never) => Record<string, unknown>;
     (FIXTURE_HANDLERS as Record<string, unknown>)["workspace.list"] = ((p: never, c: never) => ({ ...handler(p, c), monoTools: false })) as never;
     mount(`/monos/${MONO}`);
