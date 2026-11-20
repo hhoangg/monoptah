@@ -309,6 +309,50 @@ impl MentionAudit {
     }
 }
 
+/// What the audit line of a `file.prepare` call needs, kept until it ended.
+struct TransferAudit {
+    device: DeviceContext,
+    fingerprint: String,
+    conversation: Option<String>,
+    command_id: String,
+}
+
+impl TransferAudit {
+    fn record(&self, call: &monocode_core::mobile::mentioned_file::transfer::TransferCall) {
+        audit::record_file_transfer_with(
+            &self.device,
+            &audit::FileTransfer {
+                fingerprint: &self.fingerprint,
+                conversation_id: self.conversation.as_deref(),
+                path: &call.path,
+                asset: call.asset.as_deref(),
+                bytes: call.bytes,
+                outside_projects: call.outside_projects,
+                reused: call.reused,
+                rule: call.rule,
+                command_id: Some(&self.command_id),
+                transport: self.device.kind.into(),
+                outcome: call.outcome(),
+            },
+        );
+    }
+
+    /// A refusal before the policy ran (unknown conversation, no web server).
+    fn refuse(&self, request: &Request, failure: Failure, rule: &'static str) -> Failure {
+        let call = monocode_core::mobile::mentioned_file::transfer::TransferCall {
+            result: Err(failure.clone()),
+            rule: Some(rule),
+            path: string(&request.params, "path").unwrap_or_default(),
+            asset: string(&request.params, "asset"),
+            bytes: 0,
+            outside_projects: false,
+            reused: false,
+        };
+        self.record(&call);
+        failure
+    }
+}
+
 /// What a `chat.mentionedFile` call knows of the session beyond its rows.
 struct Scene<'a> {
     /// When the session was created, when the database records it (Unix milliseconds).
@@ -1257,6 +1301,7 @@ impl Shell {
             }
             "project.gitAction" => self.mobile_git_action(request, cx),
             "chat.mentionedFile" => self.mobile_mentioned_file(request, cx),
+            "file.prepare" => self.mobile_file_prepare(request, cx),
             "cloud.instances" | "cloud.startOptions" => cloud::dispatch_request(
                 self,
                 request,
@@ -1509,6 +1554,156 @@ impl Shell {
                 },
             };
             audited.record_call(&call);
+            request.reply(call.result)
+        })
+        .detach();
+    }
+
+    /// `file.prepare`: opens a file through an end-to-end encrypted object in R2. The policy
+    /// (Control may open any readable file, Read only inside the shared projects, the deny-list
+    /// and symlink rules for both), the content hash, the key and the upload live in
+    /// `monocode_core::mobile::mentioned_file::transfer`; this gathers the folder the
+    /// conversation runs in (to read a relative path as the desktop's click does), the Mono's
+    /// roots, the projects the device selected, and the web server's address. The call is
+    /// audited once, success included, with a mark when a Control device opened a file outside
+    /// its shared projects.
+    fn mobile_file_prepare(&mut self, request: Request, cx: &mut Context<Self>) {
+        use monocode_core::mobile::{file_transfer, mentioned_file as mention};
+        let conversation = string(&request.params, "conversationId");
+        let audited = TransferAudit {
+            device: request.device.clone(),
+            fingerprint: self.mobile_fingerprint(&request.device.id),
+            conversation: conversation.clone(),
+            command_id: request.command_id.clone(),
+        };
+        let Some((base, token)) = self.mobile.host.as_ref().and_then(file_transfer::endpoint)
+        else {
+            let error = audited.refuse(
+                &request,
+                "This desktop is not connected to the web server".into(),
+                mention::rule::FAILED,
+            );
+            return request.reply(Err(error));
+        };
+        let Some(dir) = locked(&self.store)
+            .ok()
+            .and_then(|store| store.data_dir().map(Path::to_path_buf))
+        else {
+            let error = audited.refuse(&request, "No data folder".into(), mention::rule::FAILED);
+            return request.reply(Err(error));
+        };
+        // The folder a relative path is read against: the conversation's, when one is named.
+        let target = match conversation.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => match self.mobile_target(id, &request.device, cx) {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    let error = audited.refuse(&request, error, mention::rule::FAILED);
+                    return request.reply(Err(error));
+                }
+            },
+            None => None,
+        };
+        let mono_projects = match &target {
+            Some(Target::Mono(id)) => self
+                .monos
+                .as_ref()
+                .and_then(|m| m.read(cx).roster.get(id).cloned())
+                .map(|mono| mono.projects)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let roots = crate::file_links::candidate_roots(None, &mono_projects);
+        let is_mono = matches!(target, Some(Target::Mono(_)));
+        let device = request.device.clone();
+        let projects: Vec<(String, String, bool)> = self
+            .mobile_projects(cx)
+            .into_iter()
+            .map(|path| {
+                let id = project_id(&path);
+                let selected = in_selection(&device.projects, &id);
+                (id, path, selected)
+            })
+            .collect();
+        let live = target.as_ref().and_then(|target| {
+            self.with_live_snapshot(target, &device, cx, |snapshot: &Snapshot| {
+                (snapshot.cwd.to_owned(), snapshot.exec_cwd.to_owned())
+            })
+        });
+        let saved = match (&live, &target) {
+            (None, Some(target)) => Some(self.load_saved(target, &device, cx)),
+            _ => None,
+        };
+        let params = request.params.clone();
+        let asked = request.params.clone();
+        let failed = move |error: Failure| mention::transfer::TransferCall {
+            result: Err(error),
+            rule: Some(mention::rule::FAILED),
+            path: string(&asked, "path").unwrap_or_default(),
+            asset: string(&asked, "asset"),
+            bytes: 0,
+            outside_projects: false,
+            reused: false,
+        };
+        cx.spawn(async move |_, _| {
+            let folders = match (live, saved) {
+                (Some(live), _) => Ok(live),
+                (None, Some(load)) => load.await.map(|saved| {
+                    let exec = saved.settings.execution_cwd(&saved.cwd).to_owned();
+                    (saved.cwd.clone(), exec)
+                }),
+                (None, None) => Ok((String::new(), String::new())),
+            };
+            let call = match folders {
+                Ok((project_cwd, exec_cwd)) => {
+                    // Hashing and uploading block for as long as the file and the uplink take, and a second open of the
+                    // same content waits for the first: that runs on a thread of its own (at most a few at a time, see
+                    // `PrepareSlot`), never on the executor threads every other request of the app shares.
+                    let (sender, receiver) = async_channel::bounded(1);
+                    let work = move || {
+                        let projects: Vec<mention::Project> = projects
+                            .iter()
+                            .map(|(id, path, selected)| {
+                                mention::Project::new(
+                                    id,
+                                    Path::new(path),
+                                    *selected,
+                                    DenyList::for_project(path),
+                                )
+                            })
+                            .collect();
+                        let cwd = roots.first().cloned().unwrap_or_else(|| exec_cwd.clone());
+                        let scene = Scene {
+                            created: None,
+                            exec_cwd: &exec_cwd,
+                            project_cwd: &project_cwd,
+                            mono: is_mono,
+                        };
+                        let no_texts: [String; 0] = [];
+                        let mut ctx = mention_context(&no_texts, &cwd, &roots, &projects, &scene);
+                        ctx.private_dirs = vec![dir.clone()];
+                        let keys = file_transfer::keystore::KeyStore::shared(&dir);
+                        let store = file_transfer::HttpStore {
+                            base: &base,
+                            token: &token,
+                        };
+                        mention::transfer::handle(&device, &params, &ctx, &store, &keys)
+                    };
+                    let started = std::thread::Builder::new()
+                        .name("file-prepare".into())
+                        .spawn(move || {
+                            let _ = sender.send_blocking(work());
+                        });
+                    match started {
+                        Ok(_) => match receiver.recv().await {
+                            Ok(call) => call,
+                            Err(_) => failed("The file could not be prepared".into()),
+                        },
+                        Err(_) => failed("The file could not be prepared".into()),
+                    }
+                }
+                Err(error) => failed(error.into()),
+            };
+            audited.record(&call);
             request.reply(call.result)
         })
         .detach();
@@ -4113,6 +4308,40 @@ mod tests {
             Request::with_receiver(&format!("c-{method}"), method, params, device.clone());
         shell.handle_mobile_request(request, window, cx);
         answer.try_recv().ok()
+    }
+
+    #[gpui::test]
+    fn file_prepare_is_routed_to_its_own_handler_and_refuses_at_once_without_a_web_server(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                // No web pairing in a test shell: the answer is the handler's own, not the generic command path's.
+                for device in [
+                    web(None, None),
+                    DeviceContext {
+                        permission: Permission::Read,
+                        ..web(None, None)
+                    },
+                ] {
+                    let answer = ask(
+                        shell,
+                        window,
+                        cx,
+                        &device,
+                        "file.prepare",
+                        json!({"path": "/tmp/report.txt"}),
+                    );
+                    assert_eq!(
+                        answer,
+                        Some(Err(Failure::from(
+                            "This desktop is not connected to the web server"
+                        )))
+                    );
+                }
+            })
+            .unwrap();
     }
 
     #[gpui::test]

@@ -62,6 +62,7 @@ pub mod html;
 pub mod mentions;
 pub mod prepass;
 pub mod sandbox;
+pub mod transfer;
 
 use std::{
     borrow::Cow,
@@ -393,6 +394,7 @@ pub mod rule {
     pub const TOO_LARGE: &str = "too_large";
     pub const BUSY: &str = "busy";
     pub const ASSET: &str = "asset";
+    pub const NOT_IN_PROJECT: &str = "not_in_project";
     pub const FAILED: &str = "failed";
 }
 
@@ -570,6 +572,7 @@ impl Guard {
                 .iter()
                 .chain(MORE_HOME_CREDENTIALS.iter())
                 .chain(["Library/Keychains", "Library/Cookies"].iter())
+                .chain(crate::credential_guard::SECRET_STORE_DIRS.iter())
             {
                 protect(&home.join(tail));
             }
@@ -592,7 +595,8 @@ impl Guard {
         }
         Self {
             projects,
-            default: DenyList::default(),
+            // A file outside every project also answers to the profile and password store file names.
+            default: DenyList::outside_project(),
             protected,
             home: ctx.home.clone(),
         }
@@ -884,7 +888,14 @@ fn authorize(
         return Err(Refusal::new(forbidden(), rule::NO_EVIDENCE));
     }
     // 3. Authorized: now the deny-list on what the link really leads to.
-    if let Some(by) = guard.denial(&canonical) {
+    authorize_parts(ctx, guard, &canonical)?;
+    Ok(canonical)
+}
+
+/// The deny-lists on the canonical target of an authorized request: the app's folders and the
+/// credential places, the owning project's patterns and the session worktree's.
+fn authorize_parts(ctx: &Context, guard: &Guard, canonical: &Path) -> Result<(), Refusal> {
+    if let Some(by) = guard.denial(canonical) {
         return Err(Refusal::new(denied(), by));
     }
     if let Some(project) = ctx
@@ -894,7 +905,7 @@ fn authorize(
     {
         project
             .deny
-            .check(&project.canonical, &canonical)
+            .check(&project.canonical, canonical)
             .map_err(|_| Refusal::new(denied(), rule::DENY_LIST))?;
     }
     // A file of the session's worktree answers to its project's patterns too.
@@ -902,11 +913,11 @@ fn authorize(
         if canonical.starts_with(&worktree) {
             owner
                 .deny
-                .check(&worktree, &canonical)
+                .check(&worktree, canonical)
                 .map_err(|_| Refusal::new(denied(), rule::DENY_LIST))?;
         }
     }
-    Ok(canonical)
+    Ok(())
 }
 
 /// Whether `written` (which does not exist) is itself the file one of the `hits` mentions, and
@@ -1721,6 +1732,37 @@ fn serve_asset(
     asset: &str,
     params: &Params,
 ) -> Result<Reply, Refusal> {
+    let ctx = env.ctx;
+    let (mut file, metadata, canonical, mime) =
+        resolve_asset(env, parent_file, parent, parent_meta, asset)?;
+    let mut reply = Reply {
+        path: lossy(&canonical),
+        name: file_name(&canonical),
+        size: metadata.len(),
+        kind: Kind::Image,
+        mime: Some(mime),
+        encoding: "base64",
+        data: String::new(),
+        offset: 0,
+        total: metadata.len(),
+        next_offset: None,
+        assets: None,
+        project: project_of(ctx, &canonical),
+        served: 0,
+    };
+    image_page(&mut file, &mut reply, params.offset, env.page)?;
+    Ok(reply)
+}
+
+/// The checks of rule 6, ending at the opened image: its handle, metadata, canonical path and
+/// image mime. Shared by the paged reply and the encrypted transfer.
+fn resolve_asset(
+    env: &Env,
+    parent_file: &mut File,
+    parent: &Path,
+    parent_meta: &Metadata,
+    asset: &str,
+) -> Result<(File, Metadata, PathBuf, &'static str), Refusal> {
     let (ctx, guard) = (env.ctx, env.guard);
     // Only a page that shows images has assets.
     if !matches!(
@@ -1778,7 +1820,7 @@ fn serve_asset(
     if let Some(by) = guard.denial(&canonical) {
         return Err(Refusal::new(denied(), by));
     }
-    let (mut file, metadata) = open_regular(&canonical).map_err(not_regular_or_found)?;
+    let (file, metadata) = open_regular(&canonical).map_err(not_regular_or_found)?;
     if guard.hard_link_denied(&metadata, in_selected_project(ctx, &canonical)) {
         return Err(Refusal::new(denied(), rule::HARD_LINK));
     }
@@ -1791,23 +1833,7 @@ fn serve_asset(
     if metadata.len() > ctx.max_bytes {
         return Err(Code::TooLarge.failure().into());
     }
-    let mut reply = Reply {
-        path: lossy(&canonical),
-        name,
-        size: metadata.len(),
-        kind: Kind::Image,
-        mime: Some(mime),
-        encoding: "base64",
-        data: String::new(),
-        offset: 0,
-        total: metadata.len(),
-        next_offset: None,
-        assets: None,
-        project: project_of(ctx, &canonical),
-        served: 0,
-    };
-    image_page(&mut file, &mut reply, params.offset, env.page)?;
-    Ok(reply)
+    Ok((file, metadata, canonical, mime))
 }
 
 /// The folder an asset of the document `parent` must stay inside: the selected project that

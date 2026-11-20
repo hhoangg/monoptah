@@ -4,6 +4,7 @@
 // string: it is never parsed into the app's document.
 import type { ResultOf } from "@monoptah/protocol";
 import { hasControl } from "@/features/markdown/fileLinks";
+import { TransferError } from "./transfer/client.ts";
 
 export type MentionedPage = ResultOf<"chat.mentionedFile">;
 /** `chat.mentionedFile` over the link of one conversation. */
@@ -85,6 +86,24 @@ export function imageMime(mime: string | undefined): string | null {
   return value && IMAGE_MIMES.has(value) ? value : null;
 }
 
+export interface ReadOptions {
+  signal?: AbortSignal;
+  /** Charged before the data comes (assets only). */
+  budget?: PreviewBudget;
+  /** Bytes of the download received so far, and the total (encrypted transfers only). */
+  onProgress?: (received: number, total: number) => void;
+}
+
+/** Reads one file or asset to its end. Two implementations: paged `chat.mentionedFile`, and `file.prepare` with an encrypted object. */
+export type MentionReader = (params: { path: string; asset?: string; source?: boolean }, options?: ReadOptions) => Promise<MentionContent>;
+
+/** What the previews read through: a paged requester (older desktops) or a reader. */
+export type MentionSource = MentionRequester | { read: MentionReader };
+
+export function asReader(source: MentionSource): MentionReader {
+  return typeof source === "function" ? (params, options) => readMention(source, params, options) : source.read;
+}
+
 export interface MentionContent {
   /** The first page: path, name, size, kind, mime, assets, project. `data` is empty. */
   meta: MentionedPage;
@@ -97,7 +116,7 @@ export interface MentionContent {
 }
 
 /** Follows `nextOffset` until the file is complete. `budget` (assets only) is charged before the data comes. */
-export async function readMention(request: MentionRequester, params: { path: string; asset?: string; source?: boolean }, options: { signal?: AbortSignal; budget?: PreviewBudget } = {}): Promise<MentionContent> {
+export async function readMention(request: MentionRequester, params: { path: string; asset?: string; source?: boolean }, options: ReadOptions = {}): Promise<MentionContent> {
   const { signal, budget } = options;
   if (budget && !budget.takeAsset()) throw new PreviewLimitError();
   let offset = 0;
@@ -156,9 +175,10 @@ export function buildPreviewDocument(html: string, dataUris: ReadonlyMap<number,
 }
 
 /** The html and its images: every `assets[i]` fetched (4 at a time) and inlined. */
-export async function loadHtmlDocument(request: MentionRequester, path: string, content: MentionContent, signal?: AbortSignal): Promise<{ document: string; limited: boolean }> {
+export async function loadHtmlDocument(source: MentionSource, path: string, content: MentionContent, signal?: AbortSignal): Promise<{ document: string; limited: boolean }> {
   // The document counts by its UTF-8 bytes (what the frame holds), not its UTF-16 length.
   const budget = budgetForText(content.text);
+  const read = asReader(source);
   const assets = content.meta.assets ?? [];
   const uris = new Map<number, string>();
   const used = [...new Set([...content.text.matchAll(PLACEHOLDER)].map((match) => Number(match[1])))].filter((index) => index < assets.length);
@@ -167,7 +187,7 @@ export async function loadHtmlDocument(request: MentionRequester, path: string, 
     while (next < used.length) {
       const index = used[next++] as number;
       try {
-        const asset = await readMention(request, { path, asset: assets[index] as string }, { budget, ...(signal ? { signal } : {}) });
+        const asset = await read({ path, asset: assets[index] as string }, { budget, ...(signal ? { signal } : {}) });
         const uri = asset.meta.kind === "image" ? imageDataUri(asset.meta.mime ?? "", concat(asset.chunks, asset.length)) : null;
         if (uri) uris.set(index, uri);
       } catch (error) {
@@ -232,7 +252,7 @@ export function formatSize(bytes: number): string {
   return `${value >= 10 ? Math.round(value) : Math.round(value * 10) / 10} ${units[unit]}`;
 }
 
-export type PreviewProblemKind = "denied" | "not_mentioned" | "too_large" | "not_found" | "busy" | "not_selected" | "update_desktop" | "failed";
+export type PreviewProblemKind = "denied" | "not_mentioned" | "too_large" | "not_found" | "busy" | "not_selected" | "update_desktop" | "failed" | "expired" | "signed_out" | "damaged";
 
 export interface PreviewProblem {
   kind: PreviewProblemKind;
@@ -255,6 +275,11 @@ export interface PreviewProblemOptions {
    * the refusal reads as "update the desktop", not as "not in this conversation". Defaults to true.
    */
   desktopCurrent?: boolean;
+  /**
+   * Whether the desktop advertises `fileTransfer` (files open through encrypted objects, no mention needed). Then a
+   * `forbidden` means the file is outside the projects shared with this read-only device. Defaults to false.
+   */
+  fileTransfer?: boolean;
 }
 
 /** The short reason shown for a failed preview: not found, outside the conversation, blocked, or the desktop needs an update. */
@@ -262,12 +287,30 @@ export function previewProblem(error: unknown, options: PreviewProblemOptions = 
   if (error instanceof PreviewLimitError) {
     return { kind: "too_large", title: "This file is too large to preview", detail: "It is more than the preview can load here. Open it on your desktop instead.", retry: false };
   }
+  if (error instanceof TransferError) {
+    switch (error.problem) {
+      case "gone":
+        return { kind: "expired", title: "This file is no longer available", detail: "It expired on the server. Try again to send it from your desktop once more.", retry: true };
+      case "signed_out":
+        return { kind: "signed_out", title: "You are signed out", detail: "Sign in again, then open the file.", retry: false };
+      case "damaged":
+        return { kind: "damaged", title: "This file could not be verified", detail: "What arrived did not match what your desktop sent, so it was not shown. Try again.", retry: true };
+      case "too_large":
+        return { kind: "too_large", title: "This file is too large to preview", detail: "Open it on your desktop instead.", retry: false };
+      case "network":
+        return { kind: "failed", title: "This file could not be downloaded", detail: "Check your connection and try again.", retry: true };
+    }
+  }
   const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
   switch (code) {
     case "path_denied":
       return { kind: "denied", title: HIDDEN_PREVIEW_MESSAGE, detail: "Monoptah keeps this kind of file (for example secrets) off your devices.", retry: false };
     case "forbidden":
       if (options.desktopCurrent === false) return updateDesktop();
+      if (options.fileTransfer) {
+        return { kind: "not_mentioned", title: "This device cannot open this file", detail: "A read-only device opens files of the projects shared with it. Give it Control access on your desktop to open any file.", retry: false };
+      }
+      // A desktop without `fileTransfer` also refuses a file nothing in this conversation named, which a newer desktop opens for a Control device.
       return { kind: "not_mentioned", title: "This file is outside this conversation", detail: "Only files the assistant named, and that its work in this conversation touched, can be opened here.", retry: false };
     case "unsupported":
       return updateDesktop();

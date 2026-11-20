@@ -107,6 +107,11 @@
       "transport": "host"
     },
     {
+      "name": "file.prepare",
+      "class": "read",
+      "transport": "app"
+    },
+    {
       "name": "folder.create",
       "class": "control",
       "transport": "app"

@@ -4,6 +4,7 @@
 // open session for all tests (serial); every test opens a mention, checks the dialog and closes it.
 //
 // Set FILE_PREVIEW_SCREENSHOTS=<dir> to also save a full-page screenshot per preview kind there.
+import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -54,6 +55,37 @@ function tinyPng(): Buffer {
     chunk("IDAT", deflateSync(raw)),
     chunk("IEND", Buffer.alloc(0)),
   ]);
+}
+
+/** A valid, incompressible 1100 x 1300 RGB PNG of about 4.3 MB (more than one 4 MiB page, several sealed chunks). */
+function bigPng(): Buffer {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (buf: Buffer): number => {
+    let c = 0xffffffff;
+    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff]! ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const sum = Buffer.alloc(4);
+    sum.writeUInt32BE(crc(body));
+    return Buffer.concat([length, body, sum]);
+  };
+  const width = 1100;
+  const height = 1300;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 2;
+  const rows = Array.from({ length: height }, () => Buffer.concat([Buffer.from([0]), randomBytes(width * 3)]));
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", header), chunk("IDAT", deflateSync(Buffer.concat(rows), { level: 0 })), chunk("IEND", Buffer.alloc(0))]);
 }
 
 const HTML = `<!doctype html>
@@ -172,6 +204,7 @@ test.describe("file mention previews on the web app", () => {
     writeFileSync(join(fixtureDir, "data.bin"), Buffer.from(Array.from({ length: 2048 }, (_, i) => (i % 7 === 0 ? 0 : (i * 31) % 256))));
     writeFileSync(join(fixtureDir, ".env"), "FAKE=not-a-secret\n");
     writeFileSync(join(fixtureDir, "unmentioned-secret.txt"), "not mentioned anywhere\n");
+    writeFileSync(join(fixtureDir, "big.png"), bigPng());
     canonicalDir = realpathSync(fixtureDir);
     // Two reports a script wrote, outside the selected project: no Write or Edit tool ever touched them.
     rootDir = mkdtempSync(join(tmpdir(), "monoptah-e2e-preview-root-"));
@@ -180,11 +213,13 @@ test.describe("file mention previews on the web app", () => {
       writeFileSync(join(rootDir, "casium", "reports", `${name}.html`), `<!doctype html><html><body><h1 id="title">Report ${name}</h1></body></html>\n`);
     }
     legacyFlag = join(rootDir, "legacy-desktop.flag");
+    // Outside every project of the device and named by no tool: only a Control device may open it (file.prepare).
+    writeFileSync(join(rootDir, "outside-note.txt"), "A note outside every shared project.\n");
 
     const text = [
       "Here are the files:",
       "`{dir}/report.html`, `{dir}/img/chart.png`, `{dir}/notes.md`, `{dir}/diagram.svg`,",
-      "`{dir}/code.ts:12`, `{dir}/data.bin` and `{dir}/.env`.",
+      "`{dir}/code.ts:12`, `{dir}/data.bin`, `{dir}/big.png`, `" + realpathSync(rootDir) + "/outside-note.txt` and `{dir}/.env`.",
     ].join(" ") + [
       "",
       "",
@@ -380,25 +415,56 @@ test.describe("file mention previews on the web app", () => {
     }
   });
 
-  test("a file no assistant message mentions is refused as not mentioned", async () => {
-    // A user message does not authorize a path: the echo turn that quotes it is an assistant message of the fake
-    // desktop, which the real mention check ignores, so the chip shows up but the desktop answers `forbidden`.
+  /** The `GET /api/transfers/...` downloads the page made so far. */
+  const downloads: string[] = [];
+  let watching = false;
+  function watchDownloads(): void {
+    if (watching) return;
+    watching = true;
+    page.on("request", (request) => {
+      if (request.method() === "GET" && new URL(request.url()).pathname.startsWith("/api/transfers/")) downloads.push(new URL(request.url()).pathname);
+    });
+  }
+
+  test("an image over 4 MB opens in the viewer, and a reopen is served from the cache without another download", async () => {
+    test.setTimeout(120_000);
+    watchDownloads();
+    const before = downloads.length;
+    await open("big.png");
+    const image = page.getByTestId("preview-image");
+    await expect(image).toBeVisible({ timeout: 60_000 });
+    await expect.poll(() => image.evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBe(1100);
+    expect(downloads.length - before).toBe(1);
+    // The object name is a content hash and a key id, never the path.
+    expect(downloads.at(-1)).toMatch(/\/api\/transfers\/[0-9a-f-]{36}\/[0-9a-f]{64}\.[0-9a-f]{16}$/);
+    expect(downloads.at(-1)).not.toContain("big.png");
+    await page.keyboard.press("Escape");
+    await expect(dialog()).toHaveCount(0);
+    await open("big.png");
+    await expect(page.getByTestId("preview-image")).toBeVisible();
+    await expect.poll(() => page.getByTestId("preview-image").evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBe(1100);
+    expect(downloads.length - before).toBe(1);
+  });
+
+  test("a file outside the shared projects opens for a Control device, without a mention check", async () => {
+    await open("outside-note.txt");
+    await expect(page.getByTestId("preview-lines")).toContainText("A note outside every shared project.");
+    await page.keyboard.press("Escape");
+    await expect(dialog()).toHaveCount(0);
+  });
+
+  test("a file no assistant message mentions opens too: a Control device may open any readable file", async () => {
     const unmentioned = join(canonicalDir, "unmentioned-secret.txt");
     await page.getByRole("textbox", { name: "Message" }).fill(`please read \`${unmentioned}\``);
     await page.getByRole("button", { name: "Send", exact: true }).click();
     const echoed = page.locator(`button[data-testid="file-mention"][data-path$="unmentioned-secret.txt"]`).last();
     await expect(echoed).toBeVisible({ timeout: 30_000 });
     await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
-    // One click, once the chip stopped moving (the transcript scrolls to the bottom while the echo streams in).
     await clickWhenStable(echoed);
     await expect(dialog()).toBeVisible();
-    // It stays open: nothing closes it behind the test's back.
-    await page.waitForTimeout(750);
-    await expect(dialog()).toBeVisible();
-    const error = page.getByTestId("file-preview-error");
-    await expect(error).toBeVisible();
-    await expect(error).toHaveAttribute("data-problem", "not_mentioned");
-    await expect(page.getByText("not mentioned anywhere")).toHaveCount(0);
+    await expect(page.getByTestId("preview-lines")).toContainText("not mentioned anywhere");
+    await page.keyboard.press("Escape");
+    await expect(dialog()).toHaveCount(0);
   });
 
   test("a 0.54.1 desktop (answers forbidden, no mentionedFiles2) shows the update notice, not a mention error", async () => {
@@ -420,7 +486,7 @@ test.describe("file mention previews on the web app", () => {
       WEB_LINK_HEADLESS_MENTION_ROOT: rootDir,
       WEB_LINK_HEADLESS_MENTION_BASH_TEXT: "python3 gen.py > casium/reports/made-by-script.html",
       WEB_LINK_HEADLESS_MENTION_OLD_RULES: "1",
-      WEB_LINK_HEADLESS_HIDE_CAPABILITIES: "mentionedFiles2",
+      WEB_LINK_HEADLESS_HIDE_CAPABILITIES: "mentionedFiles2,fileTransfer",
     };
     Object.assign(process.env, env);
     try {

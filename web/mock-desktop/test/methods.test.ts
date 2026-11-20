@@ -29,11 +29,12 @@ describe("every method of methods.json is served", () => {
     }
   });
 
-  it.each(names)("handler of %s returns a result that matches the protocol result schema", (name) => {
+  it.each(names)("handler of %s returns a result that matches the protocol result schema", async (name) => {
     const device: MockDevice = { fingerprint: "ff", status: "confirmed", permission: "control", selection: { projects: null, monos: null } };
     const ctx: HandlerContext = { world: new MockWorld(), device };
     const params = METHODS[name].params.parse(SAMPLE_PARAMS[name]);
-    const result = (FIXTURE_HANDLERS[name] as (p: unknown, c: HandlerContext) => unknown)(params, ctx);
+    // `file.prepare` answers after its upload, the others at once.
+    const result = await (FIXTURE_HANDLERS[name] as (p: unknown, c: HandlerContext) => unknown)(params, ctx);
     const parsed = METHODS[name].result.safeParse(result);
     expect(parsed.success, parsed.success ? "" : JSON.stringify(parsed.error.issues)).toBe(true);
   });

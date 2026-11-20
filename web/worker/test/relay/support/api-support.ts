@@ -29,8 +29,10 @@ export interface RoomCalls {
 }
 
 /** A `ROOM` namespace double with revoke, notifyGrants and presence. `online` lists desktop ids that read as online. */
-export function fakeRoom(online: Iterable<string> = []): { namespace: TestEnv["ROOM"]; calls: RoomCalls; online: Set<string> } {
+export function fakeRoom(online: Iterable<string> = []): { namespace: TestEnv["ROOM"]; calls: RoomCalls; online: Set<string>; deviceSessionHashes: Map<string, string[]> } {
   const calls: RoomCalls = { revokes: [], notifies: [] };
+  /** Session hashes holding a live link, by device id (what `deviceSessions` answers). */
+  const deviceSessionHashes = new Map<string, string[]>();
   const onlineIds = new Set(online);
   const namespace = {
     idFromName: (name: string) => ({ name }),
@@ -44,9 +46,10 @@ export function fakeRoom(online: Iterable<string> = []): { namespace: TestEnv["R
         return Promise.resolve();
       },
       presence: () => Promise.resolve({ online: onlineIds.has(id.name) }),
+      deviceSessions: (deviceId: string) => Promise.resolve(deviceSessionHashes.get(deviceId) ?? []),
     }),
   };
-  return { namespace: namespace as unknown as TestEnv["ROOM"], calls, online: onlineIds };
+  return { namespace: namespace as unknown as TestEnv["ROOM"], calls, online: onlineIds, deviceSessionHashes };
 }
 
 /** The test environment with own values (bindings or vars) laid over it, without touching the real `env`. */

@@ -20,7 +20,7 @@ import { HtmlPreview } from "./HtmlPreview";
 import { ImageViewer } from "./ImageViewer";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { formatSize, previewProblem } from "./mentionedFile";
-import { useMentionRequester, useMentionedFile, type PreviewData } from "./useMentionedFile";
+import { useMentionSource, useMentionedFile, type DownloadProgress, type PreviewData } from "./useMentionedFile";
 
 export interface PreviewTarget {
   /** The mention as written (line suffix already cut). */
@@ -101,6 +101,42 @@ export function FilePreviewDialog({ conversationId, target, onClose }: FilePrevi
   );
 }
 
+/** A bar for a download of a large file: shown once the first bytes came, with the sizes in text for screen readers. */
+function DownloadBar({ progress }: { progress: DownloadProgress | null }) {
+  if (!progress || progress.total <= 0 || progress.total < 512 * 1024) return null;
+  const percent = Math.min(100, Math.round((progress.received / progress.total) * 100));
+  return (
+    <div className="flex w-56 flex-col items-center gap-1" data-testid="file-preview-progress">
+      <progress className="h-1.5 w-full" max={progress.total} value={progress.received} aria-label="Download progress" />
+      <p className="text-small text-muted-text">{`${formatSize(progress.received)} of ${formatSize(progress.total)} (${percent}%)`}</p>
+    </div>
+  );
+}
+
+function SaveFile({ name, chunks }: { name: string; chunks: Uint8Array[] }) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="sm"
+      data-testid="file-preview-download"
+      onClick={() => {
+        // A download only: the bytes never become a page of this origin.
+        const url = URL.createObjectURL(new Blob(chunks as BlobPart[], { type: "application/octet-stream" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = name;
+        link.rel = "noopener";
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      }}
+    >
+      <Icon name="download" size={16} />
+      Download
+    </Button>
+  );
+}
+
 function CopyPath({ path }: { path: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -142,8 +178,9 @@ function wantsSource(target: PreviewTarget): boolean {
 function PreviewContent({ conversationId, target }: { conversationId: string; target: PreviewTarget }) {
   const query = useMentionedFile(conversationId, target.path, wantsSource(target));
   const desktopCurrent = useCapability("mentionedFiles2");
+  const fileTransfer = useCapability("fileTransfer");
   if (query.isError) {
-    const problem = previewProblem(query.error, { desktopCurrent });
+    const problem = previewProblem(query.error, { desktopCurrent, fileTransfer });
     return (
       <div data-testid="file-preview-error" data-problem={problem.kind} className="min-h-0 flex-1 overflow-auto">
         <FileProblem
@@ -161,7 +198,20 @@ function PreviewContent({ conversationId, target }: { conversationId: string; ta
       </div>
     );
   }
-  if (!query.data) return <DelayedSpinner label="Loading file" className="m-6 self-center" />;
+  if (!query.data) {
+    return (
+      <div className="m-6 flex flex-col items-center gap-3 self-center">
+        <DelayedSpinner label="Loading file" />
+        <DownloadBar progress={query.progress} />
+        {fileTransfer && !query.progress ? (
+          // The desktop reads, hashes and uploads the file before the download starts: a large file takes a while.
+          <p data-testid="file-preview-preparing" className="max-w-56 text-center text-small text-muted-text">
+            Your desktop is preparing this file. A large file can take a minute.
+          </p>
+        ) : null}
+      </div>
+    );
+  }
   return (
     <>
       {query.data.kind === "binary" ? null : <PathLine path={query.data.meta.path} />}
@@ -171,7 +221,7 @@ function PreviewContent({ conversationId, target }: { conversationId: string; ta
 }
 
 function PreviewKind({ conversationId, target, data }: { conversationId: string; target: PreviewTarget; data: PreviewData }) {
-  const request = useMentionRequester(conversationId);
+  const request = useMentionSource(conversationId);
   const desktopId = useLinkDesktopId();
   const wrap = useFilePrefs((state) => state.wrap);
   const name = data.meta.name;
@@ -189,7 +239,15 @@ function PreviewKind({ conversationId, target, data }: { conversationId: string;
     case "binary":
       return (
         <div data-testid="preview-binary" className="min-h-0 flex-1 overflow-auto">
-          <FileProblem title="Cannot preview this file" actions={<CopyPath path={data.meta.path} />}>
+          <FileProblem
+            title="Cannot preview this file"
+            actions={
+              <>
+                {data.chunks ? <SaveFile name={data.meta.name} chunks={data.chunks} /> : null}
+                <CopyPath path={data.meta.path} />
+              </>
+            }
+          >
             {`${formatSize(data.meta.size)} - ${data.meta.path}`}
           </FileProblem>
         </div>

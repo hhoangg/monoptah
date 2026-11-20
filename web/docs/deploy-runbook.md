@@ -17,6 +17,32 @@ for a real run, when the OS is not macOS.
 - `VAPID_PUBLIC_KEY` in `wrangler.jsonc` `vars` is the real key (not the `REPLACE_WITH_...` placeholder).
 - The three secrets are set with `wrangler secret put`: `VAPID_PRIVATE_KEY`, `RECOVERY_PEPPER`, `AUDIT_IP_SALT`.
   Keep a copy in the sealed operator vault (losing `RECOVERY_PEPPER` invalidates stored recovery codes).
+- The file transfer bucket exists, is private, and has its 1 day lifecycle rule (next section). `wrangler deploy` fails
+  when the `TRANSFERS` binding names a bucket that does not exist. File transfers need no secret.
+
+## File transfer bucket (once, and when moving to another account)
+
+Files a device opens from the desktop travel as ciphertext through R2 (security.md "File transfers"). The Worker binding
+`TRANSFERS` (`wrangler.jsonc` `r2_buckets`) names the bucket `monoptah-transfers`. Self-hosters create their own bucket
+and change `bucket_name`. Run once, from `web/`, after `wrangler login`:
+
+```bash
+wrangler r2 bucket create monoptah-transfers
+# Cleanup is ONLY this rule: R2 deletes every object under `transfers/` one day after it was written.
+wrangler r2 bucket lifecycle add monoptah-transfers expire-transfers transfers/ --expire-days 1 --force
+wrangler r2 bucket lifecycle list monoptah-transfers     # check: one rule, prefix transfers/, expire after 1 day
+```
+
+- Keep the bucket private: no custom domain, no `r2.dev` public access (`wrangler r2 bucket domain list monoptah-transfers` and
+  `wrangler r2 bucket dev-url get monoptah-transfers` must show none). Only the Worker reads and writes it.
+- There is no cron and no early delete. R2 applies the rule once a day, so an object can stay up to about two days; the
+  desktop treats a key as stale after three days and uploads again when an object is missing (it checks with `HEAD` on every
+  open), so a late or early deletion changes nothing the user sees.
+- The Worker never overwrites an object and never lists the bucket. Free tier: the bucket stays small because of the rule
+  (a day of previews, at most 64 MiB each); watch R2 storage in the dashboard after the first weeks.
+- Local development and the tests need nothing: `wrangler dev` and the Worker tests simulate the bucket in
+  Miniflare (`--local`), including the 1 day rule's absence (objects are simply kept in the local state).
+- Rollback of this feature is deploying the previous Worker. The bucket may stay: its rule empties it within two days.
 
 ## Deploy
 

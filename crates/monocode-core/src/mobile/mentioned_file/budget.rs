@@ -74,6 +74,30 @@ impl Limiter {
         Ok(())
     }
 
+    /// Counts `bytes` against the device's byte window before the work that will spend them starts, so parallel calls
+    /// cannot together pass the window. `Busy` when they would not fit; nothing is counted then.
+    pub fn reserve(&mut self, device: &str, now: Instant, bytes: u64) -> Result<(), Code> {
+        let usage = self.devices.entry(device.to_owned()).or_default();
+        Self::forget_old(usage, now);
+        let served: u64 = usage.bytes.iter().map(|(_, n)| n).sum();
+        if served.saturating_add(bytes) > BYTES_PER_WINDOW {
+            return Err(Code::Busy);
+        }
+        if bytes > 0 {
+            usage.bytes.push_back((now, bytes));
+        }
+        Ok(())
+    }
+
+    /// Takes back a [`Limiter::reserve`] whose work spent nothing (the object was already there, or the call failed).
+    pub fn refund(&mut self, device: &str, bytes: u64) {
+        if let Some(usage) = self.devices.get_mut(device) {
+            if let Some(at) = usage.bytes.iter().rposition(|(_, n)| *n == bytes) {
+                usage.bytes.remove(at);
+            }
+        }
+    }
+
     /// Adds the bytes of a reply to the device's tally.
     pub fn served(&mut self, device: &str, now: Instant, bytes: u64) {
         if bytes == 0 {
@@ -103,6 +127,16 @@ pub fn admit(device: &str) -> Result<(), Code> {
 /// Adds the bytes of a reply on the process-wide limiter.
 pub fn served(device: &str, bytes: u64) {
     limiter().served(device, Instant::now(), bytes);
+}
+
+/// [`Limiter::reserve`] on the process-wide limiter.
+pub fn reserve(device: &str, bytes: u64) -> Result<(), Code> {
+    limiter().reserve(device, Instant::now(), bytes)
+}
+
+/// [`Limiter::refund`] on the process-wide limiter.
+pub fn refund(device: &str, bytes: u64) {
+    limiter().refund(device, bytes);
 }
 
 /// Forgets a device on the process-wide limiter.
@@ -148,6 +182,26 @@ mod tests {
         );
         assert_eq!(
             limiter.admit("d", start + BYTE_WINDOW + Duration::from_secs(1)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_reservation_counts_at_once_and_a_refund_gives_it_back() {
+        let mut limiter = Limiter::new();
+        let now = Instant::now();
+        let half = BYTES_PER_WINDOW / 2;
+        assert_eq!(limiter.reserve("d", now, half), Ok(()));
+        assert_eq!(limiter.reserve("d", now, half), Ok(()));
+        // Two calls in flight have spent the window between them.
+        assert_eq!(limiter.reserve("d", now, 1), Err(Code::Busy));
+        limiter.refund("d", half);
+        assert_eq!(limiter.reserve("d", now, half), Ok(()));
+        assert_eq!(limiter.reserve("d", now, 1), Err(Code::Busy));
+        // Another device is not affected, and the window passing frees the bytes.
+        assert_eq!(limiter.reserve("other", now, half), Ok(()));
+        assert_eq!(
+            limiter.reserve("d", now + BYTE_WINDOW + Duration::from_secs(1), half),
             Ok(())
         );
     }

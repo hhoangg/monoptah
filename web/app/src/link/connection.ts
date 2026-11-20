@@ -282,6 +282,11 @@ export class LinkConnection {
     return session.request(method, params as Record<string, unknown>, options);
   }
 
+  /** This browser's server device id (what the Worker checks for a file download). Registers the device when it has none yet. */
+  async deviceId(): Promise<string> {
+    return (await (this.#deps.ensureDevice ?? ensureDevice)()).deviceId;
+  }
+
   /** Tells the desktop what this page shows (or null). Dropped unless `ready`: the desktop forgets it on every reconnect. */
   sendPresence(target: PresenceTarget | null): boolean {
     const session = this.#session;

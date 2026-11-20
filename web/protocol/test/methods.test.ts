@@ -92,6 +92,24 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
     params: { conversationId: "s1", path: "docs/report.html", asset: "img/a.png", offset: 0, source: false },
     result: { path: "/work/app/docs/report.html", name: "report.html", size: 12, kind: "html", encoding: "utf8", data: "<p></p>", offset: 0, total: 7, assets: ["img/a.png"], project: { projectId: "p1", path: "docs/report.html" } },
   },
+  "file.prepare": {
+    params: { conversationId: "s1", path: "docs/report.html", asset: "img/a.png" },
+    result: {
+      path: "/work/app/docs/report.html",
+      name: "report.html",
+      kind: "html",
+      mime: "text/html",
+      size: 12,
+      hash: "a".repeat(64),
+      object: `${"a".repeat(64)}.${"b".repeat(16)}`,
+      key: "A".repeat(43) + "=",
+      nonce: "A".repeat(11) + "=",
+      chunkBytes: 1048576,
+      reused: false,
+      assets: ["img/a.png"],
+      project: { projectId: "p1", path: "docs/report.html" },
+    },
+  },
   "project.search": { params: { projectId: "p1", query: "app" }, result: { results: [{ path: "src/app.ts", name: "app.ts" }] } },
   "project.fileHighlight": { params: { job: "j1", from: 0 }, result: { palette: ["#fff"], lines: [], done: true } },
   "project.git": {
@@ -204,6 +222,30 @@ describe("full-access is never sendable", () => {
     for (const mode of ["supervised", "auto-accept-edits", "auto"]) {
       expect(METHODS["session.configure"].params.safeParse({ conversationId: "s1", runtimeMode: mode }).success).toBe(true);
     }
+  });
+});
+
+describe("file.prepare", () => {
+  const { params, result } = METHODS["file.prepare"];
+  it("is a read method answered by the app", () => {
+    expect(METHODS["file.prepare"].class).toBe("read");
+    expect(METHODS["file.prepare"].transport).toBe("app");
+  });
+  it("needs a path, takes an optional conversation and asset, and limits them to 1024 chars", () => {
+    expect(params.safeParse({ path: "/tmp/a.png" }).success).toBe(true);
+    expect(params.safeParse({ conversationId: "s1", path: "a".repeat(1024), asset: "b".repeat(1024) }).success).toBe(true);
+    expect(params.safeParse({ conversationId: "s1" }).success).toBe(false);
+    expect(params.safeParse({ path: "" }).success).toBe(false);
+    expect(params.safeParse({ path: "a".repeat(1025) }).success).toBe(false);
+    expect(params.safeParse({ path: "a", asset: "b".repeat(1025) }).success).toBe(false);
+  });
+  it("answers an object named by a hash and a key id, never by a path", () => {
+    const ok = { path: "/a", name: "a", kind: "text", mime: "text/plain", size: 1, hash: "a".repeat(64), object: `${"a".repeat(64)}.${"b".repeat(16)}`, key: "A".repeat(43) + "=", nonce: "A".repeat(11) + "=", chunkBytes: 1, reused: true };
+    expect(result.safeParse(ok).success).toBe(true);
+    expect(result.safeParse({ ...ok, object: "../etc/passwd" }).success).toBe(false);
+    expect(result.safeParse({ ...ok, hash: "A".repeat(64) }).success).toBe(false);
+    expect(result.safeParse({ ...ok, key: "short" }).success).toBe(false);
+    expect(result.safeParse({ ...ok, kind: "video" }).success).toBe(false);
   });
 });
 

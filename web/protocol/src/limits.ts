@@ -43,6 +43,11 @@ export const REASSEMBLY_TIMEOUT_MS = 60_000;
 
 /** Client request timeout (3.3 step 5; desktop handler is 30 s). */
 export const REQUEST_TIMEOUT_MS = 35_000;
+/**
+ * Methods that answer after work the desktop does for the request, with the time the client waits (15 s more than the host,
+ * `reply_wait` in host.rs, so the host's answer, a `busy` included, always arrives first). `file.prepare` hashes a file and uploads it to R2 first (64 MiB on a slow uplink).
+ */
+export const REQUEST_TIMEOUT_BY_METHOD: Readonly<Record<string, number>> = { "file.prepare": 5 * 60_000 + 45_000 };
 /** Desktop handler timeout, for reference (3.3 step 5). */
 export const DESKTOP_HANDLER_TIMEOUT_MS = 30_000;
 /** Watch heartbeat period on the web link (5.5; 10 s on QUIC). */
@@ -115,3 +120,16 @@ export const USER_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 export const PAIRING_TTL_SECONDS = 600;
 /** Desktop poll interval (6.4). */
 export const PAIRING_POLL_INTERVAL_SECONDS = 3;
+
+// --- Encrypted file transfers (security.md 7 "File transfers", crates/monocode-core file_transfer::crypto) ---
+
+/** Plaintext bytes of every sealed chunk but the last. */
+export const TRANSFER_CHUNK_BYTES = 1024 * 1024;
+/** The GCM tag every sealed chunk carries. */
+export const TRANSFER_TAG_BYTES = 16;
+/** Largest file the desktop seals. */
+export const TRANSFER_MAX_PLAINTEXT_BYTES = 64 * 1024 * 1024;
+/** Prefix of the R2 keys the lifecycle rule expires (docs/deploy-runbook.md). */
+export const TRANSFER_PREFIX = "transfers/";
+/** An object lives one day in R2 (lifecycle rule). */
+export const TRANSFER_RETENTION_SECONDS = 24 * 60 * 60;

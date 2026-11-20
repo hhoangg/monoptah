@@ -5,6 +5,7 @@ import { apiError, type AppEnv } from "./http.ts";
 import { scheduled } from "./cron.ts";
 import { securityHeaders } from "./middleware/security.ts";
 import { MODULES } from "./modules/index.ts";
+import { routes as transfers } from "./modules/transfers/index.ts";
 
 export { DesktopRoom } from "./relay/DesktopRoom.ts";
 
@@ -19,6 +20,9 @@ export function createApp(): Hono<AppEnv> {
   for (const entry of Object.values(MODULES)) {
     if ("routes" in entry) app.route("/", entry.routes);
   }
+
+  // The encrypted file transfers (binary bodies, so outside the JSON route registry).
+  app.route("/", transfers);
 
   // 3. Unknown API and relay paths are JSON 404s; everything else is the SPA.
   const notFound = (c: Parameters<typeof apiError>[0]) => apiError(c, 404, "not_found", "Not found");

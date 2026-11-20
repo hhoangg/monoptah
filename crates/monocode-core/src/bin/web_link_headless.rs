@@ -34,9 +34,14 @@
 //! - `chat.mentionedFile` runs the real core implementation (`monocode_core::mobile::mentioned_file::handle`,
 //!   the one the app uses) against a seeded folder, when the environment seeds one (see below); otherwise it
 //!   answers `unsupported`.
+//! - `file.prepare` runs the real core implementation (`monocode_core::mobile::mentioned_file::transfer::handle`)
+//!   over the same seeded folder as the one project of the device: it hashes, seals and uploads the file to
+//!   the web server's R2 bucket with this desktop's token, and answers the object and the key. A Control device
+//!   may open any readable file, a read-only one only the seeded folder. Hide the capability `fileTransfer` to
+//!   behave like a desktop that predates it.
 //! - any other app method answers the error code `unsupported`.
 //!
-//! Seeding `chat.mentionedFile` (environment of the `serve` process):
+//! Seeding `chat.mentionedFile` and `file.prepare` (environment of the `serve` process):
 //!
 //! ```text
 //! WEB_LINK_HEADLESS_MENTION_DIR=<folder>   required to enable it; the session folder and the root of project `e2e-project`
@@ -582,6 +587,7 @@ fn app_loop(
     events: async_channel::Receiver<Event>,
     lines: Lines,
     stop: Arc<AtomicBool>,
+    data_dir: PathBuf,
 ) {
     let mut conversation = Conversation::new();
     // Watch ids and whether the watch still has to be sent the current state.
@@ -596,7 +602,11 @@ fn app_loop(
                         &lines,
                         json!({"event": "request", "method": request.method}),
                     );
-                    let result = answer(&mut conversation, &request);
+                    let result = if request.method == "file.prepare" {
+                        answer_prepare(&host, &data_dir, &request)
+                    } else {
+                        answer(&mut conversation, &request)
+                    };
                     if request.method == "conversation.send" || request.method == "session.cancel" {
                         for watch in &mut watches {
                             watch.1 = true;
@@ -779,6 +789,49 @@ fn answer_mentioned(request: &Request) -> Result<Value, Failure> {
     let mut ctx = mention::Context::new(&texts, &cwd, &roots, &projects);
     ctx.tool_texts = &tool_texts;
     mention::handle(&request.device.id, &request.params, &ctx).result
+}
+
+/// `file.prepare` through the real core policy and upload, over the seeded folder (the one project
+/// of the device). `WEB_LINK_HEADLESS_MENTION_LEGACY_FLAG` makes it answer as a desktop without it.
+fn answer_prepare(host: &MobileHost, data_dir: &Path, request: &Request) -> Result<Value, Failure> {
+    use monocode_core::mobile::{file_transfer, mentioned_file as mention};
+    let Some(seed) = mention_seed() else {
+        return Err(Failure::coded(
+            "unsupported",
+            "The E2E desktop does not serve this method",
+        ));
+    };
+    if seed.legacy_flag.as_ref().is_some_and(|flag| flag.exists()) {
+        return Err(Failure::coded(
+            "unsupported",
+            "The E2E desktop does not serve this method",
+        ));
+    }
+    let Some((base, token)) = file_transfer::endpoint(host) else {
+        return Err(Failure::from("Not paired"));
+    };
+    let selected = request
+        .device
+        .projects
+        .as_ref()
+        .is_none_or(|list| list.contains(&PROJECT_ID.to_owned()));
+    let projects = vec![mention::Project::new(
+        PROJECT_ID,
+        &seed.dir,
+        selected,
+        monocode_core::mobile::denylist::DenyList::default(),
+    )];
+    let cwd = seed.dir.to_string_lossy().into_owned();
+    let roots: Vec<String> = seed.root.iter().cloned().collect();
+    let no_texts: [String; 0] = [];
+    let mut ctx = mention::Context::new(&no_texts, &cwd, &roots, &projects);
+    ctx.private_dirs = vec![data_dir.to_path_buf()];
+    let store = file_transfer::HttpStore {
+        base: &base,
+        token: &token,
+    };
+    let keys = file_transfer::keystore::KeyStore::shared(data_dir);
+    mention::transfer::handle(&request.device, &request.params, &ctx, &store, &keys).result
 }
 
 fn answer(conversation: &mut Conversation, request: &Request) -> Result<Value, Failure> {
@@ -1094,7 +1147,8 @@ fn run_serve(
     let stop = Arc::new(AtomicBool::new(false));
     {
         let (host, lines, stop) = (host.clone(), sender.clone(), stop.clone());
-        std::thread::spawn(move || app_loop(host, events, lines, stop));
+        let dir = data_dir.to_path_buf();
+        std::thread::spawn(move || app_loop(host, events, lines, stop, dir));
     }
     let known = Known::default();
     {

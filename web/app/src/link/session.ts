@@ -13,6 +13,7 @@ import {
   MAX_COMMAND_ID_LENGTH,
   MAX_REQUEST_BYTES,
   PROTOCOL_VERSION,
+  REQUEST_TIMEOUT_BY_METHOD,
   REQUEST_TIMEOUT_MS,
   DEAD_AFTER_MS,
   WatchFrameSchema,
@@ -325,7 +326,7 @@ export class LinkSession {
           cleanup();
           reject(new LinkRequestError("The desktop did not answer in time", "timeout"));
         }
-      }, this.#requestTimeoutMs);
+      }, Math.max(this.#requestTimeoutMs, REQUEST_TIMEOUT_BY_METHOD[method] ?? 0));
       const cleanup = (): void => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);

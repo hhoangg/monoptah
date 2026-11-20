@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { FrameType, MAX_REQUEST_BYTES, encodeFrame } from "@monoptah/protocol";
-import { InMemoryRelay, LARGE_FILE_PATH, MockDesktop, fingerprint, generateKeyPair, type FrameSocket, type KeyPair } from "@monoptah/mock-desktop";
+import { FrameType, MAX_REQUEST_BYTES, REQUEST_TIMEOUT_BY_METHOD, REQUEST_TIMEOUT_MS, encodeFrame } from "@monoptah/protocol";
+import { FIXTURE_HANDLERS, InMemoryRelay, LARGE_FILE_PATH, MockDesktop, fingerprint, generateKeyPair, type FrameSocket, type KeyPair } from "@monoptah/mock-desktop";
 import { RelayConnection } from "./relay.ts";
 import {
   LinkRequestError,
@@ -342,6 +342,29 @@ describe("watches", () => {
   it("an error response to the watch request rejects it", async () => {
     const r = await connected();
     await expect(r.s.watch("conversation.watch", { conversationId: "nope" }, () => undefined)).rejects.toBeInstanceOf(LinkRequestError);
+  });
+
+  it("file.prepare waits for the desktop's upload (5 minutes 45 seconds) while other requests time out at 35 seconds", async () => {
+    vi.useFakeTimers();
+    const original = FIXTURE_HANDLERS["file.prepare"];
+    FIXTURE_HANDLERS["file.prepare"] = (() => new Promise(() => undefined)) as never;
+    try {
+      const r = await connected();
+      const prepare = r.s.request("file.prepare", { path: "/tmp/outside-note.txt" }).then(
+        () => "answered",
+        (e: unknown) => e,
+      );
+      let settled = false;
+      void prepare.then(() => (settled = true));
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS + 1_000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_BY_METHOD["file.prepare"]! - REQUEST_TIMEOUT_MS);
+      expect(await prepare).toMatchObject({ code: "timeout" });
+      // 15 seconds more than the desktop host's 5.5 minutes: its answer, even a busy one, comes first.
+      expect(REQUEST_TIMEOUT_BY_METHOD["file.prepare"]).toBe(5 * 60_000 + 30_000 + 15_000);
+    } finally {
+      FIXTURE_HANDLERS["file.prepare"] = original;
+    }
   });
 
   it("heartbeats keep the watch alive", async () => {
