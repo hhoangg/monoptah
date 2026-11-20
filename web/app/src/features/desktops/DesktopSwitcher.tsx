@@ -41,7 +41,7 @@ function OnlineDot({ online }: { online: boolean }) {
 export function DesktopTopBar({ children }: { children?: ReactNode }) {
   return (
     <>
-      <div className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
+      <div data-testid="desktop-top-bar" className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
         <div className="flex min-h-11 w-full items-center gap-2 pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]">
           <div className="flex min-w-0 flex-1 items-center">{children}</div>
           <AppNav className="shrink-0" />

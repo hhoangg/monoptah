@@ -58,7 +58,7 @@ export function Shell() {
         </header>
       )}
       {/* On /d the banner sits under the desktop switcher row (DesktopTopBar owns the top safe-area inset there). */}
-      {inDesktop ? null : <OfflineBanner />}
+      {inDesktop ? null : <OfflineBanner pinnedBelowHeader />}
       <main
         id={MAIN_ID}
         tabIndex={-1}

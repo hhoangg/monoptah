@@ -1,10 +1,14 @@
-// Global connection banner (F-07, N-17; the composer and transcript use `useConnectivity` for F-42):
+// Global connection banner (F-07, N-17; the composer uses `useConnectivity` for F-42):
 // "You are offline", "Desktop offline" with the last time the desktop was heard from, "Reconnecting...".
-// A polite live region that is always mounted, so a change is announced. Glass surface, tokens only.
+// An overlay toast (no layout shift) behind a short show delay. A polite live region that is always mounted, so a
+// change is announced. Glass surface, tokens only.
+import { AnimatePresence, useReducedMotion } from "motion/react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useRouterState } from "@tanstack/react-router";
 import { desktopsQuery } from "@/features/accounts/queries";
 import { getLinkConnection, useLink } from "@/link";
+import { cn } from "@/lib/utils";
 import { Button } from "@/ui/button";
 import { Glass } from "@/ui/Glass";
 import { Icon } from "@/ui/Icon";
@@ -44,36 +48,64 @@ export function useDesktopConnectivity(desktopId: string | null): Connectivity {
   return describeConnectivity(online, desktopId === null ? null : { status, presence, blocked, lastFrameAt }, directoryLastSeenAt);
 }
 
-export function OfflineBanner() {
+/** A short-lived blip (a quick reconnect after the PWA resumes) never reaches the screen. */
+export const SHOW_DELAY_MS = 400;
+
+/** True once `active` has held for `delay` ms; false again the moment it ends. */
+function useShowDelay(active: boolean, delay: number): boolean {
+  const [elapsed, setElapsed] = useState(false);
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setTimeout(() => setElapsed(true), delay);
+    return () => {
+      window.clearTimeout(timer);
+      setElapsed(false);
+    };
+  }, [active, delay]);
+  return active && elapsed;
+}
+
+/**
+ * The connection status as an overlay toast. The live region is a zero-height box in the flow (right under the top
+ * bar, which already clears the notch), so showing or hiding it never moves the content; the pill floats over the
+ * content from there. Only the pill takes pointer events. It is the single live region for the connection state
+ * (the pill also says the saved data is shown).
+ */
+export function OfflineBanner({ pinnedBelowHeader = false }: { /** The page scrolls (not a /d frame): stay in view just under the sticky header. */ pinnedBelowHeader?: boolean }) {
   const desktopId = useRouterState({ select: (state) => desktopIdFromPath(state.location.pathname) });
   const connectivity = useDesktopConnectivity(desktopId);
-  const showing = connectivity.kind !== "online";
+  const reduceMotion = useReducedMotion();
+  const showing = useShowDelay(connectivity.kind !== "online", SHOW_DELAY_MS);
   const canRetry = desktopId !== null && ((connectivity.kind === "desktop_offline" || (connectivity.kind === "reconnecting" && connectivity.connecting !== true)));
+  const offset = reduceMotion ? 0 : -8;
   return (
-    <div
-      role="status"
-      aria-live="polite"
-      data-testid="connection-banner"
-      className={showing ? "shrink-0 px-2 pt-2 min-[24rem]:px-5" : undefined}
-    >
-      {showing ? (
-        <Glass
-          data-kind={connectivity.kind}
-          className="mx-auto flex min-h-11 max-w-3xl items-center gap-2 rounded-[16px] px-3 py-2 text-small text-content"
-        >
-          <Icon name={connectivity.kind === "reconnecting" ? "spinner" : "computerOff"} size={18} className="shrink-0 text-muted-text" />
-          <span className="min-w-0 flex-1">
-            <span className="font-semibold">{connectivity.label}</span>
-            {connectivity.lastSeenAt !== null ? <span className="text-muted-text">{` - last seen ${formatLastSeen(connectivity.lastSeenAt)}`}</span> : null}
-            {connectivity.kind === "offline" ? <span className="block text-muted-text">Saved data stays readable. Sending waits for the connection.</span> : null}
-          </span>
-          {canRetry && desktopId !== null ? (
-            <Button variant="ghost" size="sm" onClick={() => getLinkConnection(desktopId).reconnect()}>
-              Retry
-            </Button>
-          ) : null}
-        </Glass>
-      ) : null}
+    <div role="status" aria-live="polite" data-testid="connection-banner" className={cn("pointer-events-none z-20 h-0 shrink-0", pinnedBelowHeader ? "sticky top-[calc(env(safe-area-inset-top)+2.75rem)]" : "relative")}>
+      <AnimatePresence>
+        {showing ? (
+          <div key="toast" className="absolute inset-x-0 top-2 flex justify-center pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.5rem,env(safe-area-inset-left))]">
+            <Glass
+              data-kind={connectivity.kind}
+              initial={{ opacity: 0, y: offset }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: offset }}
+              transition={{ duration: reduceMotion ? 0 : 0.2, ease: "easeOut" }}
+              className="pointer-events-auto flex min-h-9 max-w-full items-center gap-2 rounded-[20px] bg-[var(--sheet)] px-3 py-1.5 text-small text-content"
+            >
+              <Icon name={connectivity.kind === "reconnecting" ? "spinner" : "computerOff"} size={18} className="shrink-0 text-muted-text" />
+              <span className="min-w-0">
+                <span className="font-semibold">{connectivity.label}</span>
+                {connectivity.lastSeenAt !== null ? <span className="text-muted-text">{` - last seen ${formatLastSeen(connectivity.lastSeenAt)}`}</span> : null}
+                <span className="text-muted-text">{" - showing saved data"}</span>
+              </span>
+              {canRetry && desktopId !== null ? (
+                <Button variant="ghost" size="sm" onClick={() => getLinkConnection(desktopId).reconnect()}>
+                  Retry
+                </Button>
+              ) : null}
+            </Glass>
+          </div>
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }
