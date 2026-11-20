@@ -7,6 +7,7 @@ import { PageHeader } from "@/ui/PageHeader";
 import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { Slot } from "@/ui/slots";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
+import { DesktopUpdateSection } from "./DesktopUpdateSection";
 import { DesktopLinkError, forgetDesktopLocally, useDesktopLink, type DesktopLink, type DesktopLinkStatus } from "./desktopLink";
 import { workspaceQuery } from "./desktopQueries";
 import { formatRelative } from "./format";
@@ -134,6 +135,7 @@ function DesktopSettings({ desktopId, name, accountOnline, lastSeenAt }: { deskt
           <SettingsRow icon="folder" title="Projects on this device" description="Needs a connection to the desktop" />
         )}
       </SettingsCard>
+      <DesktopUpdateSection desktopId={desktopId} link={link} status={status} />
       <Slot name="desktop-settings-sections" desktopId={desktopId} />
       <SettingsCard title="Connection">
         <SettingsRow

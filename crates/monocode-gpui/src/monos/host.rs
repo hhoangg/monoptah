@@ -415,6 +415,10 @@ impl Monos {
         if call.action.starts_with("terminals.") && (habit_run || question || heartbeat) {
             return Err("A habit run, heartbeat or workflow question cannot use terminals".into());
         }
+        // Restarting the app is only ever the user's request, made in the Mono's own chat.
+        if call.action == "app.update" && (habit_run || question || heartbeat) {
+            return Err("A habit run, heartbeat or workflow question cannot update the app".into());
+        }
         // A workflow must not start workflows through its own question to the Mono.
         if call.action.starts_with("workflows.") && question {
             return Err("A workflow's question to its Mono cannot use workflows".into());
@@ -1530,6 +1534,59 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                         _=>unreachable!(),
                     };Ok((value,Effect::None))
                 },cx);
+                return;
+            }
+            "app.update" => {
+                let request = match monocode_core::app_update::remote::parse_request(&input) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.finish_call(call, Err(error), cx);
+                        return;
+                    }
+                };
+                let origin = crate::shell::remote_update::Origin::Mono {
+                    id: mono.id.clone(),
+                    name: mono.label(),
+                    session: call.session,
+                };
+                // Run after this update: the shell reads the Monos entity being updated now.
+                let owner = self.owner.clone();
+                let handle = window.window_handle();
+                cx.spawn(async move |this, cx| {
+                    let task = handle
+                        .update(cx, |_, _, cx| {
+                            owner.update(cx, |owner, cx| owner.remote_update(origin, request, cx))
+                        })
+                        .ok()
+                        .and_then(|task| task.ok());
+                    let reply = match task {
+                        Some(task) => task.await,
+                        None => Err("The app window is gone".to_owned()),
+                    };
+                    let (result, begin) = match reply {
+                        Ok(reply) => (Ok(reply.value), reply.begin),
+                        Err(error) => (Err(error), None),
+                    };
+                    // The caller hears back first; the install starts after.
+                    let _ = this.update(cx, |this, cx| this.finish_call(call, result, cx));
+                    if let Some(begin) = begin {
+                        // Handed back when the shell cannot take it, so it can be abandoned.
+                        let slot = std::rc::Rc::new(std::cell::RefCell::new(Some(begin)));
+                        let taker = slot.clone();
+                        let _ = handle.update(cx, |_, _, cx| {
+                            let _ = owner.update(cx, |owner, cx| {
+                                if let Some(begin) = taker.borrow_mut().take() {
+                                    owner.remote_update_begin(begin, cx);
+                                }
+                            });
+                        });
+                        let left = slot.borrow_mut().take();
+                        if let Some(begin) = left {
+                            let _ = this.update(cx, |this, cx| begin.abandon(&this.store, cx));
+                        }
+                    }
+                })
+                .detach();
                 return;
             }
             terminals if terminals.starts_with("terminals.") => {

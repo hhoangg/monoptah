@@ -725,6 +725,38 @@ export const METHODS = {
   }),
   "cloud.moveToLocal": method({ class: "control", transport: "app", params: SessionIdParams, result: Json }),
   "cloud.cancelMove": method({ class: "control", transport: "app", params: SessionIdParams, result: Json }),
+
+  // Desktop app update (remote update and restart)
+  "desktop.updateStatus": method({
+    class: "read",
+    transport: "app",
+    params: Empty,
+    /** `latest` equals `current` when up to date. `error` is set when the update feed could not be read. */
+    result: z.looseObject({
+      current: z.string(),
+      latest: z.string(),
+      updateAvailable: z.boolean(),
+      notes: z.string(),
+      runningSessions: z.array(z.object({ id: z.string(), title: z.string() })),
+      error: z.string().optional(),
+      /** The desktop's message for an update that failed before the restart; present until the next install request starts. */
+      lastFailure: z.string().optional(),
+    }),
+  }),
+  "desktop.update": method({
+    class: "control",
+    transport: "app",
+    params: z.object({ confirm: z.boolean().optional() }),
+    /** `confirmation_required` does nothing; `updating` is answered before the download, install and relaunch. */
+    result: z.looseObject({
+      status: z.enum(["updating", "confirmation_required", "up_to_date"]),
+      from: z.string().optional(),
+      to: z.string().optional(),
+      current: z.string().optional(),
+      runningSessions: z.array(z.object({ id: z.string(), title: z.string() })).optional(),
+      message: z.string().optional(),
+    }),
+  }),
 } as const;
 
 export type MethodName = keyof typeof METHODS;

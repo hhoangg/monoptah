@@ -459,6 +459,22 @@ fn an_early_or_failed_exit_keeps_the_pane_for_its_bar(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_working_terminal_agent_counts_as_running_for_a_remote_update(cx: &mut TestAppContext) {
+    let (window, ids) = fixture(cx, "claude", Some("conv-1"), |ids| vec![ids.chat, ids.tui]);
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.remote_update_running(None, cx).is_empty());
+            tui(shell, ids.tui).update(cx, |tui, cx| tui.set_busy(true, cx));
+            let running = shell.remote_update_running(None, cx);
+            assert_eq!(running.len(), 1);
+            assert_eq!(running[0].id, ids.tui.to_string());
+            assert!(shell.remote_update_running(Some(ids.tui), cx).is_empty());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn busy_marks_the_session_and_the_cli_exiting_clears_it(cx: &mut TestAppContext) {
     let (window, ids) = fixture(cx, "claude", Some("conv-1"), |ids| vec![ids.chat, ids.tui]);
     cx.run_until_parked();

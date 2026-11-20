@@ -112,6 +112,9 @@ export interface WatchCursor {
 export interface MockWorldOptions {
   now?: () => number;
   capabilities?: Partial<WorldCapabilities>;
+  /** Desktop app version and the newest one in the update feed (default both "1.4.0", up to date). */
+  appVersion?: string;
+  latestVersion?: string;
 }
 
 const PROJECTS = [
@@ -126,6 +129,18 @@ export class MockWorld {
   capabilities: WorldCapabilities;
   readonly sessions = new Map<string, SessionRecord>();
   readonly instances = new Map<string, CloudInstanceRecord>();
+  /** Desktop app version and the newest version of the update feed; a test sets `latestVersion`. */
+  appVersion: string;
+  latestVersion: string;
+  updateNotes = "Fixes and improvements (fake notes)";
+  /** Set to make the feed unreadable: the status then reports `latest = current` and this error. */
+  updateFeedError: string | undefined;
+  /** Every accepted `desktop.update` that started an update (a test reads it; the version does not change until `completeUpdate`). */
+  /** A test sets this to make the next accepted `desktop.update` reply `updating` and then fail (disk full, ...). */
+  failNextUpdate: string | undefined;
+  /** What `desktop.updateStatus` reports as `lastFailure`; cleared when the next install request starts. */
+  lastUpdateFailure: string | undefined;
+  readonly updatesStarted: { from: string; to: string }[] = [];
   /** Session folders of every project, in the desktop's order. */
   folders: FolderRecord[] = [];
   #nextFolder = 1;
@@ -136,6 +151,8 @@ export class MockWorld {
   constructor(options: MockWorldOptions = {}) {
     this.now = options.now ?? (() => FIXTURE_NOW);
     this.capabilities = { approvals: true, cloud: true, ...options.capabilities };
+    this.appVersion = options.appVersion ?? "1.4.0";
+    this.latestVersion = options.latestVersion ?? this.appVersion;
     this.#seed();
   }
 
@@ -601,6 +618,49 @@ export class MockWorld {
   projectIds(): string[] {
     return PROJECTS.map((p) => p.id);
   }
+
+  // --- Desktop app update ---
+
+  /** Sessions an update and restart would interrupt. */
+  runningSessions(): { id: string; title: string }[] {
+    return [...this.sessions.values()].filter((s) => s.busy).map((s) => ({ id: s.id, title: s.title }));
+  }
+
+  updateStatus(): ResultOf<"desktop.updateStatus"> {
+    const failed = this.updateFeedError !== undefined;
+    const latest = failed ? this.appVersion : this.latestVersion;
+    return {
+      current: this.appVersion,
+      latest,
+      updateAvailable: latest !== this.appVersion,
+      notes: failed ? "" : this.updateNotes,
+      runningSessions: this.runningSessions(),
+      ...(failed ? { error: this.updateFeedError } : {}),
+      ...(this.lastUpdateFailure !== undefined ? { lastFailure: this.lastUpdateFailure } : {}),
+    };
+  }
+
+  /** The desktop never downgrades and asks first when sessions run. */
+  update(confirm: boolean): ResultOf<"desktop.update"> {
+    const status = this.updateStatus();
+    if (!status.updateAvailable) return { status: "up_to_date", current: this.appVersion };
+    if (status.runningSessions.length > 0 && !confirm) {
+      return { status: "confirmation_required", runningSessions: status.runningSessions, message: "Running sessions will be interrupted" };
+    }
+    this.lastUpdateFailure = undefined;
+    this.updatesStarted.push({ from: this.appVersion, to: status.latest });
+    if (this.failNextUpdate !== undefined) {
+      // The reply below is still `updating`; the failure only shows in the next status read, and the link stays up.
+      this.lastUpdateFailure = `Update to ${status.latest} failed: ${this.failNextUpdate}`;
+      this.failNextUpdate = undefined;
+    }
+    return { status: "updating", from: this.appVersion, to: status.latest };
+  }
+
+  /** What the relaunch does: the app comes back on the new version. */
+  completeUpdate(): void {
+    this.appVersion = this.latestVersion;
+  }
 }
 
 // --- Handlers ---
@@ -926,4 +986,6 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
   "cloud.moveToCloud": (p, { world }) => world.startMove(p.sessionId, true),
   "cloud.moveToLocal": (p, { world }) => world.startMove(p.sessionId, false),
   "cloud.cancelMove": (p, { world }) => world.cancelMove(p.sessionId),
+  "desktop.updateStatus": (_p, { world }) => world.updateStatus(),
+  "desktop.update": (p, { world }) => world.update(p.confirm === true),
 };

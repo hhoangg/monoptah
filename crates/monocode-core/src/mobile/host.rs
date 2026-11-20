@@ -85,6 +85,8 @@ pub(super) const APP_METHODS: &[&str] = &[
     "cloud.moveToCloud",
     "cloud.moveToLocal",
     "cloud.cancelMove",
+    "desktop.updateStatus",
+    "desktop.update",
 ];
 /// Under the phone's own wait, so it hears why rather than timing out.
 const REPLY_WAIT: Duration = Duration::from_secs(25);
@@ -697,6 +699,17 @@ impl MobileHost {
         project_id: Option<&str>,
         mono_id: Option<&str>,
     ) -> Vec<String> {
+        self.push_tokens_for(category, project_id, mono_id, false)
+    }
+
+    /// [`Self::push_tokens`], optionally only for phones with Control access.
+    pub fn push_tokens_for(
+        &self,
+        category: &str,
+        project_id: Option<&str>,
+        mono_id: Option<&str>,
+        control_only: bool,
+    ) -> Vec<String> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
@@ -708,6 +721,7 @@ impl MobileHost {
             .devices
             .iter()
             .filter(|device| device.kind == DeviceKind::Phone)
+            .filter(|device| !control_only || device.permission == Permission::Control)
             .filter(|device| {
                 let covers =
                     |selection: &Option<Vec<String>>, id: Option<&str>| match (selection, id) {

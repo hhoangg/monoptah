@@ -19,3 +19,11 @@ export const workspaceQuery = (desktopId: string, link: DesktopLink) =>
     staleTime: 0,
     retry: false,
   });
+
+export const updateStatusQuery = (desktopId: string, link: DesktopLink) =>
+  queryOptions({
+    queryKey: ["settings", "desktop", desktopId, "update"] as const,
+    queryFn: () => link.call("desktop.updateStatus", {}),
+    staleTime: 0,
+    retry: false,
+  });

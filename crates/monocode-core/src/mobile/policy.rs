@@ -410,6 +410,8 @@ pub const METHODS: &[Entry] = &[
     app("cloud.moveToCloud", Class::Control),
     app("cloud.moveToLocal", Class::Control),
     app("cloud.cancelMove", Class::Control),
+    app("desktop.updateStatus", Class::Read),
+    app("desktop.update", Class::Control),
     host("device.enroll", Class::Denied),
     host("device.leave", Class::Read),
     host("workspace.list", Class::Read),
@@ -1178,6 +1180,30 @@ mod tests {
                 Some(Code::ReadOnly)
             );
         }
+    }
+
+    #[test]
+    fn only_a_control_device_may_update_the_desktop_app() {
+        let off = PolicyFlags::default();
+        for kind in [DeviceKind::Web, DeviceKind::Phone] {
+            let reader = ctx(kind, Permission::Read);
+            let control = ctx(kind, Permission::Control);
+            assert_eq!(
+                call(&reader, "desktop.update", json!({"confirm": true}), &off),
+                Some(Code::ReadOnly)
+            );
+            assert_eq!(call(&control, "desktop.update", json!({}), &off), None);
+            // The status is a read, and the update is never one (it is audited).
+            assert_eq!(call(&reader, "desktop.updateStatus", json!({}), &off), None);
+        }
+        assert_eq!(
+            classify("desktop.update", &json!({})),
+            Some(Access::Control)
+        );
+        assert_eq!(
+            classify("desktop.updateStatus", &json!({})),
+            Some(Access::Read)
+        );
     }
 
     #[test]

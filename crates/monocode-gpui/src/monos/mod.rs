@@ -1186,6 +1186,27 @@ impl Monos {
             .cloned()
             .filter(|v| !self.failed_reports.contains(id) && v.read(cx).ready_for_external(cx))
         {
+            let quiet = self
+                .roster
+                .get_mut(id)
+                .map(|m| std::mem::take(&mut m.quiet_reports))
+                .unwrap_or_default();
+            let drained = !quiet.is_empty();
+            let mut kept = Vec::new();
+            for text in quiet {
+                if view
+                    .update(cx, |v, cx| v.mono_post("assistant", text.clone(), cx))
+                    .is_err()
+                {
+                    kept.push(text);
+                }
+            }
+            if let Some(mono) = self.roster.get_mut(id) {
+                mono.quiet_reports.extend(kept);
+            }
+            if drained {
+                self.save(cx);
+            }
             let reports = self
                 .roster
                 .get_mut(id)

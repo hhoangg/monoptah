@@ -67,6 +67,10 @@ pub struct Mono {
     pub desktop_launch_ids: Vec<i64>,
     pub outbox: Vec<Message>,
     pub pending_reports: Vec<String>,
+    /// Posts to the chat that are not announced to phones and web devices (the app already
+    /// pushed them, as a remote update's result).
+    #[serde(default)]
+    pub quiet_reports: Vec<String>,
     pub habit_sessions: Vec<i64>,
     pub seen_rows: usize,
     /// Minutes of inactivity before a heartbeat; zero turns heartbeats off.
@@ -206,6 +210,7 @@ impl Default for Mono {
             desktop_launch_ids: Vec::new(),
             outbox: Vec::new(),
             pending_reports: Vec::new(),
+            quiet_reports: Vec::new(),
             habit_sessions: Vec::new(),
             seen_rows: 0,
             heartbeat_minutes: heartbeat::DEFAULT_MINUTES,

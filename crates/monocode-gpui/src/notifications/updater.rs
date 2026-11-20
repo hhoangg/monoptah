@@ -52,6 +52,40 @@ enum Progress {
 pub(crate) fn version() -> &'static str {
     option_env!("MONOCODE_NATIVE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
+/// The feed, its verification key and the running version, from the build.
+pub(crate) fn feed_config() -> Result<Config, String> {
+    let endpoint = option_env!("MONOCODE_NATIVE_UPDATER_ENDPOINT")
+        .filter(|v| !v.is_empty())
+        .ok_or("Automatic updates aren’t configured for this build")?;
+    let key = option_env!("MONOCODE_NATIVE_UPDATER_PUBKEY")
+        .filter(|v| !v.is_empty())
+        .ok_or("This build has no update verification key")?;
+    Config::new(endpoint, key, version())
+}
+/// Asks the signed feed whether a newer package exists. Blocking: run it off the UI thread.
+pub(crate) fn check_feed() -> Result<Option<(Update, Installation)>, String> {
+    let config = feed_config()?;
+    let installation = Installation::detect()?;
+    Ok(app_update::check(&config, &installation)?.map(|update| (update, installation)))
+}
+/// Called with the reason when a remote install fails before the app restarts.
+pub(crate) type InstallFailed = Box<dyn FnOnce(String, &mut App)>;
+/// Starts the install of an update found by [`check_feed`], through the one path the Update
+/// and Restart button uses (download, signature check, install, relaunch).
+pub(crate) fn install_remote(
+    update: Update,
+    installation: Installation,
+    failed: InstallFailed,
+    cx: &mut App,
+) -> Result<(), String> {
+    let entity = cx
+        .try_global::<Shared>()
+        .map(|shared| shared.0.clone())
+        .ok_or("The updater is not running")?;
+    entity.update(cx, |updater, cx| {
+        updater.install_remote(update, installation, failed, cx)
+    })
+}
 pub(crate) fn shared(store: Database, cx: &mut App) -> Entity<Updater> {
     if let Some(shared) = cx.try_global::<Shared>() {
         return shared.0.clone();
@@ -72,20 +106,13 @@ pub(crate) struct Updater {
     message: Option<String>,
     poll: Option<gpui::Task<()>>,
     gate: Arc<Mutex<InstallGate>>,
+    /// A remote install in progress: told why it failed, once.
+    remote_failed: Option<InstallFailed>,
 }
 impl EventEmitter<Event> for Updater {}
 impl Updater {
     fn new(store: Database, cx: &mut Context<Self>) -> Self {
-        let setup = (|| {
-            let endpoint = option_env!("MONOCODE_NATIVE_UPDATER_ENDPOINT")
-                .filter(|v| !v.is_empty())
-                .ok_or("Automatic updates aren’t configured for this build")?;
-            let key = option_env!("MONOCODE_NATIVE_UPDATER_PUBKEY")
-                .filter(|v| !v.is_empty())
-                .ok_or("This build has no update verification key")?;
-            Config::new(endpoint, key, version())
-        })();
-        let (config, message) = match setup {
+        let (config, message) = match feed_config() {
             Ok(config) => (Some(config), None),
             Err(error) => (None, Some(error)),
         };
@@ -103,6 +130,7 @@ impl Updater {
             message,
             poll: None,
             gate: Arc::new(Mutex::new(InstallGate::default())),
+            remote_failed: None,
         };
         if this.config.is_some() {
             this.check(false, cx);
@@ -185,6 +213,28 @@ impl Updater {
         })
         .detach();
     }
+    fn install_remote(
+        &mut self,
+        update: Update,
+        installation: Installation,
+        failed: InstallFailed,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.busy() {
+            return Err("An update is already in progress".into());
+        }
+        self.pending = Some(update);
+        self.installation = Some(installation);
+        self.remote_failed = Some(failed);
+        self.install(cx);
+        Ok(())
+    }
+    /// Tells a remote requester why the install ended before the restart.
+    fn tell_remote_failure(&mut self, error: &str, cx: &mut Context<Self>) {
+        if let Some(failed) = self.remote_failed.take() {
+            failed(error.to_owned(), cx);
+        }
+    }
     fn install(&mut self, cx: &mut Context<Self>) {
         if self.busy() {
             return;
@@ -261,6 +311,10 @@ impl Updater {
                             "The update was installed. Reopen Monoptah Native to finish: {error}"
                         )));
                         this.changed(cx);
+                        this.tell_remote_failure(
+                            &format!("installed, but the app could not restart itself: {error}"),
+                            cx,
+                        );
                     } else {
                         crate::quit(cx);
                     }
@@ -273,6 +327,7 @@ impl Updater {
                         "Couldn’t install the update: {error}"
                     )));
                     this.changed(cx);
+                    this.tell_remote_failure(&error, cx);
                     if this.gate.lock().unwrap_or_else(|e| e.into_inner()).quitting {
                         crate::quit(cx);
                     }

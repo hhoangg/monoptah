@@ -595,6 +595,37 @@ fn rules_live_in_instructions_and_the_context_only_repeats_them_when_not_in_syst
 }
 
 #[test]
+fn app_update_is_documented_validated_and_captioned() {
+    use serde_json::json;
+    assert!(bridge::HELP.contains("app.update {mode?:"));
+    assert!(bridge::HELP.contains("never a downgrade"));
+    assert!(bridge::HELP.contains("confirmation_required"));
+    assert_eq!(
+        crate::tool::app_activity("app.update", false),
+        ("Updated", "the app")
+    );
+    for input in [
+        json!({}),
+        json!({"mode": "check"}),
+        json!({"mode": "install", "force": true}),
+        json!({"mode": "install", "confirm": true}),
+    ] {
+        assert_eq!(api::validate("app.update", &input), Ok(()), "{input}");
+    }
+    // No version and no URL can be named: the feed alone decides.
+    for input in [
+        json!({"mode": "downgrade"}),
+        json!({"mode": "install", "force": "yes"}),
+        json!({"mode": "install", "version": "0.0.1"}),
+        json!({"url": "https://example.test/app.zip"}),
+    ] {
+        assert!(api::validate("app.update", &input).is_err(), "{input}");
+    }
+    // Not an Operator action: only a Mono may update the app.
+    assert!(crate::app_access::validate_operator("app.update", &json!({})).is_err());
+}
+
+#[test]
 fn terminal_actions_are_documented_validated_and_captioned() {
     use serde_json::json;
     for action in [

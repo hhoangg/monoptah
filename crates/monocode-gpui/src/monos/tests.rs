@@ -4227,6 +4227,39 @@ mod reset_flow {
         );
     }
     #[gpui::test]
+    fn a_remote_update_result_is_posted_into_the_requesting_chat(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        recorder(&s, Vec::new(), cx);
+        ask(&s, cx);
+        let handle: gpui::AnyWindowHandle = s.window.into();
+        let posted = handle
+            .update(cx, |_, _, cx| {
+                s.manager.update(cx, |m, cx| {
+                    assert!(!m.post_update_result("missing", "Updated to 1.0.0", cx));
+                    m.post_update_result(&s.id, "Updated to 1.0.0", cx)
+                })
+            })
+            .unwrap();
+        assert!(posted);
+        cx.run_until_parked();
+        let (waiting, shown) = cx.update(|cx| {
+            let m = s.manager.read(cx);
+            let waiting = m.roster.get(&s.id).unwrap().pending_reports.clone();
+            let rows = m.chats[&s.id]
+                .read(cx)
+                .transcript
+                .read(cx)
+                .source_rows()
+                .to_vec();
+            (waiting, rows.iter().any(|r| r.text == "Updated to 1.0.0"))
+        });
+        assert!(
+            shown || waiting.iter().any(|r| r.ends_with("Updated to 1.0.0")),
+            "the result is in the chat, or queued until it can take it"
+        );
+    }
+    #[gpui::test]
     fn the_notice_names_the_dialogs_provider_when_the_record_vanished(cx: &mut TestAppContext) {
         let s = setup(cx);
         conversation(&s, "claude", Some(A), &[]);
@@ -6089,6 +6122,35 @@ fn terminals_belong_to_the_monos_own_chat_and_not_to_habit_runs_or_heartbeats(
     // Nothing the refused calls asked for happened.
     let after = ask_habit(&s, "t-list2", "terminals.list", json!({}), cx).unwrap();
     assert_eq!(after.as_array().unwrap().len(), 1);
+}
+
+const UPDATE_REFUSED: &str = "A habit run, heartbeat or workflow question cannot update the app";
+
+#[gpui::test]
+fn a_habit_run_and_a_heartbeat_cannot_update_the_app(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let heartbeat = fake_run(&s, cx);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            m.running.get_mut(&heartbeat).unwrap().habit = mono::heartbeat::RUN_ID.into();
+        })
+    });
+    for session in [run, heartbeat] {
+        for input in [json!({"mode": "install", "force": true}), json!({})] {
+            let refused = call_from(
+                &s,
+                session,
+                &format!("{session}-{input}"),
+                "app.update",
+                input,
+                cx,
+            )
+            .try_recv()
+            .unwrap();
+            assert_eq!(refused, Err(UPDATE_REFUSED.into()));
+        }
+    }
 }
 
 #[gpui::test]

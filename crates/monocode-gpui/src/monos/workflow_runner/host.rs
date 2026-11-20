@@ -673,6 +673,25 @@ impl Monos {
         self.dispatch(&report.mono_id, cx);
     }
 
+    /// Puts the result of a remote update in the Mono's chat. It waits in the Mono's pending
+    /// reports until the chat can take it, so it also works right after a launch. False when
+    /// the Mono is gone.
+    pub(crate) fn post_update_result(
+        &mut self,
+        mono: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(entry) = self.roster.get_mut(mono) else {
+            return false;
+        };
+        entry.quiet_reports.push(text.to_owned());
+        self.ensure_chat(mono, cx);
+        self.save(cx);
+        self.dispatch(mono, cx);
+        true
+    }
+
     fn workflow_attention(&mut self, mono: &str, session: &str, on: bool, cx: &mut Context<Self>) {
         let Some(local) = self.workflow_local_id(session) else {
             return;

@@ -14,6 +14,8 @@ export interface MockDesktopLinkOptions {
   /** False leaves the desktop side of the relay empty, so the link goes offline (`desktop_offline`). Default true. */
   online?: boolean;
   name?: string;
+  /** Permission of this browser's device on the mock desktop. Default "control". */
+  permission?: "read" | "control";
 }
 
 /** A link plus the pieces tests inspect. */
@@ -24,6 +26,10 @@ export interface MockDesktopLink extends DesktopLink {
   readonly calls: Array<{ method: string; params: unknown }>;
   /** Number of completed handshakes (HS1 sent) so far. */
   readonly handshakes: number;
+  /** Drops the connection and keeps it down (status "reconnecting", or "offline" with `offline: true`) until `restore()`. */
+  hold(options?: { offline?: boolean }): void;
+  /** Ends a `hold`: runs the handshake again and resolves when connected. */
+  restore(): Promise<void>;
   close(): void;
 }
 
@@ -39,7 +45,7 @@ export function createMockDesktopLink(options: MockDesktopLinkOptions = {}): Moc
   const deviceKey: KeyPair = generateKeyPair();
   const relay = new InMemoryRelay();
   const desktop = new MockDesktop({ desktopId, name: options.name ?? "Mock desktop" });
-  desktop.setDevice(fingerprint(deviceKey.publicKey), { status: "confirmed", permission: "control" });
+  desktop.setDevice(fingerprint(deviceKey.publicKey), { status: "confirmed", permission: options.permission ?? "control" });
   if (options.online !== false) desktop.attach(relay.connectDesktop());
 
   const listeners = new Set<() => void>();
@@ -49,6 +55,7 @@ export function createMockDesktopLink(options: MockDesktopLinkOptions = {}): Moc
   let connecting: Promise<void> | null = null;
   let handshakes = 0;
   let channel = 0;
+  let held = false;
 
   function setStatus(next: DesktopLinkStatus): void {
     if (status === next) return;
@@ -113,7 +120,21 @@ export function createMockDesktopLink(options: MockDesktopLinkOptions = {}): Moc
         throw toLinkError(error);
       }
     },
+    hold(holdOptions = {}) {
+      held = true;
+      const old = client;
+      client = null;
+      old?.bye();
+      setStatus(holdOptions.offline ? "offline" : "reconnecting");
+    },
+    async restore() {
+      held = false;
+      setStatus("reconnecting");
+      await relay.settled();
+      await connect();
+    },
     async reconnect() {
+      if (held) throw new DesktopLinkError("The connection is held down", "desktop_offline");
       setStatus("reconnecting");
       const old = client;
       client = null;

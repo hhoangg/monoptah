@@ -2,6 +2,7 @@
 //! Tauri. The native feed is additionally signed, binding version, channel and
 //! platform to the package; it cannot dispatch a production Tauri update.
 mod install;
+pub mod remote;
 #[cfg(test)]
 mod tests;
 
