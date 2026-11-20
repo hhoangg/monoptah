@@ -9,6 +9,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "@/ui/sonner";
 import { Icon } from "@/ui/Icon";
+import { useLongPress } from "@/lib/useLongPress";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "./contextMenu";
 import { REACTION_EMOJIS, messageKey, setReaction, useMonoReactions } from "./reactions";
 
@@ -46,9 +47,11 @@ function wantsNativeMenu(target: EventTarget | null): boolean {
 }
 
 /** Opens the context menu at the middle of `element`, as a right click there would. */
-function openMenuAt(element: Element): void {
+function openMenuAt(element: Element, point?: { x: number; y: number }): void {
   const box = element.getBoundingClientRect();
-  element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: box.left + box.width / 2, clientY: box.top + box.height / 2 }));
+  const clientX = point?.x ?? box.left + box.width / 2;
+  const clientY = point?.y ?? box.top + box.height / 2;
+  element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX, clientY }));
 }
 
 export function MessageActions({
@@ -74,6 +77,16 @@ export function MessageActions({
   const heldRef = useRef<HeldMessage | null>(null);
   const [open, setOpen] = useState(false);
   const reactions = useMonoReactions(desktopId, monoId);
+  // The shared long press (500 ms, haptic, cancelled by a move or a scroll) opens the menu where the finger is. Radix
+  // has its own 700 ms pointerdown timer, which then finds the menu already open.
+  const { bind: press } = useLongPress({
+    onLongPress: ({ x, y, target }) => {
+      // A selection or a link keeps the browser's menu: not ours, so no haptic and the click goes through.
+      if (!heldRef.current || wantsNativeMenu(target) || !(target instanceof Element) || !target.isConnected) return false;
+      openMenuAt(target, { x, y });
+      return true;
+    },
+  });
 
   const setHeld = (message: HeldMessage | null) => {
     heldRef.current = message;
@@ -106,9 +119,14 @@ export function MessageActions({
         <div
           ref={root}
           className={className}
+          onPointerMove={press.onPointerMove}
+          onPointerUp={press.onPointerUp}
+          onPointerCancel={press.onPointerCancel}
+          onClickCapture={press.onClickCapture}
           // iOS fires no `contextmenu` on a long press: Radix opens the menu from a pointerdown timer, so the
           // message under the finger is taken here too.
           onPointerDownCapture={(event) => setHeld(wantsNativeMenu(event.target) ? null : messageAt(event.target))}
+          onPointerDown={press.onPointerDown}
           onContextMenuCapture={(event) => {
             const message = wantsNativeMenu(event.target) ? null : messageAt(event.target);
             setHeld(message);

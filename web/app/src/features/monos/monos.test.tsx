@@ -328,6 +328,37 @@ describe("message actions on touch, from the keyboard and with the native menu (
     expect(screen.getByRole("menuitem", { name: "Copy" })).toBeInTheDocument();
   });
 
+  it("the shared long press (500 ms) opens the menu with a haptic tick", async () => {
+    const vibrate = vi.fn();
+    Object.defineProperty(navigator, "vibrate", { value: vibrate, configurable: true, writable: true });
+    mount(`/monos/${MONO}`);
+    const message = await messageOf();
+    fireEvent.pointerDown(message, { pointerType: "touch", pointerId: 1, isPrimary: true, button: 0, clientX: 20, clientY: 20 });
+    expect(await screen.findByRole("menu", undefined, { timeout: 2000 })).toBeInTheDocument();
+    expect(vibrate).toHaveBeenCalledTimes(1);
+    Reflect.deleteProperty(navigator, "vibrate");
+  });
+
+  it("a long press on a selection keeps the native menu: no haptic tick, and the next click is not swallowed", async () => {
+    const vibrate = vi.fn();
+    Object.defineProperty(navigator, "vibrate", { value: vibrate, configurable: true, writable: true });
+    mount(`/monos/${MONO}`);
+    const message = await messageOf();
+    const selection = vi.spyOn(window, "getSelection").mockReturnValue({ isCollapsed: false, anchorNode: message } as unknown as Selection);
+    const clicked = vi.fn();
+    document.addEventListener("click", clicked);
+    fireEvent.pointerDown(message, { pointerType: "touch", pointerId: 1, isPrimary: true, button: 0, clientX: 20, clientY: 20 });
+    await new Promise((resolve) => setTimeout(resolve, 650));
+    fireEvent.pointerUp(message, { pointerType: "touch", pointerId: 1, isPrimary: true, button: 0 });
+    fireEvent.click(message);
+    expect(vibrate).not.toHaveBeenCalled();
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(clicked).toHaveBeenCalledTimes(1);
+    document.removeEventListener("click", clicked);
+    selection.mockRestore();
+    Reflect.deleteProperty(navigator, "vibrate");
+  });
+
   it("does not open from a long press outside a message", async () => {
     mount(`/monos/${MONO}`);
     const message = await messageOf();
