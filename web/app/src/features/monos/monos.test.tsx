@@ -94,6 +94,11 @@ const noReset = () => {
 };
 
 describe("Mono chat (F-69)", () => {
+  it("says so when the Mono is not in the catalog (deleted, or no access)", async () => {
+    mount("/monos/mono-does-not-exist");
+    expect(await screen.findByText(/This Mono is not available on this device/)).toBeInTheDocument();
+  });
+
   it("renders the transcript of mono:<id> under the Mono's name and sends from the composer", async () => {
     const user = userEvent.setup();
     mount(`/monos/${MONO}`);

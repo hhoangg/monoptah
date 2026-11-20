@@ -14,15 +14,21 @@ export function navigationTarget(data: unknown): string | null {
   return message.url === FALLBACK_URL ? FALLBACK_URL : safeNotificationUrl(message.url);
 }
 
+/** The tap id of a navigate message (the time the worker saw the click), when it carries one. */
+export function navigationTap(data: unknown): number | undefined {
+  const at = (data as { at?: unknown } | null)?.at;
+  return typeof at === "number" && Number.isFinite(at) ? at : undefined;
+}
+
 type MessageSource = Pick<EventTarget, "addEventListener" | "removeEventListener">;
 
 /** Routes navigate messages from the service worker. Returns the function that stops listening. */
-export function installNavigationListener(navigate: (url: string) => void, source?: MessageSource): () => void {
+export function installNavigationListener(navigate: (url: string, at?: number) => void, source?: MessageSource): () => void {
   const target = source ?? (typeof navigator !== "undefined" && "serviceWorker" in navigator ? navigator.serviceWorker : undefined);
   if (!target) return () => undefined;
   const listener = (event: Event) => {
     const url = navigationTarget((event as MessageEvent).data);
-    if (url) navigate(url);
+    if (url) navigate(url, navigationTap((event as MessageEvent).data));
   };
   target.addEventListener("message", listener);
   return () => target.removeEventListener("message", listener);

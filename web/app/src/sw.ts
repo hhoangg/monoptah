@@ -10,6 +10,7 @@
 import { clientsClaim } from "workbox-core";
 import { cleanupOutdatedCaches, createHandlerBoundToURL, precacheAndRoute } from "workbox-precaching";
 import { NavigationRoute, registerRoute } from "workbox-routing";
+import { idbPendingStore } from "./sw/pendingTarget";
 import { createPushHandlers } from "./sw/pushHandlers";
 import { resubscribe } from "./sw/resubscribe";
 import { NAVIGATION_DENYLIST, NAVIGATION_FALLBACK } from "./sw/routing";
@@ -40,7 +41,9 @@ clientsClaim();
 // --- 3. Push handlers (P-04) ---
 // No fetch handler and no caching here: see src/sw/pushHandlers.ts for the rules of the three listeners.
 
+const pendingStore = idbPendingStore(self.indexedDB);
 const pushHandlers = createPushHandlers({
+  savePending: (url, at) => pendingStore.put(url, at),
   origin: self.location.origin,
   showNotification: (title, options) => self.registration.showNotification(title, options),
   listWindowClients: () => self.clients.matchAll({ type: "window", includeUncontrolled: true }),

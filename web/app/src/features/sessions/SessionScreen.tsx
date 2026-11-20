@@ -22,6 +22,7 @@ import { Notice } from "@/ui/Notice";
 import { ComposerRegion } from "./ComposerRegion";
 import { PaneHeading } from "@/features/layout/tabs/PaneContext";
 import { useRememberPlace } from "./lastPlace";
+import { useConfirmedMissing } from "./useConfirmedMissing";
 import { SessionHeaderMenu } from "./SessionHeaderMenu";
 import { SessionHeaderChipSlot } from "./slots";
 import { useReadOnly } from "./WorkspaceFrame";
@@ -30,7 +31,8 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
   useRememberPlace();
   const navigate = useNavigate();
   const readOnly = useReadOnly();
-  const catalog = useCatalog().data;
+  const catalogQuery = useCatalog();
+  const catalog = catalogQuery.data;
   const session = catalog?.sessions.find((candidate) => candidate.id === sessionId);
   const conversation = useConversation(sessionId);
   const state = conversation.state;
@@ -65,6 +67,8 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
     [catalog, desktopId, mentions.onOpenFile, navigate, readOnly, replies.onChoose],
   );
 
+  // An archived or just-created session may be absent from a stale catalog, so the notice also needs a conversation without turns.
+  const missing = useConfirmedMissing(catalogQuery, catalog !== undefined, !session) && (state?.turns.length ?? 0) === 0;
   const title = session?.title ?? "Session";
 
   return (
@@ -102,6 +106,14 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
           {session ? <SessionHeaderMenu desktopId={desktopId} session={session} readOnly={readOnly} /> : null}
         </div>
       </header>
+
+      {missing ? (
+        <div className="mx-auto w-full max-w-[768px] px-5">
+          <Notice variant="error">
+            This session is not available on this device. It may have been deleted, or this device has no access to it.
+          </Notice>
+        </div>
+      ) : null}
 
       {state?.error && state.turns.length === 0 ? (
         <div className="mx-auto w-full max-w-[768px] px-5">

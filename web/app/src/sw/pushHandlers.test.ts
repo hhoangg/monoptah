@@ -186,7 +186,7 @@ describe("notificationclick", () => {
     handlers.notificationclick(click.event);
     await click.settle();
     expect(opened).toEqual([]);
-    expect(existing.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url: "/d/dk1/s/s9" });
+    expect(existing.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url: "/d/dk1/s/s9", at: expect.any(Number) });
     expect(existing.focus).toHaveBeenCalledOnce();
   });
 });
@@ -207,7 +207,7 @@ describe("notificationclick targets", () => {
     handlers.notificationclick(click.event);
     await click.settle();
     expect(opened).toEqual([]);
-    expect(existing.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url });
+    expect(existing.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url, at: expect.any(Number) });
     expect(existing.focus).toHaveBeenCalledOnce();
   });
 });
@@ -240,5 +240,64 @@ describe("sw.ts wiring", () => {
   it("never suppresses a notification by window state", () => {
     const handlers = readFileSync(path.resolve(import.meta.dirname, "pushHandlers.ts"), "utf8");
     expect(`${source}\n${handlers}`).not.toMatch(/visibilityState|\.focused/);
+  });
+});
+
+describe("notificationclick pending target", () => {
+  it.each([
+    ["a Mono message", "/d/dk2/monos/m7"],
+    ["a session event", "/d/dk1/s/s9"],
+  ])("saves %s for the page and still opens a window when none is open", async (_name, url) => {
+    const saved: Array<[string, number]> = [];
+    const { handlers, opened } = setup([], { savePending: (u, at) => Promise.resolve(void saved.push([u, at])), now: () => 1234 });
+    const click = clickEvent({ url });
+    handlers.notificationclick(click.event);
+    await click.settle();
+    expect(saved).toEqual([[url, 1234]]);
+    expect(opened).toEqual([url]);
+  });
+
+  it("saves the target and posts it to an open window (a different desktop than the one shown)", async () => {
+    const saved: string[] = [];
+    const open = client(`${ORIGIN}/d/dk1/s/s1`);
+    const { handlers } = setup([open], { savePending: (u) => Promise.resolve(void saved.push(u)) });
+    const click = clickEvent({ url: "/d/dk2/monos/m7" });
+    handlers.notificationclick(click.event);
+    await click.settle();
+    expect(saved).toEqual(["/d/dk2/monos/m7"]);
+    expect(open.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url: "/d/dk2/monos/m7", at: expect.any(Number) });
+    expect(open.focus).toHaveBeenCalledOnce();
+  });
+
+  it("gives the saved target and the message the same tap id", async () => {
+    const saved: number[] = [];
+    const open = client(`${ORIGIN}/`);
+    const { handlers } = setup([open], { savePending: (_u, at) => Promise.resolve(void saved.push(at)), now: () => 777 });
+    const click = clickEvent({ url: "/d/dk1/s/s9" });
+    handlers.notificationclick(click.event);
+    await click.settle();
+    expect(saved).toEqual([777]);
+    expect(open.postMessage).toHaveBeenCalledWith({ type: NAVIGATE_MESSAGE_TYPE, url: "/d/dk1/s/s9", at: 777 });
+  });
+
+  it("saves nothing for the root fallback", async () => {
+    const savePending = vi.fn(() => Promise.resolve());
+    const { handlers } = setup([], { savePending });
+    const click = clickEvent(undefined);
+    handlers.notificationclick(click.event);
+    await click.settle();
+    expect(savePending).not.toHaveBeenCalled();
+  });
+
+  it("survives a failing store, a rejecting openWindow and a failing focus", async () => {
+    const { handlers } = setup([], { savePending: () => Promise.reject(new Error("quota")), openWindow: () => Promise.reject(new Error("ios")) });
+    const click = clickEvent({ url: "/d/dk1/s/s9" });
+    handlers.notificationclick(click.event);
+    await expect(click.settle()).resolves.toBeDefined();
+    const open = { ...client(`${ORIGIN}/`), focus: vi.fn(() => Promise.reject(new Error("no"))) };
+    const second = setup([open]);
+    const again = clickEvent({ url: "/d/dk1/s/s9" });
+    second.handlers.notificationclick(again.event);
+    await expect(again.settle()).resolves.toBeDefined();
   });
 });
