@@ -57,7 +57,7 @@ export const SAMPLE_PARAMS: Record<MethodName, Record<string, unknown>> = {
   "cloud.moveToCloud": { sessionId: "sess-local-1" },
   "cloud.moveToLocal": { sessionId: "sess-codespace-1" },
   "cloud.cancelMove": { sessionId: "sess-local-1" },
-  "terminal.open": { projectId: "proj-alpha", cols: 80, rows: 24 },
+  "terminal.open": { projectId: "proj-alpha", cols: 80, rows: 24, ticket: "ticket-sample" },
   "terminal.read": { terminalId: "term-unknown", from: 0, waitMs: 0 },
   "terminal.write": { terminalId: "term-unknown", data: "bHMK" },
   "terminal.resize": { terminalId: "term-unknown", cols: 100, rows: 30 },

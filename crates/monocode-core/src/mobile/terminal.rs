@@ -5,11 +5,12 @@
 //! - **Who may open one.** [`super::policy`] gates the methods: a web device
 //!   with Control and the desktop's own "Allow web terminal" toggle for that
 //!   device (default off). A read-only device never gets it.
-//! - **Re-auth on every open.** The desktop makes a short one-time code and
-//!   shows it only on its own screen ([`Hub::status`]). The browser must send
-//!   that code back: a code is bound to one device and project, lives
-//!   [`Limits::code_ttl_ms`], allows [`Limits::max_attempts`] tries, works once
-//!   and is compared in constant time. Repeated failures lock the device out.
+//! - **Passkey re-auth on every open.** The browser sends a single-use ticket
+//!   the web server issued after a passkey check. [`Hub::open`] asks its
+//!   `verify` callback (the host's call to the server, which consumes the
+//!   ticket) only after the cheap local gates and a reserved slot, and
+//!   spawns the shell only when the callback accepts. A reattach is no open:
+//!   it reads by terminal id and needs the same device.
 //! - **Limits the desktop enforces.** Idle (no input) and maximum duration,
 //!   and a grace window after the link drops: a shell nobody reattaches within
 //!   [`Limits::grace_ms`] is killed.
@@ -37,10 +38,6 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-/// The characters of a code: no `0`, `O`, `1`, `I` or `L`, 31 in all.
-pub const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-/// Characters in a code.
-pub const CODE_LEN: usize = 6;
 /// Most bytes one `terminal.write` carries.
 pub const MAX_INPUT_BYTES: usize = 8 * 1024;
 /// Most bytes one `terminal.read` returns.
@@ -54,17 +51,6 @@ pub const ROWS: std::ops::RangeInclusive<u16> = 2..=200;
 /// Every duration and bound, so tests need not wait for real time.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// A code lives this long.
-    pub code_ttl_ms: u64,
-    /// Wrong guesses one code allows.
-    pub max_attempts: u8,
-    /// Failed codes of one device within `lockout_window_ms` that lock it out.
-    pub lockout_failures: u32,
-    pub lockout_window_ms: u64,
-    /// How long a locked-out device gets no new code.
-    pub lockout_ms: u64,
-    /// Least time between two codes asked for by one device.
-    pub code_gap_ms: u64,
     /// No input for this long ends the shell.
     pub idle_ms: u64,
     /// A shell never lives longer than this.
@@ -78,19 +64,11 @@ pub struct Limits {
     pub total: usize,
     /// Bytes the shell may write ahead of the browser's acknowledgement.
     pub window: usize,
-    /// Codes shown at once, across devices.
-    pub max_challenges: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            code_ttl_ms: 60_000,
-            max_attempts: 3,
-            lockout_failures: 5,
-            lockout_window_ms: 10 * 60_000,
-            lockout_ms: 10 * 60_000,
-            code_gap_ms: 2_000,
             idle_ms: 15 * 60_000,
             max_ms: 8 * 60 * 60_000,
             grace_ms: 30_000,
@@ -98,7 +76,6 @@ impl Default for Limits {
             per_device: 2,
             total: 4,
             window: 256 * 1024,
-            max_challenges: 4,
         }
     }
 }
@@ -352,29 +329,9 @@ struct Term {
     opened_unix: u64,
 }
 
-struct Challenge {
-    id: String,
-    owner: Owner,
-    project: String,
-    label: String,
-    code: String,
-    expires: u64,
-    attempts_left: u8,
-}
-
-#[derive(Default)]
-struct Failures {
-    /// Failure times inside the window.
-    at: Vec<u64>,
-    locked_until: u64,
-}
-
 #[derive(Default)]
 struct State {
-    challenges: Vec<Challenge>,
     terminals: HashMap<String, Term>,
-    failures: HashMap<String, Failures>,
-    last_code: HashMap<String, u64>,
     /// Device ids of shells being started: they count against the limits
     /// before they are in `terminals`, so two opens cannot both slip in.
     starting: Vec<String>,
@@ -417,51 +374,50 @@ pub struct OpenTerminal {
     pub detached: bool,
 }
 
-/// A code waiting for the user to read it to the browser.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingCode {
-    pub device_name: String,
-    pub project: String,
-    pub code: String,
-    pub expires_in_ms: u64,
-}
-
-/// What the desktop shows: shells that are open and codes to read out.
+/// What the desktop shows: the shells that are open.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TerminalStatus {
     pub open: Vec<OpenTerminal>,
-    pub codes: Vec<PendingCode>,
 }
 
-/// The answer to the first `terminal.open` step.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChallengeInfo {
-    pub challenge_id: String,
-    pub expires_in_ms: u64,
-    pub attempts: u8,
+/// What checking a terminal passkey ticket with the web server found. Only
+/// `Accepted` opens a shell; everything else fails closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TicketCheck {
+    /// The server answered 200 and consumed the ticket.
+    Accepted,
+    /// The server said no (404).
+    Rejected,
+    /// No usable answer: network error, timeout or another status.
+    Unreachable,
+    /// No token, base url or server device id to ask with.
+    NoIdentity,
 }
 
-impl ChallengeInfo {
-    pub fn to_value(&self) -> Value {
-        json!({
-            "challengeId": self.challenge_id,
-            "expiresInMs": self.expires_in_ms,
-            "codeLength": CODE_LEN,
-            "attempts": self.attempts,
-        })
+impl TicketCheck {
+    pub fn accepted(self) -> bool {
+        self == Self::Accepted
+    }
+
+    /// The audit detail of a check: a fixed word, never the ticket.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Unreachable => "unreachable",
+            Self::NoIdentity => "no_identity",
+        }
     }
 }
 
-/// What the second `terminal.open` step asks for, once the host resolved the
-/// project to a folder.
+/// What `terminal.open` asks for, once the host resolved the project to a
+/// folder.
 pub struct OpenRequest {
     pub project: String,
     pub label: String,
     pub cwd: PathBuf,
     pub cols: u16,
     pub rows: u16,
-    pub challenge_id: String,
-    pub code: String,
 }
 
 /// An opened shell.
@@ -523,13 +479,6 @@ fn random_hex(bytes: usize) -> String {
         .collect()
 }
 
-fn random_code() -> String {
-    let mut rng = rand::rng();
-    (0..CODE_LEN)
-        .map(|_| CODE_ALPHABET[rng.random_range(0..CODE_ALPHABET.len())] as char)
-        .collect()
-}
-
 /// Constant-time equality of two byte strings. The lengths are not secret.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -540,14 +489,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         difference |= x ^ y;
     }
     std::hint::black_box(difference) == 0
-}
-
-/// A typed code as stored: upper case, without spaces or hyphens.
-fn normalize(code: &str) -> String {
-    code.chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
 }
 
 fn failure(code: Code) -> Failure {
@@ -573,7 +514,7 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
-/// The shells of one desktop and the codes that open them.
+/// The shells of one desktop.
 pub struct Hub {
     clock: Arc<dyn Clock>,
     limits: Limits,
@@ -611,130 +552,51 @@ impl Hub {
         *lock(&self.rights) = Some(rights);
     }
 
-    /// Step one of opening: shows a code on the desktop. No shell yet.
-    pub fn challenge(
+    /// Opens a shell. The cheap checks (limits) come first and reserve a slot
+    /// under one lock; then `verify` asks the server whether the passkey
+    /// ticket is good (it blocks and runs with no lock held, so the caller
+    /// runs this on a blocking thread); the shell is spawned only when it says
+    /// yes. A refused ticket spawns nothing and gives the slot back.
+    pub fn open(
         &self,
         owner: &Owner,
-        project: &str,
-        label: &str,
-    ) -> Result<ChallengeInfo, Failure> {
-        if lock(&self.spawner).is_none() {
-            return Err(failure(Code::Unsupported));
-        }
+        request: OpenRequest,
+        verify: impl FnOnce() -> TicketCheck,
+    ) -> Result<Opened, Failure> {
+        let spawner = lock(&self.spawner)
+            .clone()
+            .ok_or_else(|| failure(Code::Unsupported))?;
         let now = self.clock.now_ms();
-        let mut after = After::default();
-        let result = {
+        let reserved = {
             let mut state = lock(&self.state);
             prune(&mut state, now, &self.limits);
-            let locked = state
-                .failures
-                .get(&owner.device_id)
-                .is_some_and(|f| f.locked_until > now);
             let mine = state
                 .terminals
                 .values()
                 .filter(|t| {
                     t.owner.device_id == owner.device_id && !matches!(t.phase, Phase::Ended { .. })
                 })
-                .count();
+                .count()
+                + state
+                    .starting
+                    .iter()
+                    .filter(|id| **id == owner.device_id)
+                    .count();
             let all = state
                 .terminals
                 .values()
                 .filter(|t| !matches!(t.phase, Phase::Ended { .. }))
-                .count();
-            let recent = state
-                .last_code
-                .get(&owner.device_id)
-                .is_some_and(|at| now.saturating_sub(*at) < self.limits.code_gap_ms);
-            if locked {
-                after.audit.push((
-                    Lifecycle::TerminalReauthFailed,
-                    owner.clone(),
-                    Some("locked".into()),
-                ));
-                Err(busy("Too many wrong codes. Try again later."))
-            } else if mine >= self.limits.per_device || all >= self.limits.total {
+                .count()
+                + state.starting.len();
+            if mine >= self.limits.per_device || all >= self.limits.total {
                 Err(busy("Too many terminals are open"))
-            } else if recent {
-                Err(busy("Wait a moment before asking for another code"))
             } else {
-                // One code per device: a new one replaces the old.
-                state
-                    .challenges
-                    .retain(|c| c.owner.device_id != owner.device_id);
-                if state.challenges.len() >= self.limits.max_challenges {
-                    Err(busy("Too many codes are waiting on the desktop"))
-                } else {
-                    let id = random_hex(16);
-                    state.last_code.insert(owner.device_id.clone(), now);
-                    state.challenges.push(Challenge {
-                        id: id.clone(),
-                        owner: owner.clone(),
-                        project: project.to_owned(),
-                        label: label.to_owned(),
-                        code: random_code(),
-                        expires: now + self.limits.code_ttl_ms,
-                        attempts_left: self.limits.max_attempts,
-                    });
-                    after
-                        .audit
-                        .push((Lifecycle::TerminalChallenge, owner.clone(), None));
-                    Ok(ChallengeInfo {
-                        challenge_id: id,
-                        expires_in_ms: self.limits.code_ttl_ms,
-                        attempts: self.limits.max_attempts,
-                    })
-                }
+                // Reserved under the same lock as the check.
+                state.starting.push(owner.device_id.clone());
+                Ok(())
             }
         };
-        after.run();
-        result
-    }
-
-    /// Step two: checks the code and starts the shell.
-    pub fn open(&self, owner: &Owner, request: OpenRequest) -> Result<Opened, Failure> {
-        let spawner = lock(&self.spawner)
-            .clone()
-            .ok_or_else(|| failure(Code::Unsupported))?;
-        let now = self.clock.now_ms();
-        let mut after = After::default();
-        let verified = {
-            let mut state = lock(&self.state);
-            prune(&mut state, now, &self.limits);
-            let verified = self.verify(&mut state, owner, &request, now, &mut after);
-            if verified.is_ok() {
-                let mine = state
-                    .terminals
-                    .values()
-                    .filter(|t| {
-                        t.owner.device_id == owner.device_id
-                            && !matches!(t.phase, Phase::Ended { .. })
-                    })
-                    .count()
-                    + state
-                        .starting
-                        .iter()
-                        .filter(|id| **id == owner.device_id)
-                        .count();
-                let all = state
-                    .terminals
-                    .values()
-                    .filter(|t| !matches!(t.phase, Phase::Ended { .. }))
-                    .count()
-                    + state.starting.len();
-                if mine >= self.limits.per_device || all >= self.limits.total {
-                    Err(busy("Too many terminals are open"))
-                } else {
-                    // Reserved under the same lock as the check.
-                    state.starting.push(owner.device_id.clone());
-                    Ok(())
-                }
-            } else {
-                verified
-            }
-        };
-        after.run();
-        verified?;
+        reserved?;
         // Gives the reserved slot back on every way out until it is registered,
         // including a spawner that panics.
         let mut slot = SlotGuard {
@@ -742,6 +604,24 @@ impl Hub {
             device_id: &owner.device_id,
             armed: true,
         };
+        // The ticket is asked about only now, with no lock held.
+        let check = verify();
+        // The reason is recorded on a refusal (never the ticket); this is the
+        // only audit record of a refused check.
+        audit::record_lifecycle(
+            if check.accepted() {
+                Lifecycle::TerminalTicketAccepted
+            } else {
+                Lifecycle::TerminalTicketRefused
+            },
+            &owner.device_id,
+            &owner.fingerprint,
+            Transport::Web,
+            (!check.accepted()).then(|| check.reason()),
+        );
+        if !check.accepted() {
+            return Err(failure(Code::FreshRequired));
+        }
         let out = Output::new(self.limits.window);
         let spawned = spawner.spawn(
             SpawnSpec {
@@ -808,90 +688,6 @@ impl Hub {
         if let Some(at) = state.starting.iter().position(|d| d == device_id) {
             state.starting.swap_remove(at);
         }
-    }
-
-    /// Checks the code of `request`, with the attempt and lockout rules.
-    fn verify(
-        &self,
-        state: &mut State,
-        owner: &Owner,
-        request: &OpenRequest,
-        now: u64,
-        after: &mut After,
-    ) -> Result<(), Failure> {
-        let required = || failure(Code::ReauthRequired);
-        if state
-            .failures
-            .get(&owner.device_id)
-            .is_some_and(|f| f.locked_until > now)
-        {
-            after.audit.push((
-                Lifecycle::TerminalReauthFailed,
-                owner.clone(),
-                Some("locked".into()),
-            ));
-            return Err(busy("Too many wrong codes. Try again later."));
-        }
-        let Some(position) = state
-            .challenges
-            .iter()
-            .position(|c| c.id == request.challenge_id)
-        else {
-            return Err(required());
-        };
-        let bound = {
-            let c = &state.challenges[position];
-            c.owner.device_id == owner.device_id
-                && c.owner.fingerprint == owner.fingerprint
-                && c.project == request.project
-        };
-        if !bound || state.challenges[position].expires <= now {
-            state.challenges.remove(position);
-            return Err(required());
-        }
-        let typed = normalize(&request.code);
-        let right = {
-            let c = &state.challenges[position];
-            // Both sides are compared whatever the typed length, in constant
-            // time for equal lengths.
-            constant_time_eq(typed.as_bytes(), c.code.as_bytes())
-        };
-        if right {
-            // Single use: the code is gone whether or not a shell follows.
-            state.challenges.remove(position);
-            return Ok(());
-        }
-        let exhausted = {
-            let c = &mut state.challenges[position];
-            c.attempts_left = c.attempts_left.saturating_sub(1);
-            c.attempts_left == 0
-        };
-        if exhausted {
-            state.challenges.remove(position);
-        }
-        let failures = state.failures.entry(owner.device_id.clone()).or_default();
-        failures
-            .at
-            .retain(|at| now.saturating_sub(*at) < self.limits.lockout_window_ms);
-        failures.at.push(now);
-        let locked = failures.at.len() as u32 >= self.limits.lockout_failures;
-        if locked {
-            failures.locked_until = now + self.limits.lockout_ms;
-            failures.at.clear();
-            state
-                .challenges
-                .retain(|c| c.owner.device_id != owner.device_id);
-        }
-        after.audit.push((
-            Lifecycle::TerminalReauthFailed,
-            owner.clone(),
-            Some(if locked { "locked" } else { "wrong_code" }.into()),
-        ));
-        Err(if exhausted || locked {
-            required()
-        } else {
-            failure(Code::ReauthFailed)
-        })
     }
 
     /// Long poll of the output from offset `from` (which acknowledges what
@@ -1028,27 +824,19 @@ impl Hub {
         }
     }
 
-    /// Ends every shell of a device row and drops its pending codes.
+    /// Ends every shell of a device row.
     pub fn kill_device(&self, device_id: &str, reason: Reason) -> usize {
-        self.kill_where(
-            reason,
-            |term| term.owner.device_id == device_id,
-            |owner| owner.device_id == device_id,
-        )
+        self.kill_where(reason, |term| term.owner.device_id == device_id)
     }
 
     /// Ends every shell of a device key (used by the relay's revoke).
     pub fn kill_fingerprint(&self, fingerprint: &str, reason: Reason) -> usize {
-        self.kill_where(
-            reason,
-            |term| term.owner.fingerprint == fingerprint,
-            |owner| owner.fingerprint == fingerprint,
-        )
+        self.kill_where(reason, |term| term.owner.fingerprint == fingerprint)
     }
 
-    /// Ends every shell and drops every code.
+    /// Ends every shell.
     pub fn kill_all(&self, reason: Reason) -> usize {
-        self.kill_where(reason, |_| true, |_| true)
+        self.kill_where(reason, |_| true)
     }
 
     /// The desktop's Kill button.
@@ -1069,18 +857,12 @@ impl Hub {
         found
     }
 
-    fn kill_where(
-        &self,
-        reason: Reason,
-        shells: impl Fn(&Term) -> bool,
-        codes: impl Fn(&Owner) -> bool,
-    ) -> usize {
+    fn kill_where(&self, reason: Reason, shells: impl Fn(&Term) -> bool) -> usize {
         let mut after = After::default();
         let mut count = 0;
         {
             let mut state = lock(&self.state);
             let now = self.clock.now_ms();
-            state.challenges.retain(|c| !codes(&c.owner));
             for term in state.terminals.values_mut() {
                 if !matches!(term.phase, Phase::Ended { .. }) && shells(term) {
                     end(term, reason, None, now, &mut after);
@@ -1215,17 +997,7 @@ impl Hub {
             })
             .collect();
         open.sort_by_key(|t| t.opened_unix);
-        let codes = state
-            .challenges
-            .iter()
-            .map(|c| PendingCode {
-                device_name: c.owner.name.clone(),
-                project: c.label.clone(),
-                code: c.code.clone(),
-                expires_in_ms: c.expires.saturating_sub(now),
-            })
-            .collect();
-        TerminalStatus { open, codes }
+        TerminalStatus { open }
     }
 
     /// Shells that are not ended, of one device.
@@ -1244,16 +1016,8 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Drops expired codes, old lockout records and ended shells nobody read.
+/// Drops ended shells nobody read.
 fn prune(state: &mut State, now: u64, limits: &Limits) {
-    state.challenges.retain(|c| c.expires > now);
-    state.failures.retain(|_, f| {
-        f.at.retain(|at| now.saturating_sub(*at) < limits.lockout_window_ms);
-        f.locked_until > now || !f.at.is_empty()
-    });
-    state
-        .last_code
-        .retain(|_, at| now.saturating_sub(*at) < limits.code_gap_ms);
     state.terminals.retain(|_, t| match t.phase {
         Phase::Ended { at, .. } => now.saturating_sub(at) < limits.tombstone_ms,
         _ => true,

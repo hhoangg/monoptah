@@ -2,22 +2,19 @@
 // (web/protocol/src/terminal.ts) over a fake shell, no PTY and no process. The shell echoes what is typed, runs a
 // few commands (`echo`, `whoami`, `pwd`, `flood`, `exit`) and ends like the real desktop does: with an `exited` reason.
 //
-// Rules the real desktop keeps and this mock keeps with them: a one-time code per open, shown only through the test hook
-// (`lastCode()`), 3 attempts (the attempt that uses the last one up answers `reauth_required`), a time to live, single use,
-// case-insensitive input; a terminal belongs to the device that opened it (another device gets `not_found`); a shell survives
-// a dropped link for `graceMs` and is killed after it; a killed terminal stays readable for `killedReadableMs` and is then
-// `not_found`; reads are long polls answered as soon as output exists. Not mocked: the lockout after repeated failures.
+// Rules the real desktop keeps and this mock keeps with them: one step opens a terminal when the one-time ticket checks out
+// (the desktop spends it at the Worker; the mock asks `verifyTicket`, which a test sets, and fails closed with `fresh_required`
+// when none is set or it refuses); a terminal belongs to the device that opened it (another device gets `not_found`); a shell
+// survives a dropped link for `graceMs` and is killed after it; a killed terminal stays readable for `killedReadableMs` and is
+// then `not_found`; reads are long polls answered as soon as output exists.
 // No node imports: this package also runs in the browser (the dev preview of the app).
 import {
-  TERMINAL_CODE_ATTEMPTS,
   TERMINAL_GRACE_MS,
   TERMINAL_IDLE_TIMEOUT_MS,
   TERMINAL_KILLED_READABLE_MS,
   TERMINAL_MAX_DURATION_MS,
   TERMINAL_READ_MAX_BYTES,
   TERMINAL_READ_WAIT_DEFAULT_MS,
-  TERMINAL_CODE_TTL_MS,
-  USER_CODE_ALPHABET,
   isSafeTerminalSubdir,
   type TerminalExited,
   type TerminalExitReason,
@@ -37,34 +34,21 @@ const realClock: TerminalClock = {
   clearTimeout: (handle) => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+/** Checks a one-time terminal ticket for a project (the desktop's call to the Worker); true when accepted. */
+export type TicketVerifier = (ticket: string, projectId: string) => Promise<boolean>;
+
 export interface MockTerminalOptions {
   clock?: TerminalClock;
   idleTimeoutMs?: number;
   maxDurationMs?: number;
   graceMs?: number;
   killedReadableMs?: number;
-  challengeTtlMs?: number;
   /** Terminals one device may have open (default 2; more answers `busy`). */
   maxTerminals?: number;
-  /** Open challenges one device may hold (default 4; more answers `busy`). */
-  maxChallenges?: number;
-  /** Replaces the random code, for a test that needs a known one. */
-  codeGenerator?: () => string;
+  /** Spends a terminal ticket as the desktop does at the Worker; true when accepted. Without one every open is refused. */
+  ticketVerifier?: TicketVerifier;
   /** Lines `flood` prints (default 3000, about 250 KB). */
   floodLines?: number;
-}
-
-interface Challenge {
-  id: string;
-  code: string;
-  device: string;
-  projectId: string;
-  projectName: string;
-  subdir: string | undefined;
-  cols: number;
-  rows: number;
-  attemptsLeft: number;
-  expiresAt: number;
 }
 
 interface Waiter {
@@ -96,12 +80,6 @@ function fromBase64(text: string): Uint8Array {
 function randomId(prefix: string): string {
   const bytes = crypto.getRandomValues(new Uint8Array(9));
   return `${prefix}-${[...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
-}
-
-function randomCode(): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(6));
-  // 256 mod 31 is not 0; the bias does not matter for a mock.
-  return [...bytes].map((byte) => USER_CODE_ALPHABET[byte % USER_CODE_ALPHABET.length]).join("");
 }
 
 /** One fake shell session. */
@@ -174,16 +152,12 @@ export class MockTerminals {
   readonly #maxMs: number;
   readonly #graceMs: number;
   readonly #killedReadableMs: number;
-  readonly #challengeTtlMs: number;
   readonly #maxTerminals: number;
-  readonly #maxChallenges: number;
-  readonly #codeGenerator: () => string;
   readonly #floodLines: number;
-  readonly #challenges = new Map<string, Challenge>();
   readonly #terminals = new Map<string, MockTerminal>();
-  #lastCode: string | null = null;
-  /** Called with every code the desktop would show (the test hook of the desktop window). */
-  onCode: ((code: string, challengeId: string) => void) | null = null;
+  #verifications = 0;
+  /** Test hook: how the desktop spends a ticket at the Worker. null (the default) refuses every open (fail closed). */
+  verifyTicket: TicketVerifier | null;
 
   constructor(options: MockTerminalOptions = {}) {
     this.#clock = options.clock ?? realClock;
@@ -191,18 +165,16 @@ export class MockTerminals {
     this.#maxMs = options.maxDurationMs ?? TERMINAL_MAX_DURATION_MS;
     this.#graceMs = options.graceMs ?? TERMINAL_GRACE_MS;
     this.#killedReadableMs = options.killedReadableMs ?? TERMINAL_KILLED_READABLE_MS;
-    this.#challengeTtlMs = options.challengeTtlMs ?? TERMINAL_CODE_TTL_MS;
     this.#maxTerminals = options.maxTerminals ?? 2;
-    this.#maxChallenges = options.maxChallenges ?? 4;
-    this.#codeGenerator = options.codeGenerator ?? randomCode;
+    this.verifyTicket = options.ticketVerifier ?? null;
     this.#floodLines = options.floodLines ?? 3000;
   }
 
   // --- Test hooks ---
 
-  /** The code of the latest open challenge, as the desktop window shows it; null when none is open. */
-  lastCode(): string | null {
-    return this.#lastCode;
+  /** How many times the desktop asked the verifier to spend a ticket (accepted or refused). */
+  ticketVerifications(): number {
+    return this.#verifications;
   }
 
   /** The ids of the live (not ended) terminals. */
@@ -247,77 +219,37 @@ export class MockTerminals {
 
   // --- The methods ---
 
-  open(
+  async open(
     device: string,
-    params: { projectId: string; subdir?: string; cols: number; rows: number; challengeId?: string; code?: string },
+    params: { projectId: string; subdir?: string; cols: number; rows: number; ticket: string },
     projectName: string,
-  ): { challengeId: string; expiresInMs: number; codeLength: number; attempts: number } | OpenedTerminal {
-    const { challengeId, code } = params;
-    if (challengeId === undefined && code === undefined) return this.#challenge(device, params, projectName);
-    if (challengeId === undefined || code === undefined) throw new FixtureError("A code needs its challenge", "reauth_required");
-    return this.#redeem(device, params, challengeId, code);
-  }
-
-  #challenge(
-    device: string,
-    params: { projectId: string; subdir?: string; cols: number; rows: number },
-    projectName: string,
-  ): { challengeId: string; expiresInMs: number; codeLength: number; attempts: number } {
+  ): Promise<OpenedTerminal> {
     if (params.subdir !== undefined && !isSafeTerminalSubdir(params.subdir)) throw new FixtureError("That folder is not allowed", "path_denied");
-    this.#sweep();
-    const open = [...this.#challenges.values()].filter((c) => c.device === device).length;
-    if (open >= this.#maxChallenges) throw new FixtureError("Too many open codes", "busy");
-    const live = [...this.#terminals.values()].filter((t) => t.device === device && t.exited === null).length;
-    if (live >= this.#maxTerminals) throw new FixtureError("Too many terminals", "busy");
-    const challenge: Challenge = {
-      id: randomId("chal"),
-      code: this.#codeGenerator(),
-      device,
-      projectId: params.projectId,
-      projectName,
-      subdir: params.subdir,
-      cols: params.cols,
-      rows: params.rows,
-      attemptsLeft: TERMINAL_CODE_ATTEMPTS,
-      expiresAt: this.#clock.now() + this.#challengeTtlMs,
-    };
-    this.#challenges.set(challenge.id, challenge);
-    this.#lastCode = challenge.code;
-    this.onCode?.(challenge.code, challenge.id);
-    return { challengeId: challenge.id, expiresInMs: this.#challengeTtlMs, codeLength: challenge.code.length, attempts: TERMINAL_CODE_ATTEMPTS };
-  }
-
-  #redeem(
-    device: string,
-    params: { projectId: string; subdir?: string; cols: number; rows: number },
-    challengeId: string,
-    code: string,
-  ): OpenedTerminal {
-    this.#sweep();
-    const challenge = this.#challenges.get(challengeId);
-    if (!challenge || challenge.device !== device || challenge.projectId !== params.projectId || challenge.subdir !== params.subdir) {
-      throw new FixtureError("The code expired. Start again.", "reauth_required");
+    if (this.#liveCount(device) >= this.#maxTerminals) throw new FixtureError("Too many terminals", "busy");
+    const refused = new FixtureError("Confirm with your passkey to open a terminal", "fresh_required");
+    const verify = this.verifyTicket;
+    if (verify === null || params.ticket === "") throw refused;
+    this.#verifications += 1;
+    let accepted: boolean;
+    try {
+      accepted = await verify(params.ticket, params.projectId);
+    } catch {
+      accepted = false;
     }
-    if (code.trim().toUpperCase() !== challenge.code) {
-      challenge.attemptsLeft -= 1;
-      if (challenge.attemptsLeft <= 0) {
-        this.#challenges.delete(challengeId);
-        if (this.#lastCode === challenge.code) this.#lastCode = null;
-        throw new FixtureError("Too many wrong codes. Start again.", "reauth_required");
-      }
-      throw new FixtureError("That code is not right", "reauth_failed");
-    }
-    this.#challenges.delete(challengeId);
-    if (this.#lastCode === challenge.code) this.#lastCode = null;
-    const live = [...this.#terminals.values()].filter((t) => t.device === device && t.exited === null).length;
-    if (live >= this.#maxTerminals) throw new FixtureError("Too many terminals", "busy");
-    const cwd = challenge.subdir ? `${challenge.projectName}/${challenge.subdir}` : challenge.projectName;
-    const terminal = new MockTerminal(randomId("term"), device, cwd, challenge.cols, challenge.rows);
+    if (!accepted) throw refused;
+    // The wait may have let other opens in.
+    if (this.#liveCount(device) >= this.#maxTerminals) throw new FixtureError("Too many terminals", "busy");
+    const cwd = params.subdir ? `${projectName}/${params.subdir}` : projectName;
+    const terminal = new MockTerminal(randomId("term"), device, cwd, params.cols, params.rows);
     terminal.emit(`Monoptah mock shell in ${cwd}\r\n$ `);
     this.#terminals.set(terminal.id, terminal);
     this.#armIdle(terminal);
     terminal.maxTimer = this.#clock.setTimeout(() => this.#end(terminal, "max"), this.#maxMs);
     return { terminalId: terminal.id, cols: terminal.cols, rows: terminal.rows, cwd, idleTimeoutMs: this.#idleMs, maxDurationMs: this.#maxMs };
+  }
+
+  #liveCount(device: string): number {
+    return [...this.#terminals.values()].filter((t) => t.device === device && t.exited === null).length;
   }
 
   read(device: string, params: { terminalId: string; from: number; waitMs?: number; maxBytes?: number }): Promise<ReadResult> {
@@ -375,16 +307,6 @@ export class MockTerminals {
     const terminal = this.#own(device, id);
     if (terminal.exited !== null) throw new FixtureError("The terminal has ended", "not_found");
     return terminal;
-  }
-
-  #sweep(): void {
-    const now = this.#clock.now();
-    for (const [id, challenge] of this.#challenges) {
-      if (challenge.expiresAt <= now) {
-        this.#challenges.delete(id);
-        if (this.#lastCode === challenge.code) this.#lastCode = null;
-      }
-    }
   }
 
   #armIdle(terminal: MockTerminal): void {

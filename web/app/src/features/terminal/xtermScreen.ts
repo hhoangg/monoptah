@@ -1,5 +1,5 @@
 // The one place that touches xterm.js. xterm and its stylesheet are bundled from npm and loaded here by dynamic import, so
-// they are a separate chunk that only the Terminal page pulls in (never a CDN, never a third-party script).
+// they are a separate chunk that only a terminal tab or drawer pulls in (never a CDN, never a third-party script).
 //
 // What this file deliberately does NOT do (security.md "Terminal"):
 //  - no link handling: hyperlinks the program prints (OSC 8) activate nothing, and there is no web links addon;

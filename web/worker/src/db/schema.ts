@@ -311,6 +311,34 @@ export const selectionTickets = sqliteTable(
   ],
 );
 
+/** Single-use proof of a fresh passkey re-auth that lets a web device open a terminal on a desktop, bound to one project (0007). */
+export const terminalTickets = sqliteTable(
+  "terminal_tickets",
+  {
+    /** SHA-256 hex of the ticket; the ticket itself is never stored. */
+    tokenHash: text("token_hash").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    desktopId: text("desktop_id")
+      .notNull()
+      .references(() => desktops.id, { onDelete: "cascade" }),
+    deviceId: text("device_id")
+      .notNull()
+      .references(() => devices.id, { onDelete: "cascade" }),
+    projectId: text("project_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    usedAt: integer("used_at"),
+  },
+  (t) => [
+    index("terminal_tickets_user_id_idx").on(t.userId),
+    index("terminal_tickets_desktop_id_idx").on(t.desktopId),
+    index("terminal_tickets_device_id_idx").on(t.deviceId),
+    index("terminal_tickets_expires_at_idx").on(t.expiresAt),
+  ],
+);
+
 // --- Push ---
 
 export const pushSubscriptions = sqliteTable(
@@ -461,6 +489,7 @@ export const TABLES = {
   devices,
   deviceGrants,
   selectionTickets,
+  terminalTickets,
   pushSubscriptions,
   pushPrefs,
   pairingRequests,

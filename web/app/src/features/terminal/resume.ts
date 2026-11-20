@@ -27,9 +27,9 @@ function isEntry(value: unknown): value is ResumeEntry {
   return typeof v["terminalId"] === "string" && v["terminalId"].length > 0 && count(v["next"]) && typeof v["cwd"] === "string" && count(v["idleTimeoutMs"]) && count(v["maxDurationMs"]) && count(v["openedAt"]);
 }
 
-/** One entry per desktop in `sessionStorage`; every failure (storage off, private mode, bad JSON) reads as "nothing saved". */
-export function sessionResumeStore(desktopId: string, storage: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null = safeSession()): ResumeStore {
-  const key = `${RESUME_KEY_PREFIX}${desktopId}`;
+/** One entry per `scope` (a desktop and a terminal tab, `<desktopId>.<terminalId>`) in `sessionStorage`; every failure (storage off, private mode, bad JSON) reads as "nothing saved". */
+export function sessionResumeStore(scope: string, storage: Pick<Storage, "getItem" | "setItem" | "removeItem"> | null = safeSession()): ResumeStore {
+  const key = `${RESUME_KEY_PREFIX}${scope}`;
   return {
     load() {
       try {

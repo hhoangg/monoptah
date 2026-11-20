@@ -1,13 +1,19 @@
 // The web terminal (features.md N-26) in a real browser, on the real Worker and relay, against the TypeScript mock desktop
-// of web/mock-desktop (it plays the desktop: a fake shell with the desktop's one-time code, attempts, kill reasons and the
-// capability rules). One account, one paired mock desktop, one open page for all tests (serial).
+// of web/mock-desktop (it plays the desktop: a fake shell, kill reasons and the capability rules). The desktop spends the
+// one-time passkey tickets for real: the mock's `terminals.verifyTicket` hook POSTs the Worker's
+// /api/desktop/grants/:deviceId/terminal-ticket with the desktop grants token, so single use and the project binding are
+// the Worker's. One account, one paired mock desktop, one open page for all tests (serial). The browser's passkey prompt is
+// answered by the virtual authenticator of the actor.
 //
-// What it checks: the capability gating of the entry, the open flow with the code shown "on the desktop" (the test reads
-// it from the mock's hook, the browser never sees it), a wrong code then the right one, a used up challenge restarting
-// with a new code, typing and output in xterm, a long burst, the desktop killing the shell, a reload that reattaches, the
-// phone key row, and that terminal output never becomes markup and never trips the CSP.
-import type { Page } from "@playwright/test";
+// What it checks: the capability gating of the footer chip, a terminal opened as a tab from the chip, the project chooser,
+// the passkey step, typing and output in xterm, a long burst, a used ticket refused, the desktop killing the shell, a reload
+// that reattaches, closing the tab (with confirm) killing the shell, a terminal split next to a chat tab, the phone drawer
+// (open, key row, fullscreen and shrink, close), and that terminal output never becomes markup and never trips the CSP.
+// With E2E_SHOTS_DIR set it also writes screenshots of the real UI there (nothing is written by default).
+import type { Locator, Page } from "@playwright/test";
 import { KNOWN_CAPABILITIES } from "@monoptah/protocol";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { MockDesktop } from "../../mock-desktop/src/desktop.ts";
 import { fingerprint, generateKeyPair, type KeyPair } from "../../mock-desktop/src/noise.ts";
 import type { FrameSocket } from "../../mock-desktop/src/transport.ts";
@@ -19,8 +25,10 @@ import { registerThroughUi } from "../lib/w14-ui.ts";
 
 const HANDLE = "terminal";
 const MACHINE = "terminal-mock";
+const PROJECT = "Example Alpha";
 const WITH_TERMINAL = [...KNOWN_CAPABILITIES];
 const WITHOUT_TERMINAL = KNOWN_CAPABILITIES.filter((name) => name !== "terminal");
+const SHOTS = process.env["E2E_SHOTS_DIR"] ?? "";
 
 declare global {
   interface Window {
@@ -39,6 +47,13 @@ test.describe("web terminal", () => {
   let desktopId = "";
   let desktopKey: KeyPair;
   let deviceFingerprint = "";
+  /** The tickets the browser got from the Worker, in order (the desktop spends them below). */
+  const tickets: string[] = [];
+  /** What the desktop's verifier saw: the Worker's answer for each ticket it was asked about. */
+  const verdicts: { ticket: string; projectId: string; ok: boolean }[] = [];
+
+  /** How the desktop spends a ticket at the Worker (set by the setup test), also called by the replay test. */
+  let spendTicket: (ticket: string, projectId: string) => Promise<boolean> = () => Promise.reject(new Error("setup did not run"));
 
   test.beforeAll(clearRateLimits);
 
@@ -48,60 +63,60 @@ test.describe("web terminal", () => {
     socket?.close();
   });
 
-  const terminalPath = (): string => `/d/${desktopId}/terminal`;
-  const rows = () => page.locator(".xterm-rows");
+  const rows = () => page.locator(".xterm-rows").first();
+  const chip = () => page.getByTestId("terminal-chip");
+  const terminalTabs = () => page.getByRole("tab", { name: /^Terminal - / });
 
-  /** Moves inside the loaded SPA (the relay rate limits full page loads per address). */
-  async function navigate(path: string): Promise<void> {
-    await page.evaluate((to) => {
-      window.history.pushState({}, "", to);
-      window.dispatchEvent(new PopStateEvent("popstate"));
-    }, path);
+  async function shot(name: string): Promise<void> {
+    if (!SHOTS) return;
+    mkdirSync(SHOTS, { recursive: true });
+    // Let the layout and the xterm cursor settle.
+    await page.waitForTimeout(400);
+    await page.screenshot({ path: join(SHOTS, `${name}.png`) });
   }
 
-  /** The code the desktop window would show: read from the mock's hook, never from the page. */
-  async function shownCode(): Promise<string> {
-    await expect.poll(() => desktop.terminals.lastCode(), { timeout: 15_000 }).not.toBeNull();
-    return desktop.terminals.lastCode() ?? "";
-  }
-
-  async function typeCode(code: string): Promise<void> {
-    const input = page.getByTestId("terminal-code-input");
-    await input.fill(code);
-    await page.getByTestId("terminal-code-submit").click();
-  }
-
-  /** Opens a shell the way a user does and waits for the prompt. */
-  async function openShell(project?: string): Promise<void> {
-    await navigate(terminalPath());
-    if (project) await page.getByTestId("terminal-project").selectOption({ label: project });
+  /** Opens a terminal the way a user does from the footer chip, chooses the project, and waits for the prompt. */
+  async function openShell(project = PROJECT): Promise<void> {
+    const before = desktop.terminals.liveIds().length;
+    await chip().click();
+    await page.getByTestId("terminal-project").selectOption({ label: project });
     await page.getByTestId("terminal-open").click();
-    await expect(page.getByTestId("terminal-code-dialog")).toBeVisible();
-    await typeCode(await shownCode());
-    await expect(page.getByTestId("terminal-status")).toHaveText("Connected", { timeout: 15_000 });
-    await expect(rows()).toContainText("Monoptah mock shell in Example Alpha", { timeout: 15_000 });
+    await expect.poll(() => desktop.terminals.liveIds().length, { timeout: 30_000 }).toBe(before + 1);
+    await expect(rows()).toContainText(`Monoptah mock shell in ${project}`, { timeout: 30_000 });
   }
 
   async function type(text: string): Promise<void> {
-    await page.getByTestId("terminal-screen").click();
+    await page.getByTestId("terminal-screen").last().click();
     await page.keyboard.type(text);
     await page.keyboard.press("Enter");
   }
 
-  /** Back to the chooser: the shell must be ended (a kill, an exit or Close terminal) before this. */
-  async function leaveEnded(): Promise<void> {
-    await expect(page.getByTestId("terminal-ended")).toBeVisible();
-    await page.getByRole("button", { name: "Open a new terminal" }).click();
-    await expect(page.getByTestId("terminal-open")).toBeVisible();
+  /** Closes the terminal tab that is shown, answering the confirm. */
+  async function closeTabWithConfirm(): Promise<void> {
+    await page.locator('[data-testid="tab-close"][data-tab-key^="t:"]').click({ force: true });
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("This ends the shell on your desktop");
+    await dialog.getByRole("button", { name: "Close terminal" }).click();
   }
 
-  test("setup: register, pair a mock desktop that keeps its key, serve it and confirm the browser as a control device", async ({ newSharedActor }) => {
+  test("setup: register, pair a mock desktop whose tickets the Worker verifies, and confirm the browser as a control device", async ({ newSharedActor }) => {
     test.setTimeout(240_000);
     const actor = await newSharedActor();
     page = actor.page;
+    // The approved mockup is dark: screenshots are taken in the dark scheme.
+    if (SHOTS) await page.emulateMedia({ colorScheme: "dark" });
     await page.addInitScript(() => {
       window.__csp = [];
       document.addEventListener("securitypolicyviolation", (event) => window.__csp?.push(`${event.violatedDirective} ${event.blockedURI}`));
+    });
+    page.on("response", (response) => {
+      if (response.request().method() !== "POST" || !/\/api\/desktops\/[^/]+\/grants\/[^/]+\/terminal-ticket$/.test(new URL(response.url()).pathname)) return;
+      void response
+        .json()
+        .then((json: { ticket?: string }) => {
+          if (typeof json.ticket === "string") tickets.push(json.ticket);
+        })
+        .catch(() => undefined);
     });
     await registerThroughUi(page, namedInvite("terminal"), HANDLE, "Terminal");
 
@@ -158,48 +173,82 @@ test.describe("web terminal", () => {
     });
     expect(grant.status).toBe(200);
     await expect(pendingScreen).toHaveCount(0, { timeout: 30_000 });
+
+    // The desktop spends a ticket at the Worker like the real one: single use, bound to this desktop, device and project.
+    const spend = async (ticket: string, projectId: string): Promise<boolean> => {
+      const res = await fetch(`${origin()}/api/desktop/grants/${deviceId}/terminal-ticket`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ ticket, projectId }),
+      });
+      const ok = res.status === 200 && ((await res.json()) as { ok?: boolean }).ok === true;
+      verdicts.push({ ticket, projectId, ok });
+      return ok;
+    };
+    desktop.terminals.verifyTicket = spend;
+    spendTicket = spend;
   });
 
-  test("the entry follows the capability: hidden and explained without it, in the rail with it, live", async () => {
+  test("the footer chip follows the capability: hidden without it, live, and hidden when this device's Allow web terminal is off", async () => {
     await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(`/d/${desktopId}`);
+    await expect(page.getByTestId("app-shell")).toHaveAttribute("data-layout", "desktop");
+    await expect(page.getByTestId("app-footer")).toBeVisible();
+    await expect(chip()).toBeVisible();
     desktop.setCapabilities(WITHOUT_TERMINAL);
-    await navigate(terminalPath());
-    await expect(page.getByTestId("terminal-disabled")).toContainText("Turn on Allow web terminal for this device in Monoptah on your desktop");
-    await expect(page.getByRole("link", { name: "Terminal", exact: true })).toHaveCount(0);
+    await expect(chip()).toHaveCount(0);
     desktop.setCapabilities(WITH_TERMINAL);
-    await expect(page.getByRole("link", { name: "Terminal", exact: true })).toBeVisible();
-    await expect(page.getByTestId("terminal-open")).toBeVisible();
-  });
-
-  test("a control device whose Allow web terminal is off sees no entry and the explanation, then gets it back", async () => {
+    await expect(chip()).toBeVisible();
     desktop.setDevice(deviceFingerprint, { terminal: false });
-    await navigate(`/d/${desktopId}`);
-    await expect(page.getByTestId("app-shell")).toBeVisible();
-    await expect(page.getByRole("link", { name: "Terminal", exact: true })).toHaveCount(0);
-    await navigate(terminalPath());
-    await expect(page.getByTestId("terminal-disabled")).toBeVisible();
+    await expect(chip()).toHaveCount(0);
     desktop.setDevice(deviceFingerprint, { terminal: true });
-    await expect(page.getByTestId("terminal-open")).toBeVisible();
+    await expect(chip()).toBeVisible();
+    // No terminal is open yet: no count.
+    await expect(page.getByTestId("terminal-count")).toHaveCount(0);
   });
 
-  test("opens with the code, shows output in xterm and echoes typed commands", async () => {
-    await openShell();
-    await expect(page.getByTestId("terminal-cwd")).toHaveText("Example Alpha");
-    await expect(page.getByTestId("terminal-limits")).toContainText("Closes after 15 min without typing");
+  test("the chip opens a terminal tab with the project chooser; the passkey step opens the shell and spends one ticket", async () => {
+    await chip().click();
+    await expect(terminalTabs()).toHaveCount(0);
+    await expect(page.getByTestId("terminal-chooser")).toBeVisible();
+    await expect(page.getByTestId("terminal-project")).toBeVisible();
+    await expect(page.getByTestId("terminal-project").locator("option", { hasText: PROJECT })).toHaveCount(1);
+    await shot("desktop-chooser");
+    await page.getByTestId("terminal-project").selectOption({ label: PROJECT });
+    await page.getByTestId("terminal-open").click();
+    // The virtual authenticator answers the passkey prompt; the browser gets a ticket and the desktop spends it.
+    await expect.poll(() => desktop.terminals.liveIds().length, { timeout: 30_000 }).toBe(1);
+    await expect(rows()).toContainText(`Monoptah mock shell in ${PROJECT}`, { timeout: 30_000 });
+    expect(tickets).toHaveLength(1);
+    expect(desktop.terminals.ticketVerifications()).toBe(1);
+    expect(verdicts).toEqual([{ ticket: tickets[0], projectId: "proj-alpha", ok: true }]);
+    await expect(terminalTabs()).toHaveCount(1);
+    await expect(terminalTabs().first()).toHaveAttribute("aria-selected", "true");
+    await expect(page.getByTestId("terminal-dot").first()).toHaveAttribute("data-state", "on");
+    await expect(page.getByTestId("terminal-count")).toHaveText("1");
+  });
+
+  test("a ticket the desktop already spent is refused by the Worker, also for another project", async () => {
+    const spend = spendTicket;
+    expect(await spend(tickets[0]!, "proj-alpha")).toBe(false);
+    expect(await spend(tickets[0]!, "proj-beta")).toBe(false);
+    expect(await spend("not-a-ticket", "proj-alpha")).toBe(false);
+    // The shell the first ticket opened is untouched.
+    expect(desktop.terminals.liveIds()).toHaveLength(1);
+  });
+
+  test("shell works: typing and output in xterm", async () => {
     await type("echo hello-e2e");
     await expect(rows()).toContainText("hello-e2e");
     await type("whoami");
     await expect(rows()).toContainText("example-user");
-    expect(desktop.terminals.liveIds()).toHaveLength(1);
+    await shot("desktop-single");
   });
 
   test("xterm styles reach the page without an inline <style> and the CSP saw no violation", async () => {
     await expect(page.locator(".xterm style")).toHaveCount(0);
     expect(await page.evaluate(() => document.adoptedStyleSheets.length)).toBeGreaterThan(0);
-    // The adopted stylesheets carry xterm's theme and cell rules.
     expect(await page.evaluate(() => document.adoptedStyleSheets.some((sheet) => [...sheet.cssRules].some((rule) => rule.cssText.includes("xterm-dom-renderer-owner"))))).toBe(true);
-    // The terminal background is the stylesheet's, not the browser default.
-    expect(await page.locator(".xterm-screen").evaluate((el) => getComputedStyle(el).position)).not.toBe("");
     expect(await page.evaluate(() => window.__csp ?? [])).toEqual([]);
     // Control: the strict policy is really in force and the listener sees a violation, so the empty list above means something.
     const policy = await page.evaluate(async () => (await fetch("/")).headers.get("content-security-policy"));
@@ -224,93 +273,120 @@ test.describe("web terminal", () => {
     expect(await page.evaluate(() => window.__csp ?? [])).toEqual([]);
   });
 
-  test("a long burst of output does not freeze the page: the last line arrives and the buttons still answer", async () => {
+  test("a long burst of output does not freeze the page: the last line arrives and the page still answers", async () => {
     await type("flood");
     await expect(rows()).toContainText("flood done", { timeout: 60_000 });
-    await expect(page.getByRole("button", { name: "Copy" })).toBeEnabled();
-    await page.getByRole("button", { name: "Close terminal" }).hover();
+    await expect(chip()).toBeEnabled();
     await type("echo still-alive");
     await expect(rows()).toContainText("still-alive");
   });
 
-  test("a reload within the grace window reattaches to the same shell", async () => {
+  test("a reload within the grace window reattaches to the same shell without a new passkey step", async () => {
     const [id] = desktop.terminals.liveIds();
     expect(id).toBeTruthy();
+    const issued = tickets.length;
     await page.reload();
-    await expect(page.getByTestId("terminal-status")).toHaveText("Connected", { timeout: 30_000 });
+    await expect(terminalTabs()).toHaveCount(1);
+    await expect(page.getByTestId("terminal-dot").first()).toHaveAttribute("data-state", "on", { timeout: 30_000 });
     await type("echo after-reload");
     await expect(rows()).toContainText("after-reload");
     expect(desktop.terminals.liveIds()).toEqual([id]);
+    expect(tickets).toHaveLength(issued);
   });
 
-  test("exit ends the session and a new one needs a new code", async () => {
-    await type("exit");
-    await expect(page.getByTestId("terminal-ended")).toContainText("Session ended: the shell exited with code 0.");
-    await expect(page.getByRole("button", { name: "Close terminal" })).toBeDisabled();
-    await leaveEnded();
-    expect(await page.evaluate(() => sessionStorage.getItem(`monoptah.terminal.${location.pathname.split("/")[2]}`))).toBeNull();
-  });
-
-  test("a wrong code is refused with the tries left, then the right code opens", async () => {
-    await navigate(terminalPath());
-    await page.getByTestId("terminal-open").click();
-    const code = await shownCode();
-    await typeCode(code === "ZZZZZZ" ? "YYYYYY" : "ZZZZZZ");
-    await expect(page.getByText("That code is not right. 2 tries left.")).toBeVisible();
-    await typeCode(code.toLowerCase());
-    await expect(page.getByTestId("terminal-status")).toHaveText("Connected", { timeout: 15_000 });
-    await page.getByRole("button", { name: "Close terminal" }).click();
-    await page.getByRole("dialog").getByRole("button", { name: "Close terminal" }).click();
-    await expect(page.getByTestId("terminal-ended")).toContainText("you closed the terminal");
-    await leaveEnded();
-  });
-
-  test("three wrong codes use the challenge up: a new code is shown and the old one is dead", async () => {
-    await navigate(terminalPath());
-    await page.getByTestId("terminal-open").click();
-    const first = await shownCode();
-    const wrong = first === "ZZZZZZ" ? "YYYYYY" : "ZZZZZZ";
-    await typeCode(wrong);
-    await expect(page.getByText("That code is not right. 2 tries left.")).toBeVisible();
-    await typeCode(wrong);
-    await expect(page.getByText("That code is not right. 1 try left.")).toBeVisible();
-    await typeCode(wrong);
-    await expect(page.getByText("A new code is now shown on your desktop")).toBeVisible();
-    const second = await shownCode();
-    await expect(page.getByTestId("terminal-code-input")).toHaveValue("");
-    await typeCode(second);
-    await expect(page.getByTestId("terminal-status")).toHaveText("Connected", { timeout: 15_000 });
-  });
-
-  test("the desktop kills the shell (Kill button): the page says so and stops reading", async () => {
+  test("the desktop kills the shell: the tab says so, and New terminal returns to the chooser", async () => {
     const [id] = desktop.terminals.liveIds();
     desktop.terminals.kill(id!, "killed");
     await expect(page.getByTestId("terminal-ended")).toContainText("Session ended: the terminal was closed on the desktop.");
-    await expect(page.getByRole("button", { name: "Close terminal" })).toBeDisabled();
-    await leaveEnded();
+    await expect(page.getByTestId("terminal-dot").first()).toHaveAttribute("data-state", "off");
+    await page.getByTestId("terminal-ended").getByRole("button", { name: "New terminal" }).click();
+    await expect(page.getByTestId("terminal-chooser")).toBeVisible();
+    // Closing the now empty chooser tab asks nothing: no shell runs in it.
+    await page.getByTestId("tab-close").first().click({ force: true });
+    await expect(terminalTabs()).toHaveCount(0);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
   });
 
-  test("the idle limit ends the shell", async () => {
+  test("closing a terminal tab asks, Cancel keeps the shell, Close terminal kills it", async () => {
     await openShell();
-    const [id] = desktop.terminals.liveIds();
-    desktop.terminals.kill(id!, "idle");
-    await expect(page.getByTestId("terminal-ended")).toContainText("the terminal was idle for 15 minutes");
-    await leaveEnded();
+    expect(desktop.terminals.liveIds()).toHaveLength(1);
+    await page.getByTestId("tab-close").first().click({ force: true });
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("Close this terminal?");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toHaveCount(0);
+    expect(desktop.terminals.liveIds()).toHaveLength(1);
+    await expect(terminalTabs()).toHaveCount(1);
+    await closeTabWithConfirm();
+    await expect(terminalTabs()).toHaveCount(0);
+    await expect.poll(() => desktop.terminals.liveIds().length).toBe(0);
   });
 
-  test("turning Allow web terminal off for the device ends a running shell", async () => {
+  test("the idle limit and turning Allow web terminal off end a running shell", async () => {
+    await openShell();
+    const [idle] = desktop.terminals.liveIds();
+    desktop.terminals.kill(idle!, "idle");
+    await expect(page.getByTestId("terminal-ended")).toContainText("the terminal was idle for 15 minutes");
+    await closeEnded();
     await openShell();
     desktop.setDevice(deviceFingerprint, { terminal: false });
     await expect(page.getByTestId("terminal-ended")).toContainText("Allow web terminal was turned off");
     desktop.setDevice(deviceFingerprint, { terminal: true });
-    await leaveEnded();
+    await closeEnded();
   });
 
-  test("on a phone the key row sends Esc, Ctrl combinations and arrows through the same write path", async () => {
-    await page.setViewportSize({ width: 390, height: 844 });
+  async function closeEnded(): Promise<void> {
+    await expect(page.getByTestId("terminal-ended")).toBeVisible();
+    // The shell has ended: closing the tab asks nothing.
+    await page.getByTestId("tab-close").first().click({ force: true });
+    await expect(terminalTabs()).toHaveCount(0);
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+  }
+
+  test("a terminal tab splits next to a chat tab with the existing tab drag", async () => {
+    await page.goto(`/d/${desktopId}`);
+    // A chat tab: the first session of the catalog.
+    await page.getByText("Fix the example parser").first().click({ timeout: 30_000 });
+    await expect(page.getByRole("tab", { name: "Fix the example parser" })).toBeVisible();
     await openShell();
+    const terminalTab = terminalTabs().first();
+    const body = page.getByTestId("pane-body").first();
+    const box = (await body.boundingBox())!;
+    await terminalTab.dragTo(body, { targetPosition: { x: box.width - 20, y: box.height / 2 } });
+    await expect(page.getByTestId("pane-split")).toHaveAttribute("data-dir", "row");
+    await expect(page.getByTestId("tabbed-chat")).toHaveAttribute("data-panes", "2");
+    await expect(page.getByRole("tab", { selected: true })).toHaveCount(2);
+    await expect(terminalTabs()).toHaveCount(1);
+    await expect(rows()).toContainText(`Monoptah mock shell in ${PROJECT}`);
+    await type("echo in-split");
+    await expect(rows()).toContainText("in-split");
+    await shot("desktop-split");
+    await page.setViewportSize({ width: 1024, height: 768 });
+    await shot("tablet-split");
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await closeTabWithConfirm();
+    await expect(terminalTabs()).toHaveCount(0);
+  });
+
+  test("on a phone the footer chip opens the drawer with the key row; fullscreen, shrink and close work", async () => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`/d/${desktopId}`);
+    await expect(page.getByTestId("app-shell")).toHaveAttribute("data-layout", "mobile");
+    await expect(chip()).toBeVisible();
+    await shot("mobile-footer");
+    await chip().click();
+    const drawer = page.getByTestId("terminal-drawer");
+    await expect(drawer).toBeVisible();
+    await expect(page.getByTestId("terminal-chooser")).toBeVisible();
+    await page.getByTestId("terminal-project").selectOption({ label: PROJECT });
+    await page.getByTestId("terminal-open").click();
+    await expect(rows()).toContainText(`Monoptah mock shell in ${PROJECT}`, { timeout: 30_000 });
+    await expect(page.getByTestId("terminal-drawer-title")).toContainText(PROJECT);
+    await expect(drawer).toHaveAttribute("data-fullscreen", "false");
     const keys = page.getByTestId("terminal-keys");
     await expect(keys).toBeVisible();
+    await shot("mobile-drawer");
+
     await type("echo phone");
     await expect(rows()).toContainText("phone");
     // Type a few letters, then Ctrl and c: the mock shell prints ^C and shows a fresh prompt.
@@ -323,11 +399,45 @@ test.describe("web terminal", () => {
     await expect(keys.getByRole("button", { name: "Ctrl" })).toHaveAttribute("aria-pressed", "false");
     await keys.getByRole("button", { name: "Esc" }).click();
     await keys.getByRole("button", { name: "Up arrow" }).click();
-    await expect.poll(() => desktop.terminals.received(desktop.terminals.liveIds()[0] ?? "").join("")).toContain("\x1b[A");
-    expect(desktop.terminals.received(desktop.terminals.liveIds()[0] ?? "").join("")).toContain("\x03");
-    await page.getByRole("button", { name: "Close terminal" }).click();
+    const liveId = () => desktop.terminals.liveIds()[0] ?? "";
+    await expect.poll(() => desktop.terminals.received(liveId()).join("")).toContain("\x1b[A");
+    expect(desktop.terminals.received(liveId()).join("")).toContain("\x03");
+
+    const box = async (locator: Locator) => (await locator.boundingBox())!;
+    const shrunk = await box(drawer);
+    await page.getByRole("button", { name: "Fullscreen", exact: true }).click();
+    await expect(drawer).toHaveAttribute("data-fullscreen", "true");
+    const full = await box(drawer);
+    expect(full.height).toBeGreaterThan(shrunk.height);
+    expect(full.y).toBe(0);
+    await expect(keys).toBeVisible();
+    await shot("mobile-fullscreen");
+    await page.getByRole("button", { name: "Shrink", exact: true }).click();
+    await expect(drawer).toHaveAttribute("data-fullscreen", "false");
+    expect((await box(drawer)).height).toBe(shrunk.height);
+
+    // Closing the drawer leaves the shell running; the chip shows the count and reopens it.
+    await page.getByRole("button", { name: "Close drawer" }).click();
+    await expect(drawer).toHaveCount(0);
+    expect(desktop.terminals.liveIds()).toHaveLength(1);
+    await expect(page.getByTestId("terminal-count")).toHaveText("1");
+    await chip().click();
+    await expect(drawer).toBeVisible();
+    await expect(rows()).toContainText("phone");
+
+    // The end button asks, then kills the shell.
+    await page.getByRole("button", { name: "End this terminal" }).click();
     await page.getByRole("dialog").getByRole("button", { name: "Close terminal" }).click();
-    await expect(page.getByTestId("terminal-ended")).toBeVisible();
+    await expect.poll(() => desktop.terminals.liveIds().length).toBe(0);
+  });
+
+  test("every open spent exactly one ticket at the Worker: the desktop asked once per ticket the browser got, and all were accepted", async () => {
+    // The three refused calls are the direct replays of the replay test; they did not go through the mock's open.
+    const viaOpen = verdicts.filter((v) => tickets.includes(v.ticket) && v.ok);
+    expect(viaOpen).toHaveLength(tickets.length);
+    expect(new Set(tickets).size).toBe(tickets.length);
+    expect(desktop.terminals.ticketVerifications()).toBe(tickets.length);
+    expect(verdicts.filter((v) => !v.ok)).toHaveLength(3);
   });
 
   test("no CSP violation happened during the whole spec", async () => {

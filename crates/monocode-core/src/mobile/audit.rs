@@ -100,10 +100,10 @@ pub enum Lifecycle {
     SelectionNarrow,
     /// A web device asked to widen and was refused for its ticket.
     SelectionWidenRefused,
-    /// A web device was shown a one-time code to open a terminal.
-    TerminalChallenge,
-    /// A wrong or expired terminal code, or a lockout.
-    TerminalReauthFailed,
+    /// The server accepted (and consumed) a passkey ticket to open a terminal.
+    TerminalTicketAccepted,
+    /// A terminal open was refused for its ticket. The ticket is never logged.
+    TerminalTicketRefused,
     /// A shell opened for a web device.
     TerminalOpen,
     /// A shell ended; the detail is why.
@@ -126,8 +126,8 @@ impl Lifecycle {
             Lifecycle::SelectionWiden => "selection_widen",
             Lifecycle::SelectionNarrow => "selection_narrow",
             Lifecycle::SelectionWidenRefused => "selection_widen_refused",
-            Lifecycle::TerminalChallenge => "terminal_challenge",
-            Lifecycle::TerminalReauthFailed => "terminal_reauth_failed",
+            Lifecycle::TerminalTicketAccepted => "terminal_ticket_accepted",
+            Lifecycle::TerminalTicketRefused => "terminal_ticket_refused",
             Lifecycle::TerminalOpen => "terminal_open",
             Lifecycle::TerminalClose => "terminal_close",
             Lifecycle::TerminalToggle => "terminal_toggle",

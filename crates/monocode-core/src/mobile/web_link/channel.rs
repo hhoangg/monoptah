@@ -636,8 +636,6 @@ mod tests {
             name: "Laptop".into(),
             relay_id: Some(relay_id),
         };
-        let challenge = hub.challenge(&owner, "p", "P").unwrap();
-        let code = hub.status().codes[0].code.clone();
         hub.open(
             &owner,
             OpenRequest {
@@ -646,9 +644,8 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 cols: 80,
                 rows: 24,
-                challenge_id: challenge.challenge_id,
-                code,
             },
+            || crate::mobile::terminal::TicketCheck::Accepted,
         )
         .unwrap();
         let (out, _frames) = mpsc::channel::<Out>(8);

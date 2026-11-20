@@ -1,5 +1,6 @@
 // What the user reads about a terminal: why a session ended and why an open or a write failed.
 // Exit reasons are the `exited.reason` of `terminal.read` (protocol TERMINAL_EXIT_REASONS) plus two the web adds itself.
+import { ReauthCancelledError } from "@/features/accounts/queries";
 
 /** Reasons the web adds: the desktop forgot the terminal, or the link failed for good. */
 export const LOCAL_EXIT_REASONS = ["gone", "error"] as const;
@@ -50,7 +51,9 @@ const OPEN_FAILED: Readonly<Record<string, string>> = {
   forbidden: "This device is not allowed to open a terminal.",
   disabled: "Turn on Allow web terminal for this device in Monoptah on your desktop.",
   not_selected: "This project is not shared with this device. Choose it in the desktop's Web app settings.",
-  busy: "The desktop has too many terminals or codes open. Close one and try again.",
+  busy: "The desktop has too many terminals open. Close one and try again.",
+  fresh_required: "The desktop refused the passkey check. Try again.",
+  ticket_refused: "The desktop refused the passkey check. Try again.",
   not_found: "That project or folder could not be found on your desktop.",
   path_denied: "That folder is not allowed. Use a folder inside the project.",
   unsupported: "Update Monoptah on your desktop to use the terminal.",
@@ -67,15 +70,19 @@ export function openFailedText(code: string | undefined): string {
   return (code && Object.hasOwn(OPEN_FAILED, code) ? OPEN_FAILED[code] : undefined) ?? OPEN_FAILED_FALLBACK;
 }
 
-export const CODE_RESTART_NOTICE = "That code expired or was used up. A new code is now shown on your desktop.";
-export const NOT_ALLOWED_NOTICE = "Turn on Allow web terminal for this device in Monoptah on your desktop";
-
-export function wrongCodeNotice(triesLeft: number): string {
-  return `That code is not right. ${triesLeft} ${triesLeft === 1 ? "try" : "tries"} left.`;
+/** The message of a failed ticket request: a closed passkey prompt, or an API error (`forbidden`, `fresh_required`, ...). */
+export function ticketFailedText(error: unknown): string {
+  if (error instanceof ReauthCancelledError) return PASSKEY_CANCELLED_NOTICE;
+  const code = typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+  return openFailedText(typeof code === "string" ? code : undefined);
 }
+
+/** The passkey prompt was closed before it finished: nothing was opened. */
+export const PASSKEY_CANCELLED_NOTICE = "Passkey confirmation was cancelled. No terminal was opened.";
+export const NOT_ALLOWED_NOTICE = "Turn on Allow web terminal for this device in Monoptah on your desktop";
 
 export const INPUT_DROPPED_NOTICE = "Too much input waiting: some of it was dropped.";
 export const INPUT_LOST_NOTICE = "The connection dropped: the last keys may not have reached the shell.";
 
-/** The label of the navigation entries (the activity rail and the workspace list). */
+/** The label of the navigation entries (the footer chip and the tab titles). */
 export const TERMINAL_NAV_LABEL = "Terminal";

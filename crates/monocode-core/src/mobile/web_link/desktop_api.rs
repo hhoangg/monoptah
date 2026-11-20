@@ -7,6 +7,7 @@
 //! a `Debug` output or a URL.
 use super::relay::relay_url;
 use crate::mobile::policy::Permission;
+use crate::mobile::terminal::TicketCheck;
 use serde_json::{json, Value};
 use std::io::Read;
 use std::time::Duration;
@@ -29,6 +30,37 @@ pub fn verify_selection_ticket(base: &str, token: &str, device_id: &str, ticket:
         call("POST", base, &path, Some(token), Some(&body), TICKET_TIMEOUT),
         Ok(answer) if answer.status == 200
     )
+}
+
+/// `POST /api/desktop/grants/:deviceId/terminal-ticket`: whether the server
+/// accepted the single-use passkey ticket for opening a terminal in
+/// `project_id` (200, `Accepted`) and has now consumed it. A 404 is `Rejected`;
+/// any other answer, an invalid id or no answer in 5 s is `Unreachable`: the
+/// terminal fails closed on all of them.
+pub fn verify_terminal_ticket(
+    base: &str,
+    token: &str,
+    device_id: &str,
+    ticket: &str,
+    project_id: &str,
+) -> TicketCheck {
+    let Ok(id) = path_id(device_id) else {
+        return TicketCheck::NoIdentity;
+    };
+    let path = format!("/api/desktop/grants/{id}/terminal-ticket");
+    let body = json!({"ticket": ticket, "projectId": project_id});
+    match call(
+        "POST",
+        base,
+        &path,
+        Some(token),
+        Some(&body),
+        TICKET_TIMEOUT,
+    ) {
+        Ok(answer) if answer.status == 200 => TicketCheck::Accepted,
+        Ok(answer) if answer.status == 404 => TicketCheck::Rejected,
+        _ => TicketCheck::Unreachable,
+    }
 }
 
 /// `DELETE /api/desktop/me` runs while the user waits for "Unpair".

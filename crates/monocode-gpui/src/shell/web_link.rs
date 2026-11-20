@@ -18,8 +18,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// How often the watcher reads the web status. One second, so a code for the
-/// web terminal is on screen soon after the browser asks for it.
+/// How often the watcher reads the web status. One second, so an open web
+/// terminal is on screen soon after the browser opens it.
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the bridge remembers between frames. A GPUI global, so the Shell
@@ -40,10 +40,8 @@ struct WebBridge {
     /// Bumped whenever a pairing is cancelled or Settings closes, so a ticket
     /// that arrives late is dropped instead of reopening the dialog.
     pairing_generation: u64,
-    /// Open web terminals and the codes to read out, for the corner panel.
+    /// Open web terminals, for the corner panel.
     terminals: TerminalStatus,
-    /// Codes already announced with a notification.
-    announced_codes: HashSet<String>,
 }
 
 impl Global for WebBridge {}
@@ -57,20 +55,6 @@ fn unix_now() -> u64 {
 /// The name the web server shows for this desktop: the same one phone pairing uses.
 fn machine_name() -> String {
     monocode_core::mobile::host::name()
-}
-
-/// A code on screen, by device, project and the code itself.
-fn code_key(code: &monocode_core::mobile::terminal::PendingCode) -> String {
-    format!(
-        "{}\u{0}{}\u{0}{}",
-        code.device_name, code.project, code.code
-    )
-}
-
-/// "ABC234" as "ABC 234", easier to read out.
-fn group_code(code: &str) -> String {
-    let half = code.len() / 2;
-    format!("{} {}", &code[..half], &code[half..])
 }
 
 /// The pending devices whose fingerprint was not announced yet.
@@ -227,38 +211,13 @@ impl Shell {
     }
 
     /// One watcher tick for the web terminal: keeps what the corner panel
-    /// shows and raises one notification per new code (without the code: it
-    /// is read in the app's window).
+    /// shows.
     fn web_terminals_watched(&mut self, terminals: TerminalStatus, cx: &mut Context<Self>) {
-        let notifications = self.workspace.preferences.notifications;
-        let sounds = self.workspace.preferences.sounds;
         let bridge = cx.default_global::<WebBridge>();
-        let fresh: Vec<_> = terminals
-            .codes
-            .iter()
-            .filter(|code| bridge.announced_codes.insert(code_key(code)))
-            .cloned()
-            .collect();
-        bridge
-            .announced_codes
-            .retain(|key| terminals.codes.iter().any(|code| &code_key(code) == key));
         let changed = bridge.terminals != terminals;
         bridge.terminals = terminals;
         if changed {
             cx.notify();
-        }
-        if notifications {
-            for code in fresh {
-                let _ = platform::show(platform::Notification {
-                    tag: "web-terminal-code".into(),
-                    subtitle: "Web terminal".into(),
-                    body: format!(
-                        "{} asks for a shell in {}. Open Monoptah to read the code.",
-                        code.device_name, code.project
-                    ),
-                    sound: sounds,
-                });
-            }
         }
     }
 
@@ -281,12 +240,11 @@ impl Shell {
         cx.notify();
     }
 
-    /// The corner panel: a code to read out to the browser, and every open
-    /// web terminal with its device name and a Kill button. On top of the
+    /// The corner panel: every open web terminal with its device name and a Kill button. On top of the
     /// workspace, whatever page is open.
     pub(super) fn web_terminal_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = cx.try_global::<WebBridge>()?.terminals.clone();
-        if status.open.is_empty() && status.codes.is_empty() {
+        if status.open.is_empty() {
             return None;
         }
         let mut stack = div()
@@ -297,50 +255,6 @@ impl Shell {
             .flex()
             .flex_col()
             .gap_2();
-        for code in &status.codes {
-            stack = stack.child(
-                glass_frame()
-                    .id(SharedString::from(format!("web-terminal-code-{}", code.device_name)))
-                    .role(Role::Status)
-                    .debug_selector(|| "web-terminal-code".into())
-                    .occlude()
-                    .p_3()
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Web terminal request"),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_size(px(12.))
-                            .text_color(content(0.7))
-                            .child(format!(
-                                "{} wants a shell in {}. Type this code in the browser:",
-                                code.device_name, code.project
-                            )),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_size(px(28.))
-                            .font_weight(FontWeight::BOLD)
-                            .debug_selector(|| "web-terminal-code-text".into())
-                            .child(group_code(&code.code)),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_size(px(11.))
-                            .text_color(content(0.5))
-                            .child(format!(
-                                "Works once, for {} more seconds. If you did not ask for this, ignore it.",
-                                code.expires_in_ms / 1000
-                            )),
-                    ),
-            );
-        }
         for open in &status.open {
             let id = open.id.clone();
             let label = format!(
@@ -738,29 +652,6 @@ fn with_flag(mut flags: PolicyFlags, flag: WebPolicyFlag, on: bool) -> PolicyFla
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_code_is_shown_in_two_groups_and_keyed_by_device_project_and_code() {
-        assert_eq!(group_code("ABC234"), "ABC 234");
-        let code = |device: &str, code: &str| monocode_core::mobile::terminal::PendingCode {
-            device_name: device.into(),
-            project: "Proj".into(),
-            code: code.into(),
-            expires_in_ms: 1,
-        };
-        assert_ne!(
-            code_key(&code("A", "ABC234")),
-            code_key(&code("B", "ABC234"))
-        );
-        assert_ne!(
-            code_key(&code("A", "ABC234")),
-            code_key(&code("A", "ABC235"))
-        );
-        // The countdown is not part of the key: one code, one notification.
-        let mut later = code("A", "ABC234");
-        later.expires_in_ms = 40_000;
-        assert_eq!(code_key(&code("A", "ABC234")), code_key(&later));
-    }
 
     fn pending(fingerprint: &str) -> PendingDevice {
         PendingDevice {

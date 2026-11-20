@@ -47,26 +47,16 @@ const Cols = z.number().int().min(TERMINAL_COLS_MIN).max(TERMINAL_COLS_MAX);
 const Rows = z.number().int().min(TERMINAL_ROWS_MIN).max(TERMINAL_ROWS_MAX);
 
 export const TerminalOpenParamsSchema = z.object({
-  projectId: z.string().min(1),
+  projectId: z.string().min(1).max(256),
   subdir: z.string().max(TERMINAL_SUBDIR_MAX).refine(isSafeTerminalSubdir, "subdir must be a relative path without ..").optional(),
   cols: Cols,
   rows: Rows,
-  /** Step 2 only: the challenge of step 1 and the code the user read on the desktop. */
-  challengeId: z.string().min(1).max(256).optional(),
-  code: z.string().min(1).max(32).optional(),
+  /** Single-use ticket from the Worker (fresh passkey re-auth), bound to this device and `projectId`. The desktop consumes it. */
+  ticket: z.string().min(1).max(256),
 });
 export type TerminalOpenParams = z.infer<typeof TerminalOpenParamsSchema>;
 
-/** Step 1 answer: the desktop shows a one-time code on its own screen. */
-export const TerminalChallengeSchema = z.looseObject({
-  challengeId: z.string().min(1),
-  expiresInMs: z.number().int().nonnegative(),
-  codeLength: z.number().int().positive(),
-  attempts: z.number().int().positive(),
-});
-export type TerminalChallenge = z.output<typeof TerminalChallengeSchema>;
-
-/** Step 2 answer: the shell is running. `cwd` is a display label only. */
+/** The shell is running. `cwd` is a display label only. */
 export const TerminalOpenedSchema = z.looseObject({
   terminalId: TerminalId,
   cols: z.number().int().positive(),
@@ -77,12 +67,8 @@ export const TerminalOpenedSchema = z.looseObject({
 });
 export type TerminalOpened = z.output<typeof TerminalOpenedSchema>;
 
-export const TerminalOpenResultSchema = z.union([TerminalOpenedSchema, TerminalChallengeSchema]);
-export type TerminalOpenResult = z.output<typeof TerminalOpenResultSchema>;
-
-export function isTerminalOpened(result: TerminalOpenResult): result is TerminalOpened {
-  return "terminalId" in result;
-}
+export const TerminalOpenResultSchema = TerminalOpenedSchema;
+export type TerminalOpenResult = TerminalOpened;
 
 export const TerminalReadParamsSchema = z.object({
   terminalId: TerminalId,

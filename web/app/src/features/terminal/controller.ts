@@ -1,4 +1,4 @@
-// The terminal session as plain logic (security.md "Terminal", features.md N-26): the two step open with the one-time code,
+// The terminal session as plain logic (security.md "Terminal", features.md N-26): the one step open with a passkey ticket,
 // the read loop, the write queue, resize, close, the end of a session and the way back after a dropped link. It talks to
 // two ports (port.ts), so it runs in a test with a fake link and a fake screen and needs neither xterm nor a canvas.
 //
@@ -25,32 +25,16 @@ import {
   TERMINAL_WRITE_FLUSH_MS,
   TerminalReadResultSchema,
   isSafeTerminalSubdir,
-  isTerminalOpened,
   type TerminalOpened,
   type TerminalReadResult,
 } from "@monoptah/protocol";
-import {
-  CODE_RESTART_NOTICE,
-  INPUT_DROPPED_NOTICE,
-  INPUT_LOST_NOTICE,
-  endedText,
-  openFailedText,
-  wrongCodeNotice,
-} from "./copy";
+import { INPUT_DROPPED_NOTICE, INPUT_LOST_NOTICE, endedText, openFailedText, ticketFailedText } from "./copy";
 import { chunkEnd, fromBase64, toBase64, utf8 } from "./input";
 import type { TerminalLinkPort, TerminalScreen, TerminalSize } from "./port";
 import type { ResumeEntry, ResumeStore } from "./resume";
 
-export type TerminalPhase = "idle" | "starting" | "code" | "verifying" | "running" | "reconnecting" | "ended" | "failed";
-
-export interface CodeChallenge {
-  challengeId: string;
-  /** Epoch ms the code stops working. */
-  expiresAt: number;
-  codeLength: number;
-  attempts: number;
-  attemptsLeft: number;
-}
+/** `starting` covers the passkey prompt and the open request. */
+export type TerminalPhase = "idle" | "starting" | "running" | "reconnecting" | "ended" | "failed";
 
 export interface TerminalSession {
   terminalId: string;
@@ -70,11 +54,7 @@ export interface TerminalEnded {
 
 export interface TerminalSnapshot {
   phase: TerminalPhase;
-  challenge: CodeChallenge | null;
-  /** The code of the shown challenge ran out of time: ask for a new one. */
-  codeExpired: boolean;
-  /** A soft message (a wrong code, a restart); an error that ends an attempt is `error`. */
-  notice: string | null;
+  /** Why an open failed (shown in the chooser). */
   error: string | null;
   session: TerminalSession | null;
   ended: TerminalEnded | null;
@@ -90,11 +70,13 @@ export interface OpenTarget {
 
 export interface TerminalControllerOptions {
   link: TerminalLinkPort;
+  /** A fresh single-use ticket for opening a terminal in the project (the passkey prompt shows inside). */
+  requestTicket: (projectId: string) => Promise<string>;
   store?: ResumeStore | null;
   now?: () => number;
 }
 
-const IDLE: TerminalSnapshot = { phase: "idle", challenge: null, codeExpired: false, notice: null, error: null, session: null, ended: null, inputNotice: null };
+const IDLE: TerminalSnapshot = { phase: "idle", error: null, session: null, ended: null, inputNotice: null };
 
 const DEFAULT_SIZE: TerminalSize = { cols: 80, rows: 24 };
 const RESIZE_DEBOUNCE_MS = 150;
@@ -118,6 +100,7 @@ export class TerminalController {
   readonly #link: TerminalLinkPort;
   readonly #store: ResumeStore | null;
   readonly #now: () => number;
+  readonly #requestTicket: (projectId: string) => Promise<string>;
   readonly #listeners = new Set<() => void>();
   readonly #sleepers = new Set<() => void>();
   #snapshot: TerminalSnapshot = IDLE;
@@ -126,8 +109,6 @@ export class TerminalController {
   #unsubscribeReady: (() => void) | null = null;
   /** Bumped to stop every loop of the current run (end, dispose, a new open). */
   #run = 0;
-  #target: OpenTarget | null = null;
-  #expiryTimer: ReturnType<typeof setTimeout> | null = null;
   #resumed = false;
   #wasDisconnected = false;
   #started = false;
@@ -154,6 +135,7 @@ export class TerminalController {
     this.#link = options.link;
     this.#store = options.store ?? null;
     this.#now = options.now ?? Date.now;
+    this.#requestTicket = options.requestTicket;
   }
 
   // --- Store for the UI ---
@@ -197,9 +179,12 @@ export class TerminalController {
     return { cols: clamp(size.cols, TERMINAL_COLS_MIN, TERMINAL_COLS_MAX), rows: clamp(size.rows, TERMINAL_ROWS_MIN, TERMINAL_ROWS_MAX) };
   }
 
-  // --- Opening (two steps, a new code on every open) ---
+  // --- Opening (one step: a passkey ticket, then `terminal.open`) ---
 
-  /** Step 1: asks the desktop for a code. It shows the code on its own screen; the user types it in `submitCode`. */
+  /**
+   * Asks for a fresh passkey ticket for the project (the prompt of the browser shows here), then opens the shell with it.
+   * The desktop spends the ticket once; an open never works without one, and a new open needs a new ticket.
+   */
   async begin(target: OpenTarget): Promise<void> {
     const subdir = target.subdir?.trim() ? target.subdir.trim() : undefined;
     if (subdir !== undefined && !isSafeTerminalSubdir(subdir)) {
@@ -207,102 +192,44 @@ export class TerminalController {
       return;
     }
     this.#stopRun();
-    this.#target = { projectId: target.projectId, ...(subdir === undefined ? {} : { subdir }) };
+    const run = this.#run;
+    const clean: OpenTarget = { projectId: target.projectId, ...(subdir === undefined ? {} : { subdir }) };
     this.#resumed = false;
     this.#wasDisconnected = false;
-    await this.#requestChallenge(null);
-  }
-
-  async #requestChallenge(notice: string | null): Promise<void> {
-    const target = this.#target;
-    if (!target) return;
-    const run = this.#run;
-    this.#clearExpiry();
-    this.#set({ ...IDLE, phase: "starting", notice });
+    this.#set({ ...IDLE, phase: "starting" });
+    let ticket: string;
     try {
-      const result = await this.#link.request("terminal.open", { ...target, ...this.#size });
+      ticket = await this.#requestTicket(clean.projectId);
+    } catch (error) {
       if (run !== this.#run) return;
-      if (isTerminalOpened(result)) {
-        // No code was asked for. Never open a shell without the re-auth step: treat it as a failure.
-        this.#set({ ...IDLE, phase: "failed", error: openFailedText(undefined) });
+      this.#set({ ...IDLE, phase: "failed", error: ticketFailedText(error) });
+      return;
+    }
+    if (run !== this.#run) return;
+    try {
+      const opened = await this.#link.request("terminal.open", { ...clean, ...this.#size, ticket });
+      if (run !== this.#run) {
+        // Closed or cancelled while the open was in flight: the shell exists on the desktop now, so end it instead of orphaning it.
+        this.#closeLate(opened);
         return;
       }
-      const attempts = result.attempts;
-      this.#set({
-        phase: "code",
-        notice,
-        error: null,
-        codeExpired: false,
-        challenge: { challengeId: result.challengeId, expiresAt: this.#now() + result.expiresInMs, codeLength: result.codeLength, attempts, attemptsLeft: attempts },
-      });
-      this.#armExpiry(result.expiresInMs, run);
+      this.#startSession(opened);
     } catch (error) {
       if (run !== this.#run) return;
       this.#set({ ...IDLE, phase: "failed", error: openFailedText(codeOf(error)) });
     }
   }
 
-  #armExpiry(ms: number, run: number): void {
-    this.#clearExpiry();
-    this.#expiryTimer = setTimeout(() => {
-      this.#expiryTimer = null;
-      if (run === this.#run && this.#snapshot.phase === "code") this.#set({ codeExpired: true });
-    }, ms);
+  /** Best-effort close of a shell whose open answer arrived after the run was superseded. */
+  #closeLate(opened: unknown): void {
+    const terminalId = (opened as { terminalId?: unknown } | null)?.terminalId;
+    if (typeof terminalId !== "string" || terminalId === "") return;
+    this.#link.request("terminal.close", { terminalId }).catch(() => undefined);
   }
 
-  #clearExpiry(): void {
-    if (this.#expiryTimer !== null) clearTimeout(this.#expiryTimer);
-    this.#expiryTimer = null;
-  }
-
-  /** The user asks for a new code (the old one ran out of time). */
-  async restart(): Promise<void> {
-    if (this.#snapshot.phase !== "code" && this.#snapshot.phase !== "failed") return;
-    await this.#requestChallenge(null);
-  }
-
-  /** Step 2: the code the user read on the desktop. A code of the wrong shape is not sent: it would burn an attempt. */
-  async submitCode(raw: string): Promise<void> {
-    const challenge = this.#snapshot.challenge;
-    const target = this.#target;
-    if (this.#snapshot.phase !== "code" || !challenge || !target || this.#snapshot.codeExpired) return;
-    const code = raw.replace(/\s+/g, "").toUpperCase();
-    if (code.length !== challenge.codeLength) {
-      this.#set({ notice: `Enter all ${challenge.codeLength} characters of the code.` });
-      return;
-    }
-    const run = this.#run;
-    this.#clearExpiry();
-    this.#set({ phase: "verifying", notice: null });
-    try {
-      const result = await this.#link.request("terminal.open", { ...target, ...this.#size, challengeId: challenge.challengeId, code });
-      if (run !== this.#run) return;
-      if (!isTerminalOpened(result)) {
-        this.#set({ ...IDLE, phase: "failed", error: openFailedText(undefined) });
-        return;
-      }
-      this.#startSession(result);
-    } catch (error) {
-      if (run !== this.#run) return;
-      const failure = codeOf(error);
-      if (failure === "reauth_failed") {
-        const attemptsLeft = Math.max(challenge.attemptsLeft - 1, 0);
-        this.#set({ phase: "code", notice: wrongCodeNotice(attemptsLeft), challenge: { ...challenge, attemptsLeft } });
-        this.#armExpiry(Math.max(challenge.expiresAt - this.#now(), 0), run);
-        return;
-      }
-      if (failure === "reauth_required") {
-        // Unknown, expired, used up or locked out: start again with a new code, once, for this typed attempt.
-        await this.#requestChallenge(CODE_RESTART_NOTICE);
-        return;
-      }
-      this.#set({ ...IDLE, phase: "failed", error: openFailedText(failure) });
-    }
-  }
-
-  /** The user backs out of the code step. The desktop lets the code expire by itself. */
+  /** The user backs out while the passkey prompt or the open is pending. */
   cancel(): void {
-    if (this.#snapshot.phase !== "code" && this.#snapshot.phase !== "starting" && this.#snapshot.phase !== "verifying") return;
+    if (this.#snapshot.phase !== "starting") return;
     this.#stopRun();
     this.#set({ ...IDLE });
   }
@@ -599,6 +526,11 @@ export class TerminalController {
   /** Kills the shell on the desktop now. The session ends here even when the link cannot carry the request. */
   async close(): Promise<void> {
     const session = this.#snapshot.session;
+    if (!session && this.#snapshot.phase === "starting") {
+      // The open is still in flight: its late answer is closed by begin().
+      this.cancel();
+      return;
+    }
     if (!session || this.#snapshot.ended) return;
     // Stop reading and writing first: nothing may follow the close request.
     this.#stopRun();
@@ -626,7 +558,6 @@ export class TerminalController {
     this.#started = false;
     this.#readAbort?.abort();
     this.#readAbort = null;
-    this.#clearExpiry();
     for (const timer of [this.#flushTimer, this.#resizeTimer, this.#persistTimer, this.#noticeTimer]) if (timer !== null) clearTimeout(timer);
     this.#flushTimer = this.#resizeTimer = this.#persistTimer = this.#noticeTimer = null;
     this.#pending = new Uint8Array(0);

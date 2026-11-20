@@ -9,7 +9,6 @@ import { useCatalog } from "@/data";
 import { requestCreateMono } from "@/features/monos/createRequest";
 import { useLinkState } from "@/link";
 import { useCapability } from "@/version";
-import { TerminalNavItem } from "@/features/terminal/TerminalNavItem";
 import { safeHexColor } from "@/lib/color";
 import { cn } from "@/lib/utils";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/ui/dropdown-menu";
@@ -249,7 +248,6 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono, railed = false 
       {railed ? null : (
         <div className="flex flex-col gap-0.5 border-t border-stroke p-1.5">
           <Slot name="desktop-nav-items" desktopId={desktopId} />
-          <TerminalNavItem desktopId={desktopId} onNavigate={onNavigate} />
           <Link
             to="/d/$desktopId/settings"
             params={{ desktopId }}

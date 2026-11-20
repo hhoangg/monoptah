@@ -27,10 +27,22 @@ function Harness({ send, appCursor = false }: { send: (text: string) => void; ap
 }
 
 describe("KeyboardRow", () => {
-  it("has Esc, Tab, Ctrl, Alt, four arrows and the symbols | / ~ -", () => {
+  it("has Esc, Tab, Ctrl, Alt, four arrows and the symbols | / - ~ $", () => {
     render(<Harness send={() => undefined} />);
     const names = screen.getAllByRole("button").map((button) => button.getAttribute("aria-label") ?? button.textContent);
-    expect(names).toEqual(["Esc", "Tab", "Ctrl", "Alt", "Left arrow", "Up arrow", "Down arrow", "Right arrow", "Symbol |", "Symbol /", "Symbol ~", "Symbol -", "type c"]);
+    expect(names).toEqual(["Esc", "Tab", "Ctrl", "Alt", "Left arrow", "Up arrow", "Down arrow", "Right arrow", "Symbol |", "Symbol /", "Symbol -", "Symbol ~", "Symbol $", "type c"]);
+  });
+
+  it("ends with a Paste key only when the caller gives a paste handler, and it calls it", async () => {
+    const onPaste = vi.fn();
+    const { unmount } = render(<KeyboardRow modifiers={{ ctrl: false, alt: false }} onModifiers={() => undefined} onSend={() => undefined} applicationCursor={() => false} />);
+    expect(screen.queryByRole("button", { name: "Paste" })).toBeNull();
+    unmount();
+    render(<KeyboardRow modifiers={{ ctrl: false, alt: false }} onModifiers={() => undefined} onSend={() => undefined} applicationCursor={() => false} onPaste={onPaste} />);
+    const buttons = screen.getAllByRole("button");
+    expect(buttons.at(-1)).toHaveAccessibleName("Paste");
+    await userEvent.click(buttons.at(-1)!);
+    expect(onPaste).toHaveBeenCalledTimes(1);
   });
 
   it("sends Esc and Tab as their bytes", async () => {
@@ -56,8 +68,8 @@ describe("KeyboardRow", () => {
   it("sends the symbols as they are", async () => {
     const send = vi.fn();
     render(<Harness send={send} />);
-    for (const name of ["Symbol |", "Symbol /", "Symbol ~", "Symbol -"]) await userEvent.click(screen.getByRole("button", { name }));
-    expect(send.mock.calls.map(([text]) => text)).toEqual(["|", "/", "~", "-"]);
+    for (const name of ["Symbol |", "Symbol /", "Symbol -", "Symbol ~", "Symbol $"]) await userEvent.click(screen.getByRole("button", { name }));
+    expect(send.mock.calls.map(([text]) => text)).toEqual(["|", "/", "-", "~", "$"]);
   });
 
   it("Ctrl is sticky: the next typed letter becomes a control character, then it turns itself off", async () => {

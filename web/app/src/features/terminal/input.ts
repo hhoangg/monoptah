@@ -49,7 +49,7 @@ export function arrowSequence(arrow: Arrow, applicationCursor: boolean): string 
 export const KEY_ESC = "\x1b";
 export const KEY_TAB = "\t";
 /** Symbols that are hard to reach on a phone keyboard. */
-export const SYMBOL_KEYS = ["|", "/", "~", "-"] as const;
+export const SYMBOL_KEYS = ["|", "/", "-", "~", "$"] as const;
 
 /** The control character of a typed key (`c` gives 0x03), or null when the key has none. */
 export function controlCharacter(key: string): string | null {

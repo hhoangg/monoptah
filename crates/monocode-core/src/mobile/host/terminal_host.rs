@@ -1,6 +1,6 @@
 //! The host's side of the web terminal: the `terminal.*` methods, who may
 //! hold a shell, and the desktop's own controls over it (the per-device
-//! toggle, the Kill button). The shells, codes and limits are in
+//! toggle, the Kill button). The shells and limits are in
 //! [`super::terminal`].
 use super::terminal::{self, Owner, Reason, Standing};
 use super::*;
@@ -99,6 +99,9 @@ fn resolve_cwd(project_id: &str, subdir: Option<&str>) -> Result<std::path::Path
     Ok(target)
 }
 
+/// The longest project id; the web protocol caps it at the same length.
+const MAX_PROJECT_ID: usize = 256;
+
 fn text_param<'a>(params: &'a Value, key: &str, max: usize) -> Result<&'a str, Failure> {
     params[key]
         .as_str()
@@ -140,7 +143,7 @@ impl MobileHost {
         self.terminals.set_spawner(spawner);
     }
 
-    /// Open shells and the codes waiting to be read out, for the indicator.
+    /// Open shells, for the indicator.
     pub fn terminal_status(&self) -> terminal::TerminalStatus {
         self.terminals.status()
     }
@@ -241,7 +244,7 @@ impl MobileHost {
         let hub = &self.terminals;
         match method {
             "terminal.open" => {
-                let project = text_param(params, "projectId", 2048)?;
+                let project = text_param(params, "projectId", MAX_PROJECT_ID)?;
                 let name = project_name.ok_or_else(|| policy::Code::NotFound.failure())?;
                 let subdir = match &params["subdir"] {
                     Value::Null => None,
@@ -254,26 +257,46 @@ impl MobileHost {
                     None => name,
                 };
                 hub.start_ticker();
-                if params["challengeId"].is_null() && params["code"].is_null() {
-                    return Ok(hub.challenge(&owner, project, &label)?.to_value());
-                }
-                let challenge_id = text_param(params, "challengeId", 128)?;
-                let code = text_param(params, "code", 64)?;
                 let cwd = resolve_cwd(project, subdir)?;
+                // The local gates are done; a missing ticket is refused before
+                // the server is asked, and before anything is spawned.
+                let refuse_ticket = |detail: &str| {
+                    audit::record_lifecycle(
+                        audit::Lifecycle::TerminalTicketRefused,
+                        &owner.device_id,
+                        &owner.fingerprint,
+                        Transport::Web,
+                        Some(detail),
+                    );
+                    policy::Code::FreshRequired.failure()
+                };
+                let ticket = params["ticket"]
+                    .as_str()
+                    .filter(|ticket| !ticket.is_empty() && ticket.len() <= 4096)
+                    .ok_or_else(|| refuse_ticket("no ticket"))?
+                    .to_owned();
+                let server_id = owner
+                    .relay_id
+                    .clone()
+                    .ok_or_else(|| refuse_ticket(terminal::TicketCheck::NoIdentity.reason()))?;
                 let request = terminal::OpenRequest {
                     project: project.to_owned(),
                     label,
                     cwd,
                     cols,
                     rows,
-                    challenge_id: challenge_id.to_owned(),
-                    code: code.to_owned(),
                 };
-                // Starting the pty blocks: keep it off the async workers.
-                let hub = hub.clone();
-                let opened = tokio::task::spawn_blocking(move || hub.open(&owner, request))
-                    .await
-                    .map_err(|_| Failure::from("The terminal could not be opened"))??;
+                // Checking the ticket (HTTP) and starting the pty both block:
+                // keep them off the async workers. The hub runs the check only
+                // after it reserved a slot, with no lock held.
+                let (hub, host, project) = (hub.clone(), self.clone(), project.to_owned());
+                let opened = tokio::task::spawn_blocking(move || {
+                    hub.open(&owner, request, || {
+                        host.verify_terminal_ticket_blocking(&server_id, &ticket, &project)
+                    })
+                })
+                .await
+                .map_err(|_| Failure::from("The terminal could not be opened"))??;
                 Ok(opened.to_value())
             }
             "terminal.read" => {

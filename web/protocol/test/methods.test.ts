@@ -9,7 +9,6 @@ import {
   classify,
   isMethodName,
   isSafeTerminalSubdir,
-  isTerminalOpened,
   REQUEST_TIMEOUT_BY_METHOD,
   TERMINAL_EXIT_REASONS,
   TERMINAL_READ_MAX_WAIT_MS,
@@ -168,7 +167,7 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
     params: {},
     result: { current: "1.0.0", latest: "1.1.0", updateAvailable: true, notes: "Fixes", runningSessions: [{ id: "s1", title: "Fix bug" }], lastFailure: "Update to 1.1.0 failed: disk full" },
   },
-  "terminal.open": { params: { projectId: "p1", subdir: "src/app", cols: 80, rows: 24 }, result: { challengeId: "c1", expiresInMs: 60000, codeLength: 6, attempts: 3 } },
+  "terminal.open": { params: { projectId: "p1", subdir: "src/app", cols: 80, rows: 24, ticket: "tk1" }, result: { terminalId: "t1", cols: 80, rows: 24, cwd: "app/src", idleTimeoutMs: 900000, maxDurationMs: 28800000 } },
   "terminal.read": { params: { terminalId: "t1", from: 0, waitMs: 15000, maxBytes: 32768 }, result: { from: 0, next: 5, data: "aGVsbG8=", exited: null } },
   "terminal.write": { params: { terminalId: "t1", data: "bHMK" }, result: {} },
   "terminal.resize": { params: { terminalId: "t1", cols: 100, rows: 30 }, result: {} },
@@ -310,17 +309,23 @@ describe("terminal methods", () => {
       expect(classify(name, {}, { remoteGitPush: true, remoteCloudStart: true })).toBe("terminal");
     }
   });
-  it("terminal.open validates the size, the subdir and the challenge fields", () => {
+  it("terminal.open validates the size, the subdir and the passkey ticket", () => {
     const open = METHODS["terminal.open"].params;
-    const base = { projectId: "p", cols: 80, rows: 24 };
+    const base = { projectId: "p", cols: 80, rows: 24, ticket: "tk" };
     expect(open.safeParse(base).success).toBe(true);
-    expect(open.safeParse({ ...base, subdir: "src/app", challengeId: "c", code: "AB23CD" }).success).toBe(true);
+    expect(open.safeParse({ ...base, subdir: "src/app" }).success).toBe(true);
+    // A ticket is required (no ticket, no shell) and has a bounded size.
+    expect(open.safeParse({ projectId: "p", cols: 80, rows: 24 }).success).toBe(false);
+    expect(open.safeParse({ ...base, ticket: "" }).success).toBe(false);
+    expect(open.safeParse({ ...base, ticket: "x".repeat(257) }).success).toBe(false);
     for (const cols of [9, 501, 80.5]) expect(open.safeParse({ ...base, cols }).success, `cols ${cols}`).toBe(false);
     for (const rows of [1, 201, 0.5]) expect(open.safeParse({ ...base, rows }).success, `rows ${rows}`).toBe(false);
     expect(open.safeParse({ ...base, cols: 10, rows: 2 }).success).toBe(true);
     expect(open.safeParse({ ...base, cols: 500, rows: 200 }).success).toBe(true);
-    expect(open.safeParse({ cols: 80, rows: 24 }).success).toBe(false);
+    expect(open.safeParse({ cols: 80, rows: 24, ticket: "tk" }).success).toBe(false);
     expect(open.safeParse({ ...base, projectId: "" }).success).toBe(false);
+    expect(open.safeParse({ ...base, projectId: "p".repeat(257) }).success).toBe(false);
+    expect(open.safeParse({ ...base, projectId: "p".repeat(256) }).success).toBe(true);
     for (const subdir of ["../etc", "a/../b", "a\\..\\b", "/abs", "\\abs", "C:\\x", "", "x".repeat(513)]) {
       expect(open.safeParse({ ...base, subdir }).success, subdir).toBe(false);
     }
@@ -333,13 +338,11 @@ describe("terminal methods", () => {
     expect(isSafeTerminalSubdir("./a")).toBe(true);
     expect(isSafeTerminalSubdir(".hidden/..cache")).toBe(true);
   });
-  it("terminal.open answers a challenge (step 1) or a terminal (step 2)", () => {
+  it("terminal.open answers with the opened terminal only (no challenge step)", () => {
     const result = METHODS["terminal.open"].result;
-    const challenge = result.parse({ challengeId: "c", expiresInMs: 60000, codeLength: 6, attempts: 3 });
-    expect(isTerminalOpened(challenge)).toBe(false);
     const opened = result.parse({ terminalId: "t", cols: 80, rows: 24, cwd: "app/src", idleTimeoutMs: 900000, maxDurationMs: 28800000, future: 1 });
-    expect(isTerminalOpened(opened)).toBe(true);
-    expect(opened).toMatchObject({ future: 1 });
+    expect(opened).toMatchObject({ terminalId: "t", future: 1 });
+    expect(result.safeParse({ challengeId: "c", expiresInMs: 60000, codeLength: 6, attempts: 3 }).success).toBe(false);
     expect(result.safeParse({ cwd: "x" }).success).toBe(false);
   });
   it("terminal.read limits waitMs, maxBytes and from, and reports an exit", () => {

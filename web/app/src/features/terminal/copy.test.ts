@@ -1,6 +1,7 @@
+import { ReauthCancelledError } from "@/features/accounts/queries";
 import { TERMINAL_EXIT_REASONS } from "@monoptah/protocol";
 import { describe, expect, it } from "vitest";
-import { LOCAL_EXIT_REASONS, endedText, openFailedText, OPEN_FAILED_FALLBACK, wrongCodeNotice } from "./copy";
+import { LOCAL_EXIT_REASONS, endedText, openFailedText, OPEN_FAILED_FALLBACK, ticketFailedText } from "./copy";
 import { clockText, durationText, limitsHint } from "./time";
 
 describe("endedText", () => {
@@ -27,9 +28,11 @@ describe("openFailedText", () => {
     expect(openFailedText("toString")).toBe(OPEN_FAILED_FALLBACK);
     expect(openFailedText(undefined)).toBe(OPEN_FAILED_FALLBACK);
   });
-  it("counts the tries left", () => {
-    expect(wrongCodeNotice(2)).toContain("2 tries left");
-    expect(wrongCodeNotice(1)).toContain("1 try left");
+  it("says what a refused or cancelled passkey check means", () => {
+    expect(openFailedText("fresh_required")).toContain("passkey");
+    expect(ticketFailedText(new ReauthCancelledError())).toContain("cancelled");
+    expect(ticketFailedText({ code: "forbidden" })).toBe(openFailedText("forbidden"));
+    expect(ticketFailedText(new Error("boom"))).toBe(OPEN_FAILED_FALLBACK);
   });
 });
 

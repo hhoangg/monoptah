@@ -22,6 +22,7 @@ use std::{
     },
     time::Duration,
 };
+use terminal::TicketCheck;
 use terminal_host::{catalog_project_name, terminal_rights};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
@@ -434,7 +435,7 @@ pub struct MobileHost {
     web: super::web_link::WebLink,
     /// What `device.selection` needs of a web device: refs, tickets.
     selection: Arc<SelectionState>,
-    /// The web terminal's shells and one-time codes.
+    /// The web terminal's shells.
     terminals: Arc<terminal::Hub>,
 }
 
@@ -454,11 +455,17 @@ enum Locked {
 /// ticket)`. Blocking, so it runs on `spawn_blocking`.
 type TicketVerifier = Arc<dyn Fn(String, String) -> bool + Send + Sync>;
 
+/// Says whether the server accepted a terminal ticket: `(server device id,
+/// ticket, project id)`. Blocking, so it runs on `spawn_blocking`.
+type TerminalTicketVerifier = Arc<dyn Fn(String, String, String) -> TicketCheck + Send + Sync>;
+
 struct SelectionState {
     /// Keys the refs of unshared items; random per host, memory only.
     secret: [u8; 32],
     /// Replaces the HTTP call to the web server (tests).
     verifier: Mutex<Option<TicketVerifier>>,
+    /// Replaces the HTTP call that checks a terminal ticket (tests).
+    terminal_verifier: Mutex<Option<TerminalTicketVerifier>>,
 }
 
 impl SelectionState {
@@ -469,6 +476,7 @@ impl SelectionState {
         Self {
             secret,
             verifier: Mutex::default(),
+            terminal_verifier: Mutex::default(),
         }
     }
 }
@@ -1745,6 +1753,63 @@ impl MobileHost {
         *self
             .selection
             .verifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(verifier));
+    }
+
+    /// Whether the web server accepted (and consumed) the passkey `ticket` of
+    /// the grant `server_device_id` for opening a terminal in `project_id`.
+    /// Blocking: the caller is on a blocking thread with no lock held. Any
+    /// failure, a missing token included, is `false`.
+    pub(super) fn verify_terminal_ticket_blocking(
+        &self,
+        server_device_id: &str,
+        ticket: &str,
+        project_id: &str,
+    ) -> TicketCheck {
+        let fake = self
+            .selection
+            .terminal_verifier
+            .lock()
+            .ok()
+            .and_then(|verifier| verifier.clone());
+        if let Some(verify) = fake {
+            return verify(
+                server_device_id.to_owned(),
+                ticket.to_owned(),
+                project_id.to_owned(),
+            );
+        }
+        let Ok(database) = self.web_database() else {
+            return TicketCheck::NoIdentity;
+        };
+        let Ok(Some(identity)) =
+            identity_store::load_web(&database, &identity_store::web_account_for(&self.path))
+        else {
+            return TicketCheck::NoIdentity;
+        };
+        let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) else {
+            return TicketCheck::NoIdentity;
+        };
+        desktop_api::verify_terminal_ticket(
+            &base,
+            &identity.desktop_token,
+            server_device_id,
+            ticket,
+            project_id,
+        )
+    }
+
+    /// Replaces the server call that checks a terminal ticket: `(server
+    /// device id, ticket, project id)`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_terminal_ticket_verifier(
+        &self,
+        verifier: impl Fn(String, String, String) -> TicketCheck + Send + Sync + 'static,
+    ) {
+        *self
+            .selection
+            .terminal_verifier
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(verifier));
     }

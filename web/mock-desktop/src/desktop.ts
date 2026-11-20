@@ -134,7 +134,7 @@ export class MockDesktop {
   readonly world: MockWorld;
   /** The desktop's encrypted file transfers (`file.prepare`); set `transfers.backend` to a server to enable uploads. */
   readonly transfers = new MockTransfers();
-  /** The desktop's fake shells (`terminal.*`); `terminals.lastCode()` is the code the desktop window would show. */
+  /** The desktop's fake shells (`terminal.*`); `terminals.verifyTicket` is how the desktop spends a ticket at the Worker (unset: fail closed). */
   readonly terminals: MockTerminals;
   /** Known devices by fingerprint. */
   readonly devices = new Map<string, MockDevice>();

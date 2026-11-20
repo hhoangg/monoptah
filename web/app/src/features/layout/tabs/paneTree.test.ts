@@ -19,6 +19,8 @@ import {
   serializeWorkspace,
   sessionTab,
   splitPane,
+  terminalTab,
+  parseTab,
   type Workspace,
 } from "./paneTree";
 
@@ -185,3 +187,33 @@ describe("drops and room", () => {
     expect(canSplit(ws, "column", size, "missing")).toBe(false);
   });
 });
+
+describe("terminal tabs", () => {
+  const T = terminalTab("abc123");
+
+  it("a terminal tab is the key t:<id> and parses back to its kind and id", () => {
+    expect(T).toBe("t:abc123");
+    expect(parseTab(T)).toEqual({ kind: "terminal", id: "abc123" });
+    expect(parseTab("t:")).toBeNull();
+  });
+
+  it("splits, moves, closes and persists like a chat tab", () => {
+    let ws = splitPane(opened(A, T), "p1", "row");
+    expect(ws.focused).toBe("p2");
+    ws = moveTab(ws, T, "p2");
+    expect(ws.panes.p2?.tabs).toEqual([T]);
+    expect(ws.panes.p1?.tabs).toEqual([A]);
+    expect(findTab(ws, T)).toBe("p2");
+    // Dragged to the edge of its pane: a new pane beside the chat.
+    expect(parseWorkspace(serializeWorkspace(ws))).toEqual(ws);
+    const closed = closeTab(ws, "p2", T);
+    expect(paneOrder(closed.root)).toEqual(["p1"]);
+    expect(closed.panes.p1?.tabs).toEqual([A]);
+  });
+
+  it("survives pruning of session tabs", () => {
+    const ws = pruneTabs(opened(A, T), (key) => key !== A);
+    expect(ws.panes.p1?.tabs).toEqual([T]);
+  });
+});
+
