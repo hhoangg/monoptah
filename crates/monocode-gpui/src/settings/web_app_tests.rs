@@ -49,6 +49,9 @@ fn tag(event: &SettingsEvent) -> Option<String> {
             permission,
         } => format!("permission:{device_id}:{permission:?}"),
         SettingsEvent::WebRevokeDevice(id) => format!("revoke:{id}"),
+        SettingsEvent::WebSetTerminalAllowed { device_id, on } => {
+            format!("terminal:{device_id}:{on}")
+        }
         SettingsEvent::WebAnswerRequest { device_id, approve } => {
             format!("answer:{device_id}:{approve}")
         }
@@ -407,6 +410,28 @@ fn error_and_revoked_states_show_banners(cx: &mut TestAppContext) {
         });
     });
     assert!(visual.debug_bounds("web-revoked").is_some());
+}
+
+#[gpui::test]
+fn the_web_terminal_switch_is_per_device_and_only_for_control(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![
+                device("term-control", Permission::Control),
+                device("term-read", Permission::Read),
+            ],
+            ..paired()
+        });
+    });
+    assert!(visual.debug_bounds("web-terminal-note").is_some());
+    // Off until the desktop's user says so: a click asks to turn it on.
+    click(visual, "web-terminal-term-control");
+    assert_eq!(events(&window, visual), ["terminal:term-control:true"]);
+    // A read-only device cannot be given a shell: its button does nothing.
+    click(visual, "web-terminal-term-read");
+    assert_eq!(events(&window, visual), ["terminal:term-control:true"]);
 }
 
 #[gpui::test]

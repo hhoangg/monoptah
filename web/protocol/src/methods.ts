@@ -20,6 +20,15 @@ import {
   UsageLimitSchema,
 } from "./wire.ts";
 import {
+  TerminalCloseParamsSchema,
+  TerminalOpenParamsSchema,
+  TerminalOpenResultSchema,
+  TerminalReadParamsSchema,
+  TerminalReadResultSchema,
+  TerminalResizeParamsSchema,
+  TerminalWriteParamsSchema,
+} from "./terminal.ts";
+import {
   ApprovalsFieldSchema,
   CatalogStartupSchema,
   CloudFieldSchema,
@@ -39,8 +48,10 @@ export * from "./wire.ts";
  * - `param`: depends on params; resolve with `classify()`.
  * - `denied`: never exposed, or denied for web in v1.
  * - `unsupportedWeb`: answered `code: unsupported` on the web transport.
+ * - `terminal`: a real shell on the desktop. Not implied by `control`: it needs a Control device and the desktop's per-device
+ *   "Allow web terminal" toggle (default off), and `terminal.open` re-authenticates with a one-time code on every open.
  */
-export const METHOD_CLASSES = ["read", "control", "param", "denied", "unsupportedWeb"] as const;
+export const METHOD_CLASSES = ["read", "control", "param", "denied", "unsupportedWeb", "terminal"] as const;
 export type MethodClass = (typeof METHOD_CLASSES)[number];
 
 /** `app`: forwarded to the app (APP_METHODS). `host`: answered in core (MobileHost::handle / watch). */
@@ -797,6 +808,13 @@ export const METHODS = {
       message: z.string().optional(),
     }),
   }),
+
+  // Web terminal (security.md "Terminal"): class `terminal`, answered in core (host). `terminal.read` is a long poll.
+  "terminal.open": method({ class: "terminal", transport: "host", params: TerminalOpenParamsSchema, result: TerminalOpenResultSchema }),
+  "terminal.read": method({ class: "terminal", transport: "host", params: TerminalReadParamsSchema, result: TerminalReadResultSchema }),
+  "terminal.write": method({ class: "terminal", transport: "host", params: TerminalWriteParamsSchema, result: Open }),
+  "terminal.resize": method({ class: "terminal", transport: "host", params: TerminalResizeParamsSchema, result: Open }),
+  "terminal.close": method({ class: "terminal", transport: "host", params: TerminalCloseParamsSchema, result: Open }),
 } as const;
 
 export type MethodName = keyof typeof METHODS;
@@ -815,7 +833,7 @@ export const METHOD_LIST: readonly { name: MethodName; def: MethodDef }[] = (Obj
 // --- Classification (architecture.md 7.1) ---
 
 /** What a call needs after the params are known. */
-export type ResolvedClass = "read" | "control" | "denied" | "unsupportedWeb";
+export type ResolvedClass = "read" | "control" | "denied" | "unsupportedWeb" | "terminal";
 
 /** Desktop toggles that open denied paths (default off). */
 export interface ClassifyFlags {

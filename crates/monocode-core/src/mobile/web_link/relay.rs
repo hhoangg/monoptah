@@ -645,13 +645,13 @@ fn reply(
 }
 
 /// The `state` message of a confirmed session, as `SessionTable` sends it.
-fn confirmed_state(permission: policy::Permission, name: &str) -> Value {
+fn confirmed_state(device: &crate::mobile::host::Device, name: &str) -> Value {
     json!({
         "type": "state",
         "state": "confirmed",
-        "permission": desktop_api::permission_name(permission),
+        "permission": desktop_api::permission_name(device.permission),
         "proto": PROTO,
-        "capabilities": policy::capabilities(&policy::flags()),
+        "capabilities": policy::device_capabilities(&policy::flags(), device),
         "desktop": { "name": name, "version": env!("CARGO_PKG_VERSION") },
     })
 }
@@ -718,6 +718,8 @@ fn run_command(
             }
         }
         LinkCommand::Deny { fingerprint } | LinkCommand::Revoke { fingerprint } => {
+            host.terminals()
+                .kill_fingerprint(&fingerprint, crate::mobile::terminal::Reason::Revoked);
             close_fingerprint(&fingerprint, table, requests, link, now, frames);
         }
         // Handled by the loop, which owns the grant sync.
@@ -729,11 +731,7 @@ fn run_command(
                 let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
                     continue;
                 };
-                match table.send(
-                    key,
-                    &confirmed_state(device.permission, &link.desktop_name()),
-                    now,
-                ) {
+                match table.send(key, &confirmed_state(&device, &link.desktop_name()), now) {
                     Ok(sent) => frames.extend(sent),
                     Err(SendError::Encrypt) => {
                         frames.push(SessionTable::bye_frame(key));
@@ -747,7 +745,7 @@ fn run_command(
             let Lookup::Confirmed { device } = host.web_lookup(&fingerprint) else {
                 return;
             };
-            let state = confirmed_state(device.permission, &link.desktop_name());
+            let state = confirmed_state(&device, &link.desktop_name());
             for key in table.live_channels(&fingerprint) {
                 match table.send(key, &state, now) {
                     Ok(sent) => frames.extend(sent),

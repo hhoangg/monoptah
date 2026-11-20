@@ -214,6 +214,12 @@ pub(crate) enum SettingsEvent {
         flag: WebPolicyFlag,
         on: bool,
     },
+    /// The desktop's own "Allow web terminal" switch for one web device. Off by
+    /// default and only ever set from this page.
+    WebSetTerminalAllowed {
+        device_id: String,
+        on: bool,
+    },
     /// Approve or refuse a confirmed device's request for more permission.
     WebAnswerRequest {
         device_id: String,

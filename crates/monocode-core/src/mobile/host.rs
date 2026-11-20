@@ -7,6 +7,7 @@ use super::cloud_policy;
 use super::folders;
 use super::identity_store::{self, IdentityKeychain, SystemKeychain};
 use super::policy::{self, DeviceContext, DeviceKind, Permission};
+use super::terminal;
 use super::web_link::{desktop_api, LinkCommand, PairPoll, PairTicket, PermissionRequest};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use monocode_mobile_link::{now, Address, Failure, Gate, Identity, WatchSink, PORT, VERSION};
@@ -21,8 +22,11 @@ use std::{
     },
     time::Duration,
 };
+use terminal_host::{catalog_project_name, terminal_rights};
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
+
+mod terminal_host;
 
 /// Methods the host answers itself (the `match` in `call_from`, pairing and
 /// the watch). Every one needs a class in `policy::METHODS`; `authorize`
@@ -35,6 +39,11 @@ pub(super) const HOST_METHODS: &[&str] = &[
     "device.push",
     "device.selection",
     "conversation.watch",
+    "terminal.open",
+    "terminal.read",
+    "terminal.write",
+    "terminal.resize",
+    "terminal.close",
 ];
 
 /// Methods the app answers. Pairing, leaving and the catalog are the host's.
@@ -425,6 +434,8 @@ pub struct MobileHost {
     web: super::web_link::WebLink,
     /// What `device.selection` needs of a web device: refs, tickets.
     selection: Arc<SelectionState>,
+    /// The web terminal's shells and one-time codes.
+    terminals: Arc<terminal::Hub>,
 }
 
 /// What `call_from` does once it has looked the device up under the lock.
@@ -433,6 +444,10 @@ enum Locked {
     Selection,
     /// A method the app answers, for this device.
     Forward(DeviceContext),
+    /// A `terminal.*` call of a web device, answered with no lock held. Carries
+    /// the device row and the name of the project the call names, if the
+    /// published catalog has it.
+    Terminal(Box<Device>, Option<String>),
 }
 
 /// Says whether the server accepted a selection ticket: `(server device id,
@@ -546,7 +561,10 @@ impl MobileHost {
             shut_down: Arc::default(),
             web: super::web_link::WebLink::default(),
             selection: Arc::new(SelectionState::new()),
+            terminals: terminal::Hub::with_defaults(),
         };
+        host.terminals
+            .set_rights(terminal_rights(Arc::downgrade(&host.inner)));
         // Loading the identity reads the database (and, once, the legacy
         // keychain entry, which can wait on an access prompt), and the app opens
         // the host while launching.
@@ -825,6 +843,7 @@ impl MobileHost {
     /// Stops serving and releases the router mapping; for app shutdown.
     pub fn shutdown(&self) {
         self.shut_down.store(true, Ordering::SeqCst);
+        self.terminals.kill_all(terminal::Reason::Desktop);
         self.web.stop();
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(endpoint) = inner.endpoint.take() {
@@ -1158,6 +1177,8 @@ impl MobileHost {
                     cloud_policy::forget_device(&device.id);
                     close_device_watches(&mut inner, peer);
                     drop(inner);
+                    // A device that leaves keeps no shell.
+                    self.terminal_forget_device(&device);
                     if via == DeviceKind::Web {
                         self.web.drop_request(&device.id);
                         self.web.command(LinkCommand::Revoke {
@@ -1202,6 +1223,13 @@ impl MobileHost {
                 "device.push" if via == DeviceKind::Web => {
                     return Err(unsupported());
                 }
+                method if method.starts_with("terminal.") && via == DeviceKind::Web => {
+                    // Opens a shell: answered after the lock is released.
+                    let project = params["projectId"]
+                        .as_str()
+                        .and_then(|id| catalog_project_name(&inner.catalog, id));
+                    break 'locked Locked::Terminal(Box::new(device), project);
+                }
                 "device.push" => {
                     let push = push_registration(&params)?;
                     let mut config = inner.config.clone();
@@ -1221,6 +1249,9 @@ impl MobileHost {
         };
         let device = match locked {
             Locked::Selection => return self.web_selection(peer, &params).await,
+            Locked::Terminal(device, project) => {
+                return self.terminal_call(&device, method, &params, project).await;
+            }
             Locked::Forward(context) => context,
         };
         let command_id = request["id"]
@@ -1542,9 +1573,13 @@ impl MobileHost {
             .ok_or("Device revoked or not paired")?;
         device.projects = selection.projects;
         device.monos = selection.monos;
+        let (id, projects) = (device.id.clone(), device.projects.clone());
         self.save(&config)?;
         inner.config = config;
         close_device_watches(inner, peer);
+        if let Some(projects) = projects {
+            self.terminals.kill_unselected(&id, &projects);
+        }
         Ok(())
     }
 
@@ -2191,6 +2226,9 @@ impl MobileHost {
         };
         audit_device(audit::Lifecycle::Revoke, &removed, None);
         cloud_policy::forget_device(device_id);
+        // The shell dies with the revoke: before the link is told, so a hung
+        // link cannot keep it alive.
+        self.terminal_forget_device(&removed);
         self.web.drop_request(device_id);
         self.web.command(LinkCommand::Revoke {
             fingerprint: removed.fingerprint,
@@ -2229,6 +2267,14 @@ impl MobileHost {
             close_device_watches(&mut inner, &device.fingerprint);
             device
         };
+        // A shell needs Control and a project the device still shares.
+        if device.permission != Permission::Control {
+            self.terminals
+                .kill_device(&device.id, terminal::Reason::Revoked);
+            self.terminal_clear_toggle(&device.id);
+        } else if let Some(projects) = &device.projects {
+            self.terminals.kill_unselected(&device.id, projects);
+        }
         audit_device(
             audit::Lifecycle::PermissionChange,
             &device,
@@ -2325,6 +2371,7 @@ impl MobileHost {
                 super::web_link::noise::fingerprint(&identity.static_public),
             ));
         }
+        self.terminals.kill_all(terminal::Reason::Revoked);
         self.web.stop();
         identity_store::wipe_web(
             &self.web_database()?,
@@ -2371,6 +2418,10 @@ impl MobileHost {
     ) -> Vec<Report> {
         let mut reports: Vec<Report> = Vec::new();
         let mut commands: Vec<LinkCommand> = Vec::new();
+        // Rows the server revoked and rows it lowered to read-only: their
+        // shells end once the lock is released.
+        let mut gone: Vec<Device> = Vec::new();
+        let mut demoted: Vec<String> = Vec::new();
         // `(moment, device id, fingerprint, detail)`, written once the lock is
         // released.
         let mut audits: Vec<(audit::Lifecycle, String, String, &'static str)> = Vec::new();
@@ -2407,6 +2458,7 @@ impl MobileHost {
                         "server",
                     ));
                     closing.push(removed.fingerprint.clone());
+                    gone.push(removed.clone());
                     commands.push(LinkCommand::Revoke {
                         fingerprint: removed.fingerprint,
                     });
@@ -2415,6 +2467,9 @@ impl MobileHost {
             for (row_id, permission) in &plan.lowered {
                 if let Some(row) = config.devices.iter_mut().find(|d| &d.id == row_id) {
                     row.permission = *permission;
+                    if *permission != Permission::Control {
+                        demoted.push(row.id.clone());
+                    }
                     audits.push((
                         audit::Lifecycle::PermissionChange,
                         row.id.clone(),
@@ -2490,6 +2545,13 @@ impl MobileHost {
         }
         for (kind, id, fingerprint, detail) in audits {
             audit::record_lifecycle(kind, &id, &fingerprint, Transport::Web, Some(detail));
+        }
+        for row in &gone {
+            self.terminal_forget_device(row);
+        }
+        for id in &demoted {
+            self.terminals.kill_device(id, terminal::Reason::Revoked);
+            self.terminal_clear_toggle(id);
         }
         for command in commands {
             self.web.command(command);

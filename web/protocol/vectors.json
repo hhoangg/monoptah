@@ -807,7 +807,8 @@
       "monoFiles",
       "mentionedFiles",
       "mentionedFiles2",
-      "fileTransfer"
+      "fileTransfer",
+      "terminal"
     ],
     "messages": [
       {
@@ -829,7 +830,8 @@
           "monoFiles",
           "mentionedFiles",
           "mentionedFiles2",
-          "fileTransfer"
+          "fileTransfer",
+          "terminal"
         ],
         "desktop": {
           "name": "Example Desktop",
@@ -856,6 +858,8 @@
       "not_selected",
       "path_denied",
       "read_only",
+      "reauth_failed",
+      "reauth_required",
       "revoked",
       "starting",
       "too_large",

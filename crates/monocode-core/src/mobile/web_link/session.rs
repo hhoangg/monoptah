@@ -480,7 +480,10 @@ impl SessionTable {
 
     /// `state_message` for the given toggles: the capabilities follow them.
     fn state_message_with(&self, mode: &Mode, flags: &PolicyFlags) -> Value {
-        let capabilities = policy::capabilities(flags);
+        let capabilities = match mode {
+            Mode::Ready(device) => policy::device_capabilities(flags, device),
+            Mode::Pending { .. } => policy::capabilities(flags),
+        };
         let desktop = json!({ "name": self.desktop_name, "version": self.desktop_version });
         match mode {
             Mode::Ready(device) => json!({

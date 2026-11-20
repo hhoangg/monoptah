@@ -313,6 +313,7 @@ impl Shell {
                 | SettingsEvent::PhoneSetProjects { .. }
                 | SettingsEvent::WebSetSelection { .. }
                 | SettingsEvent::WebSetPolicyFlag { .. }
+                | SettingsEvent::WebSetTerminalAllowed { .. }
                 | SettingsEvent::WebAnswerRequest { .. } => this.web_settings_event(event, cx),
             },
         ));

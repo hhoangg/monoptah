@@ -8,6 +8,12 @@ import {
   RuntimeModeSchema,
   classify,
   isMethodName,
+  isSafeTerminalSubdir,
+  isTerminalOpened,
+  REQUEST_TIMEOUT_BY_METHOD,
+  TERMINAL_EXIT_REASONS,
+  TERMINAL_READ_MAX_WAIT_MS,
+  TERMINAL_READ_TIMEOUT_SLACK_MS,
   type MethodName,
 } from "../src/index.ts";
 import { readText } from "./helpers.ts";
@@ -162,6 +168,11 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
     params: {},
     result: { current: "1.0.0", latest: "1.1.0", updateAvailable: true, notes: "Fixes", runningSessions: [{ id: "s1", title: "Fix bug" }], lastFailure: "Update to 1.1.0 failed: disk full" },
   },
+  "terminal.open": { params: { projectId: "p1", subdir: "src/app", cols: 80, rows: 24 }, result: { challengeId: "c1", expiresInMs: 60000, codeLength: 6, attempts: 3 } },
+  "terminal.read": { params: { terminalId: "t1", from: 0, waitMs: 15000, maxBytes: 32768 }, result: { from: 0, next: 5, data: "aGVsbG8=", exited: null } },
+  "terminal.write": { params: { terminalId: "t1", data: "bHMK" }, result: {} },
+  "terminal.resize": { params: { terminalId: "t1", cols: 100, rows: 30 }, result: {} },
+  "terminal.close": { params: { terminalId: "t1" }, result: {} },
   "desktop.update": {
     params: { confirm: true },
     result: { status: "confirmation_required", runningSessions: [{ id: "s1", title: "Fix bug" }] },
@@ -186,14 +197,27 @@ describe("every method has a typed entry", () => {
       expect(METHOD_CLASSES).toContain(def.class);
       expect(["app", "host"]).toContain(def.transport);
     }
-    expect(METHOD_CLASSES).toEqual(["read", "control", "param", "denied", "unsupportedWeb"]);
+    expect(METHOD_CLASSES).toEqual(["read", "control", "param", "denied", "unsupportedWeb", "terminal"]);
   });
 
   it("marks device.enroll QUIC-only and the host-answered set as host", () => {
     expect(METHODS["device.enroll"].quicOnly).toBe(true);
     const host = METHOD_LIST.filter(({ def }) => def.transport === "host").map(({ name }) => name);
     expect(host.sort()).toEqual(
-      ["conversation.watch", "device.enroll", "device.leave", "device.push", "device.selection", "sessions.list", "workspace.list"].sort(),
+      [
+        "conversation.watch",
+        "device.enroll",
+        "device.leave",
+        "device.push",
+        "device.selection",
+        "sessions.list",
+        "terminal.close",
+        "terminal.open",
+        "terminal.read",
+        "terminal.resize",
+        "terminal.write",
+        "workspace.list",
+      ].sort(),
     );
   });
 
@@ -273,6 +297,81 @@ describe("chat.mentionedFile", () => {
     expect(result.safeParse(base).success).toBe(true);
     expect(result.safeParse({ ...base, kind: "video" }).success).toBe(false);
     expect(result.safeParse({ ...base, encoding: "hex" }).success).toBe(false);
+  });
+});
+
+describe("terminal methods", () => {
+  const names = ["terminal.open", "terminal.read", "terminal.write", "terminal.resize", "terminal.close"] as const;
+  it("are class terminal on the host transport, and classify() keeps the class (control does not imply it)", () => {
+    for (const name of names) {
+      expect(METHODS[name].class).toBe("terminal");
+      expect(METHODS[name].transport).toBe("host");
+      expect(classify(name, {})).toBe("terminal");
+      expect(classify(name, {}, { remoteGitPush: true, remoteCloudStart: true })).toBe("terminal");
+    }
+  });
+  it("terminal.open validates the size, the subdir and the challenge fields", () => {
+    const open = METHODS["terminal.open"].params;
+    const base = { projectId: "p", cols: 80, rows: 24 };
+    expect(open.safeParse(base).success).toBe(true);
+    expect(open.safeParse({ ...base, subdir: "src/app", challengeId: "c", code: "AB23CD" }).success).toBe(true);
+    for (const cols of [9, 501, 80.5]) expect(open.safeParse({ ...base, cols }).success, `cols ${cols}`).toBe(false);
+    for (const rows of [1, 201, 0.5]) expect(open.safeParse({ ...base, rows }).success, `rows ${rows}`).toBe(false);
+    expect(open.safeParse({ ...base, cols: 10, rows: 2 }).success).toBe(true);
+    expect(open.safeParse({ ...base, cols: 500, rows: 200 }).success).toBe(true);
+    expect(open.safeParse({ cols: 80, rows: 24 }).success).toBe(false);
+    expect(open.safeParse({ ...base, projectId: "" }).success).toBe(false);
+    for (const subdir of ["../etc", "a/../b", "a\\..\\b", "/abs", "\\abs", "C:\\x", "", "x".repeat(513)]) {
+      expect(open.safeParse({ ...base, subdir }).success, subdir).toBe(false);
+    }
+    expect(open.safeParse({ ...base, subdir: "x".repeat(512) }).success).toBe(true);
+    expect(open.safeParse({ ...base, subdir: "a..b/c" }).success).toBe(true);
+  });
+  it("isSafeTerminalSubdir rejects a NUL byte and a parent segment, keeps dotted names", () => {
+    expect(isSafeTerminalSubdir("a\0b")).toBe(false);
+    expect(isSafeTerminalSubdir("..")).toBe(false);
+    expect(isSafeTerminalSubdir("./a")).toBe(true);
+    expect(isSafeTerminalSubdir(".hidden/..cache")).toBe(true);
+  });
+  it("terminal.open answers a challenge (step 1) or a terminal (step 2)", () => {
+    const result = METHODS["terminal.open"].result;
+    const challenge = result.parse({ challengeId: "c", expiresInMs: 60000, codeLength: 6, attempts: 3 });
+    expect(isTerminalOpened(challenge)).toBe(false);
+    const opened = result.parse({ terminalId: "t", cols: 80, rows: 24, cwd: "app/src", idleTimeoutMs: 900000, maxDurationMs: 28800000, future: 1 });
+    expect(isTerminalOpened(opened)).toBe(true);
+    expect(opened).toMatchObject({ future: 1 });
+    expect(result.safeParse({ cwd: "x" }).success).toBe(false);
+  });
+  it("terminal.read limits waitMs, maxBytes and from, and reports an exit", () => {
+    const read = METHODS["terminal.read"].params;
+    expect(read.safeParse({ terminalId: "t", from: 0 }).success).toBe(true);
+    expect(read.safeParse({ terminalId: "t", from: 0, waitMs: 20000, maxBytes: 32768 }).success).toBe(true);
+    expect(read.safeParse({ terminalId: "t", from: 0, waitMs: 0, maxBytes: 1 }).success).toBe(true);
+    expect(read.safeParse({ terminalId: "t", from: -1 }).success).toBe(false);
+    expect(read.safeParse({ terminalId: "t", from: 1.5 }).success).toBe(false);
+    expect(read.safeParse({ terminalId: "t", from: 0, waitMs: 20001 }).success).toBe(false);
+    expect(read.safeParse({ terminalId: "t", from: 0, maxBytes: 0 }).success).toBe(false);
+    expect(read.safeParse({ terminalId: "t", from: 0, maxBytes: 32769 }).success).toBe(false);
+    const result = METHODS["terminal.read"].result;
+    expect(result.safeParse({ from: 0, next: 0, data: "", exited: { reason: "idle" } }).success).toBe(true);
+    expect(result.safeParse({ from: 0, next: 0, data: "", exited: { reason: "exit", code: 2 } }).success).toBe(true);
+    expect(result.safeParse({ from: 0, next: 0, data: "" }).success).toBe(false);
+    for (const reason of TERMINAL_EXIT_REASONS) expect(result.safeParse({ from: 0, next: 0, data: "", exited: { reason } }).success).toBe(true);
+  });
+  it("terminal.write takes at most 8192 decoded bytes of base64 and resize validates the size", () => {
+    const write = METHODS["terminal.write"].params;
+    expect(write.safeParse({ terminalId: "t", data: btoa("a".repeat(8192)) }).success).toBe(true);
+    expect(write.safeParse({ terminalId: "t", data: btoa("a".repeat(8193)) }).success).toBe(false);
+    expect(write.safeParse({ terminalId: "t", data: "not base64!" }).success).toBe(false);
+    expect(write.safeParse({ terminalId: "", data: "AA==" }).success).toBe(false);
+    const resize = METHODS["terminal.resize"].params;
+    expect(resize.safeParse({ terminalId: "t", cols: 80, rows: 24 }).success).toBe(true);
+    expect(resize.safeParse({ terminalId: "t", cols: 9, rows: 24 }).success).toBe(false);
+    expect(METHODS["terminal.close"].params.safeParse({ terminalId: "t" }).success).toBe(true);
+    expect(METHODS["terminal.close"].params.safeParse({}).success).toBe(false);
+  });
+  it("terminal.read has a client timeout entry of at least waitMs max plus 10 s", () => {
+    expect(REQUEST_TIMEOUT_BY_METHOD["terminal.read"]).toBe(TERMINAL_READ_MAX_WAIT_MS + TERMINAL_READ_TIMEOUT_SLACK_MS);
   });
 });
 

@@ -550,6 +550,8 @@ impl Shell {
                 return;
             }
         };
+        // The web terminal runs its shells on the same pseudo-terminals as the dock.
+        host.set_shell_spawner(std::sync::Arc::new(crate::terminal::WebShellSpawner));
         web_link::start(&host);
         self.mobile.host = Some(host);
         // Close the link and release the router mapping with the app.

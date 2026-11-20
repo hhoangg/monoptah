@@ -100,6 +100,16 @@ pub enum Lifecycle {
     SelectionNarrow,
     /// A web device asked to widen and was refused for its ticket.
     SelectionWidenRefused,
+    /// A web device was shown a one-time code to open a terminal.
+    TerminalChallenge,
+    /// A wrong or expired terminal code, or a lockout.
+    TerminalReauthFailed,
+    /// A shell opened for a web device.
+    TerminalOpen,
+    /// A shell ended; the detail is why.
+    TerminalClose,
+    /// The user switched "Allow web terminal" for a device.
+    TerminalToggle,
 }
 
 impl Lifecycle {
@@ -116,6 +126,11 @@ impl Lifecycle {
             Lifecycle::SelectionWiden => "selection_widen",
             Lifecycle::SelectionNarrow => "selection_narrow",
             Lifecycle::SelectionWidenRefused => "selection_widen_refused",
+            Lifecycle::TerminalChallenge => "terminal_challenge",
+            Lifecycle::TerminalReauthFailed => "terminal_reauth_failed",
+            Lifecycle::TerminalOpen => "terminal_open",
+            Lifecycle::TerminalClose => "terminal_close",
+            Lifecycle::TerminalToggle => "terminal_toggle",
         }
     }
 }
@@ -246,6 +261,11 @@ fn param_dependent(method: &str) -> bool {
 fn should_write(event: &AuditEvent) -> bool {
     if event.outcome != Outcome::Ok {
         return true;
+    }
+    // A shell's polls and keystrokes would flood the log: its opening and its
+    // end are written as lifecycle lines (with the reason), refusals above.
+    if event.method.starts_with("terminal.") {
+        return false;
     }
     if param_dependent(&event.method) || event.writes {
         return true;

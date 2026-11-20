@@ -35,7 +35,7 @@ describe("generated files are fresh", () => {
     expect(names).toEqual([...names].sort());
     for (const method of parsed.methods) {
       expect(Object.keys(method).sort()).toEqual(["class", "name", "transport"]);
-      expect(["read", "control", "param", "denied", "unsupportedWeb"]).toContain(method.class);
+      expect(["read", "control", "param", "denied", "unsupportedWeb", "terminal"]).toContain(method.class);
       expect(["app", "host"]).toContain(method.transport);
     }
   });

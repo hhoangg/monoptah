@@ -7,6 +7,7 @@ import { defineConfig } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
 import { headersPlugin } from "./vite-plugins/headers.ts";
 import { staticLibraryCss } from "./vite-plugins/staticLibraryCss.ts";
+import { xtermStaticStyles } from "./vite-plugins/xtermStaticStyles.ts";
 
 // `vite dev` runs the SPA, the Worker, the Durable Objects and local D1 together through
 // @cloudflare/vite-plugin, which reads the Worker config one level up (web/wrangler.jsonc).
@@ -31,6 +32,8 @@ export default defineConfig({
     headersPlugin("../wrangler.jsonc"),
     // S-08: Sonner and vaul must not append a runtime <style> (blocked by style-src 'self'); see staticLibraryCss.ts.
     staticLibraryCss(),
+    // The terminal: xterm.js builds three <style> elements at run time, which the same CSP blocks; see xtermStaticStyles.ts.
+    xtermStaticStyles(),
     // Workbox injectManifest: src/sw.ts is compiled to /sw.js with the precache list injected. The
     // manifest stays public/manifest.webmanifest and registration is src/features/offline/registerSw.ts
     // (Trusted Types aware), so the plugin only builds the worker.

@@ -10,5 +10,6 @@ export * from "./errors.ts";
 export * from "./state.ts";
 export * from "./envelope.ts";
 export * from "./methods.ts";
+export * from "./terminal.ts";
 export * from "./watch.ts";
 export * from "./api.ts";

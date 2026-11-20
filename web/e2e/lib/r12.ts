@@ -181,11 +181,14 @@ export class TsDesktopPairing {
     this.ip = ip;
   }
 
-  /** `POST /api/pair/start` with a fresh key. Returns the user code the account approves. */
-  async start(machineName: string): Promise<string> {
+  /**
+   * `POST /api/pair/start` with a fresh key, or with `publicKey` when the test plays the desktop itself and must keep
+   * the matching private key (the device then pins this key). Returns the user code the account approves.
+   */
+  async start(machineName: string, publicKey: Uint8Array = generateKeyPair().publicKey): Promise<string> {
     const challenge = createHash("sha256").update(this.verifier).digest();
     const started = await publicPost(this.origin, "/api/pair/start", this.ip, {
-      publicKey: base64urlEncode(generateKeyPair().publicKey),
+      publicKey: base64urlEncode(publicKey),
       machineName,
       os: "linux",
       appVersion: "r12-test",

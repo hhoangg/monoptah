@@ -36,6 +36,18 @@ pub(super) const MAX_IN_FLIGHT_PER_SESSION: usize = 16;
 /// Read requests running at once on one session (watches are limited by the
 /// host, per device).
 pub(super) const MAX_READS_PER_SESSION: usize = 4;
+/// Long polls of shells one session may hold at once: two per shell a device
+/// may open (`terminal::Limits::per_device`, 2). More are answered `busy`.
+pub(super) const MAX_TERMINAL_READS_PER_SESSION: usize = 4;
+
+/// What a concurrent job counts as against the per-session caps.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    Watch,
+    Read,
+    TerminalRead,
+    TerminalOther,
+}
 
 /// The text the desktop app answers with when it does not serve a method on
 /// the cloud route, from callers that predate coded failures.
@@ -217,8 +229,8 @@ pub(super) struct Requests {
     host: MobileHost,
     out: mpsc::Sender<Out>,
     live: Live,
-    /// Running concurrent jobs; the flag marks a plain read (not a watch).
-    concurrent: HashMap<Key, (JoinHandle<()>, bool)>,
+    /// Running concurrent jobs; the class says what it counts as.
+    concurrent: HashMap<Key, (JoinHandle<()>, Class)>,
     queues: HashMap<SessionKey, Queue>,
     /// Requests ended by `cancel` from the relay side: frames still queued for
     /// them are dropped.
@@ -255,6 +267,12 @@ impl Requests {
 
     /// The requests and watches of a session end with it.
     pub(super) fn closed(&mut self, key: SessionKey) {
+        // The browser's link is gone: its shells are detached and die after
+        // the grace window unless the same device comes back.
+        let relay_id = uuid::Uuid::from_bytes(key.device_id)
+            .hyphenated()
+            .to_string();
+        self.host.terminals().link_closed(&relay_id);
         self.concurrent.retain(|(owner, _), (task, _)| {
             let keep = *owner != key;
             if !keep {
@@ -320,7 +338,26 @@ impl Requests {
                 ),
                 Some(Access::Read)
             );
-        let concurrent = watch || read;
+        // A shell's polls and keystrokes never wait behind a chat command (and
+        // its long poll never takes a chat read's place): they run alongside.
+        let terminal = matches!(
+            policy::classify(
+                envelope["method"].as_str().unwrap_or(""),
+                &envelope["params"]
+            ),
+            Some(Access::Terminal)
+        );
+        let terminal_read = terminal && envelope["method"] == "terminal.read";
+        let class = if watch {
+            Class::Watch
+        } else if read {
+            Class::Read
+        } else if terminal_read {
+            Class::TerminalRead
+        } else {
+            Class::TerminalOther
+        };
+        let concurrent = watch || read || terminal;
         let notify = Arc::new(Notify::new());
         {
             let Ok(mut live) = self.live.lock() else {
@@ -331,14 +368,18 @@ impl Requests {
                 return;
             }
             let on_session = live.keys().filter(|(owner, _)| *owner == key).count();
-            let reads = self
-                .concurrent
-                .iter()
-                .filter(|(k, (_, is_read))| k.0 == key && *is_read && live.contains_key(*k))
-                .count();
+            let counted = |class: Class| {
+                self.concurrent
+                    .iter()
+                    .filter(|(k, (_, c))| k.0 == key && *c == class && live.contains_key(*k))
+                    .count()
+            };
+            let reads = counted(Class::Read);
+            let terminal_reads = counted(Class::TerminalRead);
             if live.len() >= MAX_IN_FLIGHT
                 || on_session >= MAX_IN_FLIGHT_PER_SESSION
                 || (read && reads >= MAX_READS_PER_SESSION)
+                || (terminal_read && terminal_reads >= MAX_TERMINAL_READS_PER_SESSION)
             {
                 drop(live);
                 let _ = self.out.try_send(Out {
@@ -381,7 +422,8 @@ impl Requests {
             })
         };
         if concurrent {
-            self.concurrent.insert((key, id), (tokio::spawn(job), read));
+            self.concurrent
+                .insert((key, id), (tokio::spawn(job), class));
         } else {
             self.enqueue(key, job);
         }
@@ -468,6 +510,158 @@ mod tests {
             assert_eq!(started.elapsed(), Duration::from_secs(25));
             task.abort();
         });
+    }
+
+    /// A shell's requests run beside the chat queue, not behind it: a control
+    /// command that never finishes does not hold up a keystroke.
+    #[tokio::test]
+    async fn a_terminal_request_does_not_wait_behind_a_stuck_control_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = MobileHost::open(dir.path().join("mobile-access.json"))
+            .unwrap()
+            .0;
+        let (out, mut frames) = mpsc::channel::<Out>(8);
+        let mut requests = Requests::new(host, out);
+        let key = SessionKey {
+            device_id: [7; 16],
+            channel: 1,
+        };
+        requests.enqueue(key, Box::pin(std::future::pending()));
+        // A control request queues behind the stuck job and never answers.
+        requests.deliver(
+            key,
+            "unknown-peer".into(),
+            json!({"rid": 1, "version": 1, "id": "a", "method": "session.cancel", "params": {}}),
+        );
+        // A terminal request is answered at once (here: refused, the peer is unknown).
+        requests.deliver(
+            key,
+            "unknown-peer".into(),
+            json!({"rid": 2, "version": 1, "id": "b", "method": "terminal.write", "params": {}}),
+        );
+        let answer = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .expect("the terminal request was answered")
+            .unwrap();
+        assert_eq!(answer.value["rid"], 2);
+        assert_eq!(answer.value["ok"], false);
+        assert!(
+            frames.try_recv().is_err(),
+            "the control request is still queued"
+        );
+    }
+
+    /// Long polls of shells are capped per session: a browser cannot park
+    /// unbounded `terminal.read` tasks, while keystrokes still get through.
+    #[tokio::test]
+    async fn terminal_reads_are_capped_per_session_and_writes_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = MobileHost::open(dir.path().join("mobile-access.json"))
+            .unwrap()
+            .0;
+        let (out, mut frames) = mpsc::channel::<Out>(32);
+        let mut requests = Requests::new(host, out);
+        let key = SessionKey {
+            device_id: [7; 16],
+            channel: 1,
+        };
+        // Nothing runs until the first await (current-thread runtime), so
+        // every accepted read is still in flight when the next arrives.
+        for rid in 1..=MAX_TERMINAL_READS_PER_SESSION as u64 + 2 {
+            requests.deliver(
+                key,
+                "unknown-peer".into(),
+                json!({"rid": rid, "version": 1, "id": "r", "method": "terminal.read", "params": {}}),
+            );
+        }
+        requests.deliver(
+            key,
+            "unknown-peer".into(),
+            json!({"rid": 99, "version": 1, "id": "w", "method": "terminal.write", "params": {}}),
+        );
+        let mut busy_rids = Vec::new();
+        for _ in 0..MAX_TERMINAL_READS_PER_SESSION + 3 {
+            let frame = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+                .await
+                .expect("every request is answered")
+                .unwrap();
+            if frame.value["code"] == "busy" {
+                busy_rids.push(frame.value["rid"].as_u64().unwrap());
+            }
+        }
+        let first_over = MAX_TERMINAL_READS_PER_SESSION as u64 + 1;
+        assert_eq!(busy_rids, [first_over, first_over + 1]);
+    }
+
+    /// When a browser's link ends, its shells are detached (and die after the
+    /// grace window) rather than kept for ever.
+    #[test]
+    fn a_closed_session_detaches_the_shells_of_that_relay_device() {
+        use crate::mobile::terminal::{tests::FakeSpawner, OpenRequest, Owner};
+        let key = SessionKey {
+            device_id: [7; 16],
+            channel: 1,
+        };
+        let relay_id = uuid::Uuid::from_bytes(key.device_id)
+            .hyphenated()
+            .to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let host = MobileHost::open(dir.path().join("mobile-access.json"))
+            .unwrap()
+            .0;
+        // The settings are process-wide: no other test replaces them meanwhile.
+        let _settings = policy::TEST_SETTINGS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        host.set_flags_for_test(true, true);
+        host.add_device_for_test(crate::mobile::host::Device {
+            id: "row-detach".into(),
+            name: "Laptop".into(),
+            fingerprint: "fp".into(),
+            push: None,
+            kind: policy::DeviceKind::Web,
+            permission: policy::Permission::Control,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
+        });
+        policy::set_terminal_allowed("row-detach", true);
+        let hub = host.terminals().clone();
+        hub.set_spawner(Arc::new(FakeSpawner::default()));
+        let owner = Owner {
+            device_id: "row-detach".into(),
+            fingerprint: "fp".into(),
+            name: "Laptop".into(),
+            relay_id: Some(relay_id),
+        };
+        let challenge = hub.challenge(&owner, "p", "P").unwrap();
+        let code = hub.status().codes[0].code.clone();
+        hub.open(
+            &owner,
+            OpenRequest {
+                project: "p".into(),
+                label: "P".into(),
+                cwd: std::env::temp_dir(),
+                cols: 80,
+                rows: 24,
+                challenge_id: challenge.challenge_id,
+                code,
+            },
+        )
+        .unwrap();
+        let (out, _frames) = mpsc::channel::<Out>(8);
+        let mut requests = Requests::new(host, out);
+        // Another device's session ending changes nothing.
+        requests.closed(SessionKey {
+            device_id: [8; 16],
+            channel: 1,
+        });
+        assert!(!hub.status().open[0].detached);
+        requests.closed(key);
+        assert!(hub.status().open[0].detached);
+        policy::set_terminal_allowed("row-detach", false);
     }
 
     /// A coded failure reaches the browser with its code and no text mapping;

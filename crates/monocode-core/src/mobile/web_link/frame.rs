@@ -479,7 +479,7 @@ impl CloseCode {
 }
 
 /// The desktop `code` values (the same names as `mobile::policy::Code`).
-pub const DESKTOP_ERROR_CODES: [&str; 18] = [
+pub const DESKTOP_ERROR_CODES: [&str; 20] = [
     "auto_stopping",
     "busy",
     "disabled",
@@ -492,6 +492,8 @@ pub const DESKTOP_ERROR_CODES: [&str; 18] = [
     "not_selected",
     "path_denied",
     "read_only",
+    "reauth_failed",
+    "reauth_required",
     "revoked",
     "starting",
     "too_large",
@@ -513,6 +515,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "mentionedFiles",
     "mentionedFiles2",
     "fileTransfer",
+    "terminal",
 ];
 
 /// Codes in the ERROR relay frame body.

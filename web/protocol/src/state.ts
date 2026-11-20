@@ -16,6 +16,8 @@ export const KNOWN_CAPABILITIES = [
   "mentionedFiles",
   "mentionedFiles2",
   "fileTransfer",
+  /** A real shell on the desktop: advertised only to a Control device the user allowed in "Allow web terminal". */
+  "terminal",
 ] as const;
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 

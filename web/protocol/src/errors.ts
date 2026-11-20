@@ -29,6 +29,10 @@ export const DESKTOP_ERROR_CODES = [
   "wake_required",
   /** Widening the selection needs a passkey re-auth ticket the desktop could not verify. */
   "fresh_required",
+  /** Terminal: the code challenge is unknown, expired, used up or locked out; start again with `terminal.open`. */
+  "reauth_required",
+  /** Terminal: the code is wrong but the challenge is still valid; type it again. */
+  "reauth_failed",
 ] as const;
 export type DesktopErrorCode = (typeof DESKTOP_ERROR_CODES)[number];
 export const DesktopErrorCodeSchema = z.enum(DESKTOP_ERROR_CODES);

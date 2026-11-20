@@ -15,6 +15,7 @@ pub mod policy;
 pub mod preview;
 mod router;
 mod selection;
+pub mod terminal;
 pub mod watch;
 pub mod web_link;
 

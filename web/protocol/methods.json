@@ -277,6 +277,31 @@
       "transport": "host"
     },
     {
+      "name": "terminal.close",
+      "class": "terminal",
+      "transport": "host"
+    },
+    {
+      "name": "terminal.open",
+      "class": "terminal",
+      "transport": "host"
+    },
+    {
+      "name": "terminal.read",
+      "class": "terminal",
+      "transport": "host"
+    },
+    {
+      "name": "terminal.resize",
+      "class": "terminal",
+      "transport": "host"
+    },
+    {
+      "name": "terminal.write",
+      "class": "terminal",
+      "transport": "host"
+    },
+    {
       "name": "workspace.list",
       "class": "read",
       "transport": "host"
