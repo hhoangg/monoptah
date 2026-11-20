@@ -8,7 +8,7 @@ use crate::{
     settings::{SettingsEvent, SettingsView, widgets::checkbox},
     theme::*,
 };
-use gpui::{AnyElement, Context, FontWeight, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Context, FontWeight, SharedString, Window, div, prelude::*, px};
 use monocode_core::mobile::Permission;
 use std::collections::HashSet;
 
@@ -113,7 +113,11 @@ fn print(selector: &'static str, caption: &'static str, fingerprint: &str) -> An
 
 impl SettingsView {
     /// The dialog for the device being confirmed, or `None` when none is.
-    pub(super) fn confirm_card(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn confirm_card(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let draft = self.web_app.confirm.as_ref()?;
         let web = self.ctx.web.as_ref()?;
         let device = web
@@ -190,109 +194,136 @@ impl SettingsView {
         );
         let confirm_fingerprint = device_fingerprint.clone();
         let deny_fingerprint = device_fingerprint.clone();
-        Some(
-            modal::card()
-                .w(px(CARD_WIDTH))
-                .id("web-confirm-dialog")
-                .debug_selector(|| "web-confirm-dialog".into())
-                .role(gpui::Role::Dialog)
-                .aria_label("Confirm a web device")
-                .child(
-                    modal::card_body()
-                        .child(modal::title("Confirm this device?"))
-                        .child(
-                            div()
-                                .mt(px(12.))
-                                .text_size(px(11.))
-                                .text_color(content(0.5))
-                                .child("Name sent by the device"),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "web-confirm-name".into())
-                                .mt(px(2.))
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(name),
-                        )
-                        .child(
-                            div()
-                                .mt(px(2.))
-                                .text_size(px(12.))
-                                .text_color(content(0.5))
-                                .child(
-                                    "Anyone can pick any name. Trust the fingerprints, not the name.",
-                                ),
-                        )
-                        .children(account.map(|account| {
-                            div()
-                                .debug_selector(|| "web-confirm-account".into())
-                                .mt(px(10.))
-                                .text_size(px(12.))
-                                .text_color(content(0.7))
-                                .child(format!("Account: {account}"))
-                        }))
-                        .child(
-                            div()
-                                .mt(px(16.))
-                                .flex()
-                                .gap_4()
-                                .child(print("web-confirm-device-fp", "Device", &device_fingerprint))
-                                .child(print("web-confirm-desktop-fp", "This desktop", &own)),
-                        )
-                        .child(
-                            div()
-                                .mt(px(6.))
-                                .text_size(px(12.))
-                                .line_height(px(18.))
-                                .text_color(content(0.6))
-                                .child("Compare both with the waiting screen in your browser"),
-                        )
-                        .child(section_label("Projects"))
-                        .child(div().mt(px(6.)).flex().flex_col().gap(px(6.)).children(project_rows))
-                        .when(!mono_rows.is_empty(), |d| {
-                            d.child(section_label("Monos")).child(
-                                div().mt(px(6.)).flex().flex_col().gap(px(6.)).children(mono_rows),
-                            )
-                        })
-                        .child(section_label("Permission"))
-                        .child(div().mt(px(6.)).child(permission_control))
-                        .child(
-                            modal::actions()
-                                .child(
-                                    modal::ghost_button("web-confirm-deny", "Deny")
-                                        .debug_selector(|| "web-confirm-deny".into())
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.web_app.confirm = None;
-                                            cx.emit(SettingsEvent::WebDenyDevice(
-                                                deny_fingerprint.clone(),
-                                            ));
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    modal::primary_button("web-confirm-ok", "Confirm")
-                                        .debug_selector(|| "web-confirm-ok".into())
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            let Some(draft) = this.web_app.confirm.take() else {
-                                                return;
-                                            };
-                                            let (projects, monos) = draft
-                                                .selection(&this.ctx.web_projects, &this.ctx.web_monos);
-                                            cx.emit(SettingsEvent::WebConfirmDevice {
-                                                fingerprint: confirm_fingerprint.clone(),
-                                                permission: draft.permission,
-                                                projects,
-                                                monos,
-                                            });
-                                            cx.notify();
-                                        })),
-                                ),
-                        ),
+        let header = div()
+            .flex()
+            .flex_col()
+            .child(modal::title("Confirm this device?"))
+            .child(
+                div()
+                    .mt(px(12.))
+                    .text_size(px(11.))
+                    .text_color(content(0.5))
+                    .child("Name sent by the device"),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "web-confirm-name".into())
+                    .mt(px(2.))
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .mt(px(2.))
+                    .text_size(px(12.))
+                    .text_color(content(0.5))
+                    .child("Anyone can pick any name. Trust the fingerprints, not the name."),
+            )
+            .children(account.map(|account| {
+                div()
+                    .debug_selector(|| "web-confirm-account".into())
+                    .mt(px(10.))
+                    .text_size(px(12.))
+                    .text_color(content(0.7))
+                    .child(format!("Account: {account}"))
+            }))
+            .child(
+                div()
+                    .mt(px(16.))
+                    .flex()
+                    .gap_4()
+                    .child(print(
+                        "web-confirm-device-fp",
+                        "Device",
+                        &device_fingerprint,
+                    ))
+                    .child(print("web-confirm-desktop-fp", "This desktop", &own)),
+            )
+            .child(
+                div()
+                    .mt(px(6.))
+                    .text_size(px(12.))
+                    .line_height(px(18.))
+                    .text_color(content(0.6))
+                    .child("Compare both with the waiting screen in your browser"),
+            );
+        // The two lists are the only part that can be long, so they alone scroll.
+        let lists = div()
+            .debug_selector(|| "web-confirm-lists".into())
+            .flex()
+            .flex_col()
+            .child(section_label("Projects"))
+            .child(
+                div()
+                    .mt(px(6.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .children(project_rows),
+            )
+            .when(!mono_rows.is_empty(), |d| {
+                d.child(section_label("Monos")).child(
+                    div()
+                        .mt(px(6.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.))
+                        .children(mono_rows),
                 )
-                .into_any_element(),
+            });
+        // Pinned under the lists: the permission and the way out stay reachable.
+        let footer = div()
+            .flex()
+            .flex_col()
+            .child(section_label("Permission"))
+            .child(div().mt(px(6.)).child(permission_control))
+            .child(
+                modal::actions()
+                    .child(
+                        modal::ghost_button("web-confirm-deny", "Deny")
+                            .debug_selector(|| "web-confirm-deny".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.web_app.confirm = None;
+                                cx.emit(SettingsEvent::WebDenyDevice(deny_fingerprint.clone()));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        modal::primary_button("web-confirm-ok", "Confirm")
+                            .debug_selector(|| "web-confirm-ok".into())
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(draft) = this.web_app.confirm.take() else {
+                                    return;
+                                };
+                                let (projects, monos) =
+                                    draft.selection(&this.ctx.web_projects, &this.ctx.web_monos);
+                                cx.emit(SettingsEvent::WebConfirmDevice {
+                                    fingerprint: confirm_fingerprint.clone(),
+                                    permission: draft.permission,
+                                    projects,
+                                    monos,
+                                });
+                                cx.notify();
+                            })),
+                    ),
+            );
+        Some(
+            modal::scroll_card(
+                "web-confirm-scroll",
+                modal::max_card_height(window),
+                header,
+                lists,
+                footer,
+            )
+            .w(px(CARD_WIDTH))
+            .id("web-confirm-dialog")
+            .debug_selector(|| "web-confirm-dialog".into())
+            .role(gpui::Role::Dialog)
+            .aria_label("Confirm a web device")
+            .into_any_element(),
         )
     }
 }

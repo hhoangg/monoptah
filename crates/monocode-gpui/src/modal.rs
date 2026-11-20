@@ -148,6 +148,56 @@ pub(crate) fn card() -> Div {
 pub(crate) fn card_body() -> Div {
     div().relative().p(px(20.)).flex().flex_col()
 }
+
+/// Space kept between a tall card and the window, top and bottom together.
+const WINDOW_MARGIN: f32 = 32.;
+
+/// The tallest a card may be so that it always fits in `window`, in points.
+pub(crate) fn max_card_height(window: &Window) -> f32 {
+    max_card_height_for(window.viewport_size().height.as_f32())
+}
+
+fn max_card_height_for(viewport_height: f32) -> f32 {
+    (viewport_height - WINDOW_MARGIN).max(0.)
+}
+
+/// A [`card`] that never grows past `max_height` (see [`max_card_height`]), for a dialog whose
+/// middle can be long: the `header` and the `footer` stay put and only `scrolling` scrolls, in a
+/// column that takes the height left over. With a short `scrolling` the card is as tall as its
+/// content, like a plain card. The caller sets the width, id and role on the returned card and
+/// puts the buttons in `footer` so they stay reachable in a small window.
+///
+/// The header and footer keep their full height, so a window shorter than both together still
+/// overflows; the list is what gives way first.
+pub(crate) fn scroll_card(
+    scroll_id: impl Into<ElementId>,
+    max_height: f32,
+    header: impl IntoElement,
+    scrolling: impl IntoElement,
+    footer: impl IntoElement,
+) -> Div {
+    card().max_h(px(max_height)).flex().flex_col().child(
+        card_body()
+            .min_h_0()
+            .child(pinned(header))
+            .child(
+                div()
+                    .id(scroll_id)
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(pinned(scrolling)),
+            )
+            .child(pinned(footer)),
+    )
+}
+
+/// A part of a [`scroll_card`] that keeps its height. It is a flex column so that a top or bottom
+/// margin on `part` (the dialog parts use them) stays inside the part: in a block, taffy lets a
+/// first child's margin collapse through the wrapper, which left the scroll area shorter than its
+/// content and clipped the last row.
+fn pinned(part: impl IntoElement) -> Div {
+    div().flex().flex_col().flex_shrink_0().child(part)
+}
 pub(crate) fn title(text: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(15.))
@@ -646,5 +696,147 @@ mod tests {
         visual.run_until_parked();
         poke(visual, at);
         assert_eq!(counts(visual), (true, 1, 1, 1, 1), "no stuck barrier");
+    }
+
+    /// A [`scroll_card`] of fixed-height parts, centred in the window like a dialog.
+    struct Tall {
+        rows: usize,
+    }
+
+    const HEADER: f32 = 40.;
+    const ROW: f32 = 20.;
+    const FOOTER: f32 = 52.;
+    /// Margins the dialogs put on the first child of the middle and of the footer.
+    const MIDDLE_TOP: f32 = 16.;
+    const FOOTER_TOP: f32 = 20.;
+
+    impl Render for Tall {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let rows = div().flex().flex_col().children((0..self.rows).map(|ix| {
+                div()
+                    .h(px(ROW))
+                    .debug_selector(move || format!("tall-row-{ix}"))
+                    .child(format!("Row {ix}"))
+            }));
+            let card = scroll_card(
+                "tall-scroll",
+                max_card_height(window),
+                div().h(px(HEADER)).debug_selector(|| "tall-header".into()),
+                rows.mt(px(MIDDLE_TOP)),
+                div()
+                    .mt(px(FOOTER_TOP))
+                    .h(px(FOOTER))
+                    .child(div().size(px(32.)).debug_selector(|| "tall-ok".into())),
+            )
+            .w(px(300.))
+            .debug_selector(|| "tall-card".into());
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(card)
+        }
+    }
+
+    /// Sizes the window and draws it.
+    fn resize(visual: &mut gpui::VisualTestContext, height: f32) {
+        visual.simulate_resize(gpui::size(px(400.), px(height)));
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+    }
+
+    fn bounds(
+        visual: &mut gpui::VisualTestContext,
+        selector: &'static str,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} is not drawn"))
+    }
+
+    fn wheel(visual: &mut gpui::VisualTestContext, at: gpui::Point<gpui::Pixels>, dy: f32) {
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(dy))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        visual.run_until_parked();
+        visual.refresh().unwrap();
+        visual.run_until_parked();
+    }
+
+    #[test]
+    fn a_card_keeps_a_margin_to_the_window_and_never_goes_negative() {
+        assert_eq!(max_card_height_for(600.), 600. - WINDOW_MARGIN);
+        assert_eq!(max_card_height_for(10.), 0.);
+    }
+
+    #[gpui::test]
+    fn a_long_middle_scrolls_while_the_header_and_footer_stay_inside_the_window(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = cx.add_window(|_, _| Tall { rows: 60 });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        resize(visual, 300.);
+        let cap = 300. - WINDOW_MARGIN;
+        let card = bounds(visual, "tall-card");
+        assert!(
+            card.top() >= px(0.) && card.bottom() <= px(300.),
+            "{card:?}"
+        );
+        assert!(
+            f32::from(card.size.height) <= cap + 0.5 && f32::from(card.size.height) >= cap - 0.5,
+            "capped at {cap}, got {card:?}",
+        );
+        let (header, ok) = (bounds(visual, "tall-header"), bounds(visual, "tall-ok"));
+        assert!(header.top() >= card.top() && ok.bottom() <= card.bottom());
+
+        // The middle scrolls under the pinned header and footer.
+        let first = bounds(visual, "tall-row-0");
+        wheel(visual, first.center(), -100.);
+        let moved = bounds(visual, "tall-row-0");
+        assert!(
+            f32::from(first.top() - moved.top()) >= 99.,
+            "{first:?} then {moved:?}"
+        );
+        assert_eq!(bounds(visual, "tall-header"), header);
+        assert_eq!(bounds(visual, "tall-ok"), ok);
+
+        // Scrolled to the end, the last row is reachable above the footer.
+        wheel(visual, first.center(), -10_000.);
+        let last = bounds(visual, "tall-row-59");
+        assert!(
+            last.bottom() <= ok.top() && last.top() >= header.bottom(),
+            "{last:?} vs {header:?} {ok:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_short_middle_makes_a_card_as_tall_as_its_content(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let window = cx.add_window(|_, _| Tall { rows: 2 });
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        resize(visual, 600.);
+        // Border and padding, header, two rows and footer, each with its margin.
+        let expected = 2. + 40. + HEADER + MIDDLE_TOP + 2. * ROW + FOOTER_TOP + FOOTER;
+        let card = bounds(visual, "tall-card");
+        assert!(
+            (f32::from(card.size.height) - expected).abs() < 0.5,
+            "expected {expected}, got {card:?}"
+        );
+        let (last, ok) = (bounds(visual, "tall-row-1"), bounds(visual, "tall-ok"));
+        // The footer's margin is kept below the last row.
+        assert!(
+            f32::from(ok.top() - last.bottom()) >= FOOTER_TOP - 0.5,
+            "{last:?} then {ok:?}"
+        );
+        // Nothing to scroll: the wheel moves nothing.
+        let row = bounds(visual, "tall-row-0");
+        wheel(visual, row.center(), -100.);
+        assert_eq!(bounds(visual, "tall-row-0"), row);
     }
 }

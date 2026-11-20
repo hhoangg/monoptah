@@ -46,7 +46,7 @@ impl SettingsView {
                 this.dismiss_web_app(cx);
             });
         };
-        if let Some(card) = self.confirm_card(cx) {
+        if let Some(card) = self.confirm_card(window, cx) {
             return Some(modal::overlay("web-confirm", card, dismiss).into_any_element());
         }
         if let Some((id, name)) = self.web_app.revoking.clone() {
@@ -232,7 +232,7 @@ impl SettingsView {
         let expired = left == 0;
         let viewport = window.viewport_size();
         let width = PAIR_WIDTH.min((viewport.width.as_f32() - 24.).max(0.));
-        let max_height = (viewport.height.as_f32() - 32.).max(0.);
+        let max_height = modal::max_card_height(window);
         let side = QR_SIDE.min((width - 40.).max(0.));
         let narrow = width < NARROW_WIDTH + QR_SIDE;
         let qr = self.web_qr_tile(&ticket.link, side, "web-pair-qr", expired);
@@ -309,34 +309,25 @@ impl SettingsView {
             .when(!narrow, |d| d.flex_wrap())
             .child(qr)
             .child(codes);
-        modal::card()
+        let header = div()
+            .child(modal::title("Pair with the web app"))
+            .child(div().mt(px(6.)).child(modal::body(
+            "Scan the code or open the link in your browser, sign in, and confirm the device here.",
+        )));
+        let footer = modal::actions().child(
+            modal::ghost_button("web-pair-cancel", "Cancel")
+                .debug_selector(|| "web-pair-cancel".into())
+                .cursor_pointer()
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.emit(SettingsEvent::WebCancelPair);
+                })),
+        );
+        modal::scroll_card("web-pair-scroll", max_height, header, layout, footer)
             .w(px(width))
-            .max_h(px(max_height))
             .id("web-pair-dialog")
             .debug_selector(|| "web-pair-dialog".into())
             .role(gpui::Role::Dialog)
             .aria_label("Pair with the web app")
-            .child(
-                modal::card_body()
-                    .id("web-pair-scroll")
-                    .max_h(px(max_height))
-                    .overflow_y_scroll()
-                    .child(modal::title("Pair with the web app"))
-                    .child(div().mt(px(6.)).child(modal::body(
-                        "Scan the code or open the link in your browser, sign in, and confirm the device here.",
-                    )))
-                    .child(layout)
-                    .child(
-                        modal::actions().child(
-                            modal::ghost_button("web-pair-cancel", "Cancel")
-                                .debug_selector(|| "web-pair-cancel".into())
-                                .cursor_pointer()
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(SettingsEvent::WebCancelPair);
-                                })),
-                        ),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -348,49 +339,42 @@ impl SettingsView {
     ) -> AnyElement {
         let viewport = window.viewport_size();
         let width = 520_f32.min((viewport.width.as_f32() - 24.).max(0.));
-        let max_height = (viewport.height.as_f32() - 32.).max(0.);
+        let max_height = modal::max_card_height(window);
         let side = QR_SIDE.min((width - 40.).max(0.));
         let qr = self.web_qr_tile(&link, side, "web-verify-qr", false);
         let actions = self.link_actions(link.clone(), cx);
-        modal::card()
+        let header = div()
+            .child(modal::title("Verify on another device"))
+            .child(div().mt(px(6.)).child(modal::body(
+                "Open this link on a second device to check that it shows the same fingerprint as this desktop.",
+            )));
+        let body = div()
+            .child(div().mt_4().flex().justify_center().child(qr))
+            .child(
+                div()
+                    .debug_selector(|| "web-verify-link".into())
+                    .mt_3()
+                    .text_size(px(11.))
+                    .line_height(px(15.))
+                    .text_color(content(0.6))
+                    .child(link),
+            )
+            .child(div().mt_3().child(actions));
+        let footer = modal::actions().child(
+            modal::ghost_button("web-verify-close", "Close")
+                .debug_selector(|| "web-verify-close".into())
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.web_app.verify = false;
+                    cx.notify();
+                })),
+        );
+        modal::scroll_card("web-verify-scroll", max_height, header, body, footer)
             .w(px(width))
-            .max_h(px(max_height))
             .id("web-verify-dialog")
             .debug_selector(|| "web-verify-dialog".into())
             .role(gpui::Role::Dialog)
             .aria_label("Verify this desktop on another device")
-            .child(
-                modal::card_body()
-                    .id("web-verify-scroll")
-                    .max_h(px(max_height))
-                    .overflow_y_scroll()
-                    .child(modal::title("Verify on another device"))
-                    .child(div().mt(px(6.)).child(modal::body(
-                        "Open this link on a second device to check that it shows the same fingerprint as this desktop.",
-                    )))
-                    .child(div().mt_4().flex().justify_center().child(qr))
-                    .child(
-                        div()
-                            .debug_selector(|| "web-verify-link".into())
-                            .mt_3()
-                            .text_size(px(11.))
-                            .line_height(px(15.))
-                            .text_color(content(0.6))
-                            .child(link),
-                    )
-                    .child(div().mt_3().child(actions))
-                    .child(
-                        modal::actions().child(
-                            modal::ghost_button("web-verify-close", "Close")
-                                .debug_selector(|| "web-verify-close".into())
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.web_app.verify = false;
-                                    cx.notify();
-                                })),
-                        ),
-                    ),
-            )
             .into_any_element()
     }
 }
