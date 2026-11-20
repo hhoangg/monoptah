@@ -140,6 +140,14 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
   "cloud.moveToCloud": { params: { sessionId: "s1", target: { kind: "sandbox", instance: "new", size: "small" } }, result: {} },
   "cloud.moveToLocal": { params: { sessionId: "s1" }, result: {} },
   "cloud.cancelMove": { params: { sessionId: "s1" }, result: {} },
+  "desktop.updateStatus": {
+    params: {},
+    result: { current: "1.0.0", latest: "1.1.0", updateAvailable: true, notes: "Fixes", runningSessions: [{ id: "s1", title: "Fix bug" }], lastFailure: "Update to 1.1.0 failed: disk full" },
+  },
+  "desktop.update": {
+    params: { confirm: true },
+    result: { status: "confirmation_required", runningSessions: [{ id: "s1", title: "Fix bug" }] },
+  },
 };
 
 describe("every method has a typed entry", () => {

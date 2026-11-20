@@ -694,6 +694,24 @@ mod tests {
     }
 
     #[test]
+    fn every_remote_update_request_is_audited_and_a_status_read_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        log.record(&device(), &event("desktop.updateStatus", Outcome::Ok));
+        assert!(lines(dir.path()).is_empty());
+        log.record(&device(), &event("desktop.update", Outcome::Ok));
+        log.record(
+            &device(),
+            &event("desktop.update", Outcome::Denied(Code::ReadOnly)),
+        );
+        let lines = lines(dir.path());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["method"], "desktop.update");
+        assert_eq!(lines[0]["outcome"], "ok");
+        assert_eq!(lines[1]["outcome"], "denied:read_only");
+    }
+
+    #[test]
     fn a_denied_call_writes_its_code() {
         let dir = tempfile::tempdir().unwrap();
         let log = Log::new(dir.path());

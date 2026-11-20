@@ -316,6 +316,7 @@ impl Shell {
             }
         })
         .detach();
+        self.consume_remote_update(cx);
     }
 
     pub(super) fn start_native_notifications(&mut self, cx: &mut Context<Self>) {
@@ -372,7 +373,7 @@ impl Shell {
         }));
     }
 
-    fn notification_chats(&self, cx: &App) -> Vec<Entity<Conversation>> {
+    pub(super) fn notification_chats(&self, cx: &App) -> Vec<Entity<Conversation>> {
         let mut views: Vec<_> = self.sessions.values().cloned().collect();
         if let Some(monos) = &self.monos {
             views.extend(monos.read(cx).all_notification_chats(cx));

@@ -50,6 +50,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.archive"=>"sessionId project cloud backup",
         "sessions.delete"=>"sessionId project providerFiles removeWorktree cloud",
         "worktrees.create"=>"branch base existing project",
+        "app.update"=>"mode force confirm",
         "terminals.list"=>"project",
         "terminals.open"=>"label action command cwd place beside direction reveal project",
         "terminals.send"=>"id text key project",
@@ -79,6 +80,9 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         match key.as_str() {
             "completionDelivery" if !matches!(value.as_str(), Some("group" | "each")) => {
                 return Err("completionDelivery must be \"group\" or \"each\"".into());
+            }
+            "mode" if !matches!(value.as_str(), Some("check" | "install")) => {
+                return Err("mode must be \"check\" or \"install\"".into());
             }
             // Native session IDs are positive integers, sent as a number or numeric text.
             "parentSessionId"
@@ -111,6 +115,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "providerFiles",
             "removeWorktree",
             "backup",
+            "force",
+            "confirm",
         ]
         .contains(&key.as_str())
             && !value.is_boolean()
@@ -145,6 +151,8 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
             "providerFiles",
             "removeWorktree",
             "backup",
+            "force",
+            "confirm",
             "before",
             "limit",
             "offset",

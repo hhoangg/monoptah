@@ -1243,6 +1243,7 @@ impl Shell {
             "conversation.read" | "conversation.older" => self.mobile_read(request, cx),
             "models.list" => self.mobile_models(request, cx),
             "accounts.usage" => self.mobile_usage(request, cx),
+            "desktop.updateStatus" | "desktop.update" => self.mobile_update(request, cx),
             "mono.document" => self.mobile_document(request, cx),
             "mono.profile" | "mono.update" | "mono.delete" | "mono.create" => {
                 self.mobile_mono(request, cx)
@@ -1265,6 +1266,51 @@ impl Shell {
             method if method.starts_with("project.") => self.mobile_project(request, cx),
             _ => self.mobile_command(request, window, cx),
         }
+    }
+
+    /// `desktop.updateStatus` (a read) and `desktop.update` (Control only): the app's version
+    /// and the update from the signed feed. An install answers first, then starts; see
+    /// `shell::remote_update`.
+    fn mobile_update(&mut self, request: Request, cx: &mut Context<Self>) {
+        use super::remote_update::{Origin, Reply};
+        use monocode_core::app_update::remote::{Mode, Request as Ask};
+        let install = request.method == "desktop.update";
+        // The host already refuses a read-only device; the app does not rely on it.
+        if install && request.device.permission != policy::Permission::Control {
+            return request.reply(Err(policy::Code::ReadOnly.failure()));
+        }
+        let ask = Ask {
+            mode: if install { Mode::Install } else { Mode::Check },
+            force: request.params["confirm"].as_bool().unwrap_or(false),
+        };
+        let name = self.mobile_device_name(&request.device.id);
+        let task = self.remote_update(Origin::Device { name }, ask, cx);
+        cx.spawn(async move |this, cx| match task.await {
+            Ok(Reply { value, begin }) => {
+                request.reply(Ok(value));
+                if let Some(begin) = begin {
+                    let _ = this.update(cx, |this, cx| this.remote_update_begin(begin, cx));
+                }
+            }
+            Err(error) => request.reply(Err(Failure::from(error))),
+        })
+        .detach();
+    }
+
+    /// The name a paired device goes by, for notices on this computer.
+    fn mobile_device_name(&self, device_id: &str) -> String {
+        self.mobile
+            .host
+            .as_ref()
+            .and_then(|host| {
+                host.status()
+                    .devices
+                    .into_iter()
+                    .find(|device| device.id == device_id)
+            })
+            .map(|device| device.name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "A remote device".into())
     }
 
     /// `chat.mentionedFile`: a file the assistant mentioned in this conversation, read for a
@@ -2733,11 +2779,12 @@ impl Shell {
             project,
             title: &notice.title,
             preview: Some(raw),
+            control_only: false,
         });
         // A phone is never pushed about a session only web devices see: it
         // cannot open it, and its path or instance name stays off the wire.
         if is_mono || self.mobile_phone_push_allowed(id, cx) {
-            self.send_mobile_notice(category, notice, cx);
+            self.send_mobile_notice(category, notice, false, cx);
         }
     }
 
@@ -2781,16 +2828,23 @@ impl Shell {
         }
     }
 
-    fn send_mobile_notice(&self, category: &str, notice: notify::Notice, cx: &App) {
+    pub(super) fn send_mobile_notice(
+        &self,
+        category: &str,
+        notice: notify::Notice,
+        control_only: bool,
+        cx: &App,
+    ) {
         let Some(host) = self.mobile.host.clone() else {
             return;
         };
         // Only phones whose selection covers the project and Mono the notice
         // is about get it.
-        let tokens = host.push_tokens(
+        let tokens = host.push_tokens_for(
             category,
             notice.data["projectId"].as_str(),
             notice.data["monoId"].as_str(),
+            control_only,
         );
         if tokens.is_empty() {
             return;
@@ -4059,6 +4113,35 @@ mod tests {
             Request::with_receiver(&format!("c-{method}"), method, params, device.clone());
         shell.handle_mobile_request(request, window, cx);
         answer.try_recv().ok()
+    }
+
+    #[gpui::test]
+    fn a_read_only_device_cannot_update_the_app_but_may_read_its_version(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::super::remote_update::{Override, testing::Fake};
+        let (window, _, _) = super::super::tests::window(cx);
+        let fake = Fake::new("0.1.0", Some("0.2.0"));
+        cx.update(|cx| cx.set_global(Override(fake.clone())));
+        window
+            .update(cx, |shell, window, cx| {
+                let reader = DeviceContext {
+                    permission: Permission::Read,
+                    ..web(None, None)
+                };
+                let denied = ask(
+                    shell,
+                    window,
+                    cx,
+                    &reader,
+                    "desktop.update",
+                    json!({"confirm": true}),
+                );
+                assert_eq!(denied, Some(Err(policy::Code::ReadOnly.failure())));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(fake.installs.lock().unwrap().is_empty());
     }
 
     #[gpui::test]

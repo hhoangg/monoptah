@@ -38,6 +38,9 @@ pub struct WebNotice<'a> {
     /// The raw text to preview (reply excerpt, command asked, question).
     /// Reduced by [`super::preview`] before it leaves the desktop.
     pub preview: Option<&'a str>,
+    /// Only devices with Control access get it (a result of something a
+    /// Control device asked for, such as a remote update).
+    pub control_only: bool,
 }
 
 /// Tells the paired web devices that take `notice.category` about it, through
@@ -204,6 +207,9 @@ fn plan(
     let ids: Vec<&str> = devices
         .iter()
         .filter(|device| device.kind == super::policy::DeviceKind::Web)
+        .filter(|device| {
+            !notice.control_only || device.permission == super::policy::Permission::Control
+        })
         .filter_map(|device| {
             let id = device.server_device_id.as_deref()?;
             let project_ok = match &device.projects {
@@ -400,6 +406,7 @@ mod tests {
             project: "Alpha",
             title: "Bach Tieu Thuan",
             preview: Some("Fixed the **login** bug.\n\n```sh\ncargo test\n```"),
+            control_only: false,
         }
     }
 
@@ -479,6 +486,22 @@ mod tests {
             plan(&notice("agentInput", Some("s1"), None), &all, project_p1).unwrap()["status"],
             "needs_input"
         );
+    }
+
+    #[test]
+    fn a_control_only_notice_skips_read_only_devices() {
+        let mut control = web_device("control", None, None);
+        control.permission = super::super::policy::Permission::Control;
+        let reader = web_device("reader", None, None);
+        let devices = [control, reader];
+        let mut update = notice("monoMessages", None, Some("m1"));
+        let everyone = plan(&update, &devices, project_p1).unwrap();
+        assert_eq!(everyone["deviceIds"], json!(["control", "reader"]));
+        update.control_only = true;
+        let only = plan(&update, &devices, project_p1).unwrap();
+        assert_eq!(only["deviceIds"], json!(["control"]));
+        let readers = [web_device("reader", None, None)];
+        assert_eq!(plan(&update, &readers, project_p1), Err(Skip::NoDevice));
     }
 
     #[test]

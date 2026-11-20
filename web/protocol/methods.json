@@ -77,6 +77,16 @@
       "transport": "host"
     },
     {
+      "name": "desktop.update",
+      "class": "control",
+      "transport": "app"
+    },
+    {
+      "name": "desktop.updateStatus",
+      "class": "read",
+      "transport": "app"
+    },
+    {
       "name": "device.enroll",
       "class": "denied",
       "transport": "host"

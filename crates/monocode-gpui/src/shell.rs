@@ -64,6 +64,9 @@ mod picker_preferences;
 mod pinned_tabs;
 mod project_rail;
 mod project_removal;
+pub(crate) mod remote_update;
+#[cfg(test)]
+mod remote_update_tests;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
 mod mono_terminals;

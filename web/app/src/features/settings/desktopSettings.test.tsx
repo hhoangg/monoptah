@@ -7,11 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport, type ApiTransport } from "@/features/accounts/api";
 import { createMockServer } from "@/features/accounts/mock/transport";
 import { createMockState } from "@/features/accounts/mock/state";
+import { clearLinkStores, getLinkStore } from "@/link/store";
 import { createQueryClient } from "@/lib/queryClient";
 import { REFUSED_COPY } from "./ProjectsPicker";
 import { createAppRouter } from "@/router";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { DesktopLinkError, forgetDesktopLocally, onForgetDesktop, provideDesktopLink, resetDesktopLinks } from "./desktopLink";
+import { UPDATE_POLL_MS } from "./DesktopUpdateSection";
 import { FirstRunPicker, pickerSeenKey } from "./FirstRunPicker";
 import { createMockDesktopLink, type MockDesktopLink } from "./mockDesktopLink";
 
@@ -59,7 +61,7 @@ function installApi() {
 }
 
 /** Provides a mock desktop link for every desktop id and keeps the links for inspection. */
-function provideMockLink(options: { online?: boolean } = {}): MockDesktopLink {
+function provideMockLink(options: { online?: boolean; permission?: "read" | "control" } = {}): MockDesktopLink {
   const link = createMockDesktopLink(options);
   links.push(link);
   provideDesktopLink(() => link);
@@ -101,8 +103,10 @@ beforeEach(() => {
   webauthn.getPasskey.mockResolvedValue(ASSERTION);
   keys.getDeviceKeyInfo.mockResolvedValue({ deviceId: "dev-this", publicKey: new Uint8Array(32) });
   installApi();
+  getLinkStore(DESKTOP).setState({ permission: "control", desktopVersion: "1.4.0" });
 });
 afterEach(() => {
+  clearLinkStores();
   restore?.();
   for (const link of links) link.close();
   links = [];
@@ -572,3 +576,151 @@ function installOfflineAccount() {
   const server = createMockServer({ state });
   restore = setApiTransport(server.transport);
 }
+
+describe("Desktop app update", () => {
+  const updateCalls = (link: MockDesktopLink) => link.calls.filter((call) => call.method === "desktop.update");
+
+  it("shows both versions and, for a Control device, updates after a confirmation that lists the running sessions", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    link.desktop.world.latestVersion = "1.5.0";
+    mount(SETTINGS);
+    expect(await screen.findByRole("heading", { level: 2, name: "Desktop app" })).toBeInTheDocument();
+    expect(await screen.findByText("1.5.0")).toBeInTheDocument();
+    expect(screen.getByText("1.4.0")).toBeInTheDocument();
+
+    await user.click(await screen.findByRole("button", { name: "Update and restart" }));
+    const dialog = await screen.findByRole("dialog", { name: "Update and restart the desktop?" });
+    expect(within(dialog).getByText("Run the example checks")).toBeInTheDocument();
+    expect(updateCalls(link)).toHaveLength(0);
+
+    await user.click(within(dialog).getByRole("button", { name: "Update and restart" }));
+    expect(await screen.findByText("Desktop is updating and restarting")).toBeInTheDocument();
+    expect(updateCalls(link).map((call) => call.params)).toEqual([{ confirm: true }]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    // The app relaunches: the link drops and comes back, and the new version shows.
+    link.desktop.world.completeUpdate();
+    await link.reconnect();
+    await waitFor(() => expect(screen.queryByText("Desktop is updating and restarting")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("1.4.0")).toBeNull());
+    expect(screen.getAllByText("1.5.0")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Update and restart" })).toBeNull();
+  });
+
+  async function startUpdate(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(await screen.findByRole("button", { name: "Update and restart" }));
+    const dialog = await screen.findByRole("dialog", { name: "Update and restart the desktop?" });
+    await user.click(within(dialog).getByRole("button", { name: "Update and restart" }));
+    expect(await screen.findByText("Desktop is updating and restarting")).toBeInTheDocument();
+  }
+
+  it("says the connection is down while the desktop restarts, then shows the new version once it is back", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    link.desktop.world.latestVersion = "1.5.0";
+    mount(SETTINGS);
+    await screen.findByText("1.5.0");
+    await startUpdate(user);
+    expect(screen.getByText("The desktop is downloading and installing the update.")).toBeInTheDocument();
+
+    link.hold();
+    expect(await screen.findByText(/The connection is down while the desktop restarts/)).toBeInTheDocument();
+    link.hold({ offline: true });
+    expect(screen.getByText(/The connection is down while the desktop restarts/)).toBeInTheDocument();
+    expect(screen.getByText("Desktop is updating and restarting")).toBeInTheDocument();
+
+    link.desktop.world.completeUpdate();
+    await link.restore();
+    await waitFor(() => expect(screen.queryByText("Desktop is updating and restarting")).toBeNull());
+    await waitFor(() => expect(screen.getAllByText("1.5.0")).toHaveLength(2));
+    expect(screen.queryByText("1.4.0")).toBeNull();
+    expect(screen.queryByText(/The connection is down/)).toBeNull();
+  });
+
+  it("polls the status while the link stays up and shows a failure before the restart, then allows trying again", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    link.desktop.world.latestVersion = "1.5.0";
+    link.desktop.world.failNextUpdate = "disk full";
+    mount(SETTINGS);
+    await screen.findByText("1.5.0");
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      await startUpdate(user);
+      const statusReads = () => link.calls.filter((call) => call.method === "desktop.updateStatus").length;
+      const before = statusReads();
+      await vi.advanceTimersByTimeAsync(UPDATE_POLL_MS - 100);
+      expect(statusReads()).toBe(before);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(await screen.findByText("Update to 1.5.0 failed: disk full")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(screen.queryByText("Desktop is updating and restarting")).toBeNull();
+    expect(link.status).toBe("connected");
+
+    // Trying again clears the old failure and starts a new install.
+    await user.click(screen.getByRole("button", { name: "Update and restart" }));
+    const dialog = await screen.findByRole("dialog", { name: "Update and restart the desktop?" });
+    await user.click(within(dialog).getByRole("button", { name: "Update and restart" }));
+    expect(await screen.findByText("Desktop is updating and restarting")).toBeInTheDocument();
+    expect(screen.queryByText("Update to 1.5.0 failed: disk full")).toBeNull();
+    expect(link.desktop.world.updatesStarted).toHaveLength(2);
+  });
+
+  it("shows a failure the desktop already reported on a plain status load", async () => {
+    const link = provideMockLink();
+    link.desktop.world.latestVersion = "1.5.0";
+    link.desktop.world.lastUpdateFailure = "Update to 1.5.0 failed: disk full";
+    mount(SETTINGS);
+    expect(await screen.findByText("Update to 1.5.0 failed: disk full")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Update and restart" })).toBeInTheDocument();
+  });
+
+  it("asks again with the returned sessions when the desktop answers confirmation_required", async () => {
+    const user = userEvent.setup();
+    const link = provideMockLink();
+    link.desktop.world.latestVersion = "1.5.0";
+    link.desktop.world.session("sess-local-approval").busy = false;
+    mount(SETTINGS);
+    await user.click(await screen.findByRole("button", { name: "Update and restart" }));
+    // A session starts running after the status was read.
+    link.desktop.world.session("sess-local-approval").busy = true;
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).queryByText("Run the example checks")).toBeNull();
+
+    await user.click(within(dialog).getByRole("button", { name: "Update and restart" }));
+    expect(await within(dialog).findByText("Run the example checks")).toBeInTheDocument();
+    expect(updateCalls(link).map((call) => call.params)).toEqual([{}]);
+
+    await user.click(within(dialog).getByRole("button", { name: "Update and restart" }));
+    expect(await screen.findByText("Desktop is updating and restarting")).toBeInTheDocument();
+    expect(updateCalls(link).map((call) => call.params)).toEqual([{}, { confirm: true }]);
+  });
+
+  it("a read-only device sees the versions and a note, but no button", async () => {
+    getLinkStore(DESKTOP).setState({ permission: "read" });
+    const link = provideMockLink({ permission: "read" });
+    link.desktop.world.latestVersion = "1.5.0";
+    mount(SETTINGS);
+    expect(await screen.findByText("1.5.0")).toBeInTheDocument();
+    expect(screen.getByText("Control access is needed to update the desktop from here.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update and restart" })).toBeNull();
+    expect(updateCalls(link)).toHaveLength(0);
+  });
+
+  it("offers no button when the desktop is up to date", async () => {
+    provideMockLink();
+    mount(SETTINGS);
+    await waitFor(() => expect(screen.getAllByText("1.4.0")).toHaveLength(2));
+    expect(screen.queryByRole("button", { name: "Update and restart" })).toBeNull();
+  });
+
+  it("without a connection the card says it needs one", async () => {
+    mount(SETTINGS);
+    expect(await screen.findByRole("heading", { level: 2, name: "Desktop app" })).toBeInTheDocument();
+    expect(screen.getAllByText("Needs a connection to the desktop")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Update and restart" })).toBeNull();
+  });
+});

@@ -739,6 +739,29 @@ fn a_question_leaves_nothing_behind_and_its_session_goes_only_once_settled(
 }
 
 #[gpui::test]
+fn a_workflow_question_cannot_update_the_app(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let host = host_of(&s, cx);
+    let _answer = collect(cx, host.ask_mono(&s.id, "Ship it?".into()));
+    cx.run_until_parked();
+    let session = ask_session(&s, cx);
+    let refused = call_from(
+        &s,
+        session,
+        "u1",
+        "app.update",
+        json!({"mode": "install", "force": true}),
+        cx,
+    )
+    .try_recv()
+    .unwrap();
+    assert_eq!(
+        refused,
+        Err("A habit run, heartbeat or workflow question cannot update the app".into())
+    );
+}
+
+#[gpui::test]
 fn a_question_gives_up_a_little_before_the_run_does(cx: &mut TestAppContext) {
     let s = setup(cx);
     let host = host_of(&s, cx);

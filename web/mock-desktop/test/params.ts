@@ -56,4 +56,6 @@ export const SAMPLE_PARAMS: Record<MethodName, Record<string, unknown>> = {
   "cloud.moveToCloud": { sessionId: "sess-local-1" },
   "cloud.moveToLocal": { sessionId: "sess-codespace-1" },
   "cloud.cancelMove": { sessionId: "sess-local-1" },
+  "desktop.updateStatus": {},
+  "desktop.update": {},
 };
