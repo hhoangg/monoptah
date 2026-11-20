@@ -10,7 +10,6 @@ import { SessionComposer, SessionQuestionCard, SessionUsageCard } from "@/featur
 import { useMentionPreview } from "@/features/filePreview/useMentionPreview";
 import { DocumentDialog } from "@/features/transcript/DocumentDialog";
 import { Transcript } from "@/features/transcript/Transcript";
-import { TranscriptOfflineNote } from "@/features/transcript/TranscriptOfflineNote";
 import type { TranscriptActions } from "@/features/transcript/context";
 import { latestSessionError } from "@/features/transcript/sessionError";
 import { useOlderTurns } from "@/features/transcript/useOlderTurns";
@@ -121,7 +120,6 @@ export function SessionScreen({ desktopId, sessionId }: { desktopId: string; ses
         </div>
       ) : null}
 
-      <TranscriptOfflineNote desktopId={desktopId} />
       <ModelNamesProvider>
         <Transcript
           turns={older.turns}

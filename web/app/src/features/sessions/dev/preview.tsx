@@ -81,6 +81,9 @@ async function start() {
     import("@/ui/sonner"),
   ]);
   installSessionExpiryHandler(queryClient, router);
+  // For e2e specs: drive the link state of the seeded desktop (for example to show "Reconnecting..." without a real drop).
+  const { getLinkStore } = await import("@/link");
+  (window as unknown as { __monoptahLinkStore: unknown }).__monoptahLinkStore = getLinkStore(DESKTOP_ID);
   const container = document.getElementById("root");
   if (!container) throw new Error("Missing #root element");
   createRoot(container).render(
