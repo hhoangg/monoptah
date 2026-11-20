@@ -2,7 +2,7 @@
 // mobile/src/features/workspace/WorkspaceDrawer.tsx): Monos with their latest line and when, then
 // Projects, narrowed by the filter (All, Unread, Working now) and the search. It is the content of the
 // vaul drawer on the mobile layout and of the persistent sidebar from 640 px up (design-system 11). The desktop nav entries
-// (`desktop-nav-items` slot, Settings, Desktops) sit at the foot.
+// (`desktop-nav-items` slot, Settings, Desktops) sit at the foot, except beside the activity rail, which carries them.
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useCatalog } from "@/data";
@@ -169,9 +169,11 @@ export interface WorkspaceNavProps {
   onNavigate?: () => void;
   /** Called by the New Mono button (visible only when `canCreateMono`); by default it opens the dialog on the Mono list. */
   onNewMono?: () => void;
+  /** The activity rail carries Cloud, Desktop settings and All desktops (tablet and desktop): leave them out of the foot. */
+  railed?: boolean;
 }
 
-export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavProps) {
+export function WorkspaceNav({ desktopId, onNavigate, onNewMono, railed = false }: WorkspaceNavProps) {
   const catalog = useCatalog();
   const monoTools = useCapability("monoTools");
   const readOnly = useLinkState((state) => state.permission === "read");
@@ -243,22 +245,24 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono }: WorkspaceNavP
             </button>
           </div> : null}
       </div>
-      <div className="flex flex-col gap-0.5 border-t border-stroke p-1.5">
-        <Slot name="desktop-nav-items" desktopId={desktopId} />
-        <Link
-          to="/d/$desktopId/settings"
-          params={{ desktopId }}
-          onClick={onNavigate}
-          className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04 [&.active]:bg-selection"
-        >
-          <Icon name="settings" size={20} />
-          Desktop settings
-        </Link>
-        <Link to="/desktops" onClick={onNavigate} className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04">
-          <Icon name="computer" size={20} />
-          All desktops
-        </Link>
-      </div>
+      {railed ? null : (
+        <div className="flex flex-col gap-0.5 border-t border-stroke p-1.5">
+          <Slot name="desktop-nav-items" desktopId={desktopId} />
+          <Link
+            to="/d/$desktopId/settings"
+            params={{ desktopId }}
+            onClick={onNavigate}
+            className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04 [&.active]:bg-selection"
+          >
+            <Icon name="settings" size={20} />
+            Desktop settings
+          </Link>
+          <Link to="/desktops" onClick={onNavigate} className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04">
+            <Icon name="computer" size={20} />
+            All desktops
+          </Link>
+        </div>
+      )}
     </nav>
   );
 }

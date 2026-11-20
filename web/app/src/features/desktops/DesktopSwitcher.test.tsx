@@ -58,13 +58,14 @@ afterEach(() => {
 });
 
 describe("desktop switcher", () => {
-  it("puts the app nav icons right aligned on the switcher row", async () => {
+  it("puts the avatar menu right aligned on the switcher row, with no Desktops or Install icon", async () => {
     mountSlot(<DesktopSwitcher />);
     const trigger = await screen.findByRole("button", { name: /Switch desktop/ });
     const nav = screen.getByRole("navigation", { name: "Main" });
     expect(nav.parentElement).toContainElement(trigger);
     expect(nav.parentElement?.lastElementChild).toBe(nav);
-    expect(within(nav).getAllByRole("link").map((link) => link.getAttribute("aria-label"))).toEqual(["Desktops", "Account", "Install"]);
+    expect(within(nav).queryAllByRole("link")).toEqual([]);
+    expect(within(nav).getByRole("button", { name: "Account" })).toBeInTheDocument();
   });
 
   it("is not rendered while any blocking layer shows, including the requesting one (the nav icons stay)", async () => {

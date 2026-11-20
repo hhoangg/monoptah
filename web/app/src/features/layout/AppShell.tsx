@@ -13,6 +13,8 @@
 //                keep the chat pane at 320px).
 // A right panel belongs to a project: it shows only on that project's screens (`p/$projectId/...` and the
 // sessions of that project).
+// From 640px an activity rail (ActivityRail.tsx) sits at the far left of the shell: the desktops as avatars, then Cloud,
+// Desktop settings and the account menu. It replaces the top bar there (features/desktops/DesktopSwitcher.tsx).
 // The shell also mounts the global shortcuts (shortcuts.ts), the command palette (F-15), the project bar (from
 // 640px, in the sidebar foot: toggles Files, Changes and Git and opens the background picker) and the background dialog.
 import { useParams, useRouterState } from "@tanstack/react-router";
@@ -25,6 +27,7 @@ import { useMediaQuery } from "@/ui/useMediaQuery";
 import { BackgroundDialog } from "./BackgroundDialog";
 import { CommandPalette } from "./CommandPalette";
 import { SessionListPane } from "@/features/sessions/SessionListPane";
+import { ActivityRail } from "./ActivityRail";
 import { ChatPane } from "./ChatPane";
 import { PANEL_WIDTH, SESSION_LIST_WIDTH, SIDEBAR_WIDTH, TABLET_SIDEBAR_WIDTH, dockedPanelMax, sessionListMax, useLayoutPrefs } from "./layoutPrefs";
 import { openCommandPalette } from "./palette";
@@ -106,7 +109,7 @@ function Sidebar({ desktopId, tablet }: { desktopId: string; tablet: boolean }) 
           ) : null}
         </div>
         <div className="min-h-0 flex-1">
-          <WorkspaceNav desktopId={desktopId} />
+          <WorkspaceNav desktopId={desktopId} railed />
         </div>
         <ProjectBar variant="foot" />
       </aside>
@@ -169,7 +172,12 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
   return (
     <>
       <div data-testid="app-shell" data-layout={!wide ? "mobile" : desktop ? "desktop" : "tablet"} className="flex min-h-0 w-full flex-1 pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
-        {wide ? <Sidebar desktopId={desktopId} tablet={!desktop} /> : null}
+        {wide ? (
+          <>
+            <ActivityRail desktopId={desktopId} />
+            <Sidebar desktopId={desktopId} tablet={!desktop} />
+          </>
+        ) : null}
         {listShown ? (
           <>
             <SessionListPane desktopId={desktopId} projectId={projectId} width={listWidth} heading={projectRoute ? "h1" : "h2"} newSessionOpen={projectRoute} />
