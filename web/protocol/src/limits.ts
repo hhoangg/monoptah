@@ -47,7 +47,12 @@ export const REQUEST_TIMEOUT_MS = 35_000;
  * Methods that answer after work the desktop does for the request, with the time the client waits (15 s more than the host,
  * `reply_wait` in host.rs, so the host's answer, a `busy` included, always arrives first). `file.prepare` hashes a file and uploads it to R2 first (64 MiB on a slow uplink).
  */
-export const REQUEST_TIMEOUT_BY_METHOD: Readonly<Record<string, number>> = { "file.prepare": 5 * 60_000 + 45_000 };
+export const REQUEST_TIMEOUT_BY_METHOD: Readonly<Record<string, number>> = {
+  "file.prepare": 5 * 60_000 + 45_000,
+  // A long poll: the desktop answers within `waitMs` (at most TERMINAL_READ_MAX_WAIT_MS), plus 10 s of slack. The client takes the
+  // larger of this and REQUEST_TIMEOUT_MS; the terminal controller also aborts a single read after `waitMs + 10 s` on its own.
+  "terminal.read": 20_000 + 10_000,
+};
 /** Desktop handler timeout, for reference (3.3 step 5). */
 export const DESKTOP_HANDLER_TIMEOUT_MS = 30_000;
 /** Watch heartbeat period on the web link (5.5; 10 s on QUIC). */
@@ -133,3 +138,46 @@ export const TRANSFER_MAX_PLAINTEXT_BYTES = 64 * 1024 * 1024;
 export const TRANSFER_PREFIX = "transfers/";
 /** An object lives one day in R2 (lifecycle rule). */
 export const TRANSFER_RETENTION_SECONDS = 24 * 60 * 60;
+
+// --- Web terminal (security.md "Terminal"; features.md N-26). The desktop enforces every limit; the web mirrors them. ---
+
+/** Length of the one-time code the desktop shows (31 character alphabet, case-insensitive on input). */
+export const TERMINAL_CODE_LENGTH = 6;
+/** Wrong codes one challenge allows before it is used up (`reauth_required` follows). */
+export const TERMINAL_CODE_ATTEMPTS = 3;
+/** A challenge lives this long on the desktop (display only: the desktop answers `expiresInMs`). */
+export const TERMINAL_CODE_TTL_MS = 60_000;
+/** Idle limit of a shell (default, display only: the open result carries the desktop's value). */
+export const TERMINAL_IDLE_TIMEOUT_MS = 15 * 60_000;
+/** Longest life of a shell (default, display only). */
+export const TERMINAL_MAX_DURATION_MS = 8 * 60 * 60_000;
+/** The desktop keeps a shell this long after the link drops; a reattach within it finds the same PTY. */
+export const TERMINAL_GRACE_MS = 30_000;
+/** A killed terminal stays readable this long, so the final message arrives; then `not_found`. */
+export const TERMINAL_KILLED_READABLE_MS = 60_000;
+/** Largest `subdir` of `terminal.open`. */
+export const TERMINAL_SUBDIR_MAX = 512;
+/** Window size limits of `terminal.open` and `terminal.resize`. */
+export const TERMINAL_COLS_MIN = 10;
+export const TERMINAL_COLS_MAX = 500;
+export const TERMINAL_ROWS_MIN = 2;
+export const TERMINAL_ROWS_MAX = 200;
+/** `waitMs` of `terminal.read`: default and largest (the desktop clamps). */
+export const TERMINAL_READ_WAIT_DEFAULT_MS = 15_000;
+export const TERMINAL_READ_MAX_WAIT_MS = 20_000;
+/** Slack added to `waitMs` for the client side timeout of one read. */
+export const TERMINAL_READ_TIMEOUT_SLACK_MS = 10_000;
+/** `maxBytes` of `terminal.read`: default and largest. */
+export const TERMINAL_READ_MAX_BYTES = 32_768;
+/** Largest decoded `data` of one `terminal.write`. */
+export const TERMINAL_WRITE_MAX_BYTES = 8_192;
+/** The web sends at most this many bytes per write (well under the limit). */
+export const TERMINAL_WRITE_CHUNK_BYTES = 4_096;
+/** Keystrokes typed within this window go out in one write. */
+export const TERMINAL_WRITE_FLUSH_MS = 50;
+/** Least time between the end of a read and the next while data keeps flowing (relay limit: 40 msg/s sustained). */
+export const TERMINAL_READ_MIN_GAP_MS = 75;
+/** Input waiting for the one write in flight is capped here; more is dropped with a hint. */
+export const TERMINAL_PENDING_INPUT_MAX_BYTES = 64 * 1024;
+/** Bytes handed to the screen per slice, so a huge burst cannot freeze the tab. */
+export const TERMINAL_RENDER_SLICE_BYTES = 16 * 1024;

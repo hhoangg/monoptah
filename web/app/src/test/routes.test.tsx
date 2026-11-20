@@ -103,6 +103,7 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
     fullPath: "/d/$desktopId/monos/$monoId/profile/file/$name",
   },
   { url: "/d/dk1/cloud", route: "/d/:desktopId/cloud", params: { desktopId: "dk1" }, fullPath: "/d/$desktopId/cloud/" },
+  { url: "/d/dk1/terminal", route: "/d/:desktopId/terminal", params: { desktopId: "dk1" }, fullPath: "/d/$desktopId/terminal/" },
   {
     url: "/d/dk1/settings",
     route: "/d/:desktopId/settings",
@@ -159,6 +160,9 @@ const SCREENS: Record<string, string> = {
   // U-17 (WS-C): the cloud instance list, framed by the workspace with its "Cloud" h1.
   "/d/dk1/cloud": "Cloud",
   "/d/:desktopId/cloud": "Cloud",
+  // The terminal page (N-26), framed by the workspace with its "Terminal" h1.
+  "/d/dk1/terminal": "Terminal",
+  "/d/:desktopId/terminal": "Terminal",
   // U-05 (WS-P): the file browser, with its "Files" h1 (the splat stays in the route params).
   "/d/dk1/p/p1/files/src/main.rs": "Files",
   "/d/:desktopId/p/:projectId/files/*": "Files",

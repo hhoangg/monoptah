@@ -28,6 +28,7 @@ import { Route as DDesktopIdCloudIndexRouteImport } from './routes/d/$desktopId/
 import { Route as DDesktopIdMonosIndexRouteImport } from './routes/d/$desktopId/monos/index'
 import { Route as DDesktopIdSSessionIdRouteImport } from './routes/d/$desktopId/s/$sessionId'
 import { Route as DDesktopIdSettingsIndexRouteImport } from './routes/d/$desktopId/settings/index'
+import { Route as DDesktopIdTerminalIndexRouteImport } from './routes/d/$desktopId/terminal/index'
 import { Route as DDesktopIdMonosMonoIdIndexRouteImport } from './routes/d/$desktopId/monos/$monoId/index'
 import { Route as DDesktopIdPProjectIdIndexRouteImport } from './routes/d/$desktopId/p/$projectId/index'
 import { Route as DDesktopIdPProjectIdGitRouteImport } from './routes/d/$desktopId/p/$projectId/git'
@@ -135,6 +136,11 @@ const DDesktopIdSettingsIndexRoute = DDesktopIdSettingsIndexRouteImport.update({
   path: '/settings/',
   getParentRoute: () => DDesktopIdRouteRoute,
 } as any)
+const DDesktopIdTerminalIndexRoute = DDesktopIdTerminalIndexRouteImport.update({
+  id: '/terminal/',
+  path: '/terminal/',
+  getParentRoute: () => DDesktopIdRouteRoute,
+} as any)
 const DDesktopIdMonosMonoIdIndexRoute =
   DDesktopIdMonosMonoIdIndexRouteImport.update({
     id: '/monos/$monoId/',
@@ -220,6 +226,7 @@ export interface FileRoutesByFullPath {
   '/d/$desktopId/cloud/': typeof DDesktopIdCloudIndexRoute
   '/d/$desktopId/monos/': typeof DDesktopIdMonosIndexRoute
   '/d/$desktopId/settings/': typeof DDesktopIdSettingsIndexRoute
+  '/d/$desktopId/terminal/': typeof DDesktopIdTerminalIndexRoute
   '/d/$desktopId/p/$projectId/git': typeof DDesktopIdPProjectIdGitRoute
   '/d/$desktopId/p/$projectId/new': typeof DDesktopIdPProjectIdNewRoute
   '/d/$desktopId/monos/$monoId/': typeof DDesktopIdMonosMonoIdIndexRoute
@@ -251,6 +258,7 @@ export interface FileRoutesByTo {
   '/d/$desktopId/cloud': typeof DDesktopIdCloudIndexRoute
   '/d/$desktopId/monos': typeof DDesktopIdMonosIndexRoute
   '/d/$desktopId/settings': typeof DDesktopIdSettingsIndexRoute
+  '/d/$desktopId/terminal': typeof DDesktopIdTerminalIndexRoute
   '/d/$desktopId/p/$projectId/git': typeof DDesktopIdPProjectIdGitRoute
   '/d/$desktopId/p/$projectId/new': typeof DDesktopIdPProjectIdNewRoute
   '/d/$desktopId/monos/$monoId': typeof DDesktopIdMonosMonoIdIndexRoute
@@ -284,6 +292,7 @@ export interface FileRoutesById {
   '/d/$desktopId/cloud/': typeof DDesktopIdCloudIndexRoute
   '/d/$desktopId/monos/': typeof DDesktopIdMonosIndexRoute
   '/d/$desktopId/settings/': typeof DDesktopIdSettingsIndexRoute
+  '/d/$desktopId/terminal/': typeof DDesktopIdTerminalIndexRoute
   '/d/$desktopId/p/$projectId/git': typeof DDesktopIdPProjectIdGitRoute
   '/d/$desktopId/p/$projectId/new': typeof DDesktopIdPProjectIdNewRoute
   '/d/$desktopId/monos/$monoId/': typeof DDesktopIdMonosMonoIdIndexRoute
@@ -318,6 +327,7 @@ export interface FileRouteTypes {
     | '/d/$desktopId/cloud/'
     | '/d/$desktopId/monos/'
     | '/d/$desktopId/settings/'
+    | '/d/$desktopId/terminal/'
     | '/d/$desktopId/p/$projectId/git'
     | '/d/$desktopId/p/$projectId/new'
     | '/d/$desktopId/monos/$monoId/'
@@ -349,6 +359,7 @@ export interface FileRouteTypes {
     | '/d/$desktopId/cloud'
     | '/d/$desktopId/monos'
     | '/d/$desktopId/settings'
+    | '/d/$desktopId/terminal'
     | '/d/$desktopId/p/$projectId/git'
     | '/d/$desktopId/p/$projectId/new'
     | '/d/$desktopId/monos/$monoId'
@@ -381,6 +392,7 @@ export interface FileRouteTypes {
     | '/d/$desktopId/cloud/'
     | '/d/$desktopId/monos/'
     | '/d/$desktopId/settings/'
+    | '/d/$desktopId/terminal/'
     | '/d/$desktopId/p/$projectId/git'
     | '/d/$desktopId/p/$projectId/new'
     | '/d/$desktopId/monos/$monoId/'
@@ -546,6 +558,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DDesktopIdSettingsIndexRouteImport
       parentRoute: typeof DDesktopIdRouteRoute
     }
+    '/d/$desktopId/terminal/': {
+      id: '/d/$desktopId/terminal/'
+      path: '/terminal'
+      fullPath: '/d/$desktopId/terminal/'
+      preLoaderRoute: typeof DDesktopIdTerminalIndexRouteImport
+      parentRoute: typeof DDesktopIdRouteRoute
+    }
     '/d/$desktopId/monos/$monoId/': {
       id: '/d/$desktopId/monos/$monoId/'
       path: '/monos/$monoId'
@@ -632,6 +651,7 @@ interface DDesktopIdRouteRouteChildren {
   DDesktopIdCloudIndexRoute: typeof DDesktopIdCloudIndexRoute
   DDesktopIdMonosIndexRoute: typeof DDesktopIdMonosIndexRoute
   DDesktopIdSettingsIndexRoute: typeof DDesktopIdSettingsIndexRoute
+  DDesktopIdTerminalIndexRoute: typeof DDesktopIdTerminalIndexRoute
   DDesktopIdPProjectIdGitRoute: typeof DDesktopIdPProjectIdGitRoute
   DDesktopIdPProjectIdNewRoute: typeof DDesktopIdPProjectIdNewRoute
   DDesktopIdMonosMonoIdIndexRoute: typeof DDesktopIdMonosMonoIdIndexRoute
@@ -651,6 +671,7 @@ const DDesktopIdRouteRouteChildren: DDesktopIdRouteRouteChildren = {
   DDesktopIdCloudIndexRoute: DDesktopIdCloudIndexRoute,
   DDesktopIdMonosIndexRoute: DDesktopIdMonosIndexRoute,
   DDesktopIdSettingsIndexRoute: DDesktopIdSettingsIndexRoute,
+  DDesktopIdTerminalIndexRoute: DDesktopIdTerminalIndexRoute,
   DDesktopIdPProjectIdGitRoute: DDesktopIdPProjectIdGitRoute,
   DDesktopIdPProjectIdNewRoute: DDesktopIdPProjectIdNewRoute,
   DDesktopIdMonosMonoIdIndexRoute: DDesktopIdMonosMonoIdIndexRoute,

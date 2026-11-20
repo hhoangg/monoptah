@@ -30,6 +30,7 @@ import {
 import { HandshakeState, NoiseError, fingerprint, generateKeyPair, prologue, type KeyPair } from "./noise.ts";
 import { SecureChannel } from "./secure-channel.ts";
 import { MockTransfers } from "./transfer.ts";
+import { MockTerminals, type MockTerminalOptions } from "./terminal.ts";
 import { FIXTURE_HANDLERS, FixtureError, MockWorld, type HandlerContext, type MockDevice, type WatchCursor } from "./fixtures.ts";
 import type { FrameSocket } from "./transport.ts";
 
@@ -56,7 +57,7 @@ export interface MockDesktopOptions {
   name?: string;
   /** Version shown in `state.desktop.version`. */
   version?: string;
-  /** Capability names advertised in `state` (default: every known one, including `cloud` and `approvals`). */
+  /** Capability names advertised in `state` (default: every known one except `terminal`, which a test turns on: a shell is opt-in). */
   capabilities?: string[];
   /** Devices that are known up front. An unknown device becomes `pending`. */
   devices?: (Partial<Omit<MockDevice, "fingerprint">> & { fingerprint: string })[];
@@ -73,6 +74,8 @@ export interface MockDesktopOptions {
   maxResponseBytes?: number;
   /** When set, scripted fixture steps (cloud startup, approval clearing) advance on this period. */
   autoAdvanceMs?: number;
+  /** Limits and hooks of the fake shells (`terminal.*`); the clock is the desktop's own. */
+  terminal?: Omit<MockTerminalOptions, "clock">;
   /** Fixed ephemeral private key for deterministic handshakes. Default: random. */
   ephemeralPrivateKey?: () => Uint8Array;
 }
@@ -118,6 +121,7 @@ function requiredCapability(method: MethodName): string | undefined {
   if (method === "session.answerApproval") return "approvals";
   if (method === "chat.mentionedFile") return "mentionedFiles";
   if (method === "file.prepare") return "fileTransfer";
+  if (method.startsWith("terminal.")) return "terminal";
   return undefined;
 }
 
@@ -130,6 +134,8 @@ export class MockDesktop {
   readonly world: MockWorld;
   /** The desktop's encrypted file transfers (`file.prepare`); set `transfers.backend` to a server to enable uploads. */
   readonly transfers = new MockTransfers();
+  /** The desktop's fake shells (`terminal.*`); `terminals.lastCode()` is the code the desktop window would show. */
+  readonly terminals: MockTerminals;
   /** Known devices by fingerprint. */
   readonly devices = new Map<string, MockDevice>();
   flags: ClassifyFlags;
@@ -156,7 +162,7 @@ export class MockDesktop {
     this.fingerprint = fingerprint(this.staticKey.publicKey);
     this.#name = options.name ?? "Example Desktop";
     this.#version = options.version ?? "0.0.0-mock";
-    this.#capabilities = [...(options.capabilities ?? KNOWN_CAPABILITIES)];
+    this.#capabilities = [...(options.capabilities ?? KNOWN_CAPABILITIES.filter((name) => name !== "terminal"))];
     this.flags = options.flags ?? {};
     this.#timers = options.timers ?? globalTimers;
     this.#now = options.now ?? Date.now;
@@ -166,6 +172,14 @@ export class MockDesktop {
     this.#maxResponseBytes = options.maxResponseBytes;
     this.#ephemeral = options.ephemeralPrivateKey;
     this.world = options.world ?? new MockWorld({ now: this.#now });
+    this.terminals = new MockTerminals({
+      ...options.terminal,
+      clock: {
+        now: () => this.#now(),
+        setTimeout: (fn, ms) => this.#timers.setTimeout(fn, ms),
+        clearTimeout: (handle) => this.#timers.clearTimeout(handle),
+      },
+    });
     this.#syncWorldCapabilities();
     for (const device of options.devices ?? []) this.setDevice(device.fingerprint, device);
     if (options.autoAdvanceMs !== undefined) {
@@ -211,6 +225,8 @@ export class MockDesktop {
     const device: MockDevice = existing ?? { fingerprint: fingerprintHex, status: "pending", permission: "read", selection: { projects: null, monos: null } };
     Object.assign(device, patch);
     this.devices.set(fingerprintHex, device);
+    // A device that lost Control or whose "Allow web terminal" went off loses its shells at once.
+    if (!this.#terminalAllowed(device)) this.terminals.killDevice(fingerprintHex, "toggle_off");
     this.#resendState(device);
     return device;
   }
@@ -223,6 +239,7 @@ export class MockDesktop {
   /** The user revoked the device: BYE on each of its channels, no state. */
   revokeDevice(fingerprintHex: string): void {
     const device = this.setDevice(fingerprintHex, { status: "revoked" });
+    this.terminals.killDevice(fingerprintHex, "revoked");
     for (const session of [...this.#sessions.values()]) if (session.device === device) this.#endSession(session, true);
   }
 
@@ -230,6 +247,7 @@ export class MockDesktop {
   setCapabilities(capabilities: string[]): void {
     this.#capabilities = [...capabilities];
     this.#syncWorldCapabilities();
+    if (!this.#capabilities.includes("terminal")) this.terminals.killAll("toggle_off");
     for (const session of this.#sessions.values()) this.#sendState(session);
   }
 
@@ -359,14 +377,20 @@ export class MockDesktop {
 
   // --- State message ---
 
+  /** Control and the per-device toggle (default on in the mock): what the desktop checks before it advertises `terminal`. */
+  #terminalAllowed(device: MockDevice): boolean {
+    return device.status === "confirmed" && device.permission === "control" && device.terminal !== false;
+  }
+
   #stateMessage(device: MockDevice): StateMessage {
     if (device.status !== "confirmed") return { type: "state", state: device.status };
+    const capabilities = this.#terminalAllowed(device) ? [...this.#capabilities] : this.#capabilities.filter((name) => name !== "terminal");
     return {
       type: "state",
       state: "confirmed",
       permission: device.permission,
       proto: PROTOCOL_VERSION,
-      capabilities: [...this.#capabilities],
+      capabilities,
       desktop: { name: this.#name, version: this.#version },
     };
   }
@@ -474,8 +498,12 @@ export class MockDesktop {
       return this.#error(session, rid, "This action is not available from the web", toggleGated ? "disabled" : "forbidden");
     }
     if (resolved === "unsupportedWeb") return this.#error(session, rid, "Not supported on the web", "unsupported");
-    if (resolved === "control" && session.device.permission === "read") {
+    if ((resolved === "control" || resolved === "terminal") && session.device.permission === "read") {
       return this.#error(session, rid, "This device can only read", "read_only");
+    }
+    // `terminal.read` and `terminal.close` stay open so a shell the toggle just killed still delivers its `toggle_off` message.
+    if (resolved === "terminal" && session.device.terminal === false && name !== "terminal.read" && name !== "terminal.close") {
+      return this.#error(session, rid, "Allow web terminal is off for this device", "disabled");
     }
     const checked = METHODS[name].params.safeParse(params);
     if (!checked.success) return this.#error(session, rid, "Invalid parameters");
@@ -486,7 +514,7 @@ export class MockDesktop {
     }
     if (request.watch === true) return this.#error(session, rid, "Only conversation.watch can be watched");
 
-    const ctx: HandlerContext = { world: this.world, device: session.device, transfers: this.transfers };
+    const ctx: HandlerContext = { world: this.world, device: session.device, transfers: this.transfers, terminals: this.terminals };
     const fail = (error: unknown): void => {
       if (error instanceof FixtureError) return this.#error(session, rid, error.message, error.code);
       throw error;
@@ -516,6 +544,7 @@ export class MockDesktop {
   /** `device.leave`: the desktop forgets the device and ends its sessions. */
   #leave(session: Session): void {
     this.devices.delete(session.device.fingerprint);
+    this.terminals.killDevice(session.device.fingerprint, "revoked");
     for (const other of [...this.#sessions.values()]) if (other.device === session.device) this.#endSession(other, true);
   }
 
@@ -564,6 +593,8 @@ export class MockDesktop {
     session.pendingTimeout = null;
     session.channelCrypto.reset();
     if (this.#sessions.get(session.key) === session) this.#sessions.delete(session.key);
+    // The last link of a device is gone: its shells get the grace window, then die.
+    if (![...this.#sessions.values()].some((other) => other.device === session.device)) this.terminals.linkLost(session.device.fingerprint);
     if (sendBye) this.#bye(session.deviceId, session.channel);
   }
 

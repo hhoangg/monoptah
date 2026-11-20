@@ -3,13 +3,14 @@
 //! executor, polls a pairing until the browser answers, and watches for
 //! devices that wait for confirmation while Settings is closed.
 use super::*;
-use crate::notifications::platform;
+use crate::notifications::{platform, surface::glass_frame};
 use crate::settings::{SettingsEvent, WebPolicyFlag};
 use gpui::{Global, Task};
 use monocode_core::mobile::{
     AccessChange, DeviceKind, WebStatus,
     host::MobileHost,
     policy::{self, PolicyFlags},
+    terminal::TerminalStatus,
     web_link::{PairPoll, PairTicket, PendingDevice, attached_host},
 };
 use std::{
@@ -17,8 +18,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// How often the watcher reads the web status.
-const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the watcher reads the web status. One second, so a code for the
+/// web terminal is on screen soon after the browser asks for it.
+const WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the bridge remembers between frames. A GPUI global, so the Shell
 /// struct needs no field for it.
@@ -38,6 +40,10 @@ struct WebBridge {
     /// Bumped whenever a pairing is cancelled or Settings closes, so a ticket
     /// that arrives late is dropped instead of reopening the dialog.
     pairing_generation: u64,
+    /// Open web terminals and the codes to read out, for the corner panel.
+    terminals: TerminalStatus,
+    /// Codes already announced with a notification.
+    announced_codes: HashSet<String>,
 }
 
 impl Global for WebBridge {}
@@ -51,6 +57,20 @@ fn unix_now() -> u64 {
 /// The name the web server shows for this desktop: the same one phone pairing uses.
 fn machine_name() -> String {
     monocode_core::mobile::host::name()
+}
+
+/// A code on screen, by device, project and the code itself.
+fn code_key(code: &monocode_core::mobile::terminal::PendingCode) -> String {
+    format!(
+        "{}\u{0}{}\u{0}{}",
+        code.device_name, code.project, code.code
+    )
+}
+
+/// "ABC234" as "ABC 234", easier to read out.
+fn group_code(code: &str) -> String {
+    let half = code.len() / 2;
+    format!("{} {}", &code[..half], &code[half..])
 }
 
 /// The pending devices whose fingerprint was not announced yet.
@@ -149,12 +169,15 @@ impl Shell {
                 let Some(host) = attached_host() else {
                     continue;
                 };
-                let status = cx
+                let (status, terminals) = cx
                     .background_executor()
-                    .spawn(async move { host.web_status() })
+                    .spawn(async move { (host.web_status(), host.terminal_status()) })
                     .await;
                 if this
-                    .update(cx, |this, cx| this.web_status_watched(&status, cx))
+                    .update(cx, |this, cx| {
+                        this.web_terminals_watched(terminals, cx);
+                        this.web_status_watched(&status, cx);
+                    })
                     .is_err()
                 {
                     break;
@@ -201,6 +224,163 @@ impl Shell {
                 sound: sounds,
             });
         }
+    }
+
+    /// One watcher tick for the web terminal: keeps what the corner panel
+    /// shows and raises one notification per new code (without the code: it
+    /// is read in the app's window).
+    fn web_terminals_watched(&mut self, terminals: TerminalStatus, cx: &mut Context<Self>) {
+        let notifications = self.workspace.preferences.notifications;
+        let sounds = self.workspace.preferences.sounds;
+        let bridge = cx.default_global::<WebBridge>();
+        let fresh: Vec<_> = terminals
+            .codes
+            .iter()
+            .filter(|code| bridge.announced_codes.insert(code_key(code)))
+            .cloned()
+            .collect();
+        bridge
+            .announced_codes
+            .retain(|key| terminals.codes.iter().any(|code| &code_key(code) == key));
+        let changed = bridge.terminals != terminals;
+        bridge.terminals = terminals;
+        if changed {
+            cx.notify();
+        }
+        if notifications {
+            for code in fresh {
+                let _ = platform::show(platform::Notification {
+                    tag: "web-terminal-code".into(),
+                    subtitle: "Web terminal".into(),
+                    body: format!(
+                        "{} asks for a shell in {}. Open Monoptah to read the code.",
+                        code.device_name, code.project
+                    ),
+                    sound: sounds,
+                });
+            }
+        }
+    }
+
+    /// The Kill button of an open web terminal.
+    fn web_kill_terminal(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(host) = attached_host() else {
+            return;
+        };
+        let killed = id.clone();
+        cx.background_executor()
+            .spawn(async move {
+                host.terminal_kill(&id);
+            })
+            .detach();
+        // The next tick drops it from the panel; hide it now.
+        cx.default_global::<WebBridge>()
+            .terminals
+            .open
+            .retain(|open| open.id != killed);
+        cx.notify();
+    }
+
+    /// The corner panel: a code to read out to the browser, and every open
+    /// web terminal with its device name and a Kill button. On top of the
+    /// workspace, whatever page is open.
+    pub(super) fn web_terminal_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let status = cx.try_global::<WebBridge>()?.terminals.clone();
+        if status.open.is_empty() && status.codes.is_empty() {
+            return None;
+        }
+        let mut stack = div()
+            .absolute()
+            .top(px(44.))
+            .right(px(16.))
+            .w(px(340.))
+            .flex()
+            .flex_col()
+            .gap_2();
+        for code in &status.codes {
+            stack = stack.child(
+                glass_frame()
+                    .id(SharedString::from(format!("web-terminal-code-{}", code.device_name)))
+                    .role(Role::Status)
+                    .debug_selector(|| "web-terminal-code".into())
+                    .occlude()
+                    .p_3()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Web terminal request"),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(px(12.))
+                            .text_color(content(0.7))
+                            .child(format!(
+                                "{} wants a shell in {}. Type this code in the browser:",
+                                code.device_name, code.project
+                            )),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_size(px(28.))
+                            .font_weight(FontWeight::BOLD)
+                            .debug_selector(|| "web-terminal-code-text".into())
+                            .child(group_code(&code.code)),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(px(11.))
+                            .text_color(content(0.5))
+                            .child(format!(
+                                "Works once, for {} more seconds. If you did not ask for this, ignore it.",
+                                code.expires_in_ms / 1000
+                            )),
+                    ),
+            );
+        }
+        for open in &status.open {
+            let id = open.id.clone();
+            let label = format!(
+                "Web terminal open: {} ({}){}",
+                open.device_name,
+                open.project,
+                if open.detached { ", disconnected" } else { "" }
+            );
+            stack = stack.child(
+                glass_frame()
+                    .id(SharedString::from(format!("web-terminal-open-{id}")))
+                    .role(Role::Status)
+                    .debug_selector(|| "web-terminal-open".into())
+                    .occlude()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(12.))
+                            .child(label),
+                    )
+                    .child(
+                        crate::modal::danger_ghost_button(
+                            SharedString::from(format!("web-terminal-kill-{id}")),
+                            "Kill",
+                        )
+                        .debug_selector(|| "web-terminal-kill".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.web_kill_terminal(id.clone(), cx);
+                        })),
+                    ),
+            );
+        }
+        Some(gpui::deferred(stack).with_priority(110).into_any_element())
     }
 
     /// How many devices and requests wait for the user, for the Connections
@@ -335,6 +515,12 @@ impl Shell {
                 let device_id = device_id.clone();
                 self.web_action("Revoke", cx, move |host| host.web_revoke(&device_id));
             }
+            SettingsEvent::WebSetTerminalAllowed { device_id, on } => {
+                let (device_id, on) = (device_id.clone(), *on);
+                self.web_action("Terminal", cx, move |host| {
+                    host.web_set_terminal_allowed(&device_id, on)
+                });
+            }
             SettingsEvent::WebSetPolicyFlag { flag, on } => {
                 self.web_set_policy_flag(*flag, *on, cx);
             }
@@ -371,9 +557,10 @@ impl Shell {
         self.sync_settings(cx);
         let task = cx.background_executor().spawn(async move {
             let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
-            // One retry: a busy disk or a short-lived lock should not cost the setting.
-            policy::save_settings(&path, &policy::settings())
-                .or_else(|_| policy::save_settings(&path, &policy::settings()))
+            // One retry (inside): a busy disk or a short-lived lock should not
+            // cost the setting. The core's save shares its lock with the web
+            // terminal switch, so neither writes over the other.
+            policy::persist_settings(&path)
         });
         cx.spawn(async move |this, cx| {
             let saved = task.await;
@@ -551,6 +738,29 @@ fn with_flag(mut flags: PolicyFlags, flag: WebPolicyFlag, on: bool) -> PolicyFla
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_code_is_shown_in_two_groups_and_keyed_by_device_project_and_code() {
+        assert_eq!(group_code("ABC234"), "ABC 234");
+        let code = |device: &str, code: &str| monocode_core::mobile::terminal::PendingCode {
+            device_name: device.into(),
+            project: "Proj".into(),
+            code: code.into(),
+            expires_in_ms: 1,
+        };
+        assert_ne!(
+            code_key(&code("A", "ABC234")),
+            code_key(&code("B", "ABC234"))
+        );
+        assert_ne!(
+            code_key(&code("A", "ABC234")),
+            code_key(&code("A", "ABC235"))
+        );
+        // The countdown is not part of the key: one code, one notification.
+        let mut later = code("A", "ABC234");
+        later.expires_in_ms = 40_000;
+        assert_eq!(code_key(&code("A", "ABC234")), code_key(&later));
+    }
 
     fn pending(fingerprint: &str) -> PendingDevice {
         PendingDevice {

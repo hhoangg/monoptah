@@ -22,6 +22,7 @@ import {
   type WatchFrame,
 } from "@monoptah/protocol";
 import type { METHODS } from "@monoptah/protocol";
+import { MockTerminals } from "./terminal.ts";
 import { MENTION_MESSAGE, MentionError, mentionedFile } from "./mentioned.ts";
 import { MockTransfers } from "./transfer.ts";
 import type { z } from "zod";
@@ -48,6 +49,8 @@ export interface MockDevice {
   name?: string;
   /** Project and Mono ids the device may see; `null` means all (architecture.md 7.1). */
   selection: { projects: string[] | null; monos: string[] | null };
+  /** "Allow web terminal" of this device on the desktop. Default on in the mock (a Control device); false answers `disabled` and hides the capability. */
+  terminal?: boolean;
 }
 
 export interface WorldCapabilities {
@@ -671,12 +674,14 @@ export interface HandlerContext {
   device: MockDevice;
   /** The desktop's encrypted transfers (`file.prepare`). */
   transfers?: MockTransfers;
+  /** The desktop's fake shells (`terminal.*`). */
+  terminals?: MockTerminals;
 }
 
 type ParamsFor<M extends MethodName> = z.output<(typeof METHODS)[M]["params"]>;
 export type FixtureHandler<M extends MethodName> = (params: ParamsFor<M>, ctx: HandlerContext) => ResultOf<M>;
-/** `file.prepare` answers after the upload to the server, so its handler is async. */
-type AsyncFixtureMethod = "file.prepare";
+/** `file.prepare` answers after the upload to the server and `terminal.read` is a long poll, so their handlers are async. */
+type AsyncFixtureMethod = "file.prepare" | "terminal.read";
 type HandlerOf<M extends MethodName> = M extends AsyncFixtureMethod ? (params: ParamsFor<M>, ctx: HandlerContext) => Promise<ResultOf<M>> : FixtureHandler<M>;
 
 function project(world: MockWorld, projectId: string): void {
@@ -716,6 +721,13 @@ let fallback: MockTransfers | undefined;
 function fallbackTransfers(): MockTransfers {
   fallback ??= new MockTransfers();
   return fallback;
+}
+
+let fallbackShells: MockTerminals | undefined;
+/** The terminals of a handler call that has none (a test calling a handler directly). */
+function terminalsOf(ctx: HandlerContext): MockTerminals {
+  fallbackShells ??= new MockTerminals();
+  return ctx.terminals ?? fallbackShells;
 }
 
 const ACK = (sessionId?: string) => (sessionId === undefined ? {} : { sessionId });
@@ -1003,6 +1015,15 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: HandlerOf<M> } = {
   "cloud.moveToCloud": (p, { world }) => world.startMove(p.sessionId, true),
   "cloud.moveToLocal": (p, { world }) => world.startMove(p.sessionId, false),
   "cloud.cancelMove": (p, { world }) => world.cancelMove(p.sessionId),
+  "terminal.open": (p, ctx) => {
+    folderProject(ctx, p.projectId);
+    const name = ctx.world.projects().find((project) => project.id === p.projectId)?.name ?? p.projectId;
+    return terminalsOf(ctx).open(ctx.device.fingerprint, p, name);
+  },
+  "terminal.read": (p, ctx) => terminalsOf(ctx).read(ctx.device.fingerprint, p),
+  "terminal.write": (p, ctx) => terminalsOf(ctx).write(ctx.device.fingerprint, p),
+  "terminal.resize": (p, ctx) => terminalsOf(ctx).resize(ctx.device.fingerprint, p),
+  "terminal.close": (p, ctx) => terminalsOf(ctx).close(ctx.device.fingerprint, p),
   "desktop.updateStatus": (_p, { world }) => world.updateStatus(),
   "desktop.update": (p, { world }) => world.update(p.confirm === true),
 };

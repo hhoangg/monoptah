@@ -29,7 +29,10 @@ describe("every method of methods.json is served", () => {
     }
   });
 
-  it.each(names)("handler of %s returns a result that matches the protocol result schema", async (name) => {
+  // The terminal methods need an open shell, a code and a desktop that advertises `terminal`: test/terminal.test.ts walks them.
+  const withoutTerminal = names.filter((name) => !name.startsWith("terminal."));
+
+  it.each(withoutTerminal)("handler of %s returns a result that matches the protocol result schema", async (name) => {
     const device: MockDevice = { fingerprint: "ff", status: "confirmed", permission: "control", selection: { projects: null, monos: null } };
     const ctx: HandlerContext = { world: new MockWorld(), device };
     const params = METHODS[name].params.parse(SAMPLE_PARAMS[name]);
@@ -40,7 +43,7 @@ describe("every method of methods.json is served", () => {
   });
 
   describe("over the Noise link with both desktop toggles on", () => {
-    it.each(names)("%s answers as its class says", async (name) => {
+    it.each(withoutTerminal)("%s answers as its class says", async (name) => {
       const s = await setup({ desktop: { flags: BOTH_TOGGLES } });
       const params = SAMPLE_PARAMS[name];
       const resolved = classify(name, params, BOTH_TOGGLES);
@@ -170,7 +173,7 @@ describe("device selection", () => {
 
 describe("fixture hygiene", () => {
   it("source and fixtures contain no real-looking secrets, no em or en dashes and no MonoCode branding", () => {
-    for (const file of ["../../app/src/link/noise.ts", "../../app/src/link/secure-channel.ts", "../src/fixtures.ts", "../src/desktop.ts", "../src/client.ts", "../src/transport.ts"]) {
+    for (const file of ["../../app/src/link/noise.ts", "../../app/src/link/secure-channel.ts", "../src/fixtures.ts", "../src/desktop.ts", "../src/client.ts", "../src/transport.ts", "../src/terminal.ts"]) {
       const text = readFileSync(new URL(file, import.meta.url), "utf8");
       expect(text, file).not.toMatch(/[\u2013\u2014]/);
       expect(text, file).not.toMatch(/ghp_|github_pat_|sk-[a-z0-9]{10}|dckr_pat/i);

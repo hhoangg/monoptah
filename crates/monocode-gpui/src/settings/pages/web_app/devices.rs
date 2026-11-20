@@ -9,7 +9,7 @@ use crate::{
     theme::*,
 };
 use gpui::{AnyElement, Context, FontWeight, Role, SharedString, div, prelude::*, px};
-use monocode_core::mobile::{DeviceKind, Permission, WebStatus};
+use monocode_core::mobile::{DeviceKind, Permission, WebStatus, policy};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn permission_label(permission: Permission) -> &'static str {
@@ -388,6 +388,37 @@ impl SettingsView {
                             })
                         }),
                     )
+                    .child({
+                        // Off by default, per device, and only for Control: the
+                        // desktop alone decides, nothing the server sends turns it on.
+                        let control = device.permission == Permission::Control;
+                        let allowed = control && policy::terminal_allowed(&id);
+                        let label = if allowed {
+                            "Web terminal: on"
+                        } else {
+                            "Web terminal: off"
+                        };
+                        let toggled = id.clone();
+                        secondary_button(
+                            SharedString::from(format!("web-terminal-{id}")),
+                            label,
+                            allowed,
+                            !control,
+                        )
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("web-terminal-{id}")
+                        })
+                        .child(label)
+                        .when(control, |button| {
+                            button.on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(SettingsEvent::WebSetTerminalAllowed {
+                                    device_id: toggled.clone(),
+                                    on: !allowed,
+                                });
+                            }))
+                        })
+                    })
                     .child(
                         secondary_button(
                             SharedString::from(format!("web-revoke-{id}")),
@@ -409,6 +440,15 @@ impl SettingsView {
             })
             .collect();
         page.push(list(rows));
+        page.push(
+            div()
+                .mt_2()
+                .debug_selector(|| "web-terminal-note".into())
+                .child(note(
+                    "Web terminal opens a shell on this computer for a browser. It is off for every device until you turn it on here, works only for devices with Control, and each time the browser asks you read it a code from this window. Turning it off, revoking the device or Kill ends the shell at once.",
+                ))
+                .into_any_element(),
+        );
         page
     }
 

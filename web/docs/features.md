@@ -276,7 +276,7 @@ Every F row ships unless it is listed here.
 
 ## 3. Desktop method coverage matrix
 
-Permission: R = read-only device allowed; C = control device only. The desktop enforces this in `MobileHost::handle` (`crates/monocode-core/src/mobile/host.rs:640`), not the web client. Risk codes (R0..R5) used in the notes below: R0 metadata, R1 reads content, R2 UI-level state, R3 drives the agent, R4 destructive, R5 repo writes visible outside the machine.
+Permission: R = read-only device allowed; C = control device only; T = class `terminal` (a Control device whose "Allow web terminal" toggle is on, security.md "Terminal"). The desktop enforces this in `MobileHost::handle` (`crates/monocode-core/src/mobile/host.rs:640`), not the web client. Risk codes (R0..R5) used in the notes below: R0 metadata, R1 reads content, R2 UI-level state, R3 drives the agent, R4 destructive, R5 repo writes visible outside the machine.
 
 ### 3.1 `APP_METHODS` (31 entries, `crates/monocode-core/src/mobile/host.rs:22-54`)
 
@@ -327,6 +327,9 @@ Permission: R = read-only device allowed; C = control device only. The desktop e
 | `sessions.list` | F-21 | read | R | MVP | Filtered by selection. |
 | `device.push` | F-80, F-81 | mutate | R (own device) | obsolete on web | Answers `code: unsupported` on the web transport (section 2.17); Expo tokens do not apply. Replaced by Web Push subscriptions held by the server (N-14); the desktop only reports events. |
 | `conversation.watch` | F-32 | read (stream) | R | MVP | Max 4 per device; heartbeat 25 s on the web link (10 s on QUIC); resume with `from`. |
+| `terminal.open` | N-26 | mutate (R4: a real shell as the desktop user) | T | P2 | Two steps. Step 1 (project, optional folder, window size) makes the desktop show a one-time 6 character code on its own screen; step 2 (`challengeId`, `code`) opens the shell. Errors `reauth_required` (start again) and `reauth_failed` (retype). Needs capability `terminal`. |
+| `terminal.read` | N-26 | read of the shell output | T | P2 | A long poll (`from` acknowledges everything before it, `waitMs` up to 20 s, at most 32 KiB per answer); `exited` carries the reason when the shell ends. One in flight per terminal. |
+| `terminal.write`, `terminal.resize`, `terminal.close` | N-26 | mutate (R4) | T | P2 | Input is base64, at most 8192 bytes per write (the web sends at most 4096); `close` kills the shell at once. One write in flight per terminal. |
 
 ### 3.3 Methods to add
 
@@ -379,6 +382,7 @@ Permission: R = read-only device allowed; C = control device only. The desktop e
 | N-23 | Version and capability handling | The encrypted `state` message (architecture.md 3.3 step 4) carries `capabilities: string[]` (for example `approvals`, `cloud`, `cloudStart`, `cloudMove`, `gitPush`, `monoTools`, `monoFiles`) and `desktop.version`. The web hides features the desktop does not advertise and shows "Update Monoptah on your desktop to use <feature>". A `proto` mismatch shows a blocking screen ("Update Monoptah on your desktop" or "Reload to update the web app"). Mirrors mobile ("Update or reload Monocode on your desktop...", `mobile/src/features/connection/useProjectChanges.ts:41`) but says Monoptah. | Desktop `state` message; ticket W-22. | MVP |
 | N-24 | Session tabs and split panes | From 640px the chat area has a tab strip per pane (sessions and Mono chats): open, switch, close (button, middle click, shortcut), reorder (drag, Alt+Arrow), overflow scroll, persisted per desktop. From 1024px, or on a tablet wide enough for two 320px panes, panes split right or down, tabs drag into a pane or onto its edge, panes resize and close; the focused pane drives the URL. Shortcuts use Cmd on macOS and Ctrl elsewhere: Mod+D split right, Mod+Shift+D split down, Mod+Alt+W close tab, Mod+Alt+] and [ next and previous tab, Mod+Alt+1..9 tab n (9 is the last), Mod+Alt+Shift+arrows focus another pane (the browser keeps Mod+W, Mod+1..9 and Ctrl+Tab). Below 640px nothing changes: one session at a time. Details in [design-system.md](design-system.md) section 11.2. | `localStorage` `monoptah.layout.tabs.<desktopId>`. Native reference: `crates/monocode-gpui/src/shell.rs` (keymap at 262-325, `split_session`, `close_pane`), `pane_layout.rs`. | P1 |
 | N-25 | Update and restart the desktop app | Settings > Desktop settings > "Desktop app" shows the current and latest version (`desktop.updateStatus`). A device with Control permission gets "Update and restart" when a newer version exists; a read-only device sees a note that Control access is needed and no button. The confirmation dialog lists the running sessions, because the restart interrupts them; the app sends `desktop.update` with `confirm: true` (a `confirmation_required` answer shows the dialog again with the returned list). After `updating` the card shows "Desktop is updating and restarting" while the link is reconnecting or offline, then reads the status again once reconnected so the new version shows. While the link stays up the card reads `desktop.updateStatus` every 3 s; a failure before the restart arrives as `lastFailure` (for example "Update to 1.5.0 failed: disk full"), replaces the updating notice with an error and offers "Update and restart" again. A push about the update goes to Control devices only, and only when a Mono asked (the Worker needs a Mono or session target). The desktop never downgrades and installs only the signed package of its own update feed. | `desktop.updateStatus` (read), `desktop.update` (control), both app transport; audit log and desktop notification on every request. | P1 |
+| N-26 | Terminal | `/d/:desktopId/terminal` (entry in the activity rail and the workspace list), only when the desktop advertises `terminal` for this device. Choose a project the device can see and an optional folder, read the one-time code the desktop shows on its own screen, type it (3 tries, 60 s, a new code on every open), then work in a real shell drawn by xterm.js (bundled from npm, loaded only on this page; output is text, never markup; hyperlinks, clipboard writes and title changes by the program are ignored). Status line with the limits (idle 15 min, 8 h at most), Copy, Paste and "Close terminal" (with a confirm); on touch and narrow layouts a key row with Esc, Tab, sticky Ctrl and Alt, arrows and `\|`, `/`, `~`, `-`. One read and one write in flight, keys coalesced per 50 ms, output drawn in slices with backpressure. A dropped link keeps the shell for 30 s (reads resume from the last offset); a reload reattaches through `sessionStorage` (ids only, never output). The session ends with a reason ("Session ended: ..."). A device without Control, or with "Allow web terminal" off, sees no entry and an explanation on the page. | `terminal.*` (class `terminal`), capability `terminal`, desktop toggle "Allow web terminal" (default off), desktop indicator with Kill, audit log; security.md "Terminal". | P2 |
 
 ## 5. Summary: MVP scope at a glance
 
@@ -388,8 +392,8 @@ Feature counts (rows in sections 2.1 to 2.16 and 4; section 2.17 lists drops, no
 |---|---|---|---|---|
 | MVP | 43 | 0 | 16 | 59 |
 | P1 | 31 | 12 | 5 | 48 |
-| P2 | 22 | 9 | 2 | 33 |
-| Total | 96 | 21 | 23 | 140 |
+| P2 | 22 | 9 | 3 | 34 |
+| Total | 96 | 21 | 24 | 141 |
 
 
 | Area | MVP includes |

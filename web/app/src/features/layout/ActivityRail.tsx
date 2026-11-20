@@ -1,6 +1,6 @@
 // The activity rail (tablet and desktop, from 640 px): a vertical strip at the far left of the app shell, like the
 // activity bar of an editor. Top: the account's desktops as avatars (initials, a color per desktop, an online dot, a bar
-// beside the current one); a click opens that desktop. Bottom: Cloud (only where the desktop has it), Desktop settings
+// beside the current one); a click opens that desktop. Bottom: Cloud and Terminal (only where the desktop has them), Desktop settings
 // and the account avatar, whose menu holds Account settings, All desktops and Install app. It replaces the top bar and
 // its desktop switcher on these widths; the phone keeps the top bar (features/desktops/DesktopSwitcher.tsx).
 import { Link } from "@tanstack/react-router";
@@ -10,6 +10,7 @@ import { useDesktopGrants, useDesktops, type DesktopSummary } from "@/features/d
 import { useThisDevice } from "@/features/desktops/thisDevice";
 import { safeName } from "@/features/desktops/format";
 import { CLOUD_NAV_LABEL } from "@/features/cloud/copy";
+import { TERMINAL_NAV_LABEL } from "@/features/terminal/copy";
 import { useLinkState } from "@/link";
 import { cn } from "@/lib/utils";
 import { AccountMenu } from "@/ui/AccountMenu";
@@ -103,7 +104,7 @@ function DesktopAvatar({ desktop, current, tabStop, onFocus }: { desktop: RailDe
   );
 }
 
-function RailLink({ to, desktopId, label, icon }: { to: "/d/$desktopId/cloud" | "/d/$desktopId/settings"; desktopId: string; label: string; icon: IconName }) {
+function RailLink({ to, desktopId, label, icon }: { to: "/d/$desktopId/cloud" | "/d/$desktopId/terminal" | "/d/$desktopId/settings"; desktopId: string; label: string; icon: IconName }) {
   return (
     <li className="flex w-full justify-center">
       <RailTip label={label}>
@@ -118,6 +119,7 @@ function RailLink({ to, desktopId, label, icon }: { to: "/d/$desktopId/cloud" | 
 export function ActivityRail({ desktopId }: { desktopId: string }) {
   const desktops = useRailDesktops(desktopId);
   const cloud = useCapability("cloud");
+  const terminal = useCapability("terminal");
 
   // Roving tabindex: the desktop list is one tab stop (the last focused desktop, else the open one); Arrow Up/Down,
   // Home and End move inside it.
@@ -152,6 +154,7 @@ export function ActivityRail({ desktopId }: { desktopId: string }) {
         </ul>
         <ul data-testid="rail-actions" className="m-0 flex w-full list-none flex-col items-center gap-1 border-t border-stroke p-0 pt-2">
           {cloud ? <RailLink to="/d/$desktopId/cloud" desktopId={desktopId} label={CLOUD_NAV_LABEL} icon="cloud" /> : null}
+          {terminal ? <RailLink to="/d/$desktopId/terminal" desktopId={desktopId} label={TERMINAL_NAV_LABEL} icon="terminal" /> : null}
           <RailLink to="/d/$desktopId/settings" desktopId={desktopId} label="Desktop settings" icon="settings" />
           <li className="flex w-full justify-center">
             <AccountMenu side="right" />

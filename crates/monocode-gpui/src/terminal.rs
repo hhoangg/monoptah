@@ -1,7 +1,9 @@
 //! Port of TerminalView.tsx: a login shell on a PTY, emulated by
 //! alacritty_terminal and painted as a grid of cell-snapped text runs.
 mod shell;
+mod web;
 use shell::default_shell;
+pub(crate) use web::WebShellSpawner;
 
 use crate::theme::*;
 use alacritty_terminal::{

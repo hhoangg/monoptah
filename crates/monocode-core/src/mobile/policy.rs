@@ -8,7 +8,7 @@ use super::cloud_policy;
 use super::host::Device;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -110,6 +110,12 @@ pub struct PolicySettings {
     pub flags: PolicyFlags,
     /// Extra deny patterns by project path.
     pub deny_patterns: BTreeMap<String, Vec<String>>,
+    /// The ids of the web devices (rows of this desktop's own list) the user
+    /// allowed to open a shell here. Empty by default, written only by the
+    /// desktop's own settings page: nothing the web server sends reaches it.
+    /// Left out of the file while empty, so an earlier file is unchanged.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub terminal_devices: BTreeSet<String>,
 }
 
 static SETTINGS: RwLock<PolicySettings> = RwLock::new(PolicySettings {
@@ -120,6 +126,7 @@ static SETTINGS: RwLock<PolicySettings> = RwLock::new(PolicySettings {
         show_push_content: true,
     },
     deny_patterns: BTreeMap::new(),
+    terminal_devices: BTreeSet::new(),
 });
 
 /// The saved settings at `path`. A missing, unreadable or invalid file gives
@@ -150,6 +157,15 @@ pub fn save_settings(path: &Path, settings: &PolicySettings) -> Result<(), Strin
     })
 }
 
+/// Writes the process-wide settings to `path`. One save runs at a time and
+/// each writes the settings as they are when it runs, so the last save always
+/// holds the latest state.
+pub fn persist_settings(path: &Path) -> Result<(), String> {
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    save_settings(path, &settings()).or_else(|_| save_settings(path, &settings()))
+}
+
 /// Makes `settings` the process-wide policy settings.
 pub fn install_settings(settings: PolicySettings) {
     *SETTINGS.write().unwrap_or_else(|e| e.into_inner()) = settings;
@@ -172,6 +188,28 @@ pub(crate) static TEST_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 /// Replaces the process-wide toggles, keeping the deny patterns.
 pub fn set_flags(flags: PolicyFlags) {
     SETTINGS.write().unwrap_or_else(|e| e.into_inner()).flags = flags;
+}
+
+/// Whether the user allowed the web device `device_id` to open a shell on
+/// this desktop ("Allow web terminal", default off, per device).
+pub fn terminal_allowed(device_id: &str) -> bool {
+    SETTINGS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .terminal_devices
+        .contains(device_id)
+}
+
+/// Sets the "Allow web terminal" toggle of one device in the process-wide
+/// settings. The caller saves the file. Only the desktop's own settings code
+/// calls this: there is no wire path to it.
+pub fn set_terminal_allowed(device_id: &str, on: bool) {
+    let mut settings = SETTINGS.write().unwrap_or_else(|e| e.into_inner());
+    if on {
+        settings.terminal_devices.insert(device_id.to_owned());
+    } else {
+        settings.terminal_devices.remove(device_id);
+    }
 }
 
 /// Declares `Code` with its wire names and the list of all variants in one
@@ -217,6 +255,8 @@ codes! {
     NeedsDesktop => "needs_desktop",
     WakeRequired => "wake_required",
     FreshRequired => "fresh_required",
+    ReauthRequired => "reauth_required",
+    ReauthFailed => "reauth_failed",
 }
 
 impl Code {
@@ -247,6 +287,8 @@ impl Code {
             Code::NeedsDesktop => "Answer this request on the desktop",
             Code::WakeRequired => "Sending wakes the stopped cloud instance; confirm to continue",
             Code::FreshRequired => "Confirm with your passkey again to add projects",
+            Code::ReauthRequired => "Ask for a new code on the desktop",
+            Code::ReauthFailed => "That code is not right",
         }
     }
 }
@@ -299,6 +341,9 @@ impl Denial {
 pub enum Class {
     Read,
     Control,
+    /// A shell on the desktop: web devices only, Control, and the desktop's
+    /// own per-device toggle. Never implied by `Control`.
+    Terminal,
     /// The class depends on the parameters: see [`classify`].
     Param,
     /// Denied for web devices in v1 (or never exposed).
@@ -312,6 +357,7 @@ impl Class {
         match self {
             Class::Read => "read",
             Class::Control => "control",
+            Class::Terminal => "terminal",
             Class::Param => "param",
             Class::Denied => "denied",
             Class::UnsupportedWeb => "unsupportedWeb",
@@ -420,6 +466,11 @@ pub const METHODS: &[Entry] = &[
     host("device.push", Class::UnsupportedWeb),
     host("device.selection", Class::Param),
     host("conversation.watch", Class::Read),
+    host("terminal.open", Class::Terminal),
+    host("terminal.read", Class::Terminal),
+    host("terminal.write", Class::Terminal),
+    host("terminal.resize", Class::Terminal),
+    host("terminal.close", Class::Terminal),
 ];
 
 /// A desktop toggle a method waits on.
@@ -436,6 +487,8 @@ pub enum Access {
     Control,
     /// Control, and every listed toggle must be on (web devices).
     ControlWith(Vec<Toggle>),
+    /// A shell: a web device with Control and the desktop's per-device toggle.
+    Terminal,
     /// Denied for web devices in v1.
     DeniedForWeb,
     /// Denied for web devices unless the toggle is on.
@@ -467,6 +520,7 @@ pub fn classify(method: &str, params: &Value) -> Option<Access> {
     Some(match entry.class {
         Class::Read => Access::Read,
         Class::Denied => Access::DeniedForWeb,
+        Class::Terminal => Access::Terminal,
         Class::UnsupportedWeb => Access::UnsupportedWeb,
         Class::Control => match method {
             "session.configure" if full_access(params) => Access::DeniedForRemote,
@@ -549,17 +603,37 @@ fn check_selection(device: &DeviceContext, params: &Value) -> Result<(), Denial>
 
 /// Checks a call before it runs, against the process-wide toggles.
 pub fn authorize(device: &DeviceContext, method: &str, params: &Value) -> Result<(), Denial> {
-    authorize_with(device, method, params, &flags(), REMOTE_APPROVALS_ENABLED)
+    authorize_full(
+        device,
+        method,
+        params,
+        &flags(),
+        REMOTE_APPROVALS_ENABLED,
+        terminal_allowed(&device.id),
+    )
 }
 
-/// [`authorize`] with the toggles given. Order: permission, forbidden,
-/// disabled and unsupported first, then the selection.
+/// [`authorize`] with the toggles given. The device's terminal toggle counts
+/// as off. Order: permission, forbidden, disabled and unsupported first, then
+/// the selection.
 pub fn authorize_with(
     device: &DeviceContext,
     method: &str,
     params: &Value,
     flags: &PolicyFlags,
     approvals_gate: bool,
+) -> Result<(), Denial> {
+    authorize_full(device, method, params, flags, approvals_gate, false)
+}
+
+/// [`authorize_with`] with the device's "Allow web terminal" toggle given.
+pub fn authorize_full(
+    device: &DeviceContext,
+    method: &str,
+    params: &Value,
+    flags: &PolicyFlags,
+    approvals_gate: bool,
+    terminal_on: bool,
 ) -> Result<(), Denial> {
     // Fail closed: a method with no class is unsupported, whoever answers it.
     let Some(access) = classify(method, params) else {
@@ -569,6 +643,17 @@ pub fn authorize_with(
     match access {
         Access::Read => {}
         Access::Control => require_control(device)?,
+        Access::Terminal => {
+            // Only a browser opens a shell, and only with Control: a
+            // read-only device never gets one, whatever the toggle says.
+            if !web {
+                return Err(Denial::new(Code::Forbidden));
+            }
+            require_control(device)?;
+            if !terminal_on {
+                return Err(Denial::new(Code::Disabled));
+            }
+        }
         Access::ControlWith(toggles) => {
             require_control(device)?;
             if toggles.iter().any(|toggle| !toggle_on(*toggle, flags)) {
@@ -757,6 +842,24 @@ pub fn capabilities(flags: &PolicyFlags) -> Vec<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     list.retain(|name| !hidden.contains(name));
+    list
+}
+
+/// [`capabilities`] of one device: the desktop's list, plus `terminal` for a
+/// web device that has Control and the desktop's "Allow web terminal" toggle.
+pub fn device_capabilities(flags: &PolicyFlags, device: &Device) -> Vec<String> {
+    let mut list = capabilities(flags);
+    if device.kind == DeviceKind::Web
+        && device.permission == Permission::Control
+        && terminal_allowed(&device.id)
+        && !HIDDEN_CAPABILITIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|name| name == "terminal")
+    {
+        list.push("terminal".to_owned());
+    }
     list
 }
 
@@ -1018,6 +1121,8 @@ mod tests {
                 | "cloud.moveToCloud"
                 | "cloud.moveToLocal"
                 | "cloud.cancelMove" => continue,
+                // A shell is for browsers only: see the terminal tests.
+                _ if entry.class == Class::Terminal => continue,
                 _ => json!({}),
             };
             assert_eq!(
@@ -1095,6 +1200,14 @@ mod tests {
                     }
                     Access::DeniedForRemote => Some(Code::Forbidden),
                     Access::UnsupportedWeb => web.then_some(Code::Unsupported),
+                    // Read-only first, then the toggle, which is off here.
+                    Access::Terminal => Some(if !web {
+                        Code::Forbidden
+                    } else if read {
+                        Code::ReadOnly
+                    } else {
+                        Code::Disabled
+                    }),
                 };
                 let expected = if entry.name == "session.answerApproval" && expected.is_none() {
                     Some(Code::Disabled)
@@ -1718,5 +1831,239 @@ mod tests {
             })
             .collect();
         assert_eq!(ours, theirs);
+    }
+
+    const TERMINAL_METHODS: [&str; 5] = [
+        "terminal.open",
+        "terminal.read",
+        "terminal.write",
+        "terminal.resize",
+        "terminal.close",
+    ];
+
+    #[test]
+    fn the_terminal_is_its_own_class_and_control_does_not_imply_it() {
+        for method in TERMINAL_METHODS {
+            assert_eq!(entry(method).unwrap().class, Class::Terminal, "{method}");
+            assert_eq!(entry(method).unwrap().transport, Transport::Host);
+            assert_eq!(classify(method, &json!({})), Some(Access::Terminal));
+        }
+        assert_eq!(Class::Terminal.as_str(), "terminal");
+        // A device with Control and every other toggle on still gets no shell.
+        let control = ctx(DeviceKind::Web, Permission::Control);
+        for method in TERMINAL_METHODS {
+            assert_eq!(
+                code(authorize_full(
+                    &control,
+                    method,
+                    &json!({}),
+                    &ON,
+                    true,
+                    false
+                )),
+                Some(Code::Disabled),
+                "{method}"
+            );
+        }
+        // And the shell toggle opens nothing but the shell.
+        assert_eq!(
+            code(authorize_full(
+                &control,
+                "mono.delete",
+                &json!({}),
+                &PolicyFlags::default(),
+                false,
+                true
+            )),
+            Some(Code::Forbidden)
+        );
+        assert_eq!(
+            code(authorize_full(
+                &control,
+                "session.answerApproval",
+                &json!({}),
+                &PolicyFlags::default(),
+                true,
+                true
+            )),
+            Some(Code::Disabled)
+        );
+    }
+
+    #[test]
+    fn a_web_device_with_control_and_the_toggle_may_use_the_terminal_methods() {
+        let control = ctx(DeviceKind::Web, Permission::Control);
+        for method in TERMINAL_METHODS {
+            let off = PolicyFlags::default();
+            assert_eq!(
+                code(authorize_full(
+                    &control,
+                    method,
+                    &json!({}),
+                    &off,
+                    false,
+                    true
+                )),
+                None,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_device_never_gets_the_terminal_whatever_the_toggle_says() {
+        let read = ctx(DeviceKind::Web, Permission::Read);
+        for method in TERMINAL_METHODS {
+            for toggle in [false, true] {
+                assert_eq!(
+                    code(authorize_full(&read, method, &json!({}), &ON, true, toggle)),
+                    Some(Code::ReadOnly),
+                    "{method} toggle {toggle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_phone_never_gets_the_terminal() {
+        for permission in [Permission::Read, Permission::Control] {
+            let phone = ctx(DeviceKind::Phone, permission);
+            for method in TERMINAL_METHODS {
+                assert_eq!(
+                    code(authorize_full(&phone, method, &json!({}), &ON, true, true)),
+                    Some(Code::Forbidden),
+                    "{method}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_methods_fail_closed_even_with_the_toggle() {
+        let control = ctx(DeviceKind::Web, Permission::Control);
+        for method in [
+            "terminal.exec",
+            "terminal",
+            "terminal.attach",
+            "terminal.read ",
+        ] {
+            assert_eq!(
+                code(authorize_full(
+                    &control,
+                    method,
+                    &json!({}),
+                    &ON,
+                    true,
+                    true
+                )),
+                Some(Code::Unsupported),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_terminal_selection_still_applies() {
+        let mut control = ctx(DeviceKind::Web, Permission::Control);
+        control.projects = Some(vec!["a".into()]);
+        let params = json!({"projectId": "b"});
+        assert_eq!(
+            code(authorize_full(
+                &control,
+                "terminal.open",
+                &params,
+                &ON,
+                true,
+                true
+            )),
+            Some(Code::NotSelected)
+        );
+    }
+
+    #[test]
+    fn the_terminal_toggle_is_off_by_default_per_device_and_loads_from_old_files() {
+        assert!(PolicySettings::default().terminal_devices.is_empty());
+        // A file an earlier version wrote has no such field.
+        let old: PolicySettings =
+            serde_json::from_str(r#"{"remoteGitPush":true,"denyPatterns":{}}"#).unwrap();
+        assert!(old.terminal_devices.is_empty());
+        let _guard = TEST_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = settings();
+        assert!(!terminal_allowed("policy-test-device"));
+        set_terminal_allowed("policy-test-device", true);
+        assert!(terminal_allowed("policy-test-device"));
+        assert!(!terminal_allowed("another-policy-test-device"));
+        // `authorize` reads the toggle of the device's own id.
+        let mut web = ctx(DeviceKind::Web, Permission::Control);
+        web.id = "policy-test-device".into();
+        assert_eq!(code(authorize(&web, "terminal.open", &json!({}))), None);
+        web.id = "another-policy-test-device".into();
+        assert_eq!(
+            code(authorize(&web, "terminal.open", &json!({}))),
+            Some(Code::Disabled)
+        );
+        set_terminal_allowed("policy-test-device", false);
+        assert!(!terminal_allowed("policy-test-device"));
+        install_settings(before);
+    }
+
+    #[test]
+    fn the_terminal_toggle_is_saved_with_the_settings() {
+        let _guard = TEST_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = settings();
+        let dir = std::env::temp_dir().join(format!("policy-terminal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SETTINGS_FILE);
+        set_terminal_allowed("saved-device", true);
+        persist_settings(&path).unwrap();
+        assert!(load_settings(&path)
+            .terminal_devices
+            .contains("saved-device"));
+        set_terminal_allowed("saved-device", false);
+        persist_settings(&path).unwrap();
+        assert!(!load_settings(&path)
+            .terminal_devices
+            .contains("saved-device"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        install_settings(before);
+    }
+
+    #[test]
+    fn only_an_allowed_web_device_with_control_is_told_it_has_a_terminal() {
+        let _guard = TEST_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = settings();
+        let row = |id: &str, kind, permission| Device {
+            id: id.into(),
+            name: "Laptop".into(),
+            fingerprint: "f".into(),
+            push: None,
+            kind,
+            permission,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
+        };
+        let flags = PolicyFlags::default();
+        let has = |device: &Device| {
+            device_capabilities(&flags, device)
+                .iter()
+                .any(|name| name == "terminal")
+        };
+        set_terminal_allowed("cap-web", true);
+        set_terminal_allowed("cap-read", true);
+        set_terminal_allowed("cap-phone", true);
+        assert!(has(&row("cap-web", DeviceKind::Web, Permission::Control)));
+        assert!(!has(&row("cap-read", DeviceKind::Web, Permission::Read)));
+        assert!(!has(&row(
+            "cap-phone",
+            DeviceKind::Phone,
+            Permission::Control
+        )));
+        assert!(!has(&row("cap-off", DeviceKind::Web, Permission::Control)));
+        // The desktop's own list never carries it.
+        assert!(!capabilities(&flags).iter().any(|name| name == "terminal"));
+        install_settings(before);
     }
 }

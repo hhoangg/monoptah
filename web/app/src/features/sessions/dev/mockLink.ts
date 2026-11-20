@@ -12,7 +12,7 @@ export const DEVICE_ID = "22222222-2222-4222-8222-222222222222";
 
 export interface MockLinkOptions {
   permission?: "read" | "control";
-  /** Desktop capability names; default: every known one except `fileTransfer` (files open through paged `chat.mentionedFile`). */
+  /** Desktop capability names; default: every known one except `fileTransfer` (files open through paged `chat.mentionedFile`) and `terminal` (a shell is opt-in). */
   capabilities?: string[];
   /** Called with the desktop before it attaches, to seed extra data. */
   seed?: (desktop: MockDesktop) => void;
@@ -33,8 +33,8 @@ export function connectMockDesktop(options: MockLinkOptions = {}): MockLink {
     desktopId: DESKTOP_ID,
     name: "Example Desktop",
     version: "9.9.9",
-    // A desktop that predates `fileTransfer` unless a test asks for it: files open through paged `chat.mentionedFile`.
-    capabilities: options.capabilities ?? KNOWN_CAPABILITIES.filter((name) => name !== "fileTransfer"),
+    // A desktop that predates `fileTransfer` and has no terminal unless a test asks for them.
+    capabilities: options.capabilities ?? KNOWN_CAPABILITIES.filter((name) => name !== "fileTransfer" && name !== "terminal"),
   });
   resetFixtures(desktop.world);
   desktop.setDevice(fingerprint(deviceKey.publicKey), { status: "confirmed", permission: options.permission ?? "control" });

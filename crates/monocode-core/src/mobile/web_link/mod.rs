@@ -467,6 +467,8 @@ pub(crate) fn sync_with(host: &MobileHost, timing: relay::Timing) {
     let link = host.web_link().clone();
     if !host.web_enabled() || host.is_shut_down() {
         link.stop();
+        // No link, no shell: the browsers that held them are gone.
+        host.terminals().kill_all(super::terminal::Reason::Desktop);
         return;
     }
     if link.is_running() {
