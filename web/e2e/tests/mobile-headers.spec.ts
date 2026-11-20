@@ -168,10 +168,13 @@ test.describe("headers and bottom bars on an iPhone", () => {
     expect(Math.abs(gap)).toBeLessThanOrEqual(1);
   });
 
-  test("Mono chat on a desktop keeps its Mono actions menu", async () => {
-    await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto(`${base}${MONO}`);
-    await expect(page.getByRole("button", { name: "Mono actions" })).toHaveCount(1, { timeout: 60_000 });
+  test("Mono chat on tablet and desktop: the info link stays and there is no Mono actions button", async () => {
+    for (const viewport of [{ width: 768, height: 1024 }, { width: 1280, height: 800 }]) {
+      await page.setViewportSize(viewport);
+      await page.goto(`${base}${MONO}`);
+      await expect(page.getByRole("link", { name: "Mono profile" })).toBeVisible({ timeout: 60_000 });
+      await expect(page.getByRole("button", { name: "Mono actions" })).toHaveCount(0);
+    }
   });
 
   test("tablet and desktop: header fits, the project entry points stay", async () => {

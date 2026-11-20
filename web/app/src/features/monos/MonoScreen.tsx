@@ -19,8 +19,7 @@ import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useMentionPreview } from "@/features/filePreview/useMentionPreview";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
-import { WIDE_QUERY, useReadOnly } from "@/features/sessions/WorkspaceFrame";
-import { useMediaQuery } from "@/ui/useMediaQuery";
+import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { Transcript } from "@/features/transcript/Transcript";
 import type { TranscriptActions } from "@/features/transcript/context";
 import { useOlderTurns } from "@/features/transcript/useOlderTurns";
@@ -33,7 +32,6 @@ import { Notice } from "@/ui/Notice";
 import { useMonoAccentStyle } from "./monoAccent";
 import { MessageActions, type HeldMessage } from "./MessageActions";
 import { MonoMascot } from "./MonoMascot";
-import { MonoMenu } from "./MonoMenu";
 
 const EXCERPT = 140;
 const excerpt = (text: string) => (text.length > EXCERPT ? `${text.slice(0, EXCERPT - 1)}...` : text);
@@ -55,7 +53,6 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const catalog = useCatalog().data;
   const mono = catalog?.monos.find((candidate) => candidate.id === monoId);
   const monoTools = catalog?.monoTools === true;
-  const wide = useMediaQuery(WIDE_QUERY);
   const conversationId = monoConversationId(monoId);
   const conversation = useConversation(conversationId);
   const state = conversation.state;
@@ -152,18 +149,14 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             </Glass>
           ) : null}
           {monoTools ? (
-            <>
-              <Link
-                to="/d/$desktopId/monos/$monoId/profile"
-                params={{ desktopId, monoId }}
-                aria-label="Mono profile"
-                className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection pointer-fine:size-9"
-              >
-                <Icon name="info" size={18} />
-              </Link>
-              {/* The menu holds only "View details", which the info button already opens: on a phone it is a duplicate. */}
-              {wide ? <MonoMenu desktopId={desktopId} monoId={monoId} /> : null}
-            </>
+            <Link
+              to="/d/$desktopId/monos/$monoId/profile"
+              params={{ desktopId, monoId }}
+              aria-label="Mono profile"
+              className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection pointer-fine:size-9"
+            >
+              <Icon name="info" size={18} />
+            </Link>
           ) : (
             <Link
               to="/d/$desktopId/settings"
