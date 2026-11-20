@@ -54,7 +54,7 @@ fn row(line: &Value) -> Row {
         time: time_text(line["ts"].as_u64().unwrap_or(0)),
         device: text(line, "deviceId"),
         transport: text(line, "transport"),
-        what: if event == "call" && !method.is_empty() {
+        what: if (event == "call" || event == "appAction") && !method.is_empty() {
             method
         } else if event == "webPush" {
             format!(

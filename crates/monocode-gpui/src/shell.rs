@@ -69,6 +69,7 @@ pub(crate) mod remote_update;
 mod remote_update_tests;
 pub(crate) use project_removal::FilesOutcome;
 mod cloud_workspaces;
+mod mono_projects;
 mod mono_terminals;
 mod project_cloud;
 mod project_settings;
@@ -5179,7 +5180,7 @@ impl Shell {
                 if let Some(path) = paths.first() {
                     let path = path.to_string_lossy().into_owned();
                     let _ = this.update_in(cx, |this, window, cx| {
-                        this.workspace.add_project(&path);
+                        this.add_project_path(&path, None, cx);
                         this.select_project(path, window, cx);
                     });
                 }

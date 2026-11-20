@@ -6153,6 +6153,78 @@ fn a_habit_run_and_a_heartbeat_cannot_update_the_app(cx: &mut TestAppContext) {
     }
 }
 
+const PROJECTS_REFUSED: &str = "A habit run, heartbeat or workflow question cannot add projects";
+
+#[gpui::test]
+fn a_habit_run_and_a_heartbeat_cannot_add_projects(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let run = fake_run(&s, cx);
+    let heartbeat = fake_run(&s, cx);
+    cx.update(|cx| {
+        s.manager.update(cx, |m, _| {
+            m.running.get_mut(&heartbeat).unwrap().habit = mono::heartbeat::RUN_ID.into();
+        })
+    });
+    for session in [run, heartbeat] {
+        let refused = call_from(
+            &s,
+            session,
+            &format!("{session}-add"),
+            "projects.add",
+            json!({"path": std::env::temp_dir().to_str().unwrap()}),
+            cx,
+        )
+        .try_recv()
+        .unwrap();
+        assert_eq!(refused, Err(PROJECTS_REFUSED.into()));
+    }
+}
+
+#[gpui::test]
+#[cfg_attr(
+    windows,
+    ignore = "temp dir lives under AppData, which projects.add refuses"
+)]
+fn a_mono_adds_and_lists_a_project_and_a_second_add_is_idempotent(cx: &mut TestAppContext) {
+    let s = setup(cx);
+    let dir = std::env::temp_dir().join(format!("native-add-{}", mono::new_id()));
+    let project = dir.join("added-by-mono");
+    std::fs::create_dir_all(&project).unwrap();
+    let canonical = project
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let input = json!({"path": project.to_str().unwrap()});
+    let first = call(&s, "p1", "projects.add", input.clone(), cx);
+    cx.run_until_parked();
+    let first = first.try_recv().unwrap().unwrap();
+    assert_eq!(first["path"], json!(canonical));
+    assert_eq!(first["alreadyExisted"], json!(false));
+    let second = call(&s, "p2", "projects.add", input, cx);
+    cx.run_until_parked();
+    assert_eq!(
+        second.try_recv().unwrap().unwrap()["alreadyExisted"],
+        json!(true)
+    );
+    let listed = call(&s, "p3", "projects.list", json!({}), cx);
+    cx.run_until_parked();
+    let listed = listed.try_recv().unwrap().unwrap();
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["path"] == json!(canonical))
+            .count(),
+        1
+    );
+    let bad = call(&s, "p4", "projects.add", json!({"path": "relative"}), cx);
+    cx.run_until_parked();
+    assert!(bad.try_recv().unwrap().is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[gpui::test]
 fn imports_respect_the_habit_limit(cx: &mut TestAppContext) {
     let s = setup(cx);

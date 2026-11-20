@@ -506,6 +506,25 @@ impl Log {
         }));
     }
 
+    /// One line per app action a Mono took that changes what the user sees on this computer
+    /// (`projects.add`): the action, the Mono's name, the canonical path and the outcome.
+    /// No device is involved, so the device fields are null.
+    pub fn record_app_action(&self, method: &str, mono: &str, path: &str, outcome: &str) {
+        self.append(&json!({
+            "ts": now_ms(),
+            "deviceId": null,
+            "fingerprint": null,
+            "transport": "app",
+            "event": "appAction",
+            "method": capped(method, METHOD_CHARS),
+            "projectId": null,
+            "outcome": capped(outcome, DETAIL_CHARS),
+            "commandId": null,
+            "mono": capped(mono, METHOD_CHARS),
+            "path": capped(path, PATH_CHARS),
+        }));
+    }
+
     pub fn record_lifecycle(
         &self,
         kind: Lifecycle,
@@ -617,6 +636,13 @@ pub fn record_web_push(category: &str, target: &str, devices: usize, outcome: &s
     }
 }
 
+/// Records an app action a Mono took (`projects.add`). A no-op before [`init`].
+pub fn record_app_action(method: &str, mono: &str, path: &str, outcome: &str) {
+    if let Some(log) = global() {
+        log.record_app_action(method, mono, path, outcome);
+    }
+}
+
 /// Records a moment in a device's life. A no-op before [`init`].
 pub fn record_lifecycle(
     kind: Lifecycle,
@@ -710,6 +736,21 @@ mod tests {
         let mut all = read_recent(dir, 1000);
         all.reverse();
         all
+    }
+
+    #[test]
+    fn an_app_action_writes_the_mono_and_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        log.record_app_action("projects.add", "Ada", "/work/app", "ok");
+        let lines = lines(dir.path());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], "appAction");
+        assert_eq!(lines[0]["method"], "projects.add");
+        assert_eq!(lines[0]["mono"], "Ada");
+        assert_eq!(lines[0]["path"], "/work/app");
+        assert_eq!(lines[0]["outcome"], "ok");
+        assert!(lines[0]["deviceId"].is_null());
     }
 
     #[test]

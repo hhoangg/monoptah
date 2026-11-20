@@ -28,6 +28,7 @@ pub mod mobile;
 pub mod mono;
 pub mod notes;
 pub mod process;
+pub mod project_add;
 pub mod project_appearance;
 pub mod provider;
 pub mod provider_cleanup;
