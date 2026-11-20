@@ -313,7 +313,7 @@ fn the_next_launch_records_what_became_of_the_request(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn two_requests_in_flight_start_one_install_and_keep_the_first_record(cx: &mut TestAppContext) {
+fn two_requests_in_flight_start_one_install_and_keep_the_winners_record(cx: &mut TestAppContext) {
     let (window, _, _) = window(cx);
     let fake = Fake::new("0.1.0", Some("0.2.0"));
     use_backend(cx, &fake);
@@ -322,9 +322,15 @@ fn two_requests_in_flight_start_one_install_and_keep_the_first_record(cx: &mut T
     let refused = results.iter().find_map(|r| r.as_ref().err()).unwrap();
     assert_eq!(refused, "An update is already in progress");
     assert_eq!(fake.installs.lock().unwrap().len(), 1);
-    // The refused one did not touch the record of the one that runs.
+    // The feed checks run on the background executor, so either request may win. The
+    // refused one did not touch the record of the one that runs.
+    let winner = if results[0].is_ok() {
+        "first"
+    } else {
+        "second"
+    };
     let pending = stored(&window, cx).expect("the running request stays recorded");
-    assert_eq!(pending.chat.as_deref(), Some("first"));
+    assert_eq!(pending.chat.as_deref(), Some(winner));
     assert!(cx.update(|cx| cx.default_global::<State>().installing));
 }
 
