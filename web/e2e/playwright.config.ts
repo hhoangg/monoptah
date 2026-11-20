@@ -21,6 +21,6 @@ export default defineConfig({
     // Real WebKit with an iPhone profile (touch, 390 px, mobile UA) for what iOS Safari renders differently. The other
     // specs drive a Chromium-only virtual WebAuthn authenticator, so only specs that sign in without a browser
     // ceremony (an API session cookie) are listed here.
-    { name: "webkit-mobile", use: { ...devices["iPhone 14"] }, testMatch: /html-preview\.spec\.ts$/ },
+    { name: "webkit-mobile", use: { ...devices["iPhone 14"] }, testMatch: /(html-preview|push-deeplink)\.spec\.ts$/ },
   ],
 });

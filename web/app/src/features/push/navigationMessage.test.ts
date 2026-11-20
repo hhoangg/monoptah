@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { NAVIGATE_MESSAGE_TYPE } from "@/sw/pushHandlers";
-import { installNavigationListener, navigationTarget } from "./navigationMessage";
+import { installNavigationListener, navigationTap, navigationTarget } from "./navigationMessage";
 
 describe("navigationTarget", () => {
   it("accepts a navigate message with a safe URL", () => {
@@ -30,9 +30,17 @@ describe("installNavigationListener", () => {
     const stop = installNavigationListener(navigate, source);
     source.dispatchEvent(new MessageEvent("message", { data: { type: NAVIGATE_MESSAGE_TYPE, url: "/d/dk1/s/s9" } }));
     source.dispatchEvent(new MessageEvent("message", { data: { type: NAVIGATE_MESSAGE_TYPE, url: "/\\evil" } }));
-    expect(navigate).toHaveBeenCalledExactlyOnceWith("/d/dk1/s/s9");
+    expect(navigate).toHaveBeenCalledExactlyOnceWith("/d/dk1/s/s9", undefined);
     stop();
     source.dispatchEvent(new MessageEvent("message", { data: { type: NAVIGATE_MESSAGE_TYPE, url: "/d/dk1/s/s9" } }));
     expect(navigate).toHaveBeenCalledOnce();
+  });
+});
+
+describe("navigationTap", () => {
+  it("reads the tap id when present and ignores anything else", () => {
+    expect(navigationTap({ type: NAVIGATE_MESSAGE_TYPE, url: "/d/a/s/b", at: 42 })).toBe(42);
+    expect(navigationTap({ at: "42" })).toBeUndefined();
+    expect(navigationTap(null)).toBeUndefined();
   });
 });

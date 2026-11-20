@@ -18,6 +18,7 @@ import { PaneHeading } from "@/features/layout/tabs/PaneContext";
 import { ComposerRegion } from "@/features/sessions/ComposerRegion";
 import { useMentionPreview } from "@/features/filePreview/useMentionPreview";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
+import { useConfirmedMissing } from "@/features/sessions/useConfirmedMissing";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { Transcript } from "@/features/transcript/Transcript";
@@ -50,12 +51,14 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const readOnly = useReadOnly();
   const ready = useLinkReady();
   const guard = useSendGuard();
-  const catalog = useCatalog().data;
+  const catalogQuery = useCatalog();
+  const catalog = catalogQuery.data;
   const mono = catalog?.monos.find((candidate) => candidate.id === monoId);
   const monoTools = catalog?.monoTools === true;
   const conversationId = monoConversationId(monoId);
   const conversation = useConversation(conversationId);
   const state = conversation.state;
+  const missing = useConfirmedMissing(catalogQuery, catalog !== undefined, !mono) && (state?.turns.length ?? 0) === 0;
   const [initialText] = useState(() => readChatDraft(desktopId, conversationId));
   const rememberText = useCallback((text: string) => writeChatDraft(desktopId, conversationId, text), [desktopId, conversationId]);
   const older = useOlderTurns(conversationId, state?.turns ?? [], state?.older ?? false);
@@ -169,6 +172,14 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
           )}
         </div>
       </header>
+
+      {missing ? (
+        <div className="mx-auto w-full max-w-[768px] px-5">
+          <Notice variant="error">
+            This Mono is not available on this device. It may have been deleted, or this device has no access to it.
+          </Notice>
+        </div>
+      ) : null}
 
       {state?.error && state.turns.length === 0 ? (
         <div className="mx-auto w-full max-w-[768px] px-5">

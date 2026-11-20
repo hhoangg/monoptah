@@ -59,6 +59,11 @@ function mount(path: string, options: MockLinkOptions = {}) {
 }
 
 describe("session screen (W-07)", () => {
+  it("says so when the session is not in the catalog (deleted, or no access)", async () => {
+    mount("/s/sess-does-not-exist");
+    expect(await screen.findByText(/This session is not available on this device/)).toBeInTheDocument();
+  });
+
   it("shows the title, the conversation and the composer region with its slot host", async () => {
     registerSlot("composer-top", (props) => <div data-testid="composer-top-content">top of {String(props.sessionId)}</div>);
     registerSlot("session-header-chip", () => <span data-testid="chip">cloud chip</span>);

@@ -1,7 +1,7 @@
 // The three push listeners of the service worker (P-04), written against small structural types so they
 // run under the WebWorker lib (sw.ts) and under vitest with a fake scope.
 import { notificationFor, parsePushPayload, readPushData } from "./payload";
-import { clickTarget } from "./safeUrl";
+import { FALLBACK_URL, clickTarget } from "./safeUrl";
 
 /** Posted to a window that is already open; features/push/navigationMessage.ts routes it. */
 export const NAVIGATE_MESSAGE_TYPE = "monoptah:navigate";
@@ -19,6 +19,10 @@ export interface PushDeps {
   /** Windows of this origin, controlled or not. */
   listWindowClients(): Promise<readonly ClientLike[]>;
   openWindow(url: string): Promise<unknown>;
+  /** Leaves the target for a page that is not ready to hear a message (sw/pendingTarget.ts). Optional: omitted in older tests. */
+  savePending?(url: string, at: number): Promise<unknown>;
+  /** Milliseconds since the epoch. */
+  now?(): number;
   resubscribe(): Promise<unknown>;
 }
 
@@ -46,7 +50,7 @@ export function createPushHandlers(deps: PushDeps) {
       event.notification.close();
       const data: unknown = event.notification.data;
       const url = clickTarget(typeof data === "object" && data !== null ? (data as { url?: unknown }).url : undefined);
-      event.waitUntil(openOrFocus(deps, url));
+      event.waitUntil(handleClick(deps, url));
     },
 
     pushsubscriptionchange(event: SubscriptionChangeEventLike): void {
@@ -56,16 +60,32 @@ export function createPushHandlers(deps: PushDeps) {
   };
 }
 
-async function openOrFocus(deps: PushDeps, url: string): Promise<void> {
+async function handleClick(deps: PushDeps, url: string): Promise<void> {
+  // Saved first and always: on iOS standalone, `openWindow` may open the app at its start URL and a window may be
+  // suspended or still booting when the message arrives. The page takes the target once (features/push/register.ts).
+  // `at` identifies this tap: the saved target and the message carry it, so the page routes a tap once.
+  const at = (deps.now ?? Date.now)();
+  if (deps.savePending && url !== FALLBACK_URL) {
+    await Promise.resolve(deps.savePending(url, at)).catch(() => undefined);
+  }
+  await openOrFocus(deps, url, at);
+}
+
+async function openOrFocus(deps: PushDeps, url: string, at: number): Promise<void> {
   const windows = await deps.listWindowClients();
   const existing = windows.find((client) => sameOrigin(client.url, deps.origin));
   if (!existing) {
-    await deps.openWindow(url);
+    // iOS can refuse (reject) this in a standalone app: the saved target still opens on the next start.
+    await Promise.resolve(deps.openWindow(url)).catch(() => undefined);
     return;
   }
   // The page routes the URL itself: no reload, the link stays up and the session resyncs (F-83).
-  existing.postMessage({ type: NAVIGATE_MESSAGE_TYPE, url });
-  await existing.focus();
+  try {
+    existing.postMessage({ type: NAVIGATE_MESSAGE_TYPE, url, at });
+  } catch {
+    // The saved target covers it.
+  }
+  await Promise.resolve(existing.focus()).catch(() => undefined);
 }
 
 function sameOrigin(raw: string, origin: string): boolean {
