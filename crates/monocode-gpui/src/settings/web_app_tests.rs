@@ -674,6 +674,201 @@ fn the_dialog_closes_when_the_device_is_no_longer_waiting(cx: &mut TestAppContex
     assert!(events(&window, visual).is_empty());
 }
 
+/// A catalog long enough to outgrow any small window: `n` projects `p00..` and `n` Monos `m00..`.
+fn many(window: &WindowHandle<Preview>, visual: &mut VisualTestContext, n: usize) {
+    set_web(window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            pending: vec![waiting()],
+            ..paired()
+        });
+        let ids = |prefix: &str| -> Vec<(String, String)> {
+            (0..n)
+                .map(|ix| (format!("{prefix}{ix:02}"), format!("Name {prefix}{ix:02}")))
+                .collect()
+        };
+        ctx.web_projects = ids("p");
+        ctx.web_monos = ids("m");
+    });
+}
+
+fn resize(visual: &mut VisualTestContext, height: f32) {
+    visual.simulate_resize(size(px(1200.), px(height)));
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    visual.run_until_parked();
+}
+
+fn bounds_of(visual: &mut VisualTestContext, selector: &'static str) -> Bounds<gpui::Pixels> {
+    visual
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} is not drawn"))
+}
+
+fn wheel(visual: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, dy: f32) {
+    visual.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(dy))),
+        modifiers: Default::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    visual.run_until_parked();
+}
+
+fn inside(window_height: f32, inner: Bounds<gpui::Pixels>) -> bool {
+    inner.top() >= px(0.) && inner.bottom() <= px(window_height) && inner.left() >= px(0.)
+}
+
+#[gpui::test]
+fn a_long_catalog_keeps_the_dialog_inside_a_small_window_and_scrolls_the_lists(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    many(&window, visual, 14);
+    // Open it while the page is tall enough to reach the row, then shrink the window.
+    click(visual, "web-confirm-0123456789abcdef");
+    resize(visual, 600.);
+
+    // The whole card fits, so nothing is clipped at either end.
+    let card = bounds_of(visual, "web-confirm-dialog");
+    assert!(inside(600., card), "{card:?}");
+    // The top (title block and both fingerprints) and the bottom (permission and the two buttons)
+    // are all on screen.
+    for selector in [
+        "web-confirm-name",
+        "web-confirm-device-fp",
+        "web-confirm-desktop-fp",
+        "settings-web-confirm-permission-read",
+        "settings-web-confirm-permission-control",
+        "web-confirm-deny",
+        "web-confirm-ok",
+    ] {
+        let bounds = bounds_of(visual, selector);
+        assert!(inside(600., bounds), "{selector} {bounds:?}");
+        assert!(
+            bounds.top() >= card.top() && bounds.bottom() <= card.bottom(),
+            "{selector} {bounds:?} outside {card:?}"
+        );
+    }
+    // The lists are longer than the room they have: the last Mono is cut off until scrolled to.
+    let first_mono = bounds_of(visual, "web-confirm-mono-m00");
+    let ok = bounds_of(visual, "web-confirm-ok");
+    let permission = bounds_of(visual, "settings-web-confirm-permission-read");
+    let last_mono = bounds_of(visual, "web-confirm-mono-m13");
+    assert!(last_mono.bottom() > permission.top(), "the lists overflow");
+    assert!(first_mono.top() > bounds_of(visual, "web-confirm-desktop-fp").bottom());
+
+    // The wheel over the lists moves the Monos and leaves the header and the footer alone.
+    let (name, device_fp) = (
+        bounds_of(visual, "web-confirm-name"),
+        bounds_of(visual, "web-confirm-device-fp"),
+    );
+    let over_lists = bounds_of(visual, "web-confirm-project-p00").center();
+    wheel(visual, over_lists, -120.);
+    let moved = bounds_of(visual, "web-confirm-mono-m00");
+    assert!(
+        f32::from(first_mono.top() - moved.top()) >= 119.,
+        "{first_mono:?} then {moved:?}"
+    );
+    assert_eq!(bounds_of(visual, "web-confirm-name"), name);
+    assert_eq!(bounds_of(visual, "web-confirm-device-fp"), device_fp);
+    assert_eq!(bounds_of(visual, "web-confirm-ok"), ok);
+    assert_eq!(bounds_of(visual, "web-confirm-dialog"), card);
+
+    // At the end of the lists the last Mono sits fully above the pinned permission.
+    wheel(visual, over_lists, -10_000.);
+    let last_mono = bounds_of(visual, "web-confirm-mono-m13");
+    assert!(
+        last_mono.bottom() <= permission.top() && last_mono.top() >= name.bottom(),
+        "{last_mono:?} vs {permission:?}"
+    );
+    // A row scrolled into view can be ticked, and Confirm sends the same selection as ever.
+    click(visual, "web-confirm-mono-m13");
+    click(visual, "web-confirm-ok");
+    assert_eq!(
+        events(&window, visual),
+        [format!("confirm:{FP}:Read:None:Some([\"m13\"])")]
+    );
+}
+
+#[gpui::test]
+fn the_dialog_fits_down_to_a_very_small_window_with_the_buttons_reachable(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    many(&window, visual, 40);
+    click(visual, "web-confirm-0123456789abcdef");
+    for height in [800., 620., 560.] {
+        resize(visual, height);
+        let card = bounds_of(visual, "web-confirm-dialog");
+        assert!(inside(height, card), "{height}: {card:?}");
+        for selector in ["web-confirm-deny", "web-confirm-ok"] {
+            let bounds = bounds_of(visual, selector);
+            assert!(inside(height, bounds), "{height}: {selector} {bounds:?}");
+        }
+    }
+    click(visual, "web-confirm-deny");
+    assert_eq!(events(&window, visual), [format!("deny:{FP}")]);
+}
+
+#[gpui::test]
+fn a_short_catalog_keeps_the_dialog_as_tall_as_its_content_and_centred(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    with_pending(&window, visual);
+    click(visual, "web-confirm-0123456789abcdef");
+    resize(visual, 900.);
+    let card = bounds_of(visual, "web-confirm-dialog");
+    assert!(inside(900., card), "{card:?}");
+    // Not stretched: far shorter than the window, centred in it, rows in their natural place.
+    assert!(card.size.height < px(600.), "{card:?}");
+    let gap = (card.top() - (px(900.) - card.bottom())).abs();
+    assert!(gap < px(1.), "centred: {card:?}");
+    let p1 = bounds_of(visual, "web-confirm-project-p1");
+    let p2 = bounds_of(visual, "web-confirm-project-p2");
+    let mono = bounds_of(visual, "web-confirm-mono-m1");
+    // Rows keep their 6px rhythm and the permission follows the last list.
+    assert!(p2.top() > p1.top() && mono.top() > p2.bottom());
+    assert!(
+        bounds_of(visual, "settings-web-confirm-permission-read").top() > mono.bottom(),
+        "the permission follows the lists"
+    );
+    // Wheeling a list that fits moves nothing.
+    wheel(visual, p1.center(), -100.);
+    assert_eq!(bounds_of(visual, "web-confirm-project-p1"), p1);
+    assert_eq!(bounds_of(visual, "web-confirm-dialog"), card);
+}
+
+#[gpui::test]
+fn the_pairing_and_verify_dialogs_keep_their_buttons_on_screen_in_a_small_window(
+    cx: &mut TestAppContext,
+) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| ctx.web = Some(paired()));
+    click(visual, "web-verify");
+    resize(visual, 520.);
+    let card = bounds_of(visual, "web-verify-dialog");
+    assert!(inside(520., card), "{card:?}");
+    let close = bounds_of(visual, "web-verify-close");
+    assert!(inside(520., close), "{close:?}");
+    click(visual, "web-verify-close");
+    assert!(visual.debug_bounds("web-verify-dialog").is_none());
+
+    set_web(&window, visual, |ctx| ctx.web_pairing = Some(ticket()));
+    let card = bounds_of(visual, "web-pair-dialog");
+    assert!(inside(520., card), "{card:?}");
+    let cancel = bounds_of(visual, "web-pair-cancel");
+    assert!(inside(520., cancel), "{cancel:?}");
+    click(visual, "web-pair-cancel");
+    assert_eq!(events(&window, visual), ["cancel-pair"]);
+}
+
 #[test]
 fn selection_is_none_for_all_projects_and_some_for_a_narrowed_list() {
     let projects = choices(&["p1", "p2"]);
