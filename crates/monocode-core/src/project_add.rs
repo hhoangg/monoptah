@@ -290,7 +290,7 @@ mod tests {
         let h = home();
         let project = h.path().join("work").join("app");
         std::fs::create_dir_all(&project).unwrap();
-        let expected = project.canonicalize().unwrap();
+        let expected = plain(project.canonicalize().unwrap());
         assert_eq!(
             resolve(project.to_str().unwrap(), Some(h.path())).unwrap(),
             expected
@@ -309,7 +309,7 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(
             resolve(link.to_str().unwrap(), Some(h.path())).unwrap(),
-            real.canonicalize().unwrap()
+            plain(real.canonicalize().unwrap())
         );
     }
 
