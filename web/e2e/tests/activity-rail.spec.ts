@@ -89,13 +89,26 @@ test.describe("activity rail", () => {
     await expect(pendingScreen).toHaveCount(0, { timeout: 30_000 });
   }
 
+  /**
+   * Moves inside the loaded SPA (history push plus the popstate the router listens to) instead of `page.goto`. The relay
+   * rate limits requests per address, and every full page load makes several API calls (the rail adds one grant read per
+   * desktop), so a spec with a load per test ran into "Too many requests" on a slow CI runner. The setup test does the
+   * only full loads.
+   */
+  async function navigate(path: string): Promise<void> {
+    await page.evaluate((to) => {
+      window.history.pushState({}, "", to);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    }, path);
+  }
+
   async function open(desktop: string, layout: (typeof LAYOUTS)[number]): Promise<void> {
     if (!watching) {
       watching = true;
       page.on("pageerror", (err) => console.log("PAGEERROR", err.message, err.stack?.slice(0, 800)));
     }
     await page.setViewportSize({ width: layout.width, height: layout.height });
-    await page.goto(`/d/${ids[desktop]}`);
+    await navigate(`/d/${ids[desktop]}`);
     await expect(page.getByTestId("app-shell")).toBeVisible({ timeout: 30_000 });
   }
 
@@ -114,7 +127,7 @@ test.describe("activity rail", () => {
   test("screenshots", async () => {
     test.skip(!shotDir, "set RAIL_SCREENSHOTS to save screenshots");
     mkdirSync(shotDir!, { recursive: true });
-    // One page load, then resizes: the relay rate limits page loads per address, and the later tests load pages too.
+    // Resizes the loaded page: the rail follows the media query.
     await open(ALPHA, LAYOUTS[0]);
     for (const layout of LAYOUTS) {
       await page.setViewportSize({ width: layout.width, height: layout.height });
