@@ -31,7 +31,7 @@ pub fn is_format_char(c: char) -> bool {
 pub fn validate(action: &str, input: &Value) -> Result<(), String> {
     let cloud_fields;
     let fields=match action{
-        "models.list"|"soul.read"|"habits.list"=>"",
+        "models.list"|"soul.read"|"habits.list"|"projects.list"=>"",
         "accounts.list"=>"provider",
         "sessions.list"|"folders.list"|"worktrees.list"=>"project",
         "sessions.read"=>"sessionId project before limit maxChars",
@@ -51,6 +51,7 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
         "sessions.delete"=>"sessionId project providerFiles removeWorktree cloud",
         "worktrees.create"=>"branch base existing project",
         "app.update"=>"mode force confirm",
+        "projects.add"=>"path name",
         "terminals.list"=>"project",
         "terminals.open"=>"label action command cwd place beside direction reveal project",
         "terminals.send"=>"id text key project",
@@ -334,6 +335,17 @@ pub fn validate(action: &str, input: &Value) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn projects_actions_take_only_their_fields_and_text() {
+        assert!(validate("projects.add", &json!({"path":"/work/app","name":"App"})).is_ok());
+        assert!(validate("projects.list", &json!({})).is_ok());
+        assert!(validate("projects.list", &json!({"path":"/x"})).is_err());
+        assert!(validate("projects.add", &json!({"path":"/work/app","extra":"x"})).is_err());
+        assert_eq!(
+            validate("projects.add", &json!({"path":5})).unwrap_err(),
+            "path must be text"
+        );
+    }
     #[test]
     fn invisible_characters_are_told_from_visible_ones() {
         for c in [

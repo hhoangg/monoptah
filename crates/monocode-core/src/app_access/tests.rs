@@ -2,6 +2,14 @@ use super::*;
 use crate::{follow_up::State, notes::NoteUpsert};
 use std::path::Path;
 
+#[test]
+fn an_operator_thread_cannot_add_projects() {
+    for action in ["projects.add", "projects.list"] {
+        let error = validate_operator(action, &json!({"path":"/work/app"})).unwrap_err();
+        assert!(error.starts_with("Unknown Operator action"), "{error}");
+    }
+}
+
 fn model() -> Model {
     Model {
         id: "test-model".into(),

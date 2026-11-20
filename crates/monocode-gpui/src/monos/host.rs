@@ -419,6 +419,10 @@ impl Monos {
         if call.action == "app.update" && (habit_run || question || heartbeat) {
             return Err("A habit run, heartbeat or workflow question cannot update the app".into());
         }
+        // Adding a project changes what the user sees and works in: only the Mono's own chat.
+        if call.action == "projects.add" && (habit_run || question || heartbeat) {
+            return Err("A habit run, heartbeat or workflow question cannot add projects".into());
+        }
         // A workflow must not start workflows through its own question to the Mono.
         if call.action.starts_with("workflows.") && question {
             return Err("A workflow's question to its Mono cannot use workflows".into());
@@ -478,6 +482,7 @@ impl Monos {
                 | "today.tags"
                 | "terminals.list"
                 | "terminals.read"
+                | "projects.list"
         ) {
             let _ = call.reply.send(result);
             return;
@@ -1585,6 +1590,26 @@ if let Some(enabled)=input.get("enabled").and_then(Value::as_bool){h.set_enabled
                             let _ = this.update(cx, |this, cx| begin.abandon(&this.store, cx));
                         }
                     }
+                })
+                .detach();
+                return;
+            }
+            projects if projects.starts_with("projects.") => {
+                // Run after this update: the shell may read the Monos entity being updated now.
+                let owner = self.owner.clone();
+                let handle = window.window_handle();
+                let name = mono.label();
+                cx.spawn(async move |this, cx| {
+                    let result = handle
+                        .update(cx, |_, _, cx| {
+                            owner.update(cx, |owner, cx| {
+                                owner.mono_projects_call(&name, &action, &input, cx)
+                            })
+                        })
+                        .map_err(|_| "The app window is gone".to_owned())
+                        .and_then(|result| result.map_err(|_| "The app window is gone".to_owned()))
+                        .and_then(|result| result);
+                    let _ = this.update(cx, |this, cx| this.finish_call(call, result, cx));
                 })
                 .detach();
                 return;

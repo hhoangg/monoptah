@@ -412,6 +412,8 @@ pub fn app_activity(action: &str, running: bool) -> (&'static str, &'static str)
         "soul.read" => ("Checking", "Checked", "instructions"),
         "models.list" => ("Checking", "Checked", "models"),
         "app.update" => ("Updating", "Updated", "the app"),
+        "projects.add" => ("Adding", "Added", "a project"),
+        "projects.list" => ("Reading", "Read", "projects"),
         "chat.card" => ("Preparing", "Prepared", "a card"),
         "terminals.open" => ("Opening", "Opened", "a terminal"),
         "terminals.send" => ("Typing in", "Typed in", "a terminal"),
