@@ -194,6 +194,24 @@ describe("handshake and state", () => {
   });
 });
 
+describe("presence", () => {
+  it("reaches the desktop, is cleared with null and does not disturb requests", async () => {
+    const r = await connected();
+    expect(r.s.sendPresence({ kind: "mono", id: "m1" })).toBe(true);
+    await r.relay.settled();
+    expect(r.desktop.sessions[0]?.presence).toEqual({ kind: "mono", id: "m1" });
+    r.s.sendPresence(null);
+    await r.relay.settled();
+    expect(r.desktop.sessions[0]?.presence).toBeNull();
+    expect((await r.s.request("workspace.list")).projects).toHaveLength(2);
+  });
+
+  it("is not sent before the device is confirmed", async () => {
+    const r = await connected({ device: "pending" });
+    expect(r.s.sendPresence({ kind: "session", id: "s1" })).toBe(false);
+  });
+});
+
 describe("requests", () => {
   it("surfaces a desktop error code as LinkRequestError", async () => {
     const r = await connected({ permission: "read" });

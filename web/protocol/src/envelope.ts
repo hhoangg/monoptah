@@ -27,7 +27,24 @@ export type EnvelopeRequest = z.infer<typeof EnvelopeRequestSchema>;
 export const CancelSchema = z.object({ rid: RidSchema, cancel: z.literal(true) });
 export type Cancel = z.infer<typeof CancelSchema>;
 
-export const DeviceMessageSchema = z.union([EnvelopeRequestSchema, CancelSchema]);
+/** What a visible, focused page shows: a session transcript or a Mono chat. */
+export const PresenceTargetSchema = z.object({ kind: z.enum(["session", "mono"]), id: z.string().min(1).max(256) });
+export type PresenceTarget = z.infer<typeof PresenceTargetSchema>;
+
+/**
+ * `{t: "presence", version, target}`: sent on route, visibility and focus changes and every 25 s while visible and
+ * focused. `target: null` means the page is hidden, unfocused or off a chat. It has no `rid` and no answer, so a
+ * desktop that does not know it drops it. The desktop keeps it in memory per session and treats it as stale after
+ * 50 s; it only decides whether a web push is sent for that target (never persisted, never sent to the Worker).
+ */
+export const PresenceMessageSchema = z.object({
+  t: z.literal("presence"),
+  version: z.literal(ENVELOPE_VERSION),
+  target: PresenceTargetSchema.nullable(),
+});
+export type PresenceMessage = z.infer<typeof PresenceMessageSchema>;
+
+export const DeviceMessageSchema = z.union([EnvelopeRequestSchema, CancelSchema, PresenceMessageSchema]);
 export type DeviceMessage = z.infer<typeof DeviceMessageSchema>;
 
 // --- Desktop -> device ---

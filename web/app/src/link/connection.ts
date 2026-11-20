@@ -18,6 +18,7 @@ import {
   type CloseAction,
   type MethodName,
   type ParamsOf,
+  type PresenceTarget,
   type ResultOf,
   type StateMessage,
   type WatchFrame,
@@ -279,6 +280,18 @@ export class LinkConnection {
       return Promise.reject(new LinkRequestError("The desktop link is not ready", "not_ready"));
     }
     return session.request(method, params as Record<string, unknown>, options);
+  }
+
+  /** Tells the desktop what this page shows (or null). Dropped unless `ready`: the desktop forgets it on every reconnect. */
+  sendPresence(target: PresenceTarget | null): boolean {
+    const session = this.#session;
+    if (!session || this.status !== "ready" || !session.ready) return false;
+    try {
+      return session.sendPresence(target);
+    } catch {
+      // A report is best effort: a socket that is closing must not break the screen that sent it.
+      return false;
+    }
   }
 
   /** Registers a watch: opened now when `ready`, and reopened after every reconnect. */

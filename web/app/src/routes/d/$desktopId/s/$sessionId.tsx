@@ -2,6 +2,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import "@/features/sessions/register";
 import { SessionScreen } from "@/features/sessions/SessionScreen";
+import { PresenceReporter } from "@/link/PresenceReporter";
 
 export const Route = createFileRoute("/d/$desktopId/s/$sessionId")({
   component: Page,
@@ -10,5 +11,10 @@ export const Route = createFileRoute("/d/$desktopId/s/$sessionId")({
 function Page() {
   const { desktopId, sessionId } = Route.useParams();
   // Keyed by the session: a new session starts with its own pages and scroll state.
-  return <SessionScreen key={sessionId} desktopId={desktopId} sessionId={sessionId} />;
+  return (
+    <>
+      <PresenceReporter kind="session" id={sessionId} />
+      <SessionScreen key={sessionId} desktopId={desktopId} sessionId={sessionId} />
+    </>
+  );
 }

@@ -9,6 +9,7 @@ pub mod grants;
 mod live_tests;
 pub mod noise;
 mod pacer;
+pub mod presence;
 pub mod relay;
 pub mod session;
 #[cfg(test)]
@@ -188,6 +189,8 @@ struct Shared {
     /// was asked: they stay hidden until the server asks for something else.
     hidden: Mutex<HashMap<String, Permission>>,
     sync: grants::SyncGate,
+    /// What each connected web tab shows (memory only).
+    presence: Mutex<presence::PresenceTable>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -265,6 +268,7 @@ impl WebLink {
         *lock(&self.shared.facts) = None;
         *lock(&self.shared.pairing) = None;
         lock(&self.shared.live).clear();
+        lock(&self.shared.presence).clear();
         lock(&self.shared.requests).clear();
         lock(&self.shared.access_changes).clear();
         lock(&self.shared.hidden).clear();
@@ -310,10 +314,27 @@ impl WebLink {
 
     pub(crate) fn live_remove(&self, key: &SessionKey) {
         lock(&self.shared.live).remove(key);
+        lock(&self.shared.presence).remove(key);
+    }
+
+    /// Records what a tab reports it is looking at (`None`: nothing).
+    pub(crate) fn presence_set(
+        &self,
+        key: SessionKey,
+        device_id: &str,
+        target: Option<presence::Target>,
+    ) {
+        lock(&self.shared.presence).set(key, device_id, target, presence::clock_ms());
+    }
+
+    /// Whether a tab of the web device `device_id` shows `target` right now.
+    pub(crate) fn presence_is_viewing(&self, device_id: &str, target: &presence::Target) -> bool {
+        lock(&self.shared.presence).is_viewing(device_id, target, presence::clock_ms())
     }
 
     pub(crate) fn live_clear(&self) {
         lock(&self.shared.live).clear();
+        lock(&self.shared.presence).clear();
     }
 
     /// A fresh command channel for a running relay loop; the earlier one, if

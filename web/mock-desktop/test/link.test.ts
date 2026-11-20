@@ -228,3 +228,30 @@ describe("errors", () => {
     await expect(s.client.call("conversation.read", { conversationId: "nope" })).rejects.toBeInstanceOf(ClientError);
   });
 });
+
+describe("presence", () => {
+  it("keeps the last report per session, clears it on null and never answers", async () => {
+    const s = await setup();
+    expect(s.desktop.sessions[0]?.presence).toBeNull();
+    s.client.sendPresence({ kind: "session", id: "sess-1" });
+    await s.relay.settled();
+    expect(s.desktop.sessions[0]?.presence).toEqual({ kind: "session", id: "sess-1" });
+    s.client.sendPresence({ kind: "mono", id: "mono-1" });
+    await s.relay.settled();
+    expect(s.desktop.sessions[0]?.presence).toEqual({ kind: "mono", id: "mono-1" });
+    s.client.sendPresence(null);
+    await s.relay.settled();
+    expect(s.desktop.sessions[0]?.presence).toBeNull();
+    // The session still serves requests: a presence report did not disturb the rid space.
+    expect((await s.client.call("workspace.list")).projects).toHaveLength(2);
+  });
+
+  it("the report ends with the session", async () => {
+    const s = await setup();
+    s.client.sendPresence({ kind: "session", id: "sess-1" });
+    await s.relay.settled();
+    s.client.bye();
+    await s.relay.settled();
+    expect(s.desktop.sessions).toHaveLength(0);
+  });
+});
