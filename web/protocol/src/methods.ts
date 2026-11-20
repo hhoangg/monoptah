@@ -585,6 +585,46 @@ export const METHODS = {
       project: z.looseObject({ projectId: z.string(), path: z.string() }).optional(),
     }),
   }),
+  /**
+   * Opens a file through an end-to-end encrypted object in R2 (capability `fileTransfer`). The desktop decides (a Control
+   * device may open any readable file, a read-only device only files of its shared projects, the deny-list for both),
+   * hashes the content, stores it sealed (AES-256-GCM in `chunkBytes` chunks, see web/docs/security.md "File transfers")
+   * when the server does not hold it yet, and answers with the object name and the key. The device downloads
+   * `GET /api/transfers/:desktopId/:object?device=ID` and decrypts in the browser. `asset` asks for an image an html or
+   * markdown file lists in `assets`; an html file is answered as its sanitized document, as for `chat.mentionedFile`.
+   * `conversationId` is only needed for a relative `path`.
+   */
+  "file.prepare": method({
+    class: "read",
+    transport: "app",
+    params: z.object({
+      conversationId: ConversationId.optional(),
+      path: z.string().min(1).max(1024),
+      asset: z.string().min(1).max(1024).optional(),
+      /** Answer an html or markdown file as its raw text (kind "text"), for a jump to a line. */
+      source: z.boolean().optional(),
+    }),
+    result: z.looseObject({
+      path: z.string(),
+      name: z.string(),
+      kind: z.enum(["text", "markdown", "html", "image", "binary"]),
+      mime: z.string(),
+      /** Bytes of the plaintext (of the sanitized document for html). */
+      size: z.number().int().min(0),
+      /** Lowercase hex SHA-256 of the plaintext. */
+      hash: z.string().regex(/^[0-9a-f]{64}$/),
+      /** `<hash>.<keyId>`: the name of the object under this desktop. */
+      object: z.string().regex(/^[0-9a-f]{64}\.[0-9a-f]{16}$/),
+      /** Base64 of the 32 byte AES key and of the 8 byte nonce prefix. */
+      key: z.string().length(44),
+      nonce: z.string().length(12),
+      chunkBytes: z.number().int().positive(),
+      /** The server already held the object: nothing was uploaded for this call. */
+      reused: z.boolean(),
+      assets: z.array(z.string()).optional(),
+      project: z.looseObject({ projectId: z.string(), path: z.string() }).optional(),
+    }),
+  }),
   "project.search": method({
     class: "read",
     transport: "app",

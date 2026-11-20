@@ -51,6 +51,7 @@ pub(super) const APP_METHODS: &[&str] = &[
     "project.search",
     "project.fileHighlight",
     "chat.mentionedFile",
+    "file.prepare",
     "project.git",
     "project.gitAction",
     "session.start",
@@ -90,6 +91,52 @@ pub(super) const APP_METHODS: &[&str] = &[
 ];
 /// Under the phone's own wait, so it hears why rather than timing out.
 const REPLY_WAIT: Duration = Duration::from_secs(25);
+/// `file.prepare` hashes the file and uploads it before it answers (the upload alone may take 4 minutes), so it waits longer.
+const LONG_REPLY_WAIT: Duration = Duration::from_secs(5 * 60 + 30);
+/// `file.prepare` calls one device may have in flight, and all devices together. They are outside [`MAX_PENDING`]: a
+/// call that waits minutes for an upload must not take the slots every other method of every device needs.
+const MAX_PREPARES_PER_DEVICE: usize = 3;
+const MAX_PREPARES_TOTAL: usize = 6;
+
+static PREPARES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One in-flight `file.prepare` of a device; released on drop.
+pub(crate) struct PrepareSlot(String);
+
+impl PrepareSlot {
+    /// A slot, or `None` when the device (or the desktop) already has the most it may.
+    pub(crate) fn take(device: &str) -> Option<Self> {
+        let mut flying = PREPARES.lock().unwrap_or_else(|e| e.into_inner());
+        let total: usize = flying.values().sum();
+        let mine = flying.get(device).copied().unwrap_or(0);
+        if mine >= MAX_PREPARES_PER_DEVICE || total >= MAX_PREPARES_TOTAL {
+            return None;
+        }
+        *flying.entry(device.to_owned()).or_default() += 1;
+        Some(Self(device.to_owned()))
+    }
+}
+
+impl Drop for PrepareSlot {
+    fn drop(&mut self) {
+        let mut flying = PREPARES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = flying.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                flying.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn reply_wait(method: &str) -> Duration {
+    if method == "file.prepare" {
+        LONG_REPLY_WAIT
+    } else {
+        REPLY_WAIT
+    }
+}
 const MAX_PENDING: usize = 16;
 const MAX_WATCHES_PER_DEVICE: usize = 4;
 
@@ -1180,7 +1227,14 @@ impl MobileHost {
             .as_str()
             .filter(|id| !id.is_empty() && id.len() <= 128)
             .ok_or("Missing command ID")?;
-        if self.pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
+        // A `file.prepare` has its own small allowance; every other method shares `MAX_PENDING`.
+        let prepare_slot = if method == "file.prepare" {
+            Some(PrepareSlot::take(&device.id).ok_or_else(busy)?)
+        } else {
+            None
+        };
+        let counted = prepare_slot.is_none();
+        if counted && self.pending.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             return Err(busy());
         }
@@ -1196,14 +1250,17 @@ impl MobileHost {
             }))
             .is_ok();
         let response = if sent {
-            tokio::time::timeout(REPLY_WAIT, receive)
+            tokio::time::timeout(reply_wait(method), receive)
                 .await
                 .map_err(|_| Failure::from("Desktop did not answer"))
                 .and_then(|reply| reply.map_err(|_| Failure::from("Desktop is unavailable")))
         } else {
             Err(Failure::from("Desktop is unavailable"))
         };
-        self.pending.fetch_sub(1, Ordering::SeqCst);
+        if counted {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        drop(prepare_slot);
         // The app wrote its own audit line for the calls it audits, and only a reply proves it
         // got this one: a request that was never delivered, or whose reply channel was dropped,
         // leaves the host's line as the only record.
@@ -3997,6 +4054,34 @@ mod tests {
             "Desktop is busy; try again"
         );
         host.pending.store(0, Ordering::SeqCst);
+
+        // `file.prepare` has its own allowance: a device with all of it in flight gets busy for one more, while the
+        // shared slots stay free and every other method of every device still answers.
+        let held: Vec<PrepareSlot> = (0..MAX_PREPARES_PER_DEVICE)
+            .map(|_| PrepareSlot::take("wc").unwrap())
+            .collect();
+        assert!(PrepareSlot::take("wc").is_none());
+        let failure = host
+            .handle_web(
+                "web-control",
+                call("file.prepare", json!({"path": "/tmp/a.txt"})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("busy"));
+        assert_eq!(host.pending.load(Ordering::SeqCst), 0);
+        assert!(host
+            .handle_web("web-control", call("sessions.list", json!({})))
+            .await
+            .is_ok());
+        // Together the desktop admits a few more, then no device gets one; a released slot frees its place.
+        let others: Vec<PrepareSlot> = (0..MAX_PREPARES_TOTAL - MAX_PREPARES_PER_DEVICE)
+            .map(|i| PrepareSlot::take(&format!("other-{i}")).unwrap())
+            .collect();
+        assert!(PrepareSlot::take("one-more").is_none());
+        drop(others);
+        drop(held);
+        assert!(PrepareSlot::take("wc").is_some());
 
         // The per-device watch cap: busy on web, plain text on QUIC. The
         // receivers stay alive, or the host drops the watches as closed.

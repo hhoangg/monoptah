@@ -2,6 +2,7 @@
 // connection of its desktop pre-created exactly like `data/integration.test.tsx` `setup()`. Never imported
 // by app code, so it never reaches the production bundle (only `preview.html` and tests use it).
 import { InMemoryRelay, MockDesktop, fingerprint, generateKeyPair } from "@monoptah/mock-desktop";
+import { KNOWN_CAPABILITIES } from "@monoptah/protocol";
 import { getLinkConnection } from "@/link";
 import { RelayConnection } from "@/link/relay.ts";
 import { base64UrlEncode } from "@/link/base64url.ts";
@@ -11,7 +12,7 @@ export const DEVICE_ID = "22222222-2222-4222-8222-222222222222";
 
 export interface MockLinkOptions {
   permission?: "read" | "control";
-  /** Desktop capability names; default: every known one. */
+  /** Desktop capability names; default: every known one except `fileTransfer` (files open through paged `chat.mentionedFile`). */
   capabilities?: string[];
   /** Called with the desktop before it attaches, to seed extra data. */
   seed?: (desktop: MockDesktop) => void;
@@ -32,7 +33,8 @@ export function connectMockDesktop(options: MockLinkOptions = {}): MockLink {
     desktopId: DESKTOP_ID,
     name: "Example Desktop",
     version: "9.9.9",
-    ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+    // A desktop that predates `fileTransfer` unless a test asks for it: files open through paged `chat.mentionedFile`.
+    capabilities: options.capabilities ?? KNOWN_CAPABILITIES.filter((name) => name !== "fileTransfer"),
   });
   resetFixtures(desktop.world);
   desktop.setDevice(fingerprint(deviceKey.publicKey), { status: "confirmed", permission: options.permission ?? "control" });

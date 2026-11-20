@@ -29,6 +29,7 @@ import {
 } from "@monoptah/protocol";
 import { HandshakeState, NoiseError, fingerprint, generateKeyPair, prologue, type KeyPair } from "./noise.ts";
 import { SecureChannel } from "./secure-channel.ts";
+import { MockTransfers } from "./transfer.ts";
 import { FIXTURE_HANDLERS, FixtureError, MockWorld, type HandlerContext, type MockDevice, type WatchCursor } from "./fixtures.ts";
 import type { FrameSocket } from "./transport.ts";
 
@@ -116,6 +117,7 @@ function requiredCapability(method: MethodName): string | undefined {
   if (method.startsWith("cloud.")) return "cloud";
   if (method === "session.answerApproval") return "approvals";
   if (method === "chat.mentionedFile") return "mentionedFiles";
+  if (method === "file.prepare") return "fileTransfer";
   return undefined;
 }
 
@@ -126,6 +128,8 @@ export class MockDesktop {
   readonly staticKey: KeyPair;
   readonly fingerprint: string;
   readonly world: MockWorld;
+  /** The desktop's encrypted file transfers (`file.prepare`); set `transfers.backend` to a server to enable uploads. */
+  readonly transfers = new MockTransfers();
   /** Known devices by fingerprint. */
   readonly devices = new Map<string, MockDevice>();
   flags: ClassifyFlags;
@@ -482,15 +486,30 @@ export class MockDesktop {
     }
     if (request.watch === true) return this.#error(session, rid, "Only conversation.watch can be watched");
 
-    const ctx: HandlerContext = { world: this.world, device: session.device };
+    const ctx: HandlerContext = { world: this.world, device: session.device, transfers: this.transfers };
+    const fail = (error: unknown): void => {
+      if (error instanceof FixtureError) return this.#error(session, rid, error.message, error.code);
+      throw error;
+    };
     try {
       const handler = FIXTURE_HANDLERS[name] as (p: unknown, c: HandlerContext) => unknown;
       const result = handler(checked.data, ctx);
+      if (result instanceof Promise) {
+        // An upload to the server: the answer comes when it is done. The session may have ended meanwhile.
+        void result.then(
+          (value) => {
+            if (this.#sessions.get(session.key) === session) this.#send(session, { rid, ok: true, result: value });
+          },
+          (error: unknown) => {
+            if (this.#sessions.get(session.key) === session) fail(error);
+          },
+        );
+        return;
+      }
       this.#send(session, { rid, ok: true, result });
       if (name === "device.leave") this.#leave(session);
     } catch (error) {
-      if (error instanceof FixtureError) return this.#error(session, rid, error.message, error.code);
-      throw error;
+      fail(error);
     }
   }
 

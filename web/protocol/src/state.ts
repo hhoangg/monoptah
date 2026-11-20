@@ -15,6 +15,7 @@ export const KNOWN_CAPABILITIES = [
   "monoFiles",
   "mentionedFiles",
   "mentionedFiles2",
+  "fileTransfer",
 ] as const;
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 

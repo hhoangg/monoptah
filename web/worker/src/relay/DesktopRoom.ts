@@ -294,6 +294,16 @@ export class DesktopRoom extends DurableObject<Env> {
     }
   }
 
+  /** The session hashes of the live sockets of `deviceId` (file downloads bind to the session that holds the link). */
+  async deviceSessions(deviceId: string): Promise<string[]> {
+    const hashes = new Set<string>();
+    for (const ws of this.ctx.getWebSockets(`device:${deviceId.toLowerCase()}`)) {
+      const att = this.#att(ws);
+      if (att && !att.gone && att.role === "device" && att.sessionIdHash) hashes.add(att.sessionIdHash);
+    }
+    return [...hashes];
+  }
+
   /** Whether the desktop socket is live (architecture.md 4.4 "Presence"). */
   async presence(): Promise<{ online: boolean }> {
     return { online: this.#online() };

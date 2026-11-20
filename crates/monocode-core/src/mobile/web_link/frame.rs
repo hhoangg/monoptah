@@ -512,6 +512,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "monoFiles",
     "mentionedFiles",
     "mentionedFiles2",
+    "fileTransfer",
 ];
 
 /// Codes in the ERROR relay frame body.

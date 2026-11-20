@@ -53,6 +53,19 @@ pub const DEFAULT_PATTERNS: &[&str] = &[
     ".*_history",
 ];
 
+/// Patterns that apply only to a file outside every project of the device (see [`DenyList::outside_project`]): the
+/// files of a browser profile or a password store that was copied somewhere. Inside a project they would hide
+/// legitimate fixtures such as `test/fixtures/logins.json` from the project routes, so they are not defaults.
+pub const OUTSIDE_PROJECT_PATTERNS: &[&str] = &[
+    "logins.json",
+    "key3.db",
+    "key4.db",
+    "cookies.sqlite",
+    "login data",
+    "login data for account",
+    ".password-store/**",
+];
+
 /// Final file names exempt from the `.env.*` pattern (and only from it).
 pub const ALLOW: &[&str] = &[".env.example", ".env.sample", ".env.template"];
 
@@ -205,6 +218,15 @@ impl DenyList {
             .filter_map(Pattern::parse)
             .collect();
         Self { patterns }
+    }
+
+    /// The defaults plus [`OUTSIDE_PROJECT_PATTERNS`]: what a file outside every project of the device is judged by.
+    pub fn outside_project() -> Self {
+        let extra: Vec<String> = OUTSIDE_PROJECT_PATTERNS
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect();
+        Self::new(&extra)
     }
 
     /// The defaults plus the extra patterns saved for `project` in the policy
@@ -368,6 +390,27 @@ mod tests {
             assert!(list().is_denied_rel(sample), "{sample} should be denied");
         }
         assert_eq!(DEFAULT_PATTERNS.len(), 32);
+    }
+
+    #[test]
+    fn profile_files_are_denied_outside_projects_only() {
+        let outside = DenyList::outside_project();
+        let project = list();
+        for sample in [
+            "profile/logins.json",
+            "profile/key4.db",
+            "profile/key3.db",
+            "profile/cookies.sqlite",
+            "Default/Login Data",
+            "Default/Login Data For Account",
+            ".password-store/work/mail.gpg",
+        ] {
+            assert!(outside.is_denied_rel(sample), "{sample} outside a project");
+            assert!(!project.is_denied_rel(sample), "{sample} inside a project");
+        }
+        // The defaults still apply outside.
+        assert!(outside.is_denied_rel("x/.env"));
+        assert!(!outside.is_denied_rel("notes/todo.txt"));
     }
 
     #[test]

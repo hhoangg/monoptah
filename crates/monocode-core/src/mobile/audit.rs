@@ -1,7 +1,7 @@
 //! Audit trail of what remote devices did (security.md section 7). One JSON
 //! line per event in `mobile-audit.jsonl`, rotated by size. Parameters and
 //! content are never written; the only path ever logged is a file read's.
-use super::policy::{self, Access, Code, DeviceContext, DeviceKind};
+use super::policy::{self, Access, Code, DeviceContext, DeviceKind, Permission};
 use serde_json::{json, Value};
 use std::{
     fs::{self, OpenOptions},
@@ -195,6 +195,25 @@ pub struct MentionedFile<'a> {
     pub outcome: Outcome,
 }
 
+/// A `file.prepare` call to record: the conversation, the canonical path (or the requested one
+/// when refused), the asset, the size of the file, whether a Control device opened a file
+/// outside its shared projects, whether the server already held the object, the rule that
+/// refused it and how it ended. Never the content or the key.
+#[derive(Clone, Copy)]
+pub struct FileTransfer<'a> {
+    pub fingerprint: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub path: &'a str,
+    pub asset: Option<&'a str>,
+    pub bytes: u64,
+    pub outside_projects: bool,
+    pub reused: bool,
+    pub rule: Option<&'a str>,
+    pub command_id: Option<&'a str>,
+    pub transport: Transport,
+    pub outcome: Outcome,
+}
+
 /// One answer to a remote approval, written by the app once it resolved the
 /// project. Ids and the decision only: never the label or detail text.
 #[derive(Clone, Copy)]
@@ -249,6 +268,7 @@ fn written_by_the_app(event: &AuditEvent) -> bool {
         return event.from_app && matches!(event.outcome, Outcome::Ok | Outcome::Denied(_));
     }
     mentioned_file_answered(event)
+        || file_transfer_answered(event)
         || event.method == "project.file"
             && event.from_app
             && matches!(
@@ -266,6 +286,11 @@ fn written_by_the_app(event: &AuditEvent) -> bool {
 /// would be a second. Only a failure from the core before the app is the host's.
 fn mentioned_file_answered(event: &AuditEvent) -> bool {
     event.method == "chat.mentionedFile" && event.from_app
+}
+
+/// `file.prepare` is audited by the app for every outcome, with its own fields.
+fn file_transfer_answered(event: &AuditEvent) -> bool {
+    event.method == "file.prepare" && event.from_app
 }
 
 fn now_ms() -> u64 {
@@ -387,6 +412,46 @@ impl Log {
             "path": capped(path, PATH_CHARS),
             "asset": asset.map(|asset| capped(asset, PATH_CHARS)),
             "bytes": bytes,
+            "rule": rule.map(|rule| capped(rule, ID_CHARS)),
+        }));
+    }
+
+    /// One line per `file.prepare` call, success included. A Control device opening a file
+    /// outside its shared projects is marked `outsideProjects`.
+    pub fn record_file_transfer(&self, device: &DeviceContext, read: &FileTransfer) {
+        let FileTransfer {
+            fingerprint,
+            conversation_id,
+            path,
+            asset,
+            bytes,
+            outside_projects,
+            reused,
+            rule,
+            command_id,
+            transport,
+            outcome,
+        } = *read;
+        self.append(&json!({
+            "ts": now_ms(),
+            "deviceId": capped(&device.id, ID_CHARS),
+            "fingerprint": prefix(fingerprint),
+            "transport": transport.as_str(),
+            "event": "call",
+            "method": "file.prepare",
+            "projectId": null,
+            "outcome": outcome.text(),
+            "commandId": command_id.map(|id| capped(id, ID_CHARS)),
+            "conversationId": conversation_id.map(|id| capped(id, ID_CHARS)),
+            "path": capped(path, PATH_CHARS),
+            "asset": asset.map(|asset| capped(asset, PATH_CHARS)),
+            "bytes": bytes,
+            "outsideProjects": outside_projects,
+            "reused": reused,
+            "permission": match device.permission {
+                Permission::Read => "read",
+                Permission::Control => "control",
+            },
             "rule": rule.map(|rule| capped(rule, ID_CHARS)),
         }));
     }
@@ -528,6 +593,13 @@ pub fn record_file_read_with(device: &DeviceContext, read: &FileRead) {
 pub fn record_mentioned_file_with(device: &DeviceContext, read: &MentionedFile) {
     if let Some(log) = global() {
         log.record_mentioned_file(device, read);
+    }
+}
+
+/// Records one `file.prepare` call. A no-op before [`init`].
+pub fn record_file_transfer_with(device: &DeviceContext, read: &FileTransfer) {
+    if let Some(log) = global() {
+        log.record_file_transfer(device, read);
     }
 }
 
@@ -870,6 +942,71 @@ mod tests {
             &event("chat.mentionedFile", Outcome::Denied(Code::NotSelected)),
         );
         assert_eq!(lines(dir.path()).len(), 2);
+    }
+
+    #[test]
+    fn a_file_prepare_call_is_audited_with_the_outside_projects_mark_and_never_the_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        for (outside, outcome, rule) in [
+            (true, Outcome::Ok, None),
+            (false, Outcome::Denied(Code::PathDenied), Some("deny_list")),
+        ] {
+            log.record_file_transfer(
+                &device(),
+                &FileTransfer {
+                    fingerprint: "abcdef0123456789",
+                    conversation_id: Some("s1"),
+                    path: "/tmp/report.txt",
+                    asset: None,
+                    bytes: 11,
+                    outside_projects: outside,
+                    reused: false,
+                    rule,
+                    command_id: Some("c1"),
+                    transport: Transport::Web,
+                    outcome,
+                },
+            );
+        }
+        let all = lines(dir.path());
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0]["method"], "file.prepare");
+        assert_eq!(all[0]["outsideProjects"], true);
+        assert_eq!(all[0]["path"], "/tmp/report.txt");
+        assert_eq!(all[0]["bytes"], 11);
+        assert_eq!(all[0]["permission"], "control");
+        assert_eq!(all[1]["outsideProjects"], false);
+        assert_eq!(all[1]["outcome"], "denied:path_denied");
+        assert_eq!(all[1]["rule"], "deny_list");
+        // Nothing but metadata: no key, no object name, no content field.
+        let text = std::fs::read_to_string(dir.path().join("mobile-audit.jsonl")).unwrap();
+        for field in ["\"key\"", "\"nonce\"", "\"object\"", "\"data\"", "\"hash\""] {
+            assert!(!text.contains(field), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_file_prepare_call_writes_one_line_not_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        for outcome in [
+            Outcome::Ok,
+            Outcome::Denied(Code::Forbidden),
+            Outcome::Denied(Code::PathDenied),
+            Outcome::Error,
+        ] {
+            let mut answered = event("file.prepare", outcome);
+            answered.from_app = true;
+            log.record(&device(), &answered);
+        }
+        assert!(lines(dir.path()).is_empty());
+        // A refusal from the core before the app (a read-only wire error cannot happen: it is a read).
+        log.record(
+            &device(),
+            &event("file.prepare", Outcome::Denied(Code::NotSelected)),
+        );
+        assert_eq!(lines(dir.path()).len(), 1);
     }
 
     #[test]

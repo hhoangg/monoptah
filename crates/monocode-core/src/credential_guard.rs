@@ -49,6 +49,76 @@ pub(crate) const MORE_HOME_CREDENTIALS: [&str; 15] = [
     ".bash_history",
 ];
 
+/// Secret stores of other programs under `$HOME` that a remote read refuses whole, for every device and on every
+/// platform layout (macOS `Library`, Linux dot folders, snap and flatpak, Windows `AppData`): browser profiles
+/// (saved logins, cookies, session tokens), password managers and keyrings, GnuPG, and the chat apps whose
+/// local storage holds login tokens. Not part of the hard link index: the folders are large.
+pub(crate) const SECRET_STORE_DIRS: &[&str] = &[
+    // Browsers.
+    "Library/Application Support/Firefox",
+    "Library/Application Support/Google/Chrome",
+    "Library/Application Support/Chromium",
+    "Library/Application Support/BraveSoftware",
+    "Library/Application Support/Microsoft Edge",
+    "Library/Application Support/Arc",
+    "Library/Application Support/Vivaldi",
+    "Library/Application Support/com.operasoftware.Opera",
+    "Library/Safari",
+    "Library/Containers/com.apple.Safari",
+    ".mozilla",
+    ".librewolf",
+    ".config/google-chrome",
+    ".config/google-chrome-beta",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".config/microsoft-edge",
+    ".config/vivaldi",
+    ".config/opera",
+    "snap/firefox",
+    "snap/chromium",
+    ".var/app/org.mozilla.firefox",
+    ".var/app/com.google.Chrome",
+    ".var/app/org.chromium.Chromium",
+    ".var/app/com.brave.Browser",
+    "AppData/Roaming/Mozilla",
+    "AppData/Local/Google/Chrome",
+    "AppData/Local/Chromium",
+    "AppData/Local/BraveSoftware",
+    "AppData/Local/Microsoft/Edge",
+    "AppData/Local/Vivaldi",
+    // Keyrings and password managers.
+    ".local/share/keyrings",
+    ".password-store",
+    ".gnupg",
+    ".config/op",
+    ".op",
+    ".config/1Password",
+    "Library/Application Support/1Password",
+    "Library/Group Containers/2BUA8C4S2C.com.1password",
+    "Library/Containers/com.1password.1password",
+    "AppData/Local/1Password",
+    "Library/Application Support/Bitwarden",
+    ".config/Bitwarden",
+    "AppData/Roaming/Bitwarden",
+    "snap/bitwarden",
+    ".var/app/com.bitwarden.desktop",
+    // Chat apps (leveldb and sqlite token stores).
+    "Library/Application Support/Slack",
+    "Library/Application Support/discord",
+    "Library/Application Support/Discord",
+    "Library/Application Support/Signal",
+    ".config/Slack",
+    ".config/discord",
+    ".config/Signal",
+    "AppData/Roaming/Slack",
+    "AppData/Roaming/discord",
+    "AppData/Roaming/Signal",
+    "snap/slack",
+    "snap/discord",
+    ".var/app/com.slack.Slack",
+    ".var/app/com.discordapp.Discord",
+];
+
 /// Names of the app's data folders under the platform data dirs (`Application Support`,
 /// `~/.local/share`, `~/.config`, `AppData`), both flavors: the Tauri app, the native app, its
 /// development build and the upstream names it can still read.

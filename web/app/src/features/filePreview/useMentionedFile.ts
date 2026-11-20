@@ -1,14 +1,23 @@
 // The query behind the preview: one file of one conversation, read to the end (and, for html, with its images).
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLinkConnection, useLinkDesktopId, type LinkRequestError } from "@/link";
-import { imageMime, loadHtmlDocument, readMention, type MentionContent, type MentionRequester } from "./mentionedFile";
+import { useCapability } from "@/version";
+import { asReader, imageMime, loadHtmlDocument, type MentionContent, type MentionRequester, type MentionSource, type ReadOptions } from "./mentionedFile";
+import { transferReader } from "./transfer/reader";
 
 export type PreviewData =
   | { kind: "text" | "markdown"; meta: MentionContent["meta"]; text: string }
   | { kind: "html"; meta: MentionContent["meta"]; document: string; limited: boolean }
   | { kind: "image"; meta: MentionContent["meta"]; mime: string; chunks: Uint8Array[] }
-  | { kind: "binary"; meta: MentionContent["meta"] };
+  /** `chunks` is set when the desktop sent the file (encrypted transfer): it can be saved, not previewed. */
+  | { kind: "binary"; meta: MentionContent["meta"]; chunks?: Uint8Array[] };
+
+/** Bytes of the download received, and the total. */
+export interface DownloadProgress {
+  received: number;
+  total: number;
+}
 
 /** `chat.mentionedFile` of `conversationId` over the link of the nearest provider. */
 export function useMentionRequester(conversationId: string): MentionRequester {
@@ -19,15 +28,37 @@ export function useMentionRequester(conversationId: string): MentionRequester {
   );
 }
 
-async function load(request: MentionRequester, path: string, source: boolean, signal: AbortSignal): Promise<PreviewData> {
-  const content = await readMention(request, { path, ...(source ? { source } : {}) }, { signal });
+/**
+ * What the previews read through: encrypted transfers (`file.prepare`) when the desktop advertises `fileTransfer`, else
+ * the paged `chat.mentionedFile` of older desktops.
+ */
+export function useMentionSource(conversationId: string): MentionSource {
+  const connection = useLinkConnection();
+  const desktopId = useLinkDesktopId();
+  const request = useMentionRequester(conversationId);
+  const transfer = useCapability("fileTransfer");
+  return useMemo<MentionSource>(() => {
+    if (!transfer) return request;
+    return {
+      read: transferReader({
+        desktopId,
+        deviceId: () => connection.deviceId(),
+        prepare: (params, signal) => connection.request("file.prepare", { conversationId, ...params }, signal ? { signal } : {}),
+      }),
+    };
+  }, [transfer, request, connection, desktopId, conversationId]);
+}
+
+async function load(source: MentionSource, path: string, sourceText: boolean, signal: AbortSignal, onProgress: ReadOptions["onProgress"]): Promise<PreviewData> {
+  const read = asReader(source);
+  const content = await read({ path, ...(sourceText ? { source: true } : {}) }, { signal, ...(onProgress ? { onProgress } : {}) });
   const { meta } = content;
   switch (meta.kind) {
     case "text":
     case "markdown":
       return { kind: meta.kind, meta, text: content.text };
     case "html": {
-      const { document, limited } = await loadHtmlDocument(request, path, content, signal);
+      const { document, limited } = await loadHtmlDocument(source, path, content, signal);
       return { kind: "html", meta, document, limited };
     }
     case "image": {
@@ -35,17 +66,21 @@ async function load(request: MentionRequester, path: string, source: boolean, si
       return mime ? { kind: "image", meta, mime, chunks: content.chunks } : { kind: "binary", meta };
     }
     case "binary":
-      return { kind: "binary", meta };
+      return content.chunks.length > 0 ? { kind: "binary", meta, chunks: content.chunks } : { kind: "binary", meta };
   }
 }
 
 /** `source`: ask for the raw text of an html or markdown file (a jump to a line wants the lines, not the render). */
 export function useMentionedFile(conversationId: string, path: string, source = false, enabled = true) {
   const desktopId = useLinkDesktopId();
-  const request = useMentionRequester(conversationId);
-  return useQuery<PreviewData, LinkRequestError>({
+  const mention = useMentionSource(conversationId);
+  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const query = useQuery<PreviewData, LinkRequestError>({
     queryKey: ["link", desktopId, "mentionedFile", conversationId, path, source],
-    queryFn: ({ signal }) => load(request, path, source, signal),
+    queryFn: ({ signal }) => {
+      setProgress(null);
+      return load(mention, path, source, signal, (received, total) => setProgress({ received, total }));
+    },
     enabled,
     networkMode: "always",
     retry: false,
@@ -56,6 +91,7 @@ export function useMentionedFile(conversationId: string, path: string, source = 
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   });
+  return { ...query, progress };
 }
 
 /**

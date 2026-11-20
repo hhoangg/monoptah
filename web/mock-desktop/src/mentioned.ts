@@ -154,3 +154,79 @@ export function mentionedFile(params: { path: string; asset?: string | undefined
   if (!("kind" in target) || target.kind !== "image") throw new MentionError("This asset is not an image", "forbidden");
   return serve(`${folder}/${asset}`, target, params.offset ?? 0);
 }
+
+// --- `file.prepare` (encrypted transfers) ---
+
+/** Files outside the project that only a Control device may open (it may open any readable file). */
+export const OUTSIDE_TEXT_PATH = "/tmp/outside-note.txt";
+export const OUTSIDE_IMAGE_PATH = "/tmp/outside-chart.png";
+/** About 5 MB, past one Noise message and past any 4 MB page: opened through R2 in several sealed chunks. */
+export const LARGE_BINARY_PATH = "/tmp/large-fixture.bin";
+export const LARGE_TEXT_PATH = "/tmp/large-fixture.txt";
+export const LARGE_BINARY_BYTES = 5 * 1024 * 1024 + 123;
+export const LARGE_TEXT_BYTES = 4_600_000;
+/** Names the deny-list refuses for every device, wherever they are. */
+export const SECRET_PATH = "/Users/example/.ssh/id_example";
+
+export function largeBinary(): Uint8Array {
+  return Uint8Array.from({ length: LARGE_BINARY_BYTES }, (_, i) => (i * 131 + (i >>> 8)) & 0xff);
+}
+
+export function largeTransferText(): string {
+  const line = "Example line of a large fixture file, filler text for the download test.\n";
+  return line.repeat(Math.ceil(LARGE_TEXT_BYTES / line.length)).slice(0, LARGE_TEXT_BYTES);
+}
+
+const OUTSIDE: Record<string, Served> = {
+  [OUTSIDE_TEXT_PATH]: { kind: "text", text: "A note outside every project.\n" },
+  [OUTSIDE_IMAGE_PATH]: { kind: "image", mime: "image/png", bytes: base64Bytes(PNG_BASE64) },
+  [LARGE_BINARY_PATH]: { kind: "image", mime: "application/octet-stream", bytes: new Uint8Array(0) },
+  [LARGE_TEXT_PATH]: { kind: "text", text: "" },
+};
+
+export interface FixtureContent {
+  path: string;
+  name: string;
+  kind: "text" | "markdown" | "html" | "image" | "binary";
+  mime: string;
+  bytes: Uint8Array;
+  assets?: string[];
+  project?: { projectId: string; path: string };
+}
+
+function content(canonical: string, served: Served, source: boolean): FixtureContent {
+  if ("error" in served) throw new MentionError(served.error, served.code);
+  const name = lastName(canonical);
+  const project = canonical.startsWith(`${MENTION_ROOT}/`) ? { project: { projectId: "proj-alpha", path: canonical.slice(MENTION_ROOT.length + 1) } } : {};
+  if (canonical === LARGE_BINARY_PATH) return { path: canonical, name, kind: "binary", mime: "application/octet-stream", bytes: largeBinary() };
+  if (canonical === LARGE_TEXT_PATH) return { path: canonical, name, kind: "text", mime: "text/plain", bytes: encoder.encode(largeTransferText()) };
+  if (served.kind === "binary") return { path: canonical, name, kind: "binary", mime: "application/octet-stream", bytes: Uint8Array.from({ length: served.size }, (_, i) => i & 0xff), ...project };
+  if (served.kind === "image") return { path: canonical, name, kind: "image", mime: served.mime, bytes: served.bytes, ...project };
+  const kind = source && (served.kind === "html" || served.kind === "markdown") ? "text" : served.kind;
+  const mime = kind === "html" ? "text/html" : kind === "markdown" ? "text/markdown" : "text/plain";
+  return { path: canonical, name, kind, mime, bytes: encoder.encode(served.text), ...(served.kind === "html" && kind === "html" ? { assets: [...served.assets] } : {}), ...project };
+}
+
+/**
+ * What `file.prepare` serves, by the rules of the desktop: the deny-list for everyone, the project files for every
+ * device, any other fixture file only for a Control device. A path that is none of these is `forbidden` for a read-only
+ * device and `not_found` for a Control one. Relative paths read like mentions of the project.
+ */
+export function transferContent(params: { path: string; asset?: string | undefined; source?: boolean | undefined }, control: boolean): FixtureContent {
+  if (params.path === SECRET_PATH || /(^|\/)\.env$/.test(params.path) || params.path.includes("/.ssh/")) throw new MentionError("This file is hidden", "path_denied");
+  const raw = params.path.replace(/^\.\//, "");
+  const canonical = MENTIONS[raw] ?? (raw.startsWith("/") ? raw : `${MENTION_ROOT}/${raw}`);
+  const inProject = canonical.startsWith(`${MENTION_ROOT}/`);
+  if (!inProject && !control) throw new MentionError("This device cannot open this file", "forbidden");
+  const served = FILES[canonical] ?? OUTSIDE[canonical];
+  if (!served) throw new MentionError("No such file", control ? "not_found" : "forbidden");
+  if (params.asset === undefined) return content(canonical, served, params.source === true);
+  if (!("kind" in served) || (served.kind !== "html" && served.kind !== "markdown")) throw new MentionError("This file has no assets", "forbidden");
+  const asset = safeAsset(params.asset);
+  if (asset === null) throw new MentionError("This asset is not allowed", "forbidden");
+  const folder = canonical.slice(0, canonical.lastIndexOf("/"));
+  const target = FILES[`${folder}/${asset}`];
+  if (!target) throw new MentionError("No such file", "not_found");
+  if (!("kind" in target) || target.kind !== "image") throw new MentionError("This asset is not an image", "forbidden");
+  return content(`${folder}/${asset}`, target, false);
+}

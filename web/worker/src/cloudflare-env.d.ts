@@ -6,6 +6,8 @@ declare namespace Cloudflare {
     // Bindings
     ASSETS: Fetcher;
     DB: D1Database;
+    /** R2 bucket of the encrypted file transfers (objects under `transfers/`, deleted after a day by a lifecycle rule). */
+    TRANSFERS: R2Bucket;
     // eslint-disable-next-line @typescript-eslint/consistent-type-imports -- a global .d.ts cannot use a top-level import
     ROOM: DurableObjectNamespace<import("./relay/DesktopRoom.ts").DesktopRoom>;
     // Vars (wrangler.jsonc `vars`)

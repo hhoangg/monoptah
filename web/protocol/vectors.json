@@ -806,7 +806,8 @@
       "monoTools",
       "monoFiles",
       "mentionedFiles",
-      "mentionedFiles2"
+      "mentionedFiles2",
+      "fileTransfer"
     ],
     "messages": [
       {
@@ -827,7 +828,8 @@
           "monoTools",
           "monoFiles",
           "mentionedFiles",
-          "mentionedFiles2"
+          "mentionedFiles2",
+          "fileTransfer"
         ],
         "desktop": {
           "name": "Example Desktop",

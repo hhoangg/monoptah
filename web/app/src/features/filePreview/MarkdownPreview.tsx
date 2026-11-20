@@ -4,13 +4,13 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useMemo, useState } from "react";
 import { Markdown } from "@/features/markdown/Markdown";
 import { Notice } from "@/ui/Notice";
-import { type PreviewBudget, assetPath, budgetForText, concat, imageDataUri, readMention, type MentionRequester } from "./mentionedFile";
+import { type PreviewBudget, asReader, assetPath, budgetForText, concat, imageDataUri, type MentionSource } from "./mentionedFile";
 
 interface ImageProps {
   src: string;
   alt: string;
   path: string;
-  request: MentionRequester;
+  request: MentionSource;
   budget: PreviewBudget;
   cacheKey: readonly unknown[];
   onLimited: () => void;
@@ -27,7 +27,7 @@ function MarkdownImage({ src, alt, path, request, budget, cacheKey, onLimited }:
     structuralSharing: false,
     queryFn: async ({ signal }) => {
       try {
-        const content = await readMention(request, { path, asset: asset as string }, { signal, budget });
+        const content = await asReader(request)({ path, asset: asset as string }, { signal, budget });
         const uri = content.meta.kind === "image" ? imageDataUri(content.meta.mime ?? "", concat(content.chunks, content.length)) : null;
         if (!uri) throw new Error("Not an image");
         return uri;
@@ -41,7 +41,7 @@ function MarkdownImage({ src, alt, path, request, budget, cacheKey, onLimited }:
   return <img src={query.data} alt={alt} data-testid="preview-md-image" className="my-2 block max-w-full" />;
 }
 
-export function MarkdownPreview({ text, path, request, cacheKey }: { text: string; path: string; request: MentionRequester; cacheKey: readonly unknown[] }) {
+export function MarkdownPreview({ text, path, request, cacheKey }: { text: string; path: string; request: MentionSource; cacheKey: readonly unknown[] }) {
   // The document itself counts against the budget, so its images get only what is left.
   const shared = useMemo(() => budgetForText(text), [text]);
   const [limited, setLimited] = useState(false);

@@ -14,6 +14,7 @@ export const FEATURES: Readonly<Record<KnownCapability, string>> = {
   monoFiles: "Mono files",
   mentionedFiles: "File previews",
   mentionedFiles2: "File previews of files made by commands",
+  fileTransfer: "Opening any file from the web",
 };
 
 export type { KnownCapability };

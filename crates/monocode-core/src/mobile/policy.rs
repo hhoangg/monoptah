@@ -376,6 +376,7 @@ pub const METHODS: &[Entry] = &[
     app("project.search", Class::Read),
     app("project.fileHighlight", Class::UnsupportedWeb),
     app("chat.mentionedFile", Class::Read),
+    app("file.prepare", Class::Read),
     app("project.git", Class::Read),
     app("project.gitAction", Class::Param),
     app("session.start", Class::Param),
@@ -790,6 +791,8 @@ fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
     // The widened evidence of rule 2 (a shell command or its output naming the file, or a file
     // made after the conversation began): a web that sees this knows a refusal is final.
     list.push("mentionedFiles2".to_owned());
+    // `file.prepare`: files are opened through encrypted objects in R2 (a read, always on).
+    list.push("fileTransfer".to_owned());
     list
 }
 
@@ -1438,7 +1441,7 @@ mod tests {
     fn capabilities_follow_flags_and_the_approvals_gate() {
         assert_eq!(
             capabilities_with(&PolicyFlags::default(), false),
-            ["cloud", "mentionedFiles", "mentionedFiles2"]
+            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
         );
         assert_eq!(
             capabilities_with(&ON, false),
@@ -1448,13 +1451,14 @@ mod tests {
                 "cloudStart",
                 "cloudMove",
                 "mentionedFiles",
-                "mentionedFiles2"
+                "mentionedFiles2",
+                "fileTransfer"
             ]
         );
         // The gate alone does not list approvals: the desktop toggle is needed too.
         assert_eq!(
             capabilities_with(&PolicyFlags::default(), true),
-            ["cloud", "mentionedFiles", "mentionedFiles2"]
+            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
         );
         let toggle = PolicyFlags {
             remote_approvals: true,
@@ -1462,11 +1466,17 @@ mod tests {
         };
         assert_eq!(
             capabilities_with(&toggle, false),
-            ["cloud", "mentionedFiles", "mentionedFiles2"]
+            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
         );
         assert_eq!(
             capabilities_with(&toggle, true),
-            ["cloud", "approvals", "mentionedFiles", "mentionedFiles2"]
+            [
+                "cloud",
+                "approvals",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer"
+            ]
         );
         assert_eq!(
             capabilities_with(&ON, true),
@@ -1477,7 +1487,8 @@ mod tests {
                 "cloudMove",
                 "approvals",
                 "mentionedFiles",
-                "mentionedFiles2"
+                "mentionedFiles2",
+                "fileTransfer"
             ]
         );
     }
@@ -1494,11 +1505,23 @@ mod tests {
         };
         assert_eq!(
             capabilities_with(&flags(false, true), false),
-            ["cloud", "cloudStart", "mentionedFiles", "mentionedFiles2"]
+            [
+                "cloud",
+                "cloudStart",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer"
+            ]
         );
         assert_eq!(
             capabilities_with(&flags(true, false), false),
-            ["cloud", "gitPush", "mentionedFiles", "mentionedFiles2"]
+            [
+                "cloud",
+                "gitPush",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer"
+            ]
         );
         assert_eq!(
             capabilities_with(&flags(true, true), false),
@@ -1508,12 +1531,13 @@ mod tests {
                 "cloudStart",
                 "cloudMove",
                 "mentionedFiles",
-                "mentionedFiles2"
+                "mentionedFiles2",
+                "fileTransfer"
             ]
         );
         assert_eq!(
             capabilities_with(&flags(false, false), false),
-            ["cloud", "mentionedFiles", "mentionedFiles2"]
+            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
         );
     }
 
@@ -1588,11 +1612,17 @@ mod tests {
         }
         assert_eq!(
             capabilities_with(&off, REMOTE_APPROVALS_ENABLED),
-            ["cloud", "mentionedFiles", "mentionedFiles2"]
+            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
         );
         assert_eq!(
             capabilities_with(&on, REMOTE_APPROVALS_ENABLED),
-            ["cloud", "approvals", "mentionedFiles", "mentionedFiles2"]
+            [
+                "cloud",
+                "approvals",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer"
+            ]
         );
     }
 

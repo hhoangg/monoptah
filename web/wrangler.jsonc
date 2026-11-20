@@ -43,6 +43,11 @@
     }
   ],
 
+  // Encrypted file transfers (modules/transfers): ciphertext only, never public (no custom domain, no public URL, no
+  // r2.dev). A lifecycle rule deletes everything under `transfers/` after 1 day; it is bucket configuration, not part of
+  // this file: see docs/deploy-runbook.md "File transfer bucket". `wrangler dev` and the tests use a local simulation.
+  "r2_buckets": [{ "binding": "TRANSFERS", "bucket_name": "monoptah-transfers" }],
+
   // Daily cleanup (worker/src/cron.ts): expired challenges, sessions, rate limit windows, old audit rows.
   "triggers": { "crons": ["17 3 * * *"] },
 

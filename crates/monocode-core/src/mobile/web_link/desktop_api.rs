@@ -435,3 +435,194 @@ pub fn push_notify(base: &str, token: &str, body: &Value) -> Result<u64, PushErr
     }
     Ok(answer.body["sent"].as_u64().unwrap_or(0))
 }
+
+/// How long an upload of a sealed file may take in all.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(4 * 60);
+
+/// An object name is `<64 hex content hash>.<16 hex key id>`: never a path, and the only text
+/// that goes into the URL of the transfer routes.
+pub fn valid_object_name(name: &str) -> bool {
+    let Some((hash, key_id)) = name.split_once('.') else {
+        return false;
+    };
+    let hex = |text: &str, len: usize| {
+        text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    hex(hash, 64) && hex(key_id, 16)
+}
+
+fn transfer_agent(timeout: Duration) -> ureq::Agent {
+    // Redirects are never followed, so the bearer header cannot leave the host.
+    ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build()
+}
+
+fn transfer_error(error: ureq::Error) -> crate::mobile::file_transfer::StoreError {
+    use crate::mobile::file_transfer::StoreError;
+    match error {
+        ureq::Error::Status(status, _) => StoreError::Http(status),
+        ureq::Error::Transport(_) => StoreError::Unreachable,
+    }
+}
+
+/// `HEAD /api/desktop/transfers/:object`: the size of the stored object, `None` for 404.
+pub fn transfer_head(
+    base: &str,
+    token: &str,
+    object: &str,
+) -> Result<Option<u64>, crate::mobile::file_transfer::StoreError> {
+    use crate::mobile::file_transfer::StoreError;
+    if !valid_object_name(object) {
+        return Err(StoreError::Failed);
+    }
+    let bearer = Zeroizing::new(format!("Bearer {token}"));
+    let result = transfer_agent(TIMEOUT)
+        .request("HEAD", &format!("{base}/api/desktop/transfers/{object}"))
+        .set("Authorization", &bearer)
+        .call();
+    match result {
+        Ok(response) => Ok(response
+            .header("Content-Length")
+            .and_then(|value| value.trim().parse::<u64>().ok())),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(error) => Err(transfer_error(error)),
+    }
+}
+
+/// `PUT /api/desktop/transfers/:object`: `len` bytes of ciphertext read from `body`. The server
+/// keeps an object that already exists and answers 200 either way.
+pub fn transfer_put(
+    base: &str,
+    token: &str,
+    object: &str,
+    len: u64,
+    body: &mut dyn Read,
+) -> Result<(), crate::mobile::file_transfer::StoreError> {
+    use crate::mobile::file_transfer::StoreError;
+    if !valid_object_name(object) {
+        return Err(StoreError::Failed);
+    }
+    let bearer = Zeroizing::new(format!("Bearer {token}"));
+    transfer_agent(UPLOAD_TIMEOUT)
+        .request("PUT", &format!("{base}/api/desktop/transfers/{object}"))
+        .set("Authorization", &bearer)
+        .set("Content-Type", "application/octet-stream")
+        .set("Content-Length", &len.to_string())
+        .send(body)
+        .map(|_| ())
+        .map_err(transfer_error)
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use crate::mobile::file_transfer::StoreError;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    const OBJECT: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.0123456789abcdef";
+
+    /// Serves one request with `status` and `headers`, and returns what it received.
+    fn serve_once(
+        status: &'static str,
+        extra: &'static str,
+    ) -> (String, std::thread::JoinHandle<(String, Vec<u8>)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                head.push_str(&line);
+            }
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body).unwrap();
+            let mut stream = stream;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\n{extra}Connection: close\r\n\r\n"
+            );
+            (head, body)
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn object_names_are_a_hash_and_a_key_id_and_nothing_else() {
+        assert!(valid_object_name(OBJECT));
+        for bad in [
+            "",
+            "../etc/passwd",
+            "0123.0123",
+            &OBJECT.to_uppercase(),
+            &format!("{OBJECT}/x"),
+            &format!("{}.{}", &OBJECT[..64], &OBJECT[65..80]),
+            &OBJECT.replace('.', "/"),
+        ] {
+            assert!(!valid_object_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn head_reads_the_size_and_a_404_is_none() {
+        let (base, server) = serve_once("200 OK", "Content-Length: 1234\r\n");
+        assert_eq!(transfer_head(&base, "tok", OBJECT), Ok(Some(1234)));
+        let (head, _) = server.join().unwrap();
+        assert!(head.starts_with(&format!("HEAD /api/desktop/transfers/{OBJECT} HTTP/1.1")));
+        assert!(head.contains("Authorization: Bearer tok"));
+        let (base, server) = serve_once("404 Not Found", "Content-Length: 0\r\n");
+        assert_eq!(transfer_head(&base, "tok", OBJECT), Ok(None));
+        server.join().unwrap();
+        let (base, server) = serve_once("401 Unauthorized", "Content-Length: 0\r\n");
+        assert_eq!(
+            transfer_head(&base, "tok", OBJECT),
+            Err(StoreError::Http(401))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn put_sends_exactly_the_announced_bytes_with_the_token() {
+        let (base, server) = serve_once("200 OK", "Content-Length: 0\r\n");
+        let mut body = std::io::Cursor::new(b"ciphertext".to_vec());
+        assert_eq!(transfer_put(&base, "tok", OBJECT, 10, &mut body), Ok(()));
+        let (head, received) = server.join().unwrap();
+        assert!(head.starts_with(&format!("PUT /api/desktop/transfers/{OBJECT} HTTP/1.1")));
+        assert!(head.contains("Authorization: Bearer tok"));
+        assert!(head.to_ascii_lowercase().contains("content-length: 10"));
+        assert_eq!(received, b"ciphertext");
+        let (base, server) = serve_once("413 Payload Too Large", "Content-Length: 0\r\n");
+        let mut body = std::io::Cursor::new(b"x".to_vec());
+        assert_eq!(
+            transfer_put(&base, "tok", OBJECT, 1, &mut body),
+            Err(StoreError::Http(413))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_bad_object_name_never_reaches_the_network() {
+        let mut body = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            transfer_put("http://127.0.0.1:1", "t", "../x", 0, &mut body),
+            Err(StoreError::Failed)
+        );
+        assert_eq!(
+            transfer_head("http://127.0.0.1:1", "t", "../x"),
+            Err(StoreError::Failed)
+        );
+    }
+}

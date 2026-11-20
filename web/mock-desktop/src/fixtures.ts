@@ -23,6 +23,7 @@ import {
 } from "@monoptah/protocol";
 import type { METHODS } from "@monoptah/protocol";
 import { MENTION_MESSAGE, MentionError, mentionedFile } from "./mentioned.ts";
+import { MockTransfers } from "./transfer.ts";
 import type { z } from "zod";
 
 /** Time used by default so fixtures are deterministic. */
@@ -668,10 +669,15 @@ export class MockWorld {
 export interface HandlerContext {
   world: MockWorld;
   device: MockDevice;
+  /** The desktop's encrypted transfers (`file.prepare`). */
+  transfers?: MockTransfers;
 }
 
 type ParamsFor<M extends MethodName> = z.output<(typeof METHODS)[M]["params"]>;
 export type FixtureHandler<M extends MethodName> = (params: ParamsFor<M>, ctx: HandlerContext) => ResultOf<M>;
+/** `file.prepare` answers after the upload to the server, so its handler is async. */
+type AsyncFixtureMethod = "file.prepare";
+type HandlerOf<M extends MethodName> = M extends AsyncFixtureMethod ? (params: ParamsFor<M>, ctx: HandlerContext) => Promise<ResultOf<M>> : FixtureHandler<M>;
 
 function project(world: MockWorld, projectId: string): void {
   if (!world.projectIds().includes(projectId)) throw new FixtureError(`Unknown project ${projectId}`, "not_selected");
@@ -705,9 +711,16 @@ export function largeText(bytes = 200_000): string {
   return line.repeat(Math.ceil(bytes / line.length)).slice(0, bytes);
 }
 
+let fallback: MockTransfers | undefined;
+/** The transfers of a handler call that has none (a test calling a handler directly). */
+function fallbackTransfers(): MockTransfers {
+  fallback ??= new MockTransfers();
+  return fallback;
+}
+
 const ACK = (sessionId?: string) => (sessionId === undefined ? {} : { sessionId });
 
-export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
+export const FIXTURE_HANDLERS: { [M in MethodName]: HandlerOf<M> } = {
   "conversation.read": (p, { world }) => world.read(p.conversationId),
   "conversation.older": (p, { world }) => {
     world.session(p.conversationId);
@@ -848,6 +861,10 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: FixtureHandler<M> } = {
       if (error instanceof MentionError) throw new FixtureError(error.message, error.code);
       throw error;
     }
+  },
+  "file.prepare": async (p, { world, device, transfers }) => {
+    if (p.conversationId !== undefined) world.session(p.conversationId);
+    return (transfers ?? fallbackTransfers()).prepare(p, device.permission === "control");
   },
   "project.search": (p, { world }) => {
     project(world, p.projectId);
