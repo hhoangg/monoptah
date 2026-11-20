@@ -80,10 +80,9 @@ function DesktopAvatar({ desktop, current, tabStop, onFocus }: { desktop: RailDe
           aria-current={current ? "page" : undefined}
           aria-label={`${desktop.name}, ${status.toLowerCase()}${cueText ? `, ${cueText}` : ""}${current ? ", current desktop" : ""}`}
           className={cn(
-            "relative inline-flex size-11 shrink-0 items-center justify-center text-small font-semibold outline-offset-2 hover:opacity-85 motion-safe:transition-[border-radius] motion-safe:duration-150 pointer-fine:size-10",
+            "relative inline-flex size-11 shrink-0 items-center justify-center text-small font-semibold outline-offset-2 hover:brightness-110 motion-safe:transition-[border-radius] motion-safe:duration-150 pointer-fine:size-10",
             // The current desktop squares off a little (and has the bar beside it); the others stay round.
-            current ? "rounded-row" : "rounded-pill opacity-90",
-            cue && "opacity-55",
+            current ? "rounded-row" : "rounded-pill",
           )}
           style={{ backgroundColor: background, color: onAvatarColor(background) }}
         >

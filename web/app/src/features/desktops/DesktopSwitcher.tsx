@@ -52,7 +52,8 @@ export function DesktopTopBar({ children, railReplaces = false }: { children?: R
   if (railReplaces && wide) {
     return (
       <>
-        <div className="shrink-0 bg-background pt-[env(safe-area-inset-top)]" />
+        {/* Keeps the testid of the bar it replaces (a hairline under the top inset), so the layout-shift checks of the toast still measure the top edge. */}
+        <div data-testid="desktop-top-bar" className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]" />
         <OfflineBanner />
       </>
     );

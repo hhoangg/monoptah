@@ -30,14 +30,24 @@ export function desktopAvatarColor(id: string, stored: string | null | undefined
   return DESKTOP_COLORS[hash(id) % DESKTOP_COLORS.length]!.value;
 }
 
-/** The token of the text color (near-black or white) that reads better on a swatch (WCAG relative luminance). */
-export function onAvatarColor(hex: string): string {
+function luminance(hex: string): number {
   const channel = (offset: number) => {
     const value = parseInt(hex.slice(offset, offset + 2), 16) / 255;
     return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
   };
-  const luminance = 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
-  return luminance > 0.35 ? "var(--on-swatch-dark)" : "var(--on-swatch-light)";
+  return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
+}
+
+const DARK_TEXT = 0.0037; // luminance of --on-swatch-dark (#0c0c0c)
+
+/**
+ * The token of the text color that has the higher WCAG contrast on a swatch. Every desktop swatch has 4.5:1 or more with
+ * the dark one (axe color-contrast), so the light token only wins on a dark custom color.
+ */
+export function onAvatarColor(hex: string): string {
+  const light = 1.05 / (luminance(hex) + 0.05);
+  const dark = (luminance(hex) + 0.05) / (DARK_TEXT + 0.05);
+  return dark >= light ? "var(--on-swatch-dark)" : "var(--on-swatch-light)";
 }
 
 export type GrantCue = "pending" | "revoked" | "none";

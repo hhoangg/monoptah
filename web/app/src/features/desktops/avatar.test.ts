@@ -31,10 +31,10 @@ describe("desktop avatar", () => {
     expect(used.size).toBeGreaterThan(4);
   });
 
-  it("reads white on dark swatches and near-black on light ones", () => {
-    expect(onAvatarColor("#8b63e9")).toBe("var(--on-swatch-light)");
-    expect(onAvatarColor("#f4bf25")).toBe("var(--on-swatch-dark)");
-    expect(onAvatarColor("#39c363")).toBe("var(--on-swatch-dark)");
+  it("picks the text color with the better contrast, and every swatch reaches 4.5:1 with it", () => {
+    for (const { value } of DESKTOP_COLORS) expect(onAvatarColor(value)).toBe("var(--on-swatch-dark)");
+    expect(onAvatarColor("#b168d4")).toBe("var(--on-swatch-dark)"); // white is only 3.62:1 here
+    expect(onAvatarColor("#1a1a1a")).toBe("var(--on-swatch-light)");
   });
 
   it("reads the grant cue of this device", () => {
