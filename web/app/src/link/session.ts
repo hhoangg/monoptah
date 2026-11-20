@@ -24,6 +24,7 @@ import {
   type Frame,
   type MethodName,
   type ParamsOf,
+  type PresenceTarget,
   type ResultOf,
   type StateMessage,
   type WatchFrame,
@@ -390,6 +391,15 @@ export class LinkSession {
         reject(new LinkRequestError("The session has ended", "session_ended"));
       }
     });
+  }
+
+  /**
+   * Sends a presence report (what this page shows, or null). Fire and forget: it has no `rid`, gets no answer and
+   * an older desktop drops it. Not sent before the device is confirmed.
+   */
+  sendPresence(target: PresenceTarget | null): boolean {
+    if (this.#ended || this.state.state !== "confirmed" || !this.#crypto) return false;
+    return this.#sendBytes(encodeEnvelope({ t: "presence", version: ENVELOPE_VERSION, target }));
   }
 
   /** Ends the session: BYE to the desktop, pending requests reject with `session_ended`, `onEnd("closed")`. */

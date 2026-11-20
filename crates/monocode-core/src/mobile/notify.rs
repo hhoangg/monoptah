@@ -1,6 +1,7 @@
 //! Notifications for paired phones, sent through Expo's push service so they
 //! arrive while the app is closed. The desktop sends them itself; there is no
 //! server of ours in between.
+use super::web_link::presence;
 use serde_json::{json, Value};
 use std::io::Read;
 
@@ -62,9 +63,19 @@ pub fn notify_web(notice: &WebNotice) {
         return;
     }
     let show_content = super::policy::flags().show_push_content;
-    let body = match plan(notice, &status.devices, show_content, |session| {
-        host.catalog_session_project(session)
-    }) {
+    let viewed = presence::Target::of_notice(notice.session_id, notice.mono_id);
+    let viewing = |device_id: &str| {
+        viewed
+            .as_ref()
+            .is_some_and(|target| host.web_is_viewing(device_id, target))
+    };
+    let body = match plan(
+        notice,
+        &status.devices,
+        show_content,
+        |session| host.catalog_session_project(session),
+        viewing,
+    ) {
         Ok(body) => body,
         Err(skip) => {
             report(
@@ -167,6 +178,8 @@ pub enum Skip {
     Category,
     /// No confirmed web device selected the project or Mono.
     NoDevice,
+    /// Every device that selected it is looking at it right now.
+    Viewing,
 }
 
 impl Skip {
@@ -174,6 +187,7 @@ impl Skip {
         match self {
             Skip::Category => "category not pushed",
             Skip::NoDevice => "no device selected",
+            Skip::Viewing => "viewed on every selected device",
         }
     }
 }
@@ -186,12 +200,16 @@ impl Skip {
 /// session follows the project only. Only the devices that selected the
 /// project or Mono are listed, so the preview reaches no one else. With
 /// `show_content` off, or nothing readable to show, the body has no `title`
-/// or `preview` and the browser shows its generic line.
+/// or `preview` and the browser shows its generic line. A device for which
+/// `viewing` says it shows exactly this session or Mono chat right now (a
+/// visible, focused tab) is left out: it would only notify the user of what
+/// they are reading. Other devices still get the notice.
 fn plan(
     notice: &WebNotice,
     devices: &[super::host::Device],
     show_content: bool,
     project_of: impl Fn(&str) -> Option<String>,
+    viewing: impl Fn(&str) -> bool,
 ) -> Result<Value, Skip> {
     let status = match notice.category {
         "agentFinished" => "finished",
@@ -224,6 +242,10 @@ fn plan(
         .collect();
     if ids.is_empty() {
         return Err(Skip::NoDevice);
+    }
+    let ids: Vec<&str> = ids.into_iter().filter(|id| !viewing(id)).collect();
+    if ids.is_empty() {
+        return Err(Skip::Viewing);
     }
     let mut body = json!({
         "category": notice.category,
@@ -409,7 +431,7 @@ mod tests {
         devices: &[super::super::host::Device],
         project_of: impl Fn(&str) -> Option<String>,
     ) -> Result<Value, Skip> {
-        super::plan(notice, devices, true, project_of)
+        super::plan(notice, devices, true, project_of, |_| false)
     }
 
     fn project_p1(session: &str) -> Option<String> {
@@ -558,6 +580,7 @@ mod tests {
         );
         assert_eq!(Skip::Category.reason(), "category not pushed");
         assert_eq!(Skip::NoDevice.reason(), "no device selected");
+        assert_eq!(Skip::Viewing.reason(), "viewed on every selected device");
     }
 
     /// A one-thread HTTP stub: answers each request with `status`, records the bodies.
@@ -761,6 +784,7 @@ mod tests {
             &devices,
             false,
             project_p1,
+            |_| false,
         )
         .unwrap();
         assert!(off.get("title").is_none() && off.get("preview").is_none());
@@ -800,5 +824,72 @@ mod tests {
             n.preview = Some(raw);
             assert_eq!(plan(&n, &devices, project_p1).unwrap()["preview"], want);
         }
+    }
+
+    fn device_ids(body: &Value) -> Vec<&str> {
+        body["deviceIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_device_viewing_the_target_is_skipped_and_the_others_still_get_it() {
+        let devices = [web_device("a", None, None), web_device("b", None, None)];
+        let n = notice("agentFinished", Some("s1"), None);
+        let body = super::plan(&n, &devices, true, project_p1, |id| id == "a").unwrap();
+        assert_eq!(device_ids(&body), ["b"]);
+        let body = super::plan(&n, &devices, true, project_p1, |_| false).unwrap();
+        assert_eq!(device_ids(&body), ["a", "b"]);
+    }
+
+    #[test]
+    fn nothing_is_sent_when_every_selected_device_is_viewing() {
+        let devices = [web_device("a", None, None)];
+        let n = notice("agentInput", Some("s1"), None);
+        assert_eq!(
+            super::plan(&n, &devices, true, project_p1, |_| true),
+            Err(Skip::Viewing)
+        );
+        // A device that never selected the project is not "viewing": no device.
+        let none = [web_device("a", Some(&["other"]), None)];
+        assert_eq!(
+            super::plan(&n, &none, true, project_p1, |_| true),
+            Err(Skip::NoDevice)
+        );
+    }
+
+    #[test]
+    fn viewing_follows_the_exact_target_of_the_notice() {
+        use super::presence::{PresenceTable, Target};
+        let mut table = PresenceTable::default();
+        let key = super::super::web_link::session::SessionKey {
+            device_id: [1; 16],
+            channel: 1,
+        };
+        table.set(key, "a", Some(Target::Session("s1".into())), 0);
+        let devices = [web_device("a", None, None)];
+        let run = |n: &WebNotice, now: u64| {
+            let viewed = Target::of_notice(n.session_id, n.mono_id);
+            super::plan(n, &devices, true, project_p1, |id| {
+                viewed
+                    .as_ref()
+                    .is_some_and(|target| table.is_viewing(id, target, now))
+            })
+        };
+        // The viewed session is skipped, another session of the project is not.
+        assert_eq!(
+            run(&notice("agentFinished", Some("s1"), None), 1),
+            Err(Skip::Viewing)
+        );
+        assert!(run(&notice("agentFinished", Some("s2"), None), 1).is_ok());
+        let mut other = notice("agentFinished", Some("s1"), None);
+        other.session_id = Some("s1");
+        // A Mono chat is a different target from a session with that id.
+        assert!(run(&notice("monoMessages", None, Some("s1")), 1).is_ok());
+        // Stale presence no longer suppresses.
+        assert!(run(&other, super::presence::STALE_MS).is_ok());
     }
 }

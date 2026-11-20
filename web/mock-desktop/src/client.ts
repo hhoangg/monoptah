@@ -18,6 +18,7 @@ import {
   type Frame,
   type MethodName,
   type ParamsOf,
+  type PresenceTarget,
   type ResultOf,
   type StateMessage,
   type WatchFrame,
@@ -293,6 +294,11 @@ export class TestClient {
       throw new ClientError(ack.error, ack.code);
     }
     return watch;
+  }
+
+  /** Sends a presence report (`null` clears it). It has no answer. */
+  sendPresence(target: PresenceTarget | null): void {
+    this.#sendMessage({ t: "presence", version: 1, target });
   }
 
   /** Sends BYE and closes the session. */

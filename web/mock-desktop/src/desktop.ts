@@ -24,6 +24,7 @@ import {
   type EnvelopeResponse,
   type Frame,
   type MethodName,
+  type PresenceTarget,
   type StateMessage,
 } from "@monoptah/protocol";
 import { HandshakeState, NoiseError, fingerprint, generateKeyPair, prologue, type KeyPair } from "./noise.ts";
@@ -92,6 +93,8 @@ interface Session {
   channelCrypto: SecureChannel;
   watches: Map<number, Watch>;
   pendingTimeout: unknown;
+  /** The last presence report of this session (what the page shows), null when cleared. */
+  presence: { target: PresenceTarget; at: number } | null;
 }
 
 /** What a test can see of a live session. */
@@ -102,6 +105,8 @@ export interface SessionInfo {
   deviceName: string | undefined;
   state: MockDevice["status"];
   openWatches: number;
+  /** What the page reports it shows (visible and focused), null when nothing. Reports have no answer. */
+  presence: PresenceTarget | null;
   rekeysSent: number;
   rekeysReceived: number;
 }
@@ -241,6 +246,7 @@ export class MockDesktop {
       deviceName: s.deviceName,
       state: s.device.status,
       openWatches: s.watches.size,
+      presence: s.presence?.target ?? null,
       rekeysSent: s.channelCrypto.rekeysSent,
       rekeysReceived: s.channelCrypto.rekeysReceived,
     }));
@@ -340,6 +346,7 @@ export class MockDesktop {
       }),
       watches: new Map(),
       pendingTimeout: null,
+      presence: null,
     };
     this.#sessions.set(key, session);
     this.#sendFrame(FrameType.HS2, frame.deviceId, frame.channel, hs2);
@@ -436,6 +443,10 @@ export class MockDesktop {
       return;
     }
     const message = parsed.data;
+    if ("t" in message) {
+      session.presence = message.target ? { target: message.target, at: this.#now() } : null;
+      return;
+    }
     if ("cancel" in message) {
       this.#closeWatch(session, message.rid);
       return;

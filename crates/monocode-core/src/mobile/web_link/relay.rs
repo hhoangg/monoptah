@@ -7,6 +7,7 @@
 use super::channel::{Out, Requests};
 use super::desktop_api;
 use super::frame::{CloseCode, Frame, FrameType, RELAY_ERROR_CODES};
+use super::presence;
 use super::session::{Action, Directory, Lookup, SendError, SessionTable, PROTO};
 use super::{LinkCommand, WebLink, WebState};
 use crate::mobile::host::MobileHost;
@@ -534,9 +535,17 @@ fn collect(actions: Vec<Action>, requests: &mut Requests, link: &WebLink, frames
             Action::Deliver {
                 key,
                 peer,
+                device,
                 envelope,
-                ..
-            } => requests.deliver(key, peer, envelope),
+            } => match presence::parse(&envelope) {
+                // A presence report has no `rid` and gets no answer.
+                Some(target) => {
+                    if let Some(id) = device.server_device_id.as_deref() {
+                        link.presence_set(key, id, target);
+                    }
+                }
+                None => requests.deliver(key, peer, envelope),
+            },
             Action::Closed { key } => {
                 link.live_remove(&key);
                 requests.closed(key);

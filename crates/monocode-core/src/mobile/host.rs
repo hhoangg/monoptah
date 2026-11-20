@@ -2499,6 +2499,16 @@ impl MobileHost {
         (pairs("projects"), pairs("monos"))
     }
 
+    /// Whether a tab of the web device `server_device_id` is showing
+    /// `target` right now (fresh, visible and focused report; memory only).
+    pub fn web_is_viewing(
+        &self,
+        server_device_id: &str,
+        target: &super::web_link::presence::Target,
+    ) -> bool {
+        self.web.presence_is_viewing(server_device_id, target)
+    }
+
     /// What Settings shows about the web link.
     pub fn web_status(&self) -> super::web_link::WebStatus {
         let (enabled, devices) = self
