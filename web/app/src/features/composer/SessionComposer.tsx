@@ -10,10 +10,12 @@ import { useLinkDesktopId, useLinkState } from "@/link";
 import { ModelControls } from "@/features/models/ModelControls";
 import { useDefaultModels } from "@/features/models/defaultModel";
 import { UsageLimitCard } from "@/features/models/UsageLimitCard";
+import { AddToFolderDialog } from "@/features/sessions/SessionFolderDialogs";
 import { useUsageLimitActions } from "@/features/models/hooks";
 import { assertFitsRequest, toWire } from "./attachments";
 import { Composer } from "./Composer";
 import { readChatDraft, writeChatDraft } from "./chatDraft";
+import { useSlashController } from "./slash/useSlashController";
 import { useRequestControl } from "./useRequestControl";
 import { QuestionForm } from "./QuestionForm";
 import { sendErrorMessage } from "./sendErrors";
@@ -48,6 +50,9 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
   const cancel = useLinkMutation("session.cancel");
   const defaults = useDefaultModels(desktopId).defaults;
   const [configError, setConfigError] = useState<string | null>(null);
+  // The `/` menu of this session (hidden when the desktop does not advertise it); Add to folder opens the folder dialog.
+  const [folderOpen, setFolderOpen] = useState(false);
+  const slash = useSlashController({ conversationId: sessionId, readOnly, ...(session ? { onAddToFolder: () => setFolderOpen(true) } : {}) });
   // The typed text survives a remount (a tab switch, a split): it is read once, when the composer mounts.
   const [initialText] = useState(() => readChatDraft(desktopId, sessionId));
   const rememberText = useCallback((text: string) => writeChatDraft(desktopId, sessionId, text), [desktopId, sessionId]);
@@ -98,7 +103,9 @@ export function SessionComposer({ desktopId, sessionId, projectId, session, busy
         notice={notice ?? null}
         toolbar={toolbar}
         configError={configError}
+        slash={slash}
       />
+      {session ? <AddToFolderDialog desktopId={desktopId} session={session} open={folderOpen} onOpenChange={setFolderOpen} /> : null}
       {guard.dialog}
     </>
   );

@@ -122,6 +122,7 @@ function requiredCapability(method: MethodName): string | undefined {
   if (method === "chat.mentionedFile") return "mentionedFiles";
   if (method === "file.prepare") return "fileTransfer";
   if (method.startsWith("terminal.")) return "terminal";
+  if (method.startsWith("commands.")) return "slashCommands";
   return undefined;
 }
 

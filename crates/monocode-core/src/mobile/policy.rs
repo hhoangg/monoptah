@@ -413,6 +413,8 @@ pub const METHODS: &[Entry] = &[
     app("conversation.read", Class::Read),
     app("conversation.older", Class::Read),
     app("models.list", Class::Read),
+    app("commands.list", Class::Read),
+    app("commands.run", Class::Control),
     app("accounts.usage", Class::Param),
     app("session.configure", Class::Control),
     app("project.changes", Class::Read),
@@ -896,6 +898,8 @@ fn capabilities_with(flags: &PolicyFlags, approvals_gate: bool) -> Vec<String> {
     list.push("mentionedFiles2".to_owned());
     // `file.prepare`: files are opened through encrypted objects in R2 (a read, always on).
     list.push("fileTransfer".to_owned());
+    // `commands.list` (a read) and `commands.run` (Control): the `/` menu of a session composer.
+    list.push("slashCommands".to_owned());
     list
 }
 
@@ -1554,7 +1558,13 @@ mod tests {
     fn capabilities_follow_flags_and_the_approvals_gate() {
         assert_eq!(
             capabilities_with(&PolicyFlags::default(), false),
-            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
+            [
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ]
         );
         assert_eq!(
             capabilities_with(&ON, false),
@@ -1565,13 +1575,20 @@ mod tests {
                 "cloudMove",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ]
         );
         // The gate alone does not list approvals: the desktop toggle is needed too.
         assert_eq!(
             capabilities_with(&PolicyFlags::default(), true),
-            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
+            [
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ]
         );
         let toggle = PolicyFlags {
             remote_approvals: true,
@@ -1579,7 +1596,13 @@ mod tests {
         };
         assert_eq!(
             capabilities_with(&toggle, false),
-            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
+            [
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ]
         );
         assert_eq!(
             capabilities_with(&toggle, true),
@@ -1588,7 +1611,8 @@ mod tests {
                 "approvals",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ]
         );
         assert_eq!(
@@ -1601,7 +1625,8 @@ mod tests {
                 "approvals",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ]
         );
     }
@@ -1623,7 +1648,8 @@ mod tests {
                 "cloudStart",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ]
         );
         assert_eq!(
@@ -1633,7 +1659,8 @@ mod tests {
                 "gitPush",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ]
         );
         assert_eq!(
@@ -1645,12 +1672,19 @@ mod tests {
                 "cloudMove",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ]
         );
         assert_eq!(
             capabilities_with(&flags(false, false), false),
-            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
+            [
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ]
         );
     }
 
@@ -1725,7 +1759,13 @@ mod tests {
         }
         assert_eq!(
             capabilities_with(&off, REMOTE_APPROVALS_ENABLED),
-            ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"]
+            [
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ]
         );
         assert_eq!(
             capabilities_with(&on, REMOTE_APPROVALS_ENABLED),
@@ -1734,7 +1774,8 @@ mod tests {
                 "approvals",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ]
         );
     }
@@ -1908,6 +1949,37 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn the_slash_menu_is_listed_by_any_device_and_run_only_with_control() {
+        let params = json!({"conversationId": "s1", "command": "operator"});
+        for kind in [DeviceKind::Web, DeviceKind::Phone] {
+            let read = ctx(kind, Permission::Read);
+            let control = ctx(kind, Permission::Control);
+            assert_eq!(code(authorize(&read, "commands.list", &json!({}))), None);
+            assert_eq!(
+                code(authorize(&read, "commands.run", &params)),
+                Some(Code::ReadOnly),
+                "{kind:?}"
+            );
+            assert_eq!(code(authorize(&control, "commands.run", &params)), None);
+        }
+        assert_eq!(classify("commands.list", &json!({})), Some(Access::Read));
+        assert_eq!(classify("commands.run", &params), Some(Access::Control));
+        // Operator is no different from the other commands for a device outside its selection.
+        let narrowed = DeviceContext {
+            projects: Some(vec!["p1".into()]),
+            ..ctx(DeviceKind::Web, Permission::Control)
+        };
+        assert_eq!(
+            code(authorize(
+                &narrowed,
+                "commands.list",
+                &json!({"projectId": "p2"})
+            )),
+            Some(Code::NotSelected)
+        );
     }
 
     #[test]

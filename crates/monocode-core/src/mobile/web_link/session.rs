@@ -884,7 +884,13 @@ mod tests {
         policy::set_flags(policy::PolicyFlags::default());
         assert_eq!(
             capabilities(&mut h()),
-            json!(["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"])
+            json!([
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ])
         );
         policy::set_flags(policy::PolicyFlags {
             remote_cloud_start: true,
@@ -897,7 +903,8 @@ mod tests {
                 "cloudStart",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ])
         );
         policy::set_flags(before);
@@ -918,7 +925,13 @@ mod tests {
         policy::set_flags(PolicyFlags::default());
         assert_eq!(
             h.table.state_message(&mode)["capabilities"],
-            json!(["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"])
+            json!([
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ])
         );
         policy::set_flags(PolicyFlags {
             remote_approvals: true,
@@ -931,7 +944,8 @@ mod tests {
                 "approvals",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ])
         );
         policy::set_flags(before);
@@ -953,7 +967,7 @@ mod tests {
                 "state": "confirmed",
                 "permission": "read",
                 "proto": 1,
-                "capabilities": ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"],
+                "capabilities": ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer", "slashCommands"],
                 "desktop": {"name": "Test Desktop", "version": "1.2.3"},
             })]
         );
@@ -990,13 +1004,20 @@ mod tests {
                 "gitPush",
                 "mentionedFiles",
                 "mentionedFiles2",
-                "fileTransfer"
+                "fileTransfer",
+                "slashCommands"
             ])
         );
         assert_eq!(
             h.table
                 .state_message_with(&pending, &PolicyFlags::default())["capabilities"],
-            json!(["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer"])
+            json!([
+                "cloud",
+                "mentionedFiles",
+                "mentionedFiles2",
+                "fileTransfer",
+                "slashCommands"
+            ])
         );
     }
 

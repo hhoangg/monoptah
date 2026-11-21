@@ -808,7 +808,8 @@
       "mentionedFiles",
       "mentionedFiles2",
       "fileTransfer",
-      "terminal"
+      "terminal",
+      "slashCommands"
     ],
     "messages": [
       {
@@ -831,7 +832,8 @@
           "mentionedFiles",
           "mentionedFiles2",
           "fileTransfer",
-          "terminal"
+          "terminal",
+          "slashCommands"
         ],
         "desktop": {
           "name": "Example Desktop",

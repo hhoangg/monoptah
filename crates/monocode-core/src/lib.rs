@@ -59,6 +59,7 @@ pub mod composer;
 pub mod contributions;
 pub mod orchestration;
 pub mod skills;
+pub mod slash_commands;
 
 pub mod search;
 

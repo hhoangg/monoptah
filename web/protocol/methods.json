@@ -57,6 +57,16 @@
       "transport": "app"
     },
     {
+      "name": "commands.list",
+      "class": "read",
+      "transport": "app"
+    },
+    {
+      "name": "commands.run",
+      "class": "control",
+      "transport": "app"
+    },
+    {
       "name": "conversation.older",
       "class": "read",
       "transport": "app"

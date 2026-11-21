@@ -1795,6 +1795,10 @@ fn paint_question_burst(
 }
 
 impl Conversation {
+    /// A completed turn a side question can be asked about.
+    pub(super) fn btw_available(&self, cx: &App) -> bool {
+        self.btw_target(cx).is_some()
+    }
     fn btw_target(&self, cx: &App) -> Option<Target> {
         if !self.history_ready()
             || self.settings.mono.is_some()

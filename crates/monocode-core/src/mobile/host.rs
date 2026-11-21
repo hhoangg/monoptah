@@ -52,6 +52,8 @@ pub(super) const APP_METHODS: &[&str] = &[
     "conversation.read",
     "conversation.older",
     "models.list",
+    "commands.list",
+    "commands.run",
     "accounts.usage",
     "session.configure",
     "project.changes",

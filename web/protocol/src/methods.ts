@@ -228,6 +228,46 @@ export const SessionStartParamsSchema = z.object({
   target: SessionStartTargetSchema.optional(),
 });
 
+// --- Slash commands (the `/` menu of a session composer) ---
+
+/** The commands `commands.run` executes on an existing session. Skills and Add to folder need no such call. */
+export const SLASH_RUN_COMMANDS = ["plan", "operator", "orchestrator", "draft", "btw", "compact"] as const;
+export type SlashRunCommand = (typeof SLASH_RUN_COMMANDS)[number];
+
+/** One row of the menu. `id` of a skill is its name: the web inserts `/<id> ` into the message. */
+export const SlashCommandSchema = z.looseObject({
+  id: z.string(),
+  kind: z.enum(["builtin", "skill"]),
+  label: z.string(),
+  detail: z.string(),
+  /** A name for the web's own icon set: the command id, or `skill`. */
+  icon: z.string(),
+  available: z.boolean(),
+  /** Why it is not available, in a plain sentence. */
+  reason: z.string().optional(),
+  /** Draft, Plan, Operator and Orchestrator change how the next message is sent. */
+  mode: z.boolean(),
+  /** The mode is on for this session on the desktop. */
+  active: z.boolean(),
+});
+export type SlashCommand = z.infer<typeof SlashCommandSchema>;
+
+export const CommandsListParamsSchema = z.object({
+  /** The session whose menu this is. Without it, `projectId` asks for the menu of a new session. */
+  conversationId: ConversationId.optional(),
+  projectId: ProjectId.optional(),
+  harness: HarnessSchema.optional(),
+});
+
+export const CommandsRunParamsSchema = z.object({
+  conversationId: ConversationId,
+  command: z.enum(SLASH_RUN_COMMANDS),
+  /** Plan, Operator, Orchestrator: set the mode on or off. Without it the desktop flips it. */
+  enabled: z.boolean().optional(),
+  /** Draft and Side question: the message. */
+  text: z.string().max(MAX_MESSAGE_CHARS).optional(),
+});
+
 // --- Git ---
 
 export const GIT_ACTIONS = ["stage", "unstage", "stageAll", "unstageAll", "generate", "commit", "sync", "pr"] as const;
@@ -316,6 +356,20 @@ export type DeviceSelection = z.infer<typeof DeviceSelectionSchema>;
 // --- The table ---
 
 export const METHODS = {
+  // The `/` menu (capability `slashCommands`)
+  "commands.list": method({
+    class: "read",
+    transport: "app",
+    params: CommandsListParamsSchema,
+    result: z.looseObject({ commands: z.array(SlashCommandSchema) }),
+  }),
+  "commands.run": method({
+    class: "control",
+    transport: "app",
+    params: CommandsRunParamsSchema,
+    result: z.looseObject({ command: z.string(), active: z.boolean().optional(), message: z.string().optional() }),
+  }),
+
   // Conversations
   "conversation.read": method({
     class: "read",

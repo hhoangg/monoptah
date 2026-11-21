@@ -22,8 +22,13 @@
 //   error. The size change is a `motion` layout animation of 280 ms out-cubic (`--ease-out-cubic`); motion writes
 //   through the CSSOM, so the CSP needs no inline style attribute. With `prefers-reduced-motion` it is instant.
 //   `data-shape` says which one it is.
+// - The `/` menu (`slash`): typing a word that starts with `/` opens the desktop's Skills and Commands menu above the
+//   card (a popover, or a bottom sheet on a phone). Up and down, Enter or Tab and Escape drive it on a desktop layout,
+//   a tap on a phone; what is typed after the `/` filters it. Plan, Operator and Orchestrator show as a chip while on;
+//   Draft and Side question take the next send. No `slash` (an older desktop, a Mono chat) means no menu.
 import { useReducedMotion } from "motion/react";
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
+import type { SlashCommand } from "@monoptah/protocol";
 import { DictationButton } from "@/features/dictation";
 import { cn } from "@/lib/utils";
 import { Glass } from "@/ui/Glass";
@@ -42,6 +47,9 @@ import {
   type ComposerAttachment,
 } from "./attachments";
 import { AttachmentChip } from "./AttachmentChip";
+import { SlashMenu, slashOptionId } from "./slash/SlashMenu";
+import { rankCommands, slashTokenAt, type SlashToken } from "./slash/slashToken";
+import type { SlashController } from "./slash/useSlashController";
 import { useKeyboardInset } from "./useKeyboardInset";
 import type { RequestControl } from "./useRequestControl";
 import { SendCancelled } from "./useSendGuard";
@@ -49,6 +57,8 @@ import { SendCancelled } from "./useSendGuard";
 export const COMPOSER_PLACEHOLDER = "Plan, ask, build...";
 export const BUSY_PLACEHOLDER = "Send a follow-up...";
 export const OFFLINE_PLACEHOLDER = "Reconnecting to desktop...";
+export const DRAFT_PLACEHOLDER = "Write a draft to save...";
+export const SIDE_QUESTION_PLACEHOLDER = "Ask a side question...";
 export const READ_ONLY_REASON = "Read-only: this device can read sessions but not send messages.";
 /** A wide screen with a mouse or trackpad: Enter sends there, and only there. */
 export const DESKTOP_LAYOUT_QUERY = "(min-width: 640px) and (pointer: fine)";
@@ -90,6 +100,8 @@ export interface ComposerProps {
   /** The draft to start from (a page that was unmounted and comes back), and a report of every change to it. */
   initialText?: string;
   onTextChange?: (text: string) => void;
+  /** The `/` menu of this composer; `null` or absent shows none. */
+  slash?: SlashController | null;
   className?: string;
 }
 
@@ -124,8 +136,15 @@ function isInsideComposer(field: HTMLElement | null, owner: string, target: Even
   return !!field?.closest("[data-shape]")?.contains(target) || target.closest(`[data-overlay-owner="${owner}"]`) !== null;
 }
 
-export function Composer({ onSubmit, busy = false, onStop, readOnly = false, requestControl, offline = false, notice, toolbar, topRow, configError, autoFocus = false, initialText = "", onTextChange, className }: ComposerProps) {
+export function Composer({ onSubmit, busy = false, onStop, readOnly = false, requestControl, offline = false, notice, toolbar, topRow, configError, autoFocus = false, initialText = "", onTextChange, slash, className }: ComposerProps) {
   const [text, setText] = useState(initialText);
+  const [caret, setCaret] = useState(initialText.length);
+  const [fieldFocused, setFieldFocused] = useState(false);
+  const [dismissed, setDismissed] = useState<SlashToken | null>(null);
+  const [activeRow, setActiveRow] = useState(0);
+  // Where the caret goes once a menu choice rewrote the text.
+  const pendingCaret = useRef<number | null>(null);
+  const menuId = useId();
   useEffect(() => {
     onTextChange?.(text);
   }, [text, onTextChange]);
@@ -197,9 +216,38 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   }, [owner]);
 
   const hasDraft = text.trim().length > 0 || attachments.length > 0;
-  const card = focusWithin || hasDraft || !!shownNotice || !!error;
+  // An empty list (a Mono chat, a remote project) opens nothing and takes no key; a failed read says so.
+  const hasMenu = slash && !readOnly && (slash.commands.length > 0 || slash.loading || slash.failed);
+  const token = hasMenu && fieldFocused ? slashTokenAt(text, caret) : null;
+  const closedByUser = token !== null && dismissed !== null && dismissed.start === token.start && dismissed.query === token.query;
+  const menuOpen = token !== null && !closedByUser;
+  const rows = menuOpen && slash ? rankCommands(slash.commands, token.query) : [];
+  const active = Math.min(activeRow, Math.max(0, rows.length - 1));
+  const chips = slash ? [slash.mode, slash.armed].filter((row): row is SlashCommand => row !== null) : [];
+  const card = focusWithin || hasDraft || !!shownNotice || !!error || chips.length > 0;
   const fieldMin = card ? INPUT_MIN_PX : PILL_FIELD_MIN_PX;
   const canSend = hasDraft && !submitting && !readOnly && !offline;
+  const refreshMenu = slash?.refresh;
+  // The moment the menu opens asks the desktop again (`refresh` is stable, so nothing else triggers it).
+  useEffect(() => {
+    if (menuOpen) refreshMenu?.();
+  }, [menuOpen, refreshMenu]);
+  // The highlight goes back to the first row when the word changes, and a menu closed with Escape stays closed only
+  // until the word goes away (adjusted during render, React's pattern for state derived from other state).
+  const query = token?.query ?? null;
+  const [seenQuery, setSeenQuery] = useState(query);
+  if (seenQuery !== query) {
+    setSeenQuery(query);
+    setActiveRow(0);
+  }
+  if (!token && dismissed) setDismissed(null);
+  useLayoutEffect(() => {
+    const at = pendingCaret.current;
+    if (at === null) return;
+    pendingCaret.current = null;
+    area.current?.setSelectionRange(at, at);
+    setCaret(at);
+  }, [text]);
   const showStop = busy && !!onStop;
   const showSend = !showStop || hasDraft;
   // Stop is armed STOP_ARM_DELAY_MS after it appears; until then a press does nothing.
@@ -287,6 +335,34 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
     setAttachments(held.current.filter((item) => item.id !== id));
   };
 
+  /** A row of the menu was chosen: a skill puts its name in the text, a command runs and its word leaves the text. */
+  const pick = async (row: SlashCommand) => {
+    if (!slash || !token) return;
+    if (!row.available) {
+      setError(row.reason ?? "This command is not available now.");
+      return;
+    }
+    setError(null);
+    const before = text.slice(0, token.start);
+    if (row.kind === "skill") {
+      const after = text.slice(token.end).replace(/^ /, "");
+      const inserted = `/${row.id} `;
+      pendingCaret.current = before.length + inserted.length;
+      setText(before + inserted + after);
+      area.current?.focus();
+      return;
+    }
+    const after = text.slice(token.end).replace(/^ /, "");
+    pendingCaret.current = before.length;
+    setText(before + after);
+    area.current?.focus();
+    try {
+      await slash.choose(row);
+    } catch (reason) {
+      setError(reason instanceof Error && reason.message ? reason.message : "That command could not run.");
+    }
+  };
+
   const submit = async () => {
     if (!canSend) return;
     const message = text.trim();
@@ -303,7 +379,10 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
     setSubmitting(true);
     setError(null);
     try {
-      await onSubmit(message, files);
+      if (slash?.armed && files.length > 0) throw new Error("A draft or a side question carries text only. Remove the attachments first.");
+      const handled = slash?.armed ? await slash.submitArmed(message) : false;
+      if (!handled) await onSubmit(message, files);
+      slash?.afterSend();
       // Text typed while the send was in flight (or in the send-guard dialog) belongs to the next message.
       setText((current) => (current.trim() === message ? "" : current));
       setAttachments([]);
@@ -331,6 +410,26 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (menuOpen && token && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+      const plain = !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && rows.length > 0) {
+        event.preventDefault();
+        setActiveRow((active + (event.key === "ArrowDown" ? 1 : rows.length - 1)) % rows.length);
+        return;
+      }
+      if (event.key === "Escape") {
+        // Closes the menu only: the card keeps its focus.
+        event.preventDefault();
+        setDismissed(token);
+        return;
+      }
+      const chosen = rows[active];
+      if (chosen && plain && (event.key === "Tab" || (event.key === "Enter" && desktopLayout))) {
+        event.preventDefault();
+        void pick(chosen);
+        return;
+      }
+    }
     if (event.key !== "Enter" || event.nativeEvent.isComposing || event.keyCode === 229) return;
     const modified = event.metaKey || event.ctrlKey;
     if (modified || (desktopLayout && !event.shiftKey)) {
@@ -354,7 +453,8 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
 
   const noticeContent = shownNotice ? sessionErrorContent(plainErrorText(shownNotice.text)) : null;
   const noticeMessage = noticeContent ? noticeContent.message : "";
-  const placeholder = offline ? OFFLINE_PLACEHOLDER : busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER;
+  const placeholder = offline ? OFFLINE_PLACEHOLDER : slash?.armed?.id === "draft" ? DRAFT_PLACEHOLDER : slash?.armed?.id === "btw" ? SIDE_QUESTION_PLACEHOLDER : busy ? BUSY_PLACEHOLDER : COMPOSER_PLACEHOLDER;
+  const sendLabel = slash?.armed?.id === "draft" ? "Save draft" : slash?.armed?.id === "btw" ? "Ask" : "Send";
   const describedBy = [readOnly ? reasonId : null, error ? errorId : null].filter(Boolean).join(" ") || undefined;
 
   return (
@@ -362,7 +462,21 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
     <OverlayOwnerContext.Provider value={owner}>
     {/* The space under the pill is applied once, here: 0.75rem above the on-screen keyboard (lifted by `inset`), and
         otherwise the home-indicator safe area, never less than 0.75rem (a device without one keeps the small gap). */}
-    <div data-testid="composer" className={cn("pt-1", inset ? "pb-3" : "pb-app-inset", className)} style={inset ? { marginBottom: inset } : undefined}>
+    <div data-testid="composer" className={cn("relative pt-1", inset ? "pb-3" : "pb-app-inset", className)} style={inset ? { marginBottom: inset } : undefined}>
+      {menuOpen ? (
+        <SlashMenu
+          id={menuId}
+          owner={owner}
+          rows={rows}
+          loading={slash?.loading ?? false}
+          failed={slash?.failed ?? false}
+          active={active}
+          sheet={!desktopLayout}
+          onActive={setActiveRow}
+          onChoose={(row) => void pick(row)}
+          onClose={() => token && setDismissed(token)}
+        />
+      ) : null}
       <Glass
         className={cn("flex", card ? "flex-col gap-1 px-3 pb-2 pt-3" : "min-h-[50px] flex-row items-center gap-1 px-1.5 py-[3px]")}
         data-shape={card ? "card" : "pill"}
@@ -395,6 +509,28 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
         onDrop={onDrop}
       >
         {topRow ? <div data-composer-extra className={card ? "flex min-w-0 items-center gap-2 px-1" : "size-0 overflow-hidden"}>{topRow}</div> : null}
+
+        {chips.length > 0 ? (
+          <ul aria-label="Active commands" data-testid="slash-chips" className="m-0 flex list-none flex-wrap gap-2 px-1">
+            {chips.map((chip) => (
+              <li key={chip.id}>
+                <button
+                  type="button"
+                  data-testid={`slash-chip-${chip.id}`}
+                  aria-label={`${chip.label}, turn off`}
+                  onClick={() => {
+                    if (chip === slash?.armed) slash.disarm();
+                    else void slash?.clearMode().catch((reason: unknown) => setError(reason instanceof Error && reason.message ? reason.message : "Could not change the mode."));
+                  }}
+                  className="inline-flex min-h-9 items-center gap-1.5 rounded-pill bg-selection px-3 text-label text-brand"
+                >
+                  {chip.label}
+                  <Icon name="close" size={12} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : null}
 
         {attachments.length > 0 ? (
           <ul aria-label="Attachments" className="m-0 flex list-none gap-2 overflow-x-auto px-1 py-1">
@@ -438,10 +574,21 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           aria-describedby={describedBy}
           enterKeyHint={desktopLayout ? "send" : "enter"}
           placeholder={placeholder}
-          onChange={(event) => setText(event.target.value)}
+          onChange={(event) => {
+            setText(event.target.value);
+            setCaret(event.target.selectionStart);
+          }}
+          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
-          onFocus={onFocus}
+          onFocus={() => {
+            setFieldFocused(true);
+            onFocus();
+          }}
+          onBlur={() => setFieldFocused(false)}
+          aria-controls={menuOpen ? menuId : undefined}
+          aria-haspopup={slash ? "listbox" : undefined}
+          aria-activedescendant={menuOpen && rows[active] ? slashOptionId(menuId, rows[active]) : undefined}
           className={cn("order-3 block min-w-0 resize-none bg-transparent text-row text-content outline-none placeholder:text-muted-text disabled:opacity-60", card ? "order-none w-full px-1" : "flex-1 px-2")}
           style={{ minHeight: fieldMin, maxHeight: INPUT_MAX_PX }}
         />
@@ -496,7 +643,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           {showSend ? (
             <button
               type="button"
-              aria-label="Send"
+              aria-label={sendLabel}
               disabled={!canSend}
               aria-busy={submitting}
               onClick={() => void submit()}

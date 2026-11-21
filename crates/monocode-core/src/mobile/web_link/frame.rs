@@ -516,6 +516,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "mentionedFiles2",
     "fileTransfer",
     "terminal",
+    "slashCommands",
 ];
 
 /// Codes in the ERROR relay frame body.

@@ -1177,65 +1177,11 @@ impl Completion {
             }
         } else {
             let mut choices = Vec::new();
-            for (order, (id, label, detail)) in [
-                (
-                    "draft",
-                    "Draft",
-                    "Save this message without starting the agent",
-                ),
-                (
-                    "orchestrator",
-                    "Orchestrator",
-                    "Plan and coordinate agent work",
-                ),
-                (
-                    "operator",
-                    "Operator",
-                    "Give this thread access to Monoptah",
-                ),
-                ("plan", "Plan mode", "Review a plan before building"),
-                (
-                    "btw",
-                    "Side question",
-                    "Ask a read-only side question about the current turn",
-                ),
-                (
-                    "compact",
-                    "Compact context",
-                    "Summarize older conversation context to free space",
-                ),
-                (
-                    "add-to-folder",
-                    "Add to folder",
-                    "Place this session in an existing or new sidebar folder",
-                ),
-                ("mcp", "MCP server", "Find an MCP server for this message"),
-                ("stage", "Stage", "Stage only this session's changes"),
-                (
-                    "commit",
-                    "Commit",
-                    "Stage and commit this session's changes",
-                ),
-                (
-                    "visualize",
-                    "Visualize",
-                    "Create an inline visual of this topic or a specific request",
-                ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if matches!(id, "stage" | "commit") && self.has_user_command(id) {
-                    continue;
-                }
-                if id == "btw"
-                    && matches!(
-                        self.provider,
-                        monocode_core::provider::Kind::Fx
-                            | monocode_core::provider::Kind::Hermes
-                            | monocode_core::provider::Kind::Antigravity
-                    )
-                {
+            for (order, builtin) in monocode_core::slash_commands::BUILTINS.iter().enumerate() {
+                let (id, label, detail) = (builtin.id, builtin.label, builtin.detail);
+                if !monocode_core::slash_commands::builtin_listed(id, self.provider, |name| {
+                    self.has_user_command(name)
+                }) {
                     continue;
                 }
                 if let Some(score) = composer::score(&token.query, &format!("{id} {label}")) {
@@ -1306,19 +1252,7 @@ impl Completion {
                 }
             }
             for skill in &self.skills {
-                if matches!(
-                    skill.name.as_str(),
-                    "plan"
-                        | "compact"
-                        | "mcp"
-                        | "operator"
-                        | "orchestrator"
-                        | "add-to-folder"
-                        | "draft"
-                        | "btw"
-                        | "mono"
-                        | "monocode"
-                ) {
+                if !monocode_core::slash_commands::skill_listed(&skill.name) {
                     continue;
                 }
                 if let Some(score) = composer::score(

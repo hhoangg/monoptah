@@ -8,6 +8,8 @@ export const SAMPLE_PARAMS: Record<MethodName, Record<string, unknown>> = {
   "conversation.watch": { conversationId: "sess-codespace-1" },
   "conversation.send": { conversationId: "sess-local-1", text: "Hello from a test" },
   "models.list": {},
+  "commands.list": { conversationId: "sess-local-1" },
+  "commands.run": { conversationId: "sess-local-1", command: "plan" },
   "accounts.usage": { provider: "claude" },
   "session.configure": { conversationId: "sess-local-1", model: "example-model-2" },
   "session.start": { projectId: "proj-alpha", text: "Start an example", target: { kind: "sandbox" } },

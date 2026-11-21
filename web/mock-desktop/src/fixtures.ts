@@ -17,6 +17,7 @@ import {
   type MethodName,
   type ResultOf,
   type SessionCard,
+  type SlashCommand,
   type Turn,
   type UsageLimit,
   type WatchFrame,
@@ -51,6 +52,14 @@ export interface MockDevice {
   selection: { projects: string[] | null; monos: string[] | null };
   /** "Allow web terminal" of this device on the desktop. Default on in the mock (a Control device); false answers `disabled` and hides the capability. */
   terminal?: boolean;
+}
+
+export interface SlashState {
+  /** Plan, operator or orchestrator while one is on. */
+  mode: string | null;
+  draft: string | null;
+  sideQuestions: string[];
+  compactions: number;
 }
 
 export interface WorldCapabilities {
@@ -305,6 +314,90 @@ export class MockWorld {
   deleteFolder(projectId: string, folderId: string): void {
     this.#folder(projectId, folderId);
     this.folders = this.folders.filter((f) => f.id !== folderId);
+  }
+
+  /** Slash command state per session: the mode that is on, the saved draft and what the other commands did. */
+  readonly slash = new Map<string, SlashState>();
+  /** Every `commands.run` the desktop executed, in order (a test reads it). */
+  readonly commandRuns: { conversationId: string; command: string; enabled?: boolean; text?: string }[] = [];
+  /** The skills of every project in this mock. */
+  skills: { name: string; description: string }[] = [
+    { name: "review", description: "Review the current diff" },
+    { name: "lint", description: "Lint the project" },
+  ];
+
+  slashState(conversationId: string): SlashState {
+    let state = this.slash.get(conversationId);
+    if (!state) {
+      state = { mode: null, draft: null, sideQuestions: [], compactions: 0 };
+      this.slash.set(conversationId, state);
+    }
+    return state;
+  }
+
+  /** `commands.list`: the rows of the `/` menu, with the availability rules of the real desktop. */
+  commandList(params: { conversationId?: string | undefined; projectId?: string | undefined }, readOnly: boolean): SlashCommand[] {
+    const existing = params.conversationId !== undefined;
+    const record = existing ? this.session(params.conversationId as string) : undefined;
+    const state = record ? this.slashState(record.id) : undefined;
+    const sent = (record?.turns.length ?? 0) > 0;
+    const rows: [string, string, string, boolean, string | undefined][] = [
+      ["draft", "Draft", "Save this message without starting the agent", true, record?.busy ? "Wait for the current turn to finish" : state?.draft ? "A draft is already saved" : undefined],
+      ["orchestrator", "Orchestrator", "Plan and coordinate agent work", true, undefined],
+      ["operator", "Operator", "Give this thread access to Monoptah", true, existing ? undefined : "Start the session first, then turn on Operator"],
+      ["plan", "Plan mode", "Review a plan before building", true, undefined],
+      ["btw", "Side question", "Ask a read-only side question about the current turn", false, sent ? undefined : "Finish a conversation turn before asking a side question"],
+      ["compact", "Compact context", "Summarize older conversation context to free space", false, !existing ? "Available once the session has a finished turn" : record?.busy ? "Wait for the current turn and queued messages to finish" : sent ? undefined : "Send a message before compacting this session"],
+      ["add-to-folder", "Add to folder", "Place this session in an existing or new sidebar folder", false, existing ? undefined : "Available once the session exists"],
+    ];
+    const commands: SlashCommand[] = rows.map(([id, label, detail, mode, blocked]) => {
+      const reason = readOnly ? "This device can only read on this desktop" : blocked;
+      return { id, kind: "builtin", label, detail, icon: id, available: reason === undefined, ...(reason ? { reason } : {}), mode, active: id !== "draft" && state?.mode === id };
+    });
+    for (const skill of this.skills) {
+      commands.push({
+        id: skill.name,
+        kind: "skill",
+        label: skill.name,
+        detail: skill.description,
+        icon: "skill",
+        available: !readOnly,
+        ...(readOnly ? { reason: "This device can only read on this desktop" } : {}),
+        mode: false,
+        active: false,
+      });
+    }
+    return commands;
+  }
+
+  /** `commands.run`: runs the command on the session as the real desktop does (modes are exclusive). */
+  runCommand(params: { conversationId: string; command: string; enabled?: boolean | undefined; text?: string | undefined }): { command: string; active?: boolean; message?: string } {
+    const s = this.session(params.conversationId);
+    const state = this.slashState(s.id);
+    this.commandRuns.push({ conversationId: s.id, command: params.command, ...(params.enabled !== undefined ? { enabled: params.enabled } : {}), ...(params.text !== undefined ? { text: params.text } : {}) });
+    switch (params.command) {
+      case "plan":
+      case "operator":
+      case "orchestrator": {
+        const on = params.enabled ?? state.mode !== params.command;
+        state.mode = on ? params.command : state.mode === params.command ? null : state.mode;
+        return { command: params.command, active: state.mode === params.command };
+      }
+      case "draft":
+        if (!params.text?.trim()) throw new FixtureError("Enter a message under 100,000 characters");
+        if (state.draft) throw new FixtureError("A draft is already saved");
+        state.draft = params.text.trim();
+        return { command: "draft" };
+      case "btw":
+        if (!params.text?.trim()) throw new FixtureError("Enter a message under 100,000 characters");
+        state.sideQuestions.push(params.text.trim());
+        return { command: "btw", message: "The side question opened on the desktop. The answer shows there." };
+      case "compact":
+        state.compactions += 1;
+        return { command: "compact" };
+      default:
+        throw new FixtureError("Unsupported mobile operation", "unsupported");
+    }
   }
 
   session(conversationId: string): SessionRecord {
@@ -745,6 +838,12 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: HandlerOf<M> } = {
     return frame;
   },
   "conversation.send": (p, { world }) => world.send(p.conversationId, p.text, p.wake),
+
+  "commands.list": (p, ctx) => {
+    if (p.projectId !== undefined) folderProject(ctx, p.projectId);
+    return { commands: ctx.world.commandList(p, ctx.device.permission === "read") };
+  },
+  "commands.run": (p, { world }) => world.runCommand(p),
 
   "models.list": () => ({
     harnesses: [

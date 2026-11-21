@@ -53,6 +53,17 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
     params: { conversationId: "s1", text: "Please continue", attachments: [{ name: "a.png", mimeType: "image/png", data: "iVBORw0KGgo=" }] },
     result: { sessionId: "s1", wake: true, queued: true },
   },
+  "commands.list": {
+    params: { conversationId: "s1" },
+    result: {
+      commands: [
+        { id: "plan", kind: "builtin", label: "Plan mode", detail: "Review a plan before building", icon: "plan", available: true, mode: true, active: false },
+        { id: "compact", kind: "builtin", label: "Compact context", detail: "Free space", icon: "compact", available: false, reason: "Send a message first", mode: false, active: false },
+        { id: "lint", kind: "skill", label: "lint", detail: "Lint the project", icon: "skill", available: true, mode: false, active: false },
+      ],
+    },
+  },
+  "commands.run": { params: { conversationId: "s1", command: "plan", enabled: true }, result: { command: "plan", active: true } },
   "models.list": {
     params: { conversationId: "s1" },
     result: {
