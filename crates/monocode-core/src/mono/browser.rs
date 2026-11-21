@@ -6,8 +6,9 @@
 //! * The extension token is a secret: it lives only in [`MonoBrowserStore`], sealed with
 //!   `accounts::sealed` (AAD bound to the Mono id), never in the roster.
 //! * [`resolve`] turns a Mono plus its stored token into a [`Runtime`], which adds the
-//!   `playwright_browser` MCP server to a Claude or Codex launch. The token reaches the server
-//!   through the provider process environment only, never argv.
+//!   `playwright_browser` MCP server to a Claude or Codex launch. The server is one long-lived
+//!   HTTP process per Mono (see [`server`]) so the Mono keeps one Chrome tab group across turns;
+//!   the token reaches it through that process's environment only, never argv.
 //! * Chrome helpers (profiles, install detection, prerequisites) take their paths from a
 //!   [`PrereqEnv`] so tests never touch a real Chrome.
 use crate::accounts::sealed;
@@ -16,6 +17,8 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+
+pub mod server;
 
 /// Name of the MCP server. Distinct from a user-level `playwright` server.
 pub const MCP_SERVER: &str = "playwright_browser";
@@ -133,6 +136,17 @@ impl MonoBrowser {
     /// The browser is switched on and set up: the server is added and the prompt mentions it.
     pub fn active(&self) -> bool {
         self.enabled && self.ready && valid_profile_dir(&self.profile_dir)
+    }
+    /// The part of the setting that shapes the Mono's server. When it changes (or the browser is
+    /// switched off) the running server must go; "ask before" is enforced by the agent, not the
+    /// server, so it is not part of it.
+    pub fn server_key(&self) -> (bool, &str, &[String], &[String]) {
+        (
+            self.active(),
+            &self.profile_dir,
+            &self.blocked_origins,
+            &self.allowed_origins,
+        )
     }
     /// Trims the profile, keeps only valid origins once each, and clears `ready` without a profile.
     pub fn normalize(&mut self) {
@@ -767,6 +781,44 @@ impl ServerSpec {
             args,
         }
     }
+    /// Names the Chrome tab group of the Mono's tabs and gives it a fixed color.
+    pub fn with_session(mut self, name: &str, color: &str) -> Self {
+        self.args.extend([
+            "--session-name".to_owned(),
+            name.to_owned(),
+            "--session-color".into(),
+            color.to_owned(),
+        ]);
+        self
+    }
+}
+
+/// The tab group colors the extension accepts, with the RGB each is closest to.
+const GROUP_COLORS: [(&str, u32); 8] = [
+    ("blue", 0x1a73e8),
+    ("red", 0xd93025),
+    ("yellow", 0xf9ab00),
+    ("green", 0x188038),
+    ("pink", 0xd01884),
+    ("purple", 0x9334e6),
+    ("cyan", 0x129eaf),
+    ("orange", 0xe8710a),
+];
+/// The tab group color nearest to a Mono's color, so the group looks like its Mono.
+pub fn session_color(rgb: u32) -> &'static str {
+    let distance = |a: u32, b: u32| -> i64 {
+        [16, 8, 0]
+            .iter()
+            .map(|shift| {
+                let d = i64::from((a >> shift) & 0xff) - i64::from((b >> shift) & 0xff);
+                d * d
+            })
+            .sum()
+    };
+    GROUP_COLORS
+        .iter()
+        .min_by_key(|(_, color)| distance(rgb, *color))
+        .map_or("blue", |(name, _)| name)
 }
 
 /// A Mono's browser server, ready to add to a launch.
@@ -775,11 +827,20 @@ pub struct Runtime {
     pub spec: ServerSpec,
     token: Secret,
     pub confirm_actions: bool,
+    /// The URL of the Mono's running HTTP server. None: the entry starts its own stdio server
+    /// (the connection test).
+    pub endpoint: Option<String>,
+    /// Keeps the Mono's server from being stopped as idle while the run that resolved this uses it.
+    pub lease: Option<server::Lease>,
 }
 impl Runtime {
-    /// Claude's stdio entry. The token is a `${VAR}` reference, expanded by Claude from the
-    /// process environment, so it is not in argv or in this JSON.
+    /// Claude's entry: the Mono's running server over HTTP, or for a stdio runtime a command
+    /// whose token is a `${VAR}` reference that Claude expands from the process environment.
+    /// The token is never in argv or in this JSON.
     pub fn claude_server(&self) -> Value {
+        if let Some(url) = &self.endpoint {
+            return json!({"type": "http", "url": url});
+        }
         json!({
             "type": "stdio",
             "command": self.spec.command,
@@ -819,13 +880,18 @@ impl Runtime {
     /// The `-c` overrides for Codex (`key`, TOML value). `env_vars` forwards the token from
     /// the Codex process environment instead of writing it into argv.
     pub fn codex_overrides(&self) -> Vec<(String, String)> {
-        let mut values = vec![
-            ("command", json!(self.spec.command)),
-            ("args", json!(self.spec.args)),
-            ("env_vars", json!([TOKEN_ENV])),
+        let mut values = match &self.endpoint {
+            Some(url) => vec![("url", json!(url))],
+            None => vec![
+                ("command", json!(self.spec.command)),
+                ("args", json!(self.spec.args)),
+                ("env_vars", json!([TOKEN_ENV])),
+            ],
+        };
+        values.extend([
             ("disabled_tools", json!(BLOCKED_TOOLS)),
             ("startup_timeout_sec", json!(START_TIMEOUT_SECONDS)),
-        ];
+        ]);
         // "writes": a tool not marked read-only waits for approval. Where the Codex session
         // never asks (Full Access, read-only), Codex denies that call instead of running it.
         values.push((
@@ -848,8 +914,12 @@ impl Runtime {
         }
         self.apply_env(command);
     }
-    /// Puts the token in the provider's environment, where the server entry refers to it.
+    /// Puts the token in the environment of a process that starts the server itself. A runtime
+    /// that points at the Mono's running server needs none: that server has the token already.
     pub fn apply_env(&self, command: &mut std::process::Command) {
+        if self.endpoint.is_some() {
+            return;
+        }
         command.env(TOKEN_ENV, self.token.as_str());
     }
     /// The server's environment for a probe: the token itself.
@@ -869,6 +939,8 @@ pub fn probe_runtime(
         spec: ServerSpec::new(browser, output_dir, env.find_tool("npx").as_deref()),
         token,
         confirm_actions: browser.confirm_actions,
+        endpoint: None,
+        lease: None,
     }
 }
 
@@ -881,9 +953,15 @@ pub fn output_dir(root: &Path, mono_id: &str) -> PathBuf {
 /// not open, or Chrome or its profile data are not reachable now (for example Full Disk Access
 /// was revoked).
 pub fn resolve(ctx: &crate::agent::MonoContext) -> Option<Runtime> {
-    resolve_with(ctx, &PrereqEnv::detect())
+    resolve_with(ctx, &PrereqEnv::detect(), server::servers())
 }
-pub fn resolve_with(ctx: &crate::agent::MonoContext, env: &PrereqEnv) -> Option<Runtime> {
+/// [`resolve`] with its Chrome environment and server manager given. The Mono's server is started
+/// here when it is not running, so the launch can point the provider at it.
+pub fn resolve_with(
+    ctx: &crate::agent::MonoContext,
+    env: &PrereqEnv,
+    servers: &server::BrowserServers,
+) -> Option<Runtime> {
     let browser = ctx.mono.browser.as_ref().filter(|b| b.active())?;
     let database = ctx.browser_database.clone()?;
     if env.chrome().is_none() || read_local_state(env).is_err() {
@@ -892,11 +970,37 @@ pub fn resolve_with(ctx: &crate::agent::MonoContext, env: &PrereqEnv) -> Option<
     let token = MonoBrowserStore::at(database).token(&ctx.mono.id).ok()??;
     let dir = output_dir(&ctx.root, &ctx.mono.id);
     let _ = std::fs::create_dir_all(&dir);
+    let spec = ServerSpec::new(browser, &dir, env.find_tool("npx").as_deref())
+        .with_session(&group_name(&ctx.mono), session_color(ctx.mono.color));
+    let launch = server::ServerLaunch {
+        spec: &spec,
+        token: &token,
+        search_path: &env.search_path,
+    };
+    let (url, lease) = match servers.ensure(&ctx.mono.id, &launch) {
+        Ok(started) => started,
+        Err(error) => {
+            // The error text never holds the token (it is only in the server's environment).
+            eprintln!("mono browser: server unavailable: {error}");
+            return None;
+        }
+    };
     Some(Runtime {
-        spec: ServerSpec::new(browser, &dir, env.find_tool("npx").as_deref()),
+        spec,
         token,
         confirm_actions: browser.confirm_actions,
+        endpoint: Some(url),
+        lease: Some(lease),
     })
+}
+/// The title of the Mono's Chrome tab group: the Mono's name.
+pub fn group_name(mono: &super::Mono) -> String {
+    let name = prompt_name(&mono.label());
+    if name.is_empty() {
+        "Mono".into()
+    } else {
+        name
+    }
 }
 /// A Mono's standing rules as this launch can honor them: the browser paragraph only when the
 /// server is really added.
