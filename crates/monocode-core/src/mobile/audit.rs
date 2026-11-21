@@ -244,6 +244,20 @@ pub struct ApprovalAnswer<'a> {
     pub outcome: Outcome,
 }
 
+/// One `commands.run` call to record: the command id from the `/` menu (a closed set, never
+/// the text of the message), whether it switched a mode on or off, the conversation and how it
+/// ended. `operator` gives the thread access to Monoptah, which is why every outcome is kept.
+#[derive(Clone, Copy)]
+pub struct SlashCommand<'a> {
+    pub fingerprint: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub command: &'a str,
+    pub enabled: Option<bool>,
+    pub command_id: Option<&'a str>,
+    pub transport: Transport,
+    pub outcome: Outcome,
+}
+
 /// Methods whose class depends on parameters `record` does not get. They are
 /// written even when they succeed, because the no-parameter class may be the
 /// harmless one while the call was an edit (a selection change, a git action,
@@ -289,6 +303,7 @@ fn written_by_the_app(event: &AuditEvent) -> bool {
     }
     mentioned_file_answered(event)
         || file_transfer_answered(event)
+        || slash_command_answered(event)
         || event.method == "project.file"
             && event.from_app
             && matches!(
@@ -306,6 +321,11 @@ fn written_by_the_app(event: &AuditEvent) -> bool {
 /// would be a second. Only a failure from the core before the app is the host's.
 fn mentioned_file_answered(event: &AuditEvent) -> bool {
     event.method == "chat.mentionedFile" && event.from_app
+}
+
+/// `commands.run` is audited by the app for every outcome, with the command it ran.
+fn slash_command_answered(event: &AuditEvent) -> bool {
+    event.method == "commands.run" && event.from_app
 }
 
 /// `file.prepare` is audited by the app for every outcome, with its own fields.
@@ -476,6 +496,38 @@ impl Log {
         }));
     }
 
+    /// One line per `commands.run` call, success included: who, which conversation, which
+    /// command and the outcome. Never the text of a message.
+    pub fn record_slash_command(&self, device: &DeviceContext, run: &SlashCommand) {
+        let SlashCommand {
+            fingerprint,
+            conversation_id,
+            command,
+            enabled,
+            command_id,
+            transport,
+            outcome,
+        } = *run;
+        self.append(&json!({
+            "ts": now_ms(),
+            "deviceId": capped(&device.id, ID_CHARS),
+            "fingerprint": prefix(fingerprint),
+            "transport": transport.as_str(),
+            "event": "call",
+            "method": "commands.run",
+            "projectId": null,
+            "outcome": outcome.text(),
+            "commandId": command_id.map(|id| capped(id, ID_CHARS)),
+            "conversationId": conversation_id.map(|id| capped(id, ID_CHARS)),
+            "command": capped(command, METHOD_CHARS),
+            "enabled": enabled,
+            "permission": match device.permission {
+                Permission::Read => "read",
+                Permission::Control => "control",
+            },
+        }));
+    }
+
     /// One line per remote approval answer: decision, conversation, request
     /// and project ids, and the outcome with its refusal code.
     pub fn record_approval_answer(&self, device: &DeviceContext, answer: &ApprovalAnswer) {
@@ -639,6 +691,13 @@ pub fn record_mentioned_file_with(device: &DeviceContext, read: &MentionedFile) 
 pub fn record_file_transfer_with(device: &DeviceContext, read: &FileTransfer) {
     if let Some(log) = global() {
         log.record_file_transfer(device, read);
+    }
+}
+
+/// Records one `commands.run` call. A no-op before [`init`].
+pub fn record_slash_command_with(device: &DeviceContext, run: &SlashCommand) {
+    if let Some(log) = global() {
+        log.record_slash_command(device, run);
     }
 }
 
@@ -976,6 +1035,40 @@ mod tests {
         assert_eq!(all[1]["outcome"], "denied:path_denied");
         assert_eq!(all[0]["rule"], Value::Null);
         assert_eq!(all[1]["rule"], "deny_list");
+    }
+
+    #[test]
+    fn an_operator_run_is_audited_with_its_command_and_never_the_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        for outcome in [Outcome::Ok, Outcome::Denied(Code::ReadOnly)] {
+            log.record_slash_command(
+                &device(),
+                &SlashCommand {
+                    fingerprint: "abcdef0123456789",
+                    conversation_id: Some("s1"),
+                    command: "operator",
+                    enabled: Some(true),
+                    command_id: Some("c1"),
+                    transport: Transport::Web,
+                    outcome,
+                },
+            );
+        }
+        let all = lines(dir.path());
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0]["method"], "commands.run");
+        assert_eq!(all[0]["command"], "operator");
+        assert_eq!(all[0]["enabled"], true);
+        assert_eq!(all[0]["conversationId"], "s1");
+        assert_eq!(all[0]["transport"], "web");
+        assert_eq!(all[1]["outcome"], "denied:read_only");
+        assert!(all[0].get("text").is_none());
+        // The host's own line for a call the app already wrote is dropped.
+        let mut answered = event("commands.run", Outcome::Ok);
+        answered.from_app = true;
+        log.record(&device(), &answered);
+        assert_eq!(lines(dir.path()).len(), 2);
     }
 
     #[test]

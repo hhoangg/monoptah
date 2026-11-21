@@ -65,11 +65,14 @@ impl Conversation {
         self.save_settings(cx);
         cx.notify();
     }
-    pub(crate) fn toggle_mode(&mut self, id: &str, cx: &mut Context<Self>) {
+    /// Flips one mode in the session's settings, as the composer's mode menu does, and keeps
+    /// the modes exclusive. Returns false when the mode is refused or unknown. The composer
+    /// text and the saved settings are the caller's to update.
+    pub(super) fn flip_mode(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
         if self.is_remote() && matches!(id, "operator" | "orchestrator") {
             self.status = "This mode is not available on remote projects.".into();
             cx.notify();
-            return;
+            return false;
         }
         if id != "draft" {
             self.follow_ups.draft_selected = false;
@@ -96,9 +99,13 @@ impl Conversation {
                 self.settings.plan = false;
                 self.settings.operator = false;
             }
-            _ => return,
+            _ => return false,
         }
-        let selected = if self.follow_ups.draft_selected {
+        true
+    }
+    /// The mode the composer shows as selected.
+    pub(super) fn selected_mode(&self) -> Option<&'static str> {
+        if self.follow_ups.draft_selected {
             Some("draft")
         } else if self.settings.orchestrator {
             Some("orchestrator")
@@ -108,7 +115,13 @@ impl Conversation {
             Some("operator")
         } else {
             None
-        };
+        }
+    }
+    pub(crate) fn toggle_mode(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.flip_mode(id, cx) {
+            return;
+        }
+        let selected = self.selected_mode();
         self.input.update(cx, |input, cx| {
             let leading = input::Command::leading(&input.content);
             if leading.map(input::Command::name) != selected {

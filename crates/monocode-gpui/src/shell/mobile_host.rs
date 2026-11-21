@@ -1288,6 +1288,7 @@ impl Shell {
         match method.as_str() {
             "conversation.read" | "conversation.older" => self.mobile_read(request, cx),
             "models.list" => self.mobile_models(request, cx),
+            "commands.list" => self.mobile_commands_list(request, cx),
             "accounts.usage" => self.mobile_usage(request, cx),
             "desktop.updateStatus" | "desktop.update" => self.mobile_update(request, cx),
             "mono.document" => self.mobile_document(request, cx),
@@ -2366,6 +2367,13 @@ impl Shell {
             }
             request.reply(result);
         };
+        if matches!(
+            request.method.as_str(),
+            "session.start" | "conversation.send"
+        ) && let Err(error) = self.mobile_guard_prefixed_mode(&request)
+        {
+            return finish(self, request, Err(error));
+        }
         match request.method.as_str() {
             "mono.reset" => self.mobile_mono_reset(request, finish, cx),
             "session.start" => self.mobile_start(request, finish, cx),
@@ -2399,6 +2407,11 @@ impl Shell {
                 if result.is_ok() {
                     self.publish_mobile_catalog(cx);
                 }
+                finish(self, request, result);
+            }
+            "commands.run" => {
+                let result = self.mobile_run_command(&request.device, &request.params, cx);
+                self.mobile_audit_command(&request, &result);
                 finish(self, request, result);
             }
             _ => {
@@ -3919,6 +3932,7 @@ mod cloud_start;
 mod cloud_start_tests;
 #[cfg(test)]
 mod cloud_tests;
+mod slash;
 
 #[cfg(test)]
 mod tests {
@@ -4347,6 +4361,182 @@ mod tests {
     }
 
     #[gpui::test]
+    fn commands_run_needs_control_and_switches_the_mode_of_the_session(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, id, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let conversation = shell.mobile_session_id(id);
+                // A command ID is a receipt: each call gets its own.
+                let mut calls = 0;
+                let mut run = |shell: &mut Shell,
+                               window: &mut Window,
+                               cx: &mut Context<Shell>,
+                               device: &DeviceContext,
+                               params: Value| {
+                    calls += 1;
+                    let (request, mut answer) = Request::with_receiver(
+                        &format!("run-{calls}"),
+                        "commands.run",
+                        params,
+                        device.clone(),
+                    );
+                    shell.handle_mobile_request(request, window, cx);
+                    answer.try_recv().ok()
+                };
+                let reader = DeviceContext {
+                    permission: Permission::Read,
+                    ..web(None, None)
+                };
+                assert_eq!(
+                    run(
+                        shell,
+                        window,
+                        cx,
+                        &reader,
+                        json!({"conversationId": conversation, "command": "plan"})
+                    ),
+                    Some(Err(policy::Code::ReadOnly.failure()))
+                );
+                let control = web(None, None);
+                // A command with no desktop function, and one outside the menu, are refused.
+                for command in ["add-to-folder", "stage", "rm -rf", ""] {
+                    let answer = run(
+                        shell,
+                        window,
+                        cx,
+                        &control,
+                        json!({"conversationId": conversation, "command": command}),
+                    );
+                    assert!(matches!(answer, Some(Err(_))), "{command}");
+                }
+                assert_eq!(
+                    run(
+                        shell,
+                        window,
+                        cx,
+                        &control,
+                        json!({"conversationId": conversation, "command": "plan", "enabled": true}),
+                    ),
+                    Some(Ok(json!({"command": "plan", "active": true})))
+                );
+                assert!(shell.sessions[&id].read(cx).settings.plan);
+                // Operator switches Plan off: the modes are exclusive.
+                assert_eq!(
+                    run(
+                        shell,
+                        window,
+                        cx,
+                        &control,
+                        json!({"conversationId": conversation, "command": "operator"})
+                    ),
+                    Some(Ok(json!({"command": "operator", "active": true})))
+                );
+                let chat = shell.sessions[&id].read(cx);
+                assert!(chat.settings.operator && !chat.settings.plan);
+                // A device that did not select the project gets nothing.
+                let outside = web(Some(vec!["other".into()]), Some(vec![]));
+                assert_eq!(
+                    run(
+                        shell,
+                        window,
+                        cx,
+                        &outside,
+                        json!({"conversationId": conversation, "command": "plan"})
+                    ),
+                    Some(Err(policy::Code::NotSelected.failure()))
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_leading_operator_or_orchestrator_is_a_sensitive_mode_whatever_the_case() {
+        use super::slash::leading_sensitive_mode as mode;
+        assert_eq!(mode(&json!({"text": "/operator fix it"})), Some("operator"));
+        assert_eq!(
+            mode(&json!({"text": "  /Orchestrator go"})),
+            Some("orchestrator")
+        );
+        assert_eq!(mode(&json!({"text": "/operator"})), Some("operator"));
+        for text in ["/plan x", "/operators x", "use /operator", "hello", ""] {
+            assert_eq!(mode(&json!({"text": text})), None, "{text}");
+        }
+        assert_eq!(mode(&json!({})), None);
+    }
+
+    #[gpui::test]
+    fn a_message_that_starts_with_operator_needs_control_and_is_audited(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, id, _) = super::super::tests::window(cx);
+        let dir =
+            std::env::temp_dir().join(format!("monoptah-prefix-audit-{}", std::process::id()));
+        let _turn = audit::test_log(&dir);
+        window
+            .update(cx, |shell, _, cx| {
+                let conversation = shell.mobile_session_id(id);
+                let _ = cx;
+                for (method, params) in [
+                    (
+                        "conversation.send",
+                        json!({"conversationId": conversation, "text": "/operator hi"}),
+                    ),
+                    (
+                        "session.start",
+                        json!({"projectId": "p", "text": "/orchestrator hi"}),
+                    ),
+                ] {
+                    let reader = DeviceContext {
+                        permission: Permission::Read,
+                        ..web(None, None)
+                    };
+                    let (request, _) =
+                        Request::with_receiver("g-read", method, params.clone(), reader);
+                    assert_eq!(
+                        shell.mobile_guard_prefixed_mode(&request),
+                        Err(policy::Code::ReadOnly.failure()),
+                        "{method}"
+                    );
+                    let (request, _) =
+                        Request::with_receiver("g-ctl", method, params, web(None, None));
+                    assert_eq!(
+                        shell.mobile_guard_prefixed_mode(&request),
+                        Ok(()),
+                        "{method}"
+                    );
+                }
+                // An ordinary message is not a mode switch and writes nothing.
+                let (request, _) = Request::with_receiver(
+                    "g-plain",
+                    "conversation.send",
+                    json!({"conversationId": conversation, "text": "hello"}),
+                    web(None, None),
+                );
+                assert_eq!(shell.mobile_guard_prefixed_mode(&request), Ok(()));
+            })
+            .unwrap();
+        let lines = audit::read_recent(&dir, 100);
+        let _ = std::fs::remove_dir_all(&dir);
+        let of = |command: &str, outcome: &str| {
+            lines
+                .iter()
+                .filter(|l| {
+                    l["method"] == "commands.run"
+                        && l["command"] == command
+                        && l["outcome"] == outcome
+                })
+                .count()
+        };
+        assert_eq!(of("operator", "ok"), 1);
+        assert_eq!(of("operator", "denied:read_only"), 1);
+        assert_eq!(of("orchestrator", "ok"), 1);
+        assert_eq!(of("orchestrator", "denied:read_only"), 1);
+        assert!(lines.iter().all(|l| l["commandId"] != "g-plain"));
+    }
+
+    #[gpui::test]
     fn a_read_only_device_cannot_update_the_app_but_may_read_its_version(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4412,6 +4602,8 @@ mod tests {
                     "session.resumeUsage",
                     "session.resumeUsageAtReset",
                     "models.list",
+                    "commands.list",
+                    "commands.run",
                 ];
                 let project_methods = [
                     "session.start",

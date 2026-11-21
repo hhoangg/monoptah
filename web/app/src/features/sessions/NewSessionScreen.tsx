@@ -11,6 +11,7 @@ import { catalogKey, useCatalog, useLinkMutation } from "@/data";
 import { BACKGROUND_CONTAINER_CLASS, ChatBackground } from "@/features/backgrounds";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
+import { useSlashController } from "@/features/composer/slash/useSlashController";
 import { Composer } from "@/features/composer/Composer";
 import { useLinkReady } from "@/features/composer/SessionComposer";
 import { useSendGuard } from "@/features/composer/useSendGuard";
@@ -80,6 +81,9 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
   const shown = picked ? { ...picked, runtimeMode: picked.runtimeMode ?? starting?.runtimeMode ?? "supervised" } : starting;
   const defaultModelId = defaults.harness ? defaults.models[defaults.harness]?.model : undefined;
 
+  // The `/` menu of a session that does not exist yet: Plan, Orchestrator and Draft ride on the first message.
+  const slash = useSlashController({ projectId, readOnly, ...(selection?.harness ? { harness: selection.harness } : {}) });
+
   const submit = async (text: string, attachments: Parameters<typeof toWire>[0]) => {
     let validTarget: ReturnType<typeof SessionStartTargetSchema.parse> | undefined;
     if (target !== null && target !== undefined) {
@@ -88,12 +92,15 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
       validTarget = parsed.data;
     }
     assertFitsRequest(text, attachments);
+    // A draft is saved without starting the agent, so it carries no files, like a draft saved on an open session.
+    if (slash?.armed && attachments.length > 0) throw new Error("A draft carries text only. Remove the attachments first.");
+    const startText = slash ? slash.prefix(text) : text;
     // There is no session yet: the guard gets an empty session id and the target the user picked.
     await guard.check({ desktopId, sessionId: "", target: targetKind(target) });
     const wire = toWire(attachments);
     const result = await start.mutateAsync({
       projectId,
-      text,
+      text: startText,
       ...(wire.length > 0 ? { attachments: wire } : {}),
       ...(buildStartModelParams(selection) as Partial<ParamsOf<"session.start">>),
       ...(worktree ? { worktreePath: worktree.path } : {}),
@@ -191,6 +198,7 @@ export function NewSessionScreen({ desktopId, projectId, embedded = false }: { d
           requestControl={requestControl}
           offline={!ready}
           topRow={topRow}
+          slash={slash}
           configError={configError}
           toolbar={
             <ModelControls

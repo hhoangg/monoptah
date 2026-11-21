@@ -18,6 +18,8 @@ export const KNOWN_CAPABILITIES = [
   "fileTransfer",
   /** A real shell on the desktop: advertised only to a Control device the user allowed in "Allow web terminal". */
   "terminal",
+  /** The `/` menu of a session composer: `commands.list` and `commands.run`. */
+  "slashCommands",
 ] as const;
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 
