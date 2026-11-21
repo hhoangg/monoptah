@@ -1,7 +1,7 @@
 # Attention badge (blinking red dot) - design
 
 Status: spec for later, not scheduled. Estimate: about 1 week.
-Source: feasibility study in session 8776555782383442 (reconstructed here; the session was not readable through the app CLI at writing time).
+Source: feasibility study in session 8776555782383442.
 
 ## Goal
 
@@ -73,12 +73,29 @@ Otherwise show no dot (never a stale one). An offline desktop shows its offline 
 
 ## Current gaps
 
-1. No single attention value per session on the desktop; the three sources are separate.
-2. The catalog carries no `attention` field, so web cannot show the state.
-3. No per-desktop aggregate bit.
-4. `usage_limit` is mixed with needs-you signals.
-5. Changes reach web only with catalog refreshes, so clearing is slow (no delta push).
-6. The service worker never closes resolved notifications; no title, favicon or app badge.
+Facts the gaps rest on:
+
+- Approvals and questions live in memory per `Conversation`
+  (`crates/monocode-gpui/src/conversation.rs:309` `approvals`, `:313` `questions`). They are cleared on
+  answer, cancel, stop, turn end and restart.
+- The catalog is rebuilt every 3 s (`PUBLISH_INTERVAL`, `crates/monocode-gpui/src/shell/mobile_host.rs:30`);
+  the web polls it every 5 s while visible (`CATALOG_POLL_MS`, `web/app/src/data/sync.ts:18`).
+- `conversation.watch` already sends realtime frames, including `question: null` / `approvals: []`
+  when an item is resolved.
+- `mobile_claim_answer` (`crates/monocode-gpui/src/shell/mobile_host.rs`) prevents double answers.
+
+Gaps:
+
+1. Waiting is computed only for sessions open on the desktop. Cloud and remote sessions do not get
+   it (the data exists in `remote_marks`, `crates/monocode-gpui/src/shell.rs:742`), so they are missed.
+2. Mono needs-you turns on even when only the usage limit is hit, and a Mono that is not open always
+   reports idle.
+3. The catalog cache in IndexedDB and its data are not cleared when the desktop goes offline, so a
+   dot can get stuck.
+4. Desktops other than the current one are not polled, so rail avatars know nothing.
+5. Push never sends a resolved message, and there is no `setAppBadge` or title badge yet.
+6. Mono read/unread is stored per browser only; the desktop always sends `unread: 0`
+   (`crates/monocode-gpui/src/shell/mobile_host.rs:1012`).
 
 ## Risks and mitigations
 
