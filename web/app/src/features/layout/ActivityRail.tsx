@@ -5,7 +5,8 @@
 // its desktop switcher on these widths; the phone keeps the top bar (features/desktops/DesktopSwitcher.tsx).
 import { Link } from "@tanstack/react-router";
 import { useState, type KeyboardEvent, type ReactNode } from "react";
-import { GRANT_CUE_LABEL, desktopAvatarColor, desktopInitials, grantCue, onAvatarColor } from "@/features/desktops/avatar";
+import { GRANT_CUE_LABEL, desktopAvatarColor, grantCue, onAvatarColor } from "@/features/desktops/avatar";
+import { DesktopAvatarFace } from "@/features/desktops/DesktopAvatarFace";
 import { useDesktopGrants, useDesktops, type DesktopSummary } from "@/features/desktops/api";
 import { useThisDevice } from "@/features/desktops/thisDevice";
 import { safeName } from "@/features/desktops/format";
@@ -24,6 +25,7 @@ interface RailDesktop {
   id: string;
   name: string;
   color: string | null;
+  avatar: DesktopSummary["avatar"];
   online: boolean;
 }
 
@@ -37,11 +39,12 @@ function useRailDesktops(desktopId: string): RailDesktop[] {
     id: item.id,
     name: safeName(item.name, "Unnamed desktop"),
     color: item.color,
+    avatar: item.avatar ?? null,
     // The live link knows better than the 15 s list for the open desktop.
     online: item.id === desktopId && presence !== null ? presence === "online" : item.online,
   }));
   if (!items.some((item) => item.id === desktopId)) {
-    items.unshift({ id: desktopId, name: safeName(linkName ?? "", "Desktop"), color: null, online: presence === "online" });
+    items.unshift({ id: desktopId, name: safeName(linkName ?? "", "Desktop"), color: null, avatar: null, online: presence === "online" });
   }
   return items;
 }
@@ -86,7 +89,7 @@ function DesktopAvatar({ desktop, current, tabStop, onFocus }: { desktop: RailDe
           )}
           style={{ backgroundColor: background, color: onAvatarColor(background) }}
         >
-          <span aria-hidden="true">{desktopInitials(desktop.name)}</span>
+          <DesktopAvatarFace desktop={desktop} />
           <span
             aria-hidden="true"
             data-status={status.toLowerCase()}

@@ -7,6 +7,10 @@ import {
   API_ROUTES,
   ApiErrorSchema,
   CreateInviteResponse,
+  DESKTOP_AVATAR_MAX_BASE64,
+  DESKTOP_AVATAR_MIMES,
+  DesktopSummarySchema,
+  PatchDesktopBody,
   HealthResponse,
   MAX_INVITE_INPUT,
   MAX_RECOVERY_CODE_INPUT,
@@ -242,5 +246,28 @@ describe("outer input bounds and the Me contract (fix-up point 8)", () => {
   it("registers the ack route as a session route and the device forget as a fresh one", () => {
     expect(findRoute("POST", "/api/recovery-codes/ack")?.auth).toBe("session");
     expect(findRoute("DELETE", "/api/devices/:id")?.auth).toBe("fresh");
+  });
+});
+
+describe("desktop avatar schemas", () => {
+  it("accepts an emoji and a PNG, JPEG or WebP, and nothing else", () => {
+    expect(PatchDesktopBody.safeParse({ avatar: { kind: "emoji", emoji: "\u{1F680}" } }).success).toBe(true);
+    expect(PatchDesktopBody.safeParse({ avatar: { kind: "emoji", emoji: "\u{1F9D1}‍\u{1F4BB}" } }).success).toBe(true);
+    expect(PatchDesktopBody.safeParse({ avatar: null }).success).toBe(true);
+    for (const mime of DESKTOP_AVATAR_MIMES) expect(PatchDesktopBody.safeParse({ avatar: { kind: "image", mime, data: "AAAA" } }).success, mime).toBe(true);
+    for (const mime of ["image/svg+xml", "image/gif", "text/html"]) expect(PatchDesktopBody.safeParse({ avatar: { kind: "image", mime, data: "AAAA" } }).success, mime).toBe(false);
+    expect(PatchDesktopBody.safeParse({ avatar: { kind: "emoji", emoji: "x" } }).success).toBe(false);
+    expect(PatchDesktopBody.safeParse({ avatar: { kind: "image", mime: "image/png", data: "A".repeat(DESKTOP_AVATAR_MAX_BASE64 + 4) } }).success).toBe(false);
+  });
+
+  it("keeps the whole JSON body under the 32 KiB limit at the largest image", () => {
+    expect(DESKTOP_AVATAR_MAX_BASE64 + 200).toBeLessThan(32 * 1024);
+  });
+
+  it("reads a summary without an avatar (an older Worker) and with one", () => {
+    const base = { id: "11111111-1111-4111-8111-111111111111", name: "Mac", color: null, online: true, pendingCount: 0, os: null, appVersion: null, lastSeenAt: null };
+    expect(DesktopSummarySchema.parse(base).avatar).toBeUndefined();
+    expect(DesktopSummarySchema.parse({ ...base, avatar: { kind: "image", hash: "0123456789abcdef" } }).avatar).toEqual({ kind: "image", hash: "0123456789abcdef" });
+    expect(DesktopSummarySchema.safeParse({ ...base, avatar: { kind: "image", hash: "../../etc" } }).success).toBe(false);
   });
 });

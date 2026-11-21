@@ -9,6 +9,7 @@ import { displayFingerprint, fingerprint } from "@/link/fingerprint";
 import { checkPin } from "@/link/pins";
 import type * as KeysModule from "@/link/keys";
 import type * as PersistModule from "@/data/persist";
+import type * as AvatarImageModule from "./avatarImage";
 
 const webauthn = vi.hoisted(() => ({ createPasskey: vi.fn(), getPasskey: vi.fn() }));
 vi.mock("@/features/accounts/webauthn", () => webauthn);
@@ -17,6 +18,9 @@ vi.mock("@/link/keys", async (importOriginal) => ({ ...(await importOriginal<typ
 
 const persist = vi.hoisted(() => ({ clearPersistedCache: vi.fn() }));
 vi.mock("@/data/persist", async (importOriginal) => ({ ...(await importOriginal<typeof PersistModule>()), ...persist }));
+
+const avatarImage = vi.hoisted(() => ({ prepare: vi.fn() }));
+vi.mock("./avatarImage", async (importOriginal) => ({ ...(await importOriginal<typeof AvatarImageModule>()), prepareAvatarImage: avatarImage.prepare }));
 
 import { createFakeServer, desktop, grant, FP_A, FP_B, type FakeServer } from "./testServer";
 import { mountApp } from "./testMount";
@@ -260,5 +264,53 @@ describe("/desktops/:id", () => {
     mountApp("/desktops/d1");
     expect(await screen.findByText("<b onclick=x>pwn</b>")).toBeInTheDocument();
     expect(document.querySelector("b")).toBeNull();
+  });
+});
+
+describe("/desktops/:id avatar", () => {
+  const patches = () => server.calls.filter((call) => call.method === "PATCH");
+
+  it("saves a chosen emoji on the account and shows it in the preview", async () => {
+    install();
+    const user = userEvent.setup();
+    mountApp("/desktops/d1");
+    const group = await screen.findByRole("radiogroup", { name: "Avatar emoji" });
+    expect(screen.getByTestId("avatar-preview")).toHaveTextContent("SM");
+    await user.click(within(group).getByRole("radio", { name: "Emoji \u{1F680}" }));
+    await waitFor(() => expect(patches().at(-1)?.body).toEqual({ avatar: { kind: "emoji", emoji: "\u{1F680}" } }));
+    await waitFor(() => expect(within(screen.getByTestId("avatar-preview")).getByTestId("avatar-emoji")).toHaveTextContent("\u{1F680}"));
+    expect(within(group).getByRole("radio", { name: "Emoji \u{1F680}" })).toBeChecked();
+  });
+
+  it("uploads a prepared image (only the re-encoded bytes are sent) and can go back to initials", async () => {
+    install();
+    avatarImage.prepare.mockResolvedValue({ mime: "image/webp", data: "UklGRgAAAABXRUJQ" });
+    const user = userEvent.setup();
+    mountApp("/desktops/d1");
+    const file = new File(["x"], "me.png", { type: "image/png" });
+    await user.upload(await screen.findByLabelText("Avatar image file"), file);
+    await waitFor(() => expect(patches().at(-1)?.body).toEqual({ avatar: { kind: "image", mime: "image/webp", data: "UklGRgAAAABXRUJQ" } }));
+    expect(avatarImage.prepare).toHaveBeenCalledWith(file);
+    expect(await screen.findByTestId("avatar-image")).toHaveAttribute("src", expect.stringMatching(/^\/api\/desktops\/d1\/avatar\?v=[0-9a-f]{16}$/));
+    await user.click(screen.getByRole("button", { name: "Use initials" }));
+    await waitFor(() => expect(patches().at(-1)?.body).toEqual({ avatar: null }));
+    await waitFor(() => expect(screen.getByTestId("avatar-preview")).toHaveTextContent("SM"));
+  });
+
+  it("shows why a refused picture was refused and sends nothing", async () => {
+    install();
+    const { AvatarImageError } = await import("./avatarImage");
+    avatarImage.prepare.mockRejectedValue(new AvatarImageError("unsupported"));
+    const user = userEvent.setup({ applyAccept: false });
+    mountApp("/desktops/d1");
+    await user.upload(await screen.findByLabelText("Avatar image file"), new File(["<svg/>"], "logo.svg", { type: "image/svg+xml" }));
+    expect(await screen.findByText("Use a PNG, JPEG or WebP image.")).toBeInTheDocument();
+    expect(patches()).toHaveLength(0);
+  });
+
+  it("offers Use initials only when there is an avatar to clear", async () => {
+    install({ desktops: [desktop({ avatar: null })] });
+    mountApp("/desktops/d1");
+    expect(await screen.findByRole("button", { name: "Use initials" })).toBeDisabled();
   });
 });

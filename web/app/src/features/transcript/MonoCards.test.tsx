@@ -30,6 +30,15 @@ describe("MonoHeader (F-43)", () => {
     expect(screen.queryByText("Thinking...")).toBeNull();
   });
 
+  it("signs with the Mono's mascot when the desktop sent one, and with the initial when it did not", () => {
+    const { container, rerender } = render(<MonoHeader item={{ live: false }} agent={{ id: "m1", name: "Research Mono", mascot: "frog", color: "#7c5cff" }} />);
+    expect(container.querySelector("svg")).toHaveAttribute("data-mascot", "frog");
+    expect(screen.getByTestId("mono-signature")).toHaveTextContent("Research Mono");
+    rerender(<MonoHeader item={{ live: false }} agent={{ id: "m1", name: "Research Mono", color: "#7c5cff" }} />);
+    expect(container.querySelector("svg")).toBeNull();
+    expect(screen.getByTestId("mono-signature")).toHaveTextContent("RResearch Mono");
+  });
+
   it("ignores a colour that is not #rrggbb", () => {
     render(<MonoHeader item={{ live: false }} agent={{ name: "Mono", color: "red; background:url(x)" }} />);
     expect(screen.getByTestId("mono-signature").querySelector("span[aria-hidden]")?.getAttribute("style") ?? "").not.toContain("url");

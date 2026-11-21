@@ -12,7 +12,7 @@ const SPEC_COLUMNS: Record<string, string[]> = {
   recovery_codes: ["id", "user_id", "code_hash", "batch", "used_at", "created_at"],
   sessions: ["id_hash", "user_id", "created_at", "last_seen_at", "idle_expires_at", "expires_at", "reauth_at", "amr", "recovery_only", "user_agent", "revoked_at"],
   invites: ["id", "code_hash", "created_by", "kind", "expires_at", "used_by", "used_at", "revoked_at", "created_at"],
-  desktops: ["id", "user_id", "name", "color", "public_key", "fingerprint", "os", "app_version", "created_at", "last_seen_at", "revoked_at"],
+  desktops: ["id", "user_id", "name", "color", "avatar_kind", "avatar_emoji", "avatar_hash", "avatar_image", "public_key", "fingerprint", "os", "app_version", "created_at", "last_seen_at", "revoked_at"],
   desktop_tokens: ["id", "desktop_id", "token_hash", "scope", "created_at", "last_used_at", "revoked_at"],
   devices: ["id", "user_id", "name", "public_key", "fingerprint", "created_at", "last_seen_at", "revoked_at"],
   device_grants: ["device_id", "desktop_id", "state", "permission", "requested_permission", "confirmed_at", "updated_at"],

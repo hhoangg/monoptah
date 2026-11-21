@@ -23,7 +23,8 @@ import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { AppShell } from "./AppShell";
-import { PANEL_WIDTH_KEY, SESSION_LIST_WIDTH, SESSION_LIST_WIDTH_KEY, SIDEBAR_COLLAPSED_KEY, SIDEBAR_WIDTH_KEY, dockedPanelMax, reloadLayoutPrefs, useLayoutPrefs } from "./layoutPrefs";
+import { AppearanceSection } from "@/features/settings/AppearanceSection";
+import { LAYOUT_MODE_KEY, PANEL_WIDTH_KEY, SESSION_LIST_WIDTH, SESSION_LIST_WIDTH_KEY, SIDEBAR_COLLAPSED_KEY, SIDEBAR_WIDTH_KEY, dockedPanelMax, reloadLayoutPrefs, useLayoutPrefs } from "./layoutPrefs";
 import { closeCommandPalette, isCommandPaletteOpen, openCommandPalette } from "./palette";
 import { clearPanels, closePanel, openPanel, registerPanel, usePanels } from "./panels";
 import { clearCreateMonoRequest } from "@/features/monos/createRequest";
@@ -372,6 +373,59 @@ describe("classic layout: session list sidebar and chat pane (>= 1024)", () => {
     mount(1100, ALPHA);
     // 1100 - 320 (sidebar) - 320 (chat) = 460.
     expect(await screen.findByTestId("session-list-pane")).toHaveStyle({ width: "460px" });
+  });
+});
+
+describe("layout mode: Classic and Focused", () => {
+  it("is Classic by default and keeps the session list", async () => {
+    mount(1280, ALPHA);
+    expect(await screen.findByTestId("session-list-pane")).toBeInTheDocument();
+    expect(useLayoutPrefs.getState().layoutMode).toBe("classic");
+  });
+
+  it("Focused leaves the session list column out and shows the project page in the chat pane", async () => {
+    localStorage.setItem(LAYOUT_MODE_KEY, "focused");
+    reloadLayoutPrefs();
+    mount(1280, ALPHA);
+    await screen.findByTestId("app-sidebar");
+    expect(await screen.findByTestId("workspace-frame")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-list-pane")).toBeNull();
+    expect(screen.queryByTestId("chat-new-session")).toBeNull();
+  });
+
+  it("an unknown stored value is Classic", () => {
+    localStorage.setItem(LAYOUT_MODE_KEY, "sideways");
+    reloadLayoutPrefs();
+    expect(useLayoutPrefs.getState().layoutMode).toBe("classic");
+  });
+
+  it("switches at once from Settings > Appearance and remembers the choice in this browser", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(1280, ALPHA);
+    expect(await screen.findByTestId("session-list-pane")).toBeInTheDocument();
+    // The picker is the one of the Appearance card; it works on the live shell.
+    const picker = render(<AppearanceSection />);
+    const group = within(picker.container).getByRole("radiogroup", { name: "Layout" });
+    expect(within(group).getByRole("radio", { name: "Classic" })).toBeChecked();
+    await user.click(within(group).getByRole("radio", { name: "Focused" }));
+    expect(localStorage.getItem(LAYOUT_MODE_KEY)).toBe("focused");
+    await waitFor(() => expect(screen.queryByTestId("session-list-pane")).toBeNull());
+    await user.click(within(group).getByRole("radio", { name: "Classic" }));
+    expect(localStorage.getItem(LAYOUT_MODE_KEY)).toBe("classic");
+    expect(await screen.findByTestId("session-list-pane")).toBeInTheDocument();
+    expect(router).toBeDefined();
+  });
+
+  it("disables the picker on a tablet (no session-list column there) and hides it on a phone", () => {
+    stubViewport(768);
+    const tablet = render(<AppearanceSection />);
+    expect(within(tablet.container).getByRole("radio", { name: "Focused" })).toBeDisabled();
+    expect(within(tablet.container).getByRole("radiogroup", { name: "Layout" })).toHaveAttribute("aria-disabled", "true");
+    tablet.unmount();
+    stubViewport(390);
+    const phone = render(<AppearanceSection />);
+    expect(within(phone.container).queryByRole("radiogroup", { name: "Layout" })).toBeNull();
+    expect(within(phone.container).getByRole("radiogroup", { name: "Colour scheme" })).toBeInTheDocument();
   });
 });
 

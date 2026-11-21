@@ -9,17 +9,22 @@ import { safeHexColor } from "@/lib/color";
 import { HarnessIcon } from "@/ui/HarnessIcon";
 import { Icon, type IconName } from "@/ui/Icon";
 import { useTranscriptActions, type TranscriptAgent } from "./context";
+import { isKnownMascot, MonoAvatar } from "@/features/monos/MonoAvatar";
 import { Shimmer } from "./Shimmer";
 import type { DocumentItem, HeaderItem, LaunchedSession, LaunchedSessionState } from "./turnItems";
 
-/** The Mono's pill: a colour tile with its initial (the web has no mascots), then its name. */
+/** The Mono's pill: its mascot (or, without one, a colour tile with its initial), then its name. */
 function Signature({ agent, name }: { agent: TranscriptAgent; name: string }) {
   const color = safeHexColor(agent.color, "var(--accent-color)");
   return (
     <span className="inline-flex max-w-full items-center gap-1.5 self-start rounded-pill bg-[var(--content-a07)] py-0.5 pr-3 pl-2" data-testid="mono-signature">
-      <span aria-hidden="true" className="grid size-3.5 shrink-0 place-items-center rounded-[4px] text-[9px] leading-none font-bold text-white" style={{ background: color }}>
-        {agent.name.trim().charAt(0).toUpperCase()}
-      </span>
+      {agent.id !== undefined && isKnownMascot(agent.mascot) ? (
+        <MonoAvatar monoId={agent.id} name={agent.name} mascot={agent.mascot} color={agent.color} size={16} />
+      ) : (
+        <span aria-hidden="true" className="grid size-3.5 shrink-0 place-items-center rounded-[4px] text-[9px] leading-none font-bold text-white" style={{ background: color }}>
+          {agent.name.trim().charAt(0).toUpperCase()}
+        </span>
+      )}
       <span className="min-w-0 truncate text-small font-medium text-[var(--content-a85)]">{name}</span>
     </span>
   );

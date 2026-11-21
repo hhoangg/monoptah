@@ -7,3 +7,6 @@ export const E2E_CATALOG = {
   sessionId: "e2e-session",
   sessionTitle: "E2E session",
 } as const;
+
+/** The Mono `WEB_LINK_HEADLESS_MONO=1` publishes, with the look the app sends for a Mono (`mascot` and `#rrggbb` `color`). */
+export const E2E_MONO = { id: "e2e-mono", name: "E2E Mono", mascot: "frog", color: "#39c363" } as const;

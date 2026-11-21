@@ -11,6 +11,8 @@
 //                squeezing the chat pane below 320px: the panel narrows to fit, and where even 380px does
 //                not fit it opens as the overlay instead. The session list gives way first (it shrinks to
 //                keep the chat pane at 320px).
+// The layout mode (monoptah.layout.mode, Settings > Appearance) picks what the >= 1024px shell shows: "classic" is the
+// above, "focused" leaves out the session-list column (a project's sessions are its own page, as on a tablet).
 // A right panel belongs to a project: it shows only on that project's screens (`p/$projectId/...` and the
 // sessions of that project).
 // From 640px an activity rail (ActivityRail.tsx) sits at the far left of the shell: the desktops as avatars, then Cloud,
@@ -165,7 +167,8 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
   }, [desktopId, projectId, targetKind]);
 
   // The session list is the second sidebar of the classic layout: only from 1024 px, only for a project's screens.
-  const listShown = desktop && projectId !== null;
+  const classic = useLayoutPrefs((state) => state.layoutMode) === "classic";
+  const listShown = desktop && classic && projectId !== null;
   // A docked panel is sized as if the list were at its minimum, then the list shrinks to make room for it.
   const dockMax = desktop ? dockedPanelMax(viewport, sidebarWidth + (listShown ? SESSION_LIST_WIDTH.min : 0)) : null;
   const mode: PanelMode = !wide ? "sheet" : dockMax !== null ? "docked" : "overlay";

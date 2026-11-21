@@ -12,11 +12,13 @@ import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
 import { presenceOf, revokeInRooms } from "../../relay/rooms.ts";
 import { auditStatement, PREVIOUS_CHANGED } from "../audit/audit.ts";
+import { avatarOf, checkImage, decodeBase64, sniffImage } from "./avatar.ts";
 import { requireDesktopToken } from "./token.ts";
 
 const REVOKED = 4003;
 
-const DESKTOP_COLUMNS = "id, name, color, os, app_version, last_seen_at";
+// `avatar_image` (the bytes) is left out on purpose: only the avatar route reads it.
+const DESKTOP_COLUMNS = "id, name, color, avatar_kind, avatar_emoji, avatar_hash, os, app_version, last_seen_at";
 /** The user's live desktops (index `desktops_user_id_idx`; a user holds at most `MAX_DESKTOPS_PER_USER`). */
 export const LIST_DESKTOPS_SQL = `SELECT ${DESKTOP_COLUMNS} FROM desktops WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at, id`;
 /** Pending grants of non-revoked devices per desktop, one grouped query. */
@@ -26,9 +28,15 @@ export const PENDING_COUNT_ONE_SQL =
   "SELECT COUNT(*) AS n FROM device_grants g JOIN devices dv ON dv.id = g.device_id WHERE g.desktop_id = ? AND g.state = 'pending' AND dv.revoked_at IS NULL";
 /** One desktop of the user, with the key the device pins. */
 export const GET_DESKTOP_SQL = `SELECT ${DESKTOP_COLUMNS}, public_key, fingerprint, user_id FROM desktops WHERE id = ? AND revoked_at IS NULL`;
-/** Rename and recolor; `color` only changes when the flag is 1 (null clears it). */
+/**
+ * Rename, recolor and set the avatar; `color` only changes when its flag is 1 (null clears it), and the four avatar
+ * columns only when theirs is 1 (all null clears the avatar). Binds: name, color flag, color, then the avatar flag and
+ * value for kind, emoji, hash and image, then id and user id.
+ */
 export const PATCH_DESKTOP_SQL =
-  "UPDATE desktops SET name = coalesce(?, name), color = CASE WHEN ? = 1 THEN ? ELSE color END WHERE id = ? AND user_id = ? AND revoked_at IS NULL";
+  "UPDATE desktops SET name = coalesce(?, name), color = CASE WHEN ? = 1 THEN ? ELSE color END, avatar_kind = CASE WHEN ? = 1 THEN ? ELSE avatar_kind END, avatar_emoji = CASE WHEN ? = 1 THEN ? ELSE avatar_emoji END, avatar_hash = CASE WHEN ? = 1 THEN ? ELSE avatar_hash END, avatar_image = CASE WHEN ? = 1 THEN ? ELSE avatar_image END WHERE id = ? AND user_id = ? AND revoked_at IS NULL";
+/** The stored image of an owned, live desktop. */
+export const GET_AVATAR_SQL = "SELECT avatar_image FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND avatar_kind = 'image'";
 /** Condition of the revoke batch: the desktop is the user's and still live. */
 const LIVE_OWN = "EXISTS (SELECT 1 FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL)";
 export const REVOKE_DESKTOP_TOKENS_SQL = `UPDATE desktop_tokens SET revoked_at = ? WHERE desktop_id = ? AND revoked_at IS NULL AND ${LIVE_OWN}`;
@@ -48,6 +56,9 @@ interface DesktopRow {
   id: string;
   name: string;
   color: string | null;
+  avatar_kind: string | null;
+  avatar_emoji: string | null;
+  avatar_hash: string | null;
   os: string | null;
   app_version: string | null;
   last_seen_at: number | null;
@@ -57,7 +68,7 @@ interface DesktopRow {
 }
 
 function summaryOf(row: DesktopRow, online: boolean, pendingCount: number) {
-  return { id: row.id, name: row.name, color: row.color, online, pendingCount, os: row.os, appVersion: row.app_version, lastSeenAt: row.last_seen_at };
+  return { id: row.id, name: row.name, color: row.color, avatar: avatarOf(row), online, pendingCount, os: row.os, appVersion: row.app_version, lastSeenAt: row.last_seen_at };
 }
 
 const notFound = (c: AppContext): Response => apiError(c, 404, "not_found", "Desktop not found");
@@ -94,18 +105,48 @@ export const getDesktop: Handler<AppEnv> = async (c) => {
   });
 };
 
-/** `PATCH /api/desktops/:id`: name and color. An empty body is 400. */
+/** `PATCH /api/desktops/:id`: name, color and avatar. An empty body is 400, and so is an image the Worker does not accept. */
 export const patchDesktop: Handler<AppEnv> = async (c) => {
   const { user } = requireAuth(c);
   const id = c.req.param("id") ?? "";
   const body = PatchDesktopBody.safeParse(await c.req.json().catch(() => null));
-  if (!body.success || (body.data.name === undefined && body.data.color === undefined)) return apiError(c, 400, "invalid", "Invalid desktop update");
+  if (!body.success || (body.data.name === undefined && body.data.color === undefined && body.data.avatar === undefined)) return apiError(c, 400, "invalid", "Invalid desktop update");
   const colorGiven = body.data.color !== undefined;
-  const result = await c.env.DB.prepare(PATCH_DESKTOP_SQL).bind(body.data.name ?? null, colorGiven ? 1 : 0, body.data.color ?? null, id, user.id).run();
+  const avatarGiven = body.data.avatar !== undefined;
+  const input = body.data.avatar ?? null;
+  let emoji: string | null = null;
+  let image: { hash: string; data: string } | null = null;
+  if (input?.kind === "emoji") emoji = input.emoji;
+  if (input?.kind === "image") {
+    image = await checkImage(input.data);
+    if (!image) return apiError(c, 400, "invalid", "The avatar must be a PNG, JPEG or WebP image of at most 20 KiB");
+  }
+  const flag = avatarGiven ? 1 : 0;
+  const result = await c.env.DB.prepare(PATCH_DESKTOP_SQL)
+    .bind(body.data.name ?? null, colorGiven ? 1 : 0, body.data.color ?? null, flag, input?.kind ?? null, flag, emoji, flag, image?.hash ?? null, flag, image?.data ?? null, id, user.id)
+    .run();
   if (result.meta.changes === 0) return notFound(c);
   const found = await ownedSummary(c, user.id, id);
   if (!found) return notFound(c);
   return respond(c, PatchDesktopResponse, { desktop: summaryOf(found.row, found.online, found.pending) });
+};
+
+/** `GET /api/desktops/:id/avatar`: the stored image. The type comes from the magic bytes; every response header limits what a browser may do with it. */
+export const getAvatar: Handler<AppEnv> = async (c) => {
+  const { user } = requireAuth(c);
+  const row = await c.env.DB.prepare(GET_AVATAR_SQL).bind(c.req.param("id") ?? "", user.id).first<{ avatar_image: string | null }>();
+  const bytes = row?.avatar_image ? decodeBase64(row.avatar_image) : null;
+  const type = bytes ? sniffImage(bytes) : null;
+  if (!bytes || !type) return notFound(c);
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": type,
+      "Content-Length": String(bytes.length),
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+      // `Cache-Control: no-store` is added for every /api route by the security headers middleware.
+    },
+  });
 };
 
 /**

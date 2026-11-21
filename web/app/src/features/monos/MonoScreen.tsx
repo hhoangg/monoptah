@@ -32,7 +32,7 @@ import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { useMonoAccentStyle } from "./monoAccent";
 import { MessageActions, type HeldMessage } from "./MessageActions";
-import { MonoMascot } from "./MonoMascot";
+import { MonoAvatar } from "./MonoAvatar";
 
 const EXCERPT = 140;
 const excerpt = (text: string) => (text.length > EXCERPT ? `${text.slice(0, EXCERPT - 1)}...` : text);
@@ -117,7 +117,11 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const working = mono?.status === "working" || state?.busy === true;
   const empty = !!state && older.turns.length === 0 && (state.optimistic ?? []).length === 0;
   const monoColor = mono?.color;
-  const agent = useMemo(() => ({ name, ...(monoColor ? { color: safeHexColor(monoColor) } : {}) }), [name, monoColor]);
+  const monoMascot = mono?.mascot;
+  const agent = useMemo(
+    () => ({ id: monoId, name, ...(monoMascot ? { mascot: monoMascot } : {}), ...(monoColor ? { color: safeHexColor(monoColor) } : {}) }),
+    [monoId, name, monoColor, monoMascot],
+  );
 
   return (
     // "route-stub" and `data-route` are the outlet marker that test/routes.test.tsx (WS-L) looks for.
@@ -138,7 +142,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
         >
           <Icon name="chevronDown" size={20} className="rotate-90" />
         </Link>
-        <MonoMascot monoId={monoId} mascot={mono?.mascot} color={mono?.color} working={working} size={32} />
+        <MonoAvatar monoId={monoId} name={name} mascot={mono?.mascot} color={mono?.color} working={working} size={32} />
         <div className="min-w-0 flex-1">
           <PaneHeading className="truncate text-h font-semibold">{name}</PaneHeading>
           {working ? <p className="truncate text-meta text-muted-text">Working</p> : null}
@@ -189,7 +193,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
 
       {empty ? (
         <div className="mx-auto flex min-h-0 w-full max-w-[768px] flex-1 flex-col items-center justify-center gap-3 px-5 text-center" data-testid="mono-empty">
-          <MonoMascot monoId={monoId} mascot={mono?.mascot} color={mono?.color} working={working} size={96} />
+          <MonoAvatar monoId={monoId} name={name} mascot={mono?.mascot} color={mono?.color} working={working} size={96} />
           <p className="text-h font-semibold">{name}</p>
           <p className="max-w-sm text-body text-muted-text">{readOnly ? "No messages yet." : `Say hello. ${name} works in the background and replies here.`}</p>
         </div>

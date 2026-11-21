@@ -202,6 +202,13 @@ export const desktops = sqliteTable(
       .references(() => users.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     color: text("color"),
+    /** `emoji`, `image` or null (initials). See migration 0008. */
+    avatarKind: text("avatar_kind"),
+    avatarEmoji: text("avatar_emoji"),
+    /** First 16 hex of the SHA-256 of the image: the cache key of its URL. */
+    avatarHash: text("avatar_hash"),
+    /** Base64 of the re-encoded PNG, JPEG or WebP (at most 20 KiB). */
+    avatarImage: text("avatar_image"),
     /** X25519, base64url. */
     publicKey: text("public_key").notNull(),
     /** Hex SHA-256 of the public key. */

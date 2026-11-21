@@ -89,6 +89,17 @@ describe("catalog home", () => {
     expect(within(screen.getByRole("region", { name: "Recent sessions" })).getAllByTestId("session-card").length).toBe(8);
   });
 
+  it("draws each Mono with the mascot and color the desktop sent, not an initial", async () => {
+    mount("");
+    const monos = await screen.findByRole("region", { name: "Monos" });
+    const avatars = await within(monos).findAllByTestId("mono-avatar");
+    const example = avatars[0] as HTMLElement;
+    expect(example).toHaveAttribute("data-kind", "mascot");
+    expect(example.querySelector("svg")).toHaveAttribute("data-mascot", "frog");
+    // The dev seed recolors the first Mono (mockLink.ts).
+    expect(example.querySelector("path")).toHaveAttribute("fill", "#7c5cff");
+  });
+
   it("draws no sidebar of its own at 640px and up: the app shell owns it (U-02)", async () => {
     stubMatchMedia(true);
     mount("");

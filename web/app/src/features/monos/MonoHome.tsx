@@ -19,7 +19,7 @@ import { EmptyState } from "@/ui/EmptyState";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "./contextMenu";
 import { CreateMonoDialog } from "./CreateMonoDialog";
 import { clearCreateMonoRequest, useCreateMonoRequest } from "./createRequest";
-import { MonoMascot } from "./MonoMascot";
+import { MonoAvatar } from "./MonoAvatar";
 import { useMonoPrefs } from "./monoPrefs";
 
 export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: string; /** The heading element: "h1" when the list is a page of its own. */ titleAs?: "h1" | "h2" }) {
@@ -139,7 +139,7 @@ function MonoRow({ desktopId, mono, unread, onHide }: { desktopId: string; mono:
           data-unread={unread ? "true" : undefined}
           className="flex min-h-16 items-center gap-3 rounded-card px-2 py-2 hover:bg-fill"
         >
-          <MonoMascot monoId={mono.id} mascot={mono.mascot} color={mono.color} working={working} size={40} />
+          <MonoAvatar monoId={mono.id} name={mono.name} mascot={mono.mascot} color={mono.color} working={working} size={40} />
           <span className="min-w-0 flex-1">
             <span className="flex items-baseline gap-2">
               <span className={cn("min-w-0 flex-1 truncate text-row", unread ? "font-semibold" : "font-medium")}>{mono.name}</span>

@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   DELETE_DENY_APPROVED_SQL,
   DESKTOP_ME_SQL,
+  GET_AVATAR_SQL,
   GET_DESKTOP_SQL,
   LIST_DESKTOPS_SQL,
   PATCH_DESKTOP_SQL,
@@ -97,7 +98,8 @@ const CASES: PlanCase[] = [
   { name: "desktops: pending counts", sql: PENDING_COUNTS_SQL, bind: [s] },
   { name: "desktops: pending count of one", sql: PENDING_COUNT_ONE_SQL, bind: [s] },
   { name: "desktops: get", sql: GET_DESKTOP_SQL, bind: [s] },
-  { name: "desktops: patch", sql: PATCH_DESKTOP_SQL, bind: [s, 0, null, s, s] },
+  { name: "desktops: patch", sql: PATCH_DESKTOP_SQL, bind: [s, 0, null, 0, null, 0, null, 0, null, 0, null, s, s] },
+  { name: "desktops: avatar image", sql: GET_AVATAR_SQL, bind: [s, s] },
   { name: "desktops: revoke tokens", sql: REVOKE_DESKTOP_TOKENS_SQL, bind: [1, s, s, s] },
   { name: "desktops: revoke grants", sql: REVOKE_DESKTOP_GRANTS_SQL, bind: [1, s, s, s] },
   { name: "desktops: revoke", sql: REVOKE_DESKTOP_SQL, bind: [1, s, s] },

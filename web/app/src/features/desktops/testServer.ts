@@ -109,8 +109,10 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
           return json(200, { ...target, publicKey: key ?? "cHVibGljLWtleQ", fingerprint: options.fingerprintClaims?.[id] ?? (key ? fingerprint(base64UrlDecode(key)) : FP_B) });
         }
         if (method === "PATCH") {
-          const patch = body as { name?: string; color?: string | null };
-          Object.assign(target, patch.name !== undefined ? { name: patch.name.trim() } : {}, patch.color !== undefined ? { color: patch.color } : {});
+          const patch = body as { name?: string; color?: string | null; avatar?: { kind: "emoji"; emoji: string } | { kind: "image"; data: string } | null };
+          // Like the real server: an emoji is kept, an image becomes a hash the page builds its URL from, null clears.
+          const avatar = patch.avatar === undefined ? {} : { avatar: patch.avatar === null ? null : patch.avatar.kind === "emoji" ? patch.avatar : { kind: "image" as const, hash: "0123456789abcdef" } };
+          Object.assign(target, patch.name !== undefined ? { name: patch.name.trim() } : {}, patch.color !== undefined ? { color: patch.color } : {}, avatar);
           return json(200, { desktop: target });
         }
         if (method === "DELETE") {
