@@ -86,6 +86,8 @@ pub(crate) struct SettingsContext {
     /// catalog order: what a device can be given access to.
     pub web_projects: Vec<(String, String)>,
     pub web_monos: Vec<(String, String)>,
+    /// The web terminals open now, listed under their device.
+    pub web_terminals: Vec<monocode_core::mobile::terminal::OpenTerminal>,
     /// The desktop toggles that gate remote Git push and cloud start. They
     /// have no storage yet, so the page shows them off and disabled.
     pub web_policy: monocode_core::mobile::policy::PolicyFlags,
@@ -122,6 +124,7 @@ impl PartialEq for SettingsContext {
             && self.web_notice == other.web_notice
             && self.web_projects == other.web_projects
             && self.web_monos == other.web_monos
+            && self.web_terminals == other.web_terminals
             && self.web_policy == other.web_policy
             && self.today_rollover_minutes == other.today_rollover_minutes
             && self.store == other.store
@@ -220,6 +223,8 @@ pub(crate) enum SettingsEvent {
         device_id: String,
         on: bool,
     },
+    /// The Kill action of an open web terminal, by terminal id.
+    WebKillTerminal(String),
     /// Approve or refuse a confirmed device's request for more permission.
     WebAnswerRequest {
         device_id: String,

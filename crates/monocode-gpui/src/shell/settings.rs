@@ -86,6 +86,7 @@ impl Shell {
             web_notice: self.web_notice(cx),
             web_projects: web_choices.0,
             web_monos: web_choices.1,
+            web_terminals: self.web_open_terminals(cx),
             web_policy: monocode_core::mobile::policy::flags(),
             quick_error: self.quick.error.clone(),
             inbox_connections: self
@@ -314,6 +315,7 @@ impl Shell {
                 | SettingsEvent::WebSetSelection { .. }
                 | SettingsEvent::WebSetPolicyFlag { .. }
                 | SettingsEvent::WebSetTerminalAllowed { .. }
+                | SettingsEvent::WebKillTerminal(_)
                 | SettingsEvent::WebAnswerRequest { .. } => this.web_settings_event(event, cx),
             },
         ));

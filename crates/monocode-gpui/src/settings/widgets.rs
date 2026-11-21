@@ -163,6 +163,7 @@ pub(super) fn icon_action(
         .role(Role::Button)
         .aria_label(label.into())
         .group("settings-icon-action")
+        .when(!disabled, |d| d.tab_index(0))
         .size(px(side))
         .flex_shrink_0()
         .flex()
@@ -182,6 +183,74 @@ pub(super) fn icon_action(
                     i.group_hover("settings-icon-action", |s| s.text_color(content(1.)))
                 }),
         )
+}
+
+/// The small label shown on hover by the settings icon controls.
+struct SettingsTip(SharedString);
+
+impl gpui::Render for SettingsTip {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut Context<Self>) -> impl IntoElement {
+        let mut background = shell_fill();
+        background.a = 1.;
+        div()
+            .max_w(px(280.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(background)
+            .border_1()
+            .border_color(content(0.12))
+            .text_size(px(12.))
+            .text_color(content(0.85))
+            .child(self.0.clone())
+    }
+}
+
+/// A hover tooltip for any element of a settings page.
+pub(super) fn with_tip(element: Stateful<Div>, tip: impl Into<SharedString>) -> Stateful<Div> {
+    let tip: SharedString = tip.into();
+    element.tooltip(move |_, cx| cx.new(|_| SettingsTip(tip.clone())).into())
+}
+
+/// A 32px icon button with a tooltip that is either on (accent) or off (the
+/// muted color of the row labels). It is a switch for assistive tech and a tab
+/// stop that Enter and Space activate. A disabled one is not a tab stop and
+/// reports no switch state, so its `label` and `tip` must say why.
+pub(super) fn icon_toggle(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    tip: impl Into<SharedString>,
+    path: &'static str,
+    on: bool,
+    disabled: bool,
+) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    with_tip(
+        div()
+            .id(id)
+            .role(Role::Switch)
+            .aria_label(label)
+            .when(!disabled, |d| {
+                d.tab_index(0).aria_toggled(if on {
+                    gpui::Toggled::True
+                } else {
+                    gpui::Toggled::False
+                })
+            })
+            .size(px(32.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .when(on, |d| d.bg(accent(0.15)))
+            .when(disabled, |d| d.opacity(0.4))
+            .when(!disabled, |d| {
+                d.cursor_pointer().hover(|s| s.bg(content(0.1)))
+            })
+            .child(icon(path, 16.).text_color(if on { accent_color() } else { content(0.5) })),
+        tip,
+    )
 }
 
 pub(crate) fn primary_button(
@@ -499,6 +568,72 @@ impl SettingsView {
                     })
                     .child(text.to_owned())
                     .on_click(cx.listener(move |this, _, _, cx| change(this, option, cx)))
+            }))
+            .into_any_element()
+    }
+
+    /// A compact icon version of `segmented`: one icon per option, the chosen
+    /// one highlighted. Each option is `(value, icon, tooltip and label)`.
+    pub(super) fn icon_segmented(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        value: &str,
+        options: &[(&'static str, &'static str, &'static str)],
+        cx: &mut Context<Self>,
+        change: impl Fn(&mut Self, &'static str, &mut Context<Self>) + Clone + 'static,
+    ) -> AnyElement {
+        let id: SharedString = id.into();
+        div()
+            .id(SharedString::from(format!("segmented-{id}")))
+            .role(Role::RadioGroup)
+            .aria_label(label.into())
+            .flex()
+            .flex_shrink_0()
+            .gap(px(2.))
+            .rounded_md()
+            .border_1()
+            .border_color(content(0.1))
+            .p(px(2.))
+            .children(options.iter().map(|&(option, path, text)| {
+                let selected = value == option;
+                let change = change.clone();
+                let id = id.clone();
+                with_tip(
+                    div()
+                        .id(SharedString::from(format!("segmented-{id}-{option}")))
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("settings-{id}-{option}")
+                        })
+                        .role(Role::RadioButton)
+                        .aria_label(text)
+                        .aria_selected(selected)
+                        .tab_index(0)
+                        .size(px(28.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .map(|d| {
+                            if selected {
+                                d.bg(accent(0.15))
+                            } else {
+                                d.hover(|s| s.bg(content(0.1)))
+                            }
+                        })
+                        .child(icon(path, 16.).text_color(if selected {
+                            accent_color()
+                        } else {
+                            content(0.5)
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            change(this, option, cx);
+                        })),
+                    text,
+                )
             }))
             .into_any_element()
     }

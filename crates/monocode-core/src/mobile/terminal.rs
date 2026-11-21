@@ -370,6 +370,9 @@ pub struct OpenTerminal {
     pub device_name: String,
     pub project: String,
     pub opened_unix: u64,
+    /// Whole minutes since the last keystroke (coarse, so a status watcher
+    /// does not see a change every tick).
+    pub idle_minutes: u64,
     /// The browser is not connected right now.
     pub detached: bool,
 }
@@ -993,6 +996,7 @@ impl Hub {
                 device_name: t.owner.name.clone(),
                 project: t.label.clone(),
                 opened_unix: t.opened_unix,
+                idle_minutes: now.saturating_sub(t.last_input) / 60_000,
                 detached: matches!(t.phase, Phase::Detached(_)),
             })
             .collect();

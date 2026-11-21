@@ -3,14 +3,14 @@
 //! executor, polls a pairing until the browser answers, and watches for
 //! devices that wait for confirmation while Settings is closed.
 use super::*;
-use crate::notifications::{platform, surface::glass_frame};
+use crate::notifications::platform;
 use crate::settings::{SettingsEvent, WebPolicyFlag};
 use gpui::{Global, Task};
 use monocode_core::mobile::{
     AccessChange, DeviceKind, WebStatus,
     host::MobileHost,
     policy::{self, PolicyFlags},
-    terminal::TerminalStatus,
+    terminal::{OpenTerminal, TerminalStatus},
     web_link::{PairPoll, PairTicket, PendingDevice, attached_host},
 };
 use std::{
@@ -40,7 +40,7 @@ struct WebBridge {
     /// Bumped whenever a pairing is cancelled or Settings closes, so a ticket
     /// that arrives late is dropped instead of reopening the dialog.
     pairing_generation: u64,
-    /// Open web terminals, for the corner panel.
+    /// Open web terminals, listed under their device in Settings.
     terminals: TerminalStatus,
 }
 
@@ -210,13 +210,13 @@ impl Shell {
         }
     }
 
-    /// One watcher tick for the web terminal: keeps what the corner panel
-    /// shows.
+    /// One watcher tick for the web terminal: keeps what Settings lists.
     fn web_terminals_watched(&mut self, terminals: TerminalStatus, cx: &mut Context<Self>) {
         let bridge = cx.default_global::<WebBridge>();
         let changed = bridge.terminals != terminals;
         bridge.terminals = terminals;
         if changed {
+            self.sync_settings(cx);
             cx.notify();
         }
     }
@@ -232,69 +232,20 @@ impl Shell {
                 host.terminal_kill(&id);
             })
             .detach();
-        // The next tick drops it from the panel; hide it now.
+        // The next tick drops it from the list; hide it now.
         cx.default_global::<WebBridge>()
             .terminals
             .open
             .retain(|open| open.id != killed);
+        self.sync_settings(cx);
         cx.notify();
     }
 
-    /// The corner panel: every open web terminal with its device name and a Kill button. On top of the
-    /// workspace, whatever page is open.
-    pub(super) fn web_terminal_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = cx.try_global::<WebBridge>()?.terminals.clone();
-        if status.open.is_empty() {
-            return None;
-        }
-        let mut stack = div()
-            .absolute()
-            .top(px(44.))
-            .right(px(16.))
-            .w(px(340.))
-            .flex()
-            .flex_col()
-            .gap_2();
-        for open in &status.open {
-            let id = open.id.clone();
-            let label = format!(
-                "Web terminal open: {} ({}){}",
-                open.device_name,
-                open.project,
-                if open.detached { ", disconnected" } else { "" }
-            );
-            stack = stack.child(
-                glass_frame()
-                    .id(SharedString::from(format!("web-terminal-open-{id}")))
-                    .role(Role::Status)
-                    .debug_selector(|| "web-terminal-open".into())
-                    .occlude()
-                    .px_3()
-                    .py_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .truncate()
-                            .text_size(px(12.))
-                            .child(label),
-                    )
-                    .child(
-                        crate::modal::danger_ghost_button(
-                            SharedString::from(format!("web-terminal-kill-{id}")),
-                            "Kill",
-                        )
-                        .debug_selector(|| "web-terminal-kill".into())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.web_kill_terminal(id.clone(), cx);
-                        })),
-                    ),
-            );
-        }
-        Some(gpui::deferred(stack).with_priority(110).into_any_element())
+    /// The open web terminals, for the Settings > Web app device rows.
+    pub(super) fn web_open_terminals(&self, cx: &App) -> Vec<OpenTerminal> {
+        cx.try_global::<WebBridge>()
+            .map(|bridge| bridge.terminals.open.clone())
+            .unwrap_or_default()
     }
 
     /// How many devices and requests wait for the user, for the Connections
@@ -435,6 +386,7 @@ impl Shell {
                     host.web_set_terminal_allowed(&device_id, on)
                 });
             }
+            SettingsEvent::WebKillTerminal(id) => self.web_kill_terminal(id.clone(), cx),
             SettingsEvent::WebSetPolicyFlag { flag, on } => {
                 self.web_set_policy_flag(*flag, *on, cx);
             }

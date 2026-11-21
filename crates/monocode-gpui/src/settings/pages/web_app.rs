@@ -42,8 +42,11 @@ pub(in crate::settings) struct WebAppState {
     pub(in crate::settings) verify: bool,
     /// The device whose revoke waits for confirmation, as (id, name).
     pub(in crate::settings) revoking: Option<(String, String)>,
-    /// The web device whose project list is open.
-    pub(in crate::settings) projects_open: Option<String>,
+    /// The web device whose row is expanded (projects and open terminals).
+    pub(in crate::settings) expanded: Option<String>,
+    /// Redraws an expanded row that lists terminals, so "Opened X ago" and
+    /// "Idle N min" keep moving. Present only while such a row is open.
+    pub(in crate::settings) terminals_tick: Option<Task<()>>,
     /// The confirmation dialog of a pending device.
     pub(in crate::settings) confirm: Option<confirm::Draft>,
     pub(in crate::settings) copied: bool,
@@ -168,7 +171,8 @@ impl SettingsView {
         self.web_app.confirm_unpair = false;
         self.web_app.verify = false;
         self.web_app.revoking = None;
-        self.web_app.projects_open = None;
+        self.web_app.expanded = None;
+        self.web_app.terminals_tick = None;
         self.web_app.confirm = None;
         self.web_app.host_error = None;
         self.web_app.activity = None;

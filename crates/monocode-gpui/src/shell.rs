@@ -10156,7 +10156,6 @@ impl Render for Shell {
             .children(self.peek_watch(window, cx))
             .child(self.notices_overlay(cx))
             .children(self.quit_notice())
-            .children(self.web_terminal_panel(cx))
             .children(self.menu.as_ref().map(|open| {
                 let point = matches!(open.anchor, Anchor::Point(_));
                 let beside = matches!(open.target, MenuTarget::Project { .. });
