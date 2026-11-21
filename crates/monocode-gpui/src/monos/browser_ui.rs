@@ -87,6 +87,9 @@ fn trust_row(trust: BrowserTrust, selected: bool, cx: &mut Context<Monos>) -> An
         .into_any_element()
 }
 
+/// The Full Disk Access pane of System Settings. The scheme has a dot: `x-apple.systempreferences`.
+pub(super) const FULL_DISK_ACCESS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 const SELECT_PRIORITY: usize = 90;
 const AUDIT_ROWS: usize = 20;
 pub(super) const SUBTITLE: &str = "Let this Mono use your own Chrome, with the sessions you are signed in to, through Playwright MCP. Off by default.";
@@ -105,7 +108,7 @@ impl BrowserOps for RealOps {
     fn open_full_disk_access(&self) {
         #[cfg(target_os = "macos")]
         let _ = std::process::Command::new("open")
-            .arg("x-apple-systempreferences:com.apple.preference.security?Privacy_AllFiles")
+            .arg(FULL_DISK_ACCESS_URL)
             .spawn();
     }
     fn probe(&self, runtime: &browser::Runtime, env: &PrereqEnv) -> Result<(), String> {
@@ -128,6 +131,8 @@ pub(super) struct BrowserUi {
     pub(super) env: Option<PrereqEnv>,
     pub(super) prereq: Option<Prerequisites>,
     pub(super) profiles: Vec<ChromeProfile>,
+    /// Chrome's profile list could not be read: `profiles` holds only the saved profile.
+    pub(super) profiles_unreadable: bool,
     pub(super) installed: bool,
     pub(super) hint: Option<String>,
     /// The Mono `hint` was read for. The 2 second install poll must not decrypt the token again.
@@ -152,6 +157,7 @@ impl BrowserUi {
             }),
             prereq: None,
             profiles: Vec::new(),
+            profiles_unreadable: false,
             installed: false,
             hint: None,
             hint_mono: None,
@@ -226,18 +232,36 @@ impl Monos {
             return;
         };
         let env = self.browser_ui.env();
-        let profile_dir = self
+        let (profile_dir, profile_name) = self
             .roster
             .get(&id)
             .and_then(|m| m.browser.as_ref())
-            .map(|b| b.profile_dir.clone())
+            .map(|b| (b.profile_dir.clone(), b.profile_name.clone()))
             .unwrap_or_default();
         let ui = &mut self.browser_ui;
         ui.prereq = Some(browser::check_prerequisites(&env));
-        ui.profiles = browser::read_local_state(&env)
+        let listed = browser::read_local_state(&env)
             .ok()
-            .and_then(|text| browser::parse_local_state(&text).ok())
-            .unwrap_or_default();
+            .and_then(|text| browser::parse_local_state(&text).ok());
+        ui.profiles_unreadable = listed.is_none();
+        ui.profiles = listed.unwrap_or_default();
+        // The saved profile is always offered, even when Chrome's profile list cannot be read
+        // (Full Disk Access missing), so the picker still opens and shows the current choice.
+        if browser::valid_profile_dir(&profile_dir)
+            && !ui.profiles.iter().any(|p| p.dir == profile_dir)
+        {
+            ui.profiles.push(ChromeProfile {
+                dir: profile_dir.clone(),
+                name: if profile_name.is_empty() {
+                    profile_dir.clone()
+                } else {
+                    profile_name
+                },
+                email: String::new(),
+                avatar_icon: String::new(),
+                picture: None,
+            });
+        }
         ui.installed = !profile_dir.is_empty()
             && browser::extension_installed(&env.user_data_dir, &profile_dir);
         let store = self.browser_store().ok();
@@ -250,6 +274,11 @@ impl Monos {
             _ => None,
         };
         ui.hint_mono = Some(id.clone());
+        // The note of a failed launch goes once its cause is fixed: a token is saved and Chrome
+        // and node are there. A later launch sets it again if something else is wrong.
+        if ui.hint.is_some() && ui.prereq.as_ref().is_some_and(Prerequisites::can_attach) {
+            browser::server::servers().set_attach_error(&id, None);
+        }
         ui.audit = store
             .as_ref()
             .map(|s| s.recent(&id, AUDIT_ROWS))
@@ -257,7 +286,8 @@ impl Monos {
         self.browser_sync(cx);
     }
 
-    /// `ready` is what the runtime trusts: Chrome, access to its data, node, a profile and a token.
+    /// `ready` is the page's own summary: Chrome, node, a profile and a token. A launch does not
+    /// read it. Full Disk Access is not part of it: it only lets the page list other profiles.
     fn browser_sync(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.active.clone() else {
             return;
@@ -266,7 +296,7 @@ impl Monos {
             .browser_ui
             .prereq
             .as_ref()
-            .is_some_and(Prerequisites::all_ok)
+            .is_some_and(Prerequisites::can_attach)
             && self.browser_ui.hint.is_some();
         let Some(setting) = self.roster.get_mut(&id).and_then(|m| m.browser.as_mut()) else {
             cx.notify();
@@ -379,19 +409,22 @@ impl Monos {
 
     /// A token belongs to one profile's extension install, so a new profile drops it.
     pub(super) fn browser_choose_profile(&mut self, dir: &str, cx: &mut Context<Self>) {
+        // A listed profile, else the saved one, else any valid directory name: a choice always
+        // takes effect, also when Chrome's profile list cannot be read.
         let Some(profile) = self
             .browser_ui
             .profiles
             .iter()
             .find(|p| p.dir == dir)
-            .cloned()
+            .map(|p| (p.dir.clone(), p.name.clone()))
+            .or_else(|| browser::valid_profile_dir(dir).then(|| (dir.to_owned(), dir.to_owned())))
         else {
             return;
         };
         let changed = self.browser_setting().profile_dir != dir;
         self.browser_edit(cx, |b| {
-            b.profile_dir = profile.dir.clone();
-            b.profile_name = profile.name.clone();
+            b.profile_dir = profile.0.clone();
+            b.profile_name = profile.1.clone();
             if changed {
                 b.ready = false;
             }
@@ -690,6 +723,18 @@ impl Monos {
         if let Some(error) = self.browser_ui.error.clone() {
             sections.push(alert("mono-browser-error", error).into_any_element());
         }
+        if let Some(reason) = browser::server::servers()
+            .attach_error(&mono.id)
+            .filter(|_| setting.enabled)
+        {
+            sections.push(
+                alert(
+                    "mono-browser-attach-error",
+                    format!("The browser could not be attached to the last run: {reason}."),
+                )
+                .into_any_element(),
+            );
+        }
         let toggle = switch_track("mono-browser-enabled", "Use the browser", setting.enabled)
             .debug_selector(|| "mono-browser-enabled".into())
             .cursor_pointer()
@@ -871,6 +916,13 @@ impl Monos {
                     shared.join(", ")
                 ),
                 0.75,
+            )));
+        }
+        if self.browser_ui.profiles_unreadable {
+            card_ = card_.child(div().px_3().py_2().child(note(
+                "mono-browser-profiles-note",
+                "Other Chrome profiles are not listed: the app cannot read Chrome's profile data. Grant Full Disk Access to list them. The saved profile keeps working.",
+                0.6,
             )));
         }
         card_

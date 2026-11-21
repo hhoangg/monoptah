@@ -124,6 +124,9 @@ pub struct BrowserServers {
     gates: Mutex<HashMap<String, Arc<Gate>>>,
     /// How a gate reaches the server; tests replace it.
     upstream: Arc<dyn gate::Upstream>,
+    /// Why the last launch of a Mono could not attach its browser (no secrets). The Browser tab
+    /// shows it; a launch that attached clears it.
+    attach_errors: Mutex<HashMap<String, String>>,
 }
 impl BrowserServers {
     pub fn new(backend: Arc<dyn ServerBackend>, idle: Duration) -> Self {
@@ -134,7 +137,23 @@ impl BrowserServers {
             starting: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             upstream: Arc::new(gate::HttpUpstream::new()),
+            attach_errors: Mutex::new(HashMap::new()),
         }
+    }
+    pub fn set_attach_error(&self, mono_id: &str, reason: Option<String>) {
+        let mut errors = self.attach_errors.lock().unwrap_or_else(|e| e.into_inner());
+        match reason {
+            Some(reason) => errors.insert(mono_id.to_owned(), reason),
+            None => errors.remove(mono_id),
+        };
+    }
+    /// Why the Mono's last launch could not attach its browser, if it could not.
+    pub fn attach_error(&self, mono_id: &str) -> Option<String> {
+        self.attach_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(mono_id)
+            .cloned()
     }
     /// Uses `upstream` instead of real HTTP to reach the servers (tests).
     pub fn with_upstream(mut self, upstream: Arc<dyn gate::Upstream>) -> Self {

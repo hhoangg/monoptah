@@ -550,3 +550,86 @@ fn the_install_poll_does_not_decrypt_the_token_again(cx: &mut TestAppContext) {
     page.manager(|m, cx| m.browser_refresh(cx));
     assert!(page.ui(|u| u.hint.is_none()));
 }
+
+#[test]
+fn the_full_disk_access_link_uses_the_dotted_system_settings_scheme() {
+    assert_eq!(
+        browser_ui::FULL_DISK_ACCESS_URL,
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+    );
+    assert!(!browser_ui::FULL_DISK_ACCESS_URL.starts_with("x-apple-"));
+}
+
+#[gpui::test]
+fn the_picker_changes_the_profile_when_profiles_are_listed(cx: &mut TestAppContext) {
+    let mut page = open(cx);
+    page.enable();
+    page.choose("Default");
+    assert_eq!(page.setting().unwrap().profile_dir, "Default");
+    page.click("mono-browser-profile");
+    assert!(page.ui(|u| u.select_is_open()));
+    page.choose("Profile 6");
+    let setting = page.setting().unwrap();
+    assert_eq!(
+        (setting.profile_dir.as_str(), setting.profile_name.as_str()),
+        ("Profile 6", "Work")
+    );
+    assert!(!page.ui(|u| u.profiles_unreadable) && !page.on("mono-browser-profiles-note"));
+}
+
+#[gpui::test]
+fn without_chromes_profile_list_the_saved_profile_still_shows_and_works(cx: &mut TestAppContext) {
+    let mut page = open(cx);
+    page.enable();
+    page.choose("Profile 6");
+    page.save_token(TOKEN);
+    assert!(page.setting().unwrap().ready);
+    // Full Disk Access is gone: Chrome's Local State cannot be read.
+    std::fs::remove_file(page.env.user_data_dir.join("Local State")).unwrap();
+    page.manager(|m, cx| m.browser_refresh(cx));
+    assert!(page.ui(|u| u.profiles_unreadable));
+    assert_eq!(
+        page.ui(|u| u.profiles.iter().map(|p| p.dir.clone()).collect::<Vec<_>>()),
+        ["Profile 6"]
+    );
+    assert!(page.on("mono-browser-profiles-note"));
+    // The saved profile is not lost and the browser is not marked unready by it.
+    let setting = page.setting().unwrap();
+    assert_eq!(setting.profile_dir, "Profile 6");
+    assert!(setting.ready && setting.active());
+    // The picker opens, and a choice (a valid directory name) always takes effect.
+    page.click("mono-browser-profile");
+    assert!(page.ui(|u| u.select_is_open()));
+    page.choose("Default");
+    assert_eq!(page.setting().unwrap().profile_dir, "Default");
+    page.choose("../etc");
+    assert_eq!(page.setting().unwrap().profile_dir, "Default");
+}
+
+#[gpui::test]
+fn the_reason_a_launch_could_not_attach_the_browser_is_shown_on_the_tab(cx: &mut TestAppContext) {
+    let mut page = open(cx);
+    page.enable();
+    let id = page.s.id.clone();
+    assert!(!page.on("mono-browser-attach-error"));
+    browser::server::servers().set_attach_error(&id, Some("no extension token is saved".into()));
+    page.manager(|m, cx| m.browser_refresh(cx));
+    assert!(page.on("mono-browser-attach-error"));
+    browser::server::servers().set_attach_error(&id, None);
+    page.manager(|m, cx| m.browser_refresh(cx));
+    assert!(!page.on("mono-browser-attach-error"));
+}
+
+#[gpui::test]
+fn the_attach_note_goes_once_its_cause_is_fixed(cx: &mut TestAppContext) {
+    let mut page = open(cx);
+    page.enable();
+    page.choose("Profile 6");
+    let id = page.s.id.clone();
+    browser::server::servers().set_attach_error(&id, Some("no extension token is saved".into()));
+    page.manager(|m, cx| m.browser_refresh(cx));
+    assert!(page.on("mono-browser-attach-error"), "no token yet");
+    page.save_token(TOKEN);
+    assert!(!page.on("mono-browser-attach-error"));
+    assert_eq!(browser::server::servers().attach_error(&id), None);
+}
