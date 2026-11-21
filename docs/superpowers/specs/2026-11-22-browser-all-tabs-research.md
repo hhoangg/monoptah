@@ -325,3 +325,85 @@ defaults. Do not fork the Playwright extension or chrome-use up front.
 - Snapshot token comparison was not measured; only the documented options were read.
 - Privacy and trust review of the chrome-use extension (permissions `identity.email`, `downloads`,
   `scripting`, optional all-sites host access) before shipping it to users.
+
+## Addendum: one stable tab group per Mono (long-lived HTTP server)
+
+Bug: every Mono turn made a new Chrome tab group with the same name. Each turn starts a new agent
+process, hence a new stdio `@playwright/mcp`, hence a new extension connection.
+
+### Verified facts
+
+Sources: `@playwright/mcp@0.0.86` and `playwright-core@1.66.0-alpha-2026-11-18` tarballs
+(`lib/coreBundle.js`), and the extension in `microsoft/playwright` `packages/extension/src/`.
+
+- The extension makes one group per connection and never reuses one. `TabGroupManager.register`
+  creates a `ClientTabGroup` per `ClientSession`; when the session closes, `orphan(session)` greys
+  the group out and forgets it (`tabGroupManager.ts`, `connectionBroker.ts` `session.onClose`). A
+  reconnect with the same title makes a new group. The only way to join an existing group is the
+  manual `adopt` from the connect page, which the token flow skips. So reconnects must be rare:
+  the connection has to outlive the turns.
+- `@playwright/mcp` flags (the `--help` text in `coreBundle.js`, `decorateMCPCommand`): `--port`,
+  `--host`, `--allowed-hosts`, `--shared-browser-context`, `--session-name` and `--session-color`
+  (with `--extension` these are the tab group title and color; colors: blue, red, yellow, green,
+  pink, purple, cyan, orange).
+- Transports with `--port` (`tools/utils/mcp/http.ts`): streamable HTTP on any path except `/sse*`
+  (the app uses `/mcp`), and legacy SSE on `/sse`. Streamable sessions run a 3 s ping heartbeat
+  that closes the session when the client does not answer; SSE sessions have no heartbeat.
+- With `--shared-browser-context` all clients share one browser (one extension connection, one
+  group), but when the last client leaves, `dispose` closes it (`last = !clientCount`). A server
+  with no client left therefore drops the group's connection.
+- Codex supports streamable HTTP MCP servers (`mcp_servers.<name>.url`, plus `bearer_token_env_var`,
+  `http_headers`; seen in the 0.171.0 binary). Claude takes `{"type":"http","url":...}`.
+- The server exits when its stdin closes (`setupExitWatchdog`).
+
+### Design (implemented in `mono/browser/server.rs`)
+
+- One `@playwright/mcp` process per Mono with an active browser, started on the first run that
+  needs it, on a free port, bound to `127.0.0.1`, kept across turns. Name: the Mono's name
+  (`--session-name`), color: the Mono color mapped to the nearest tab group color.
+- Each run only points Claude (`--mcp-config` http entry) or Codex (`-c mcp_servers.<name>.url`)
+  at it. The disallowed tools, `disabled_tools`, approval mode, origin flags and the audit are
+  unchanged (they are client side or in the same server args). The token lives only in the server
+  process environment.
+- The app keeps one MCP client of its own connected (the keeper, over SSE, which has no heartbeat),
+  so the shared browser connection and the group survive the gap between turns. Chrome quitting
+  or the extension's service worker stopping still ends the connection, and the next run then
+  gets a new group (the keeper repeats its opening call on the next run).
+- Lifecycle: restart when the process died or its launch changed (profile, token, origin rules,
+  Mono name or color); stopped when the browser is switched off or its profile or origin rules
+  change (not for "ask before"), the token changes, the Mono is deleted, the app quits (process
+  guard) or after 30 minutes without a run. A run holds a lease on the server (dropped when the
+  run ends), a server with a lease is never stopped as idle, and idle time counts from the last
+  release. Runs of one Mono that start together share one start (a per-Mono lock).
+
+### Server-side tool restriction: none
+
+`browser_evaluate` and `browser_run_code_unsafe` have capability `core`, which `filteredTools`
+always keeps; `--caps` only adds capabilities (vision, pdf, devtools, ...), and there is no flag
+that removes a tool. The restrictions stay client side (`--disallowedTools` for Claude,
+`disabled_tools` for Codex), exactly as with the stdio server.
+
+### Residual risk
+
+The HTTP server has no authentication: it checks the `Host` header only (DNS rebinding), not a
+token or `Origin`, and the path is not secret (any non-`/sse` path is the MCP endpoint; checked:
+`/mcp/anything` returns 200). Protection used: random port, `127.0.0.1` only,
+`--allowed-hosts 127.0.0.1:<port>` (a request with another `Host` gets 403). Any local process of
+the same user that finds the port can drive the Mono's Chrome profile without the tool
+restrictions (they are enforced by the agent clients, not the server) and without the audit. It
+cannot read the token.
+
+Cross-site requests from a web page, checked against a real 0.0.86 server: `POST /mcp` with
+`Content-Type: text/plain` and a foreign `Origin` gets 415, without the `Accept` pair 406, an
+`OPTIONS` preflight gets 400 without CORS headers, and `POST /sse?sessionId=...` with
+`text/plain` gets 400. A page cannot send `application/json` cross-origin without a preflight, so
+a browser page cannot drive the server (a foreign `Origin` with the JSON type is accepted when
+sent by a non-browser client, since the server does not check `Origin`).
+
+An authenticating proxy inside the app (bearer token check, forwarding to the server) was
+considered and not built: the server only listens on TCP (`--port`; no unix socket or pipe), so
+the proxy would sit next to an unauthenticated port that a local process can still reach directly.
+It adds code and a failure point without closing the gap.
+
+Not verified live (needs Chrome with the extension): that a second client of the shared server
+reuses the first client's tabs and group. It follows from the code above.

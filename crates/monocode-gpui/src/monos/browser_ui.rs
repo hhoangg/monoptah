@@ -18,6 +18,12 @@ use monocode_core::mono::browser::{
 };
 use std::sync::Arc;
 
+/// Stops the Mono's browser server (off the UI thread: ending a process can wait a moment).
+fn stop_server(id: &str) {
+    let id = id.to_owned();
+    std::thread::spawn(move || browser::server::servers().stop(&id));
+}
+
 const SELECT_PRIORITY: usize = 90;
 const AUDIT_ROWS: usize = 20;
 pub(super) const SUBTITLE: &str = "Let this Mono use your own Chrome, with the sessions you are signed in to, through Playwright MCP. Off by default.";
@@ -224,8 +230,14 @@ impl Monos {
             return;
         };
         let setting = mono.browser.get_or_insert_with(MonoBrowser::default);
+        let before = setting.clone();
         change(setting);
         setting.normalize();
+        // The server starts again with the new setting on the next run, with a new tab group.
+        // A change that does not shape the server (ask before acting) keeps it and its group.
+        if before.server_key() != setting.server_key() {
+            stop_server(&id);
+        }
         self.save(cx);
         self.configure_chat_with(&id, false, cx);
         self.browser_ui.error = None;
@@ -372,6 +384,7 @@ impl Monos {
             .and_then(|store| store.save_token(&id, &field));
         match saved {
             Ok(()) => {
+                stop_server(&id);
                 // A new token: read its last four again.
                 self.browser_ui.hint = None;
                 if let Some(input) = self.fields.get("browser-token").cloned() {
@@ -388,6 +401,7 @@ impl Monos {
 
     fn browser_remove_token(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.active.clone() {
+            stop_server(&id);
             self.browser_ui.error = self
                 .browser_store()
                 .and_then(|store| store.remove_token(&id))
@@ -1011,6 +1025,7 @@ impl Monos {
 
     /// A deleted Mono leaves no token and no audit rows.
     pub(super) fn browser_forget(&mut self, id: &str) {
+        stop_server(id);
         if let Ok(store) = self.browser_store() {
             let _ = store.delete_mono(id);
         }

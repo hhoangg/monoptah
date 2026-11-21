@@ -29,11 +29,19 @@ fn browser(profile: &str) -> MonoBrowser {
         ..Default::default()
     }
 }
+fn fake_servers() -> server::BrowserServers {
+    server::BrowserServers::new(
+        std::sync::Arc::new(server::tests_support::FakeBackend::default()),
+        std::time::Duration::from_secs(60),
+    )
+}
 fn runtime(b: &MonoBrowser) -> Runtime {
     Runtime {
         spec: ServerSpec::new(b, Path::new("/out/browser"), None),
         token: Secret::new(TOKEN.into()),
         confirm_actions: b.confirm_actions,
+        endpoint: None,
+        lease: None,
     }
 }
 
@@ -471,9 +479,14 @@ fn a_launch_adds_the_server_only_when_everything_is_ready() {
     f.secrets.save_token(&mono.id, TOKEN).unwrap();
     let ctx = context(&f, mono.clone());
 
-    let runtime = resolve_with(&ctx, &env).expect("ready");
+    let runtime = resolve_with(&ctx, &env, &fake_servers()).expect("ready");
     assert!(runtime.spec.command.ends_with("npx"));
     assert!(runtime.spec.args.iter().any(|a| a == "Profile 6"));
+    assert_eq!(
+        runtime.endpoint.as_deref(),
+        Some("http://127.0.0.1:41000/mcp")
+    );
+    assert_eq!(runtime.claude_server()["type"], "http");
     assert!(output_dir(&ctx.root, &mono.id).is_dir());
     assert!(launch_instructions(&ctx, true).contains("## Browser"));
     assert!(!launch_instructions(&ctx, false).contains("## Browser"));
@@ -518,21 +531,21 @@ fn a_launch_adds_the_server_only_when_everything_is_ready() {
         ),
     ];
     for (name, c, e) in cases {
-        assert!(resolve_with(&c, e).is_none(), "{name}");
+        assert!(resolve_with(&c, e, &fake_servers()).is_none(), "{name}");
     }
     let no_chrome = env_in(env_dir.path(), false, true);
     let no_chrome = PrereqEnv {
         chrome_binaries: vec![env_dir.path().join("missing")],
         ..no_chrome
     };
-    assert!(resolve_with(&ctx, &no_chrome).is_none());
+    assert!(resolve_with(&ctx, &no_chrome, &fake_servers()).is_none());
     let no_data = PrereqEnv {
         user_data_dir: env_dir.path().join("revoked"),
         ..env.clone()
     };
-    assert!(resolve_with(&ctx, &no_data).is_none());
+    assert!(resolve_with(&ctx, &no_data, &fake_servers()).is_none());
     f.secrets.remove_token(&mono.id).unwrap();
-    assert!(resolve_with(&ctx, &env).is_none());
+    assert!(resolve_with(&ctx, &env, &fake_servers()).is_none());
 }
 
 #[test]
@@ -833,6 +846,8 @@ fn the_process_transport_talks_to_a_server_over_stdio() {
         },
         token: Secret::new(TOKEN.into()),
         confirm_actions: true,
+        endpoint: None,
+        lease: None,
     };
     let env = PrereqEnv {
         chrome_binaries: vec![],
@@ -841,4 +856,74 @@ fn the_process_transport_talks_to_a_server_over_stdio() {
     };
     let mut transport = ProcessTransport::spawn(&r, &env).unwrap();
     probe(&mut transport).unwrap();
+}
+
+#[test]
+fn the_group_is_named_after_the_mono_and_colored_like_it() {
+    let mut mono = Mono {
+        name: "Fin Ops".into(),
+        color: 0xd93025,
+        ..Default::default()
+    };
+    assert_eq!(group_name(&mono), "Fin Ops");
+    mono.name = "  Re\u{7}port\n  bot ".into();
+    assert_eq!(group_name(&mono), "Report bot");
+    assert_eq!(session_color(0xd93025), "red");
+    assert_eq!(session_color(0x2060f0), "blue");
+    assert_eq!(session_color(0x20b030), "green");
+    for (_, rgb) in GROUP_COLORS {
+        assert!(GROUP_COLORS
+            .iter()
+            .any(|(name, _)| *name == session_color(rgb)));
+    }
+    let b = browser("Default");
+    let spec = ServerSpec::new(&b, Path::new("/o"), None).with_session("Fin Ops", "red");
+    let at = |flag: &str| spec.args.iter().position(|a| a == flag).unwrap();
+    assert_eq!(spec.args[at("--session-name") + 1], "Fin Ops");
+    assert_eq!(spec.args[at("--session-color") + 1], "red");
+}
+
+#[test]
+fn http_runtimes_point_claude_and_codex_at_the_running_server_without_the_token() {
+    let b = browser("Profile 6");
+    let mut r = runtime(&b);
+    r.endpoint = Some("http://127.0.0.1:5123/mcp".into());
+    let claude = r.claude_server();
+    assert_eq!(
+        claude,
+        json!({"type": "http", "url": "http://127.0.0.1:5123/mcp"})
+    );
+    let overrides = r.codex_overrides();
+    let get = |key: &str| {
+        overrides
+            .iter()
+            .find(|(k, _)| k == &format!("mcp_servers.playwright_browser.{key}"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("{key}"))
+    };
+    assert_eq!(get("url"), "\"http://127.0.0.1:5123/mcp\"");
+    // No process to start: no command, arguments or token variable.
+    for key in ["command", "args", "env_vars"] {
+        assert!(overrides
+            .iter()
+            .all(|(k, _)| k != &format!("mcp_servers.playwright_browser.{key}")));
+    }
+    // The tool rules are the same as for the stdio entry.
+    assert!(get("disabled_tools").contains("browser_run_code_unsafe"));
+    assert!(get("disabled_tools").contains("browser_evaluate"));
+    assert_eq!(get("default_tools_approval_mode"), "\"writes\"");
+    let mut command = std::process::Command::new("codex");
+    r.configure_codex(&mut command);
+    r.apply_env(&mut command);
+    assert!(command.get_envs().all(|(k, _)| k != TOKEN_ENV));
+    assert!(command
+        .get_args()
+        .all(|a| !a.to_string_lossy().contains(TOKEN)));
+    assert!(!claude.to_string().contains(TOKEN));
+    // The allow and deny lists do not depend on the transport.
+    assert_eq!(
+        r.claude_disallowed("default"),
+        runtime(&b).claude_disallowed("default")
+    );
+    assert_eq!(r.claude_allowed(), runtime(&b).claude_allowed());
 }
