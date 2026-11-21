@@ -1,42 +1,9 @@
-//! The question API of a conversation, shared by the question card and Telegram: read the
-//! question being asked, answer it, and learn how each question ended.
+//! The question API of a conversation: queue the questions the provider asks, answer the one
+//! in front, and drop the ones that are no longer waiting.
 use super::*;
-use gpui::App;
-use monocode_core::{agent::Question, telegram::forwarder::Outcome};
-
-/// A question joined the queue behind the ones already waiting.
-pub(crate) struct QuestionAsked;
-impl EventEmitter<QuestionAsked> for Conversation {}
-
-/// A question left the conversation: the user answered or skipped it, or it was cancelled
-/// (the turn ended or was stopped, or the provider withdrew it). `id` is `Question::id`.
-pub(crate) struct QuestionSettled {
-    pub id: String,
-    pub outcome: Outcome,
-}
-impl EventEmitter<QuestionSettled> for Conversation {}
+use monocode_core::agent::Question;
 
 impl Conversation {
-    /// The question being asked: the front of the queue, whose card covers the composer.
-    pub(crate) fn pending_question(&self, cx: &App) -> Option<Question> {
-        self.questions
-            .front()
-            .map(|(card, _)| card.read(cx).request().clone())
-    }
-
-    /// The latest assistant message, for the summary Telegram shows above a question.
-    pub(crate) fn last_assistant_text(&self, cx: &App) -> String {
-        self.transcript.read(cx).last_assistant_text()
-    }
-
-    /// Listens for what the conversation sends the provider, in tests.
-    #[cfg(test)]
-    pub(crate) fn listen_for_controls(&mut self) -> std::sync::mpsc::Receiver<Control> {
-        let (send, receive) = std::sync::mpsc::channel();
-        self.controls = Some(send);
-        receive
-    }
-
     /// Queues a question from the provider behind the ones already waiting.
     pub(crate) fn push_question(&mut self, request: Question, cx: &mut Context<Self>) {
         let card = cx.new(|cx| crate::questions::QuestionCard::new(request, cx));
@@ -59,11 +26,10 @@ impl Conversation {
         );
         self.questions.push_back((card, vec![events, keep_open]));
         self.status = "Waiting for your answer".into();
-        cx.emit(QuestionAsked);
     }
 
     /// Answers the question at the front of the queue: one list of option labels or typed
-    /// text per item, or `None` to skip it. The card's buttons and Telegram both end here.
+    /// text per item, or `None` to skip it. The card's buttons end here.
     pub(crate) fn answer_question(
         &mut self,
         id: &str,
@@ -81,11 +47,6 @@ impl Conversation {
             return Err("The answer does not match the question".into());
         }
         let before = self.needs_approval();
-        let outcome = if answers.is_some() {
-            Outcome::Answered
-        } else {
-            Outcome::Skipped
-        };
         let decision = answers.map_or(Decision::Deny, Decision::Answer);
         if self.controls.as_ref().is_none_or(|controls| {
             controls
@@ -114,10 +75,6 @@ impl Conversation {
         if before != self.needs_approval() {
             cx.emit(SessionChanged);
         }
-        cx.emit(QuestionSettled {
-            id: id.to_owned(),
-            outcome,
-        });
         cx.notify();
         Ok(())
     }
@@ -125,30 +82,13 @@ impl Conversation {
     /// The provider withdrew these questions (an auto-skip deadline passed, say).
     pub(super) fn drop_resolved_questions(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
         for id in ids {
-            let before = self.questions.len();
             self.questions.retain(|(card, _)| card.read(cx).id() != id);
-            if self.questions.len() != before {
-                cx.emit(QuestionSettled {
-                    id,
-                    outcome: Outcome::Cancelled,
-                });
-            }
         }
     }
 
     /// The turn ended or was stopped: no question waits any longer.
-    pub(crate) fn cancel_questions(&mut self, cx: &mut Context<Self>) {
-        let ids: Vec<String> = self
-            .questions
-            .drain(..)
-            .map(|(card, _)| card.read(cx).id().to_owned())
-            .collect();
-        for id in ids {
-            cx.emit(QuestionSettled {
-                id,
-                outcome: Outcome::Cancelled,
-            });
-        }
+    pub(crate) fn cancel_questions(&mut self) {
+        self.questions.clear();
     }
 }
 
@@ -160,7 +100,7 @@ mod tests {
         agent::{QuestionItem, QuestionOption},
         store::Store,
     };
-    use std::{cell::RefCell, rc::Rc, sync::Mutex};
+    use std::sync::Mutex;
 
     fn conversation(cx: &mut TestAppContext) -> WindowHandle<Conversation> {
         let store = Store::open(Path::new(":memory:")).unwrap();
@@ -211,72 +151,24 @@ mod tests {
         }
     }
 
-    type Settled = Rc<RefCell<Vec<(String, Outcome)>>>;
-
-    /// A conversation with a provider channel and a listener for settled questions.
+    /// A conversation with a provider channel.
     fn listening(
         cx: &mut TestAppContext,
     ) -> (
         WindowHandle<Conversation>,
         std::sync::mpsc::Receiver<Control>,
-        Settled,
-        Subscription,
     ) {
         let window = conversation(cx);
         let (send, receive) = std::sync::mpsc::channel();
-        let settled: Settled = Default::default();
-        let output = settled.clone();
-        let events = window
-            .update(cx, |view, _, cx| {
-                view.controls = Some(send);
-                cx.subscribe(&cx.entity(), move |_, _, event: &QuestionSettled, _| {
-                    output.borrow_mut().push((event.id.clone(), event.outcome))
-                })
-            })
-            .unwrap();
-        (window, receive, settled, events)
-    }
-
-    #[gpui::test]
-    fn the_last_assistant_text_is_the_transcripts(cx: &mut TestAppContext) {
-        let window = conversation(cx);
         window
-            .update(cx, |view, _, cx| {
-                assert_eq!(view.last_assistant_text(cx), "");
-                view.transcript.update(cx, |transcript, cx| {
-                    transcript.patch(
-                        0,
-                        vec![monocode_core::transcript::Row {
-                            role: "assistant".into(),
-                            text: "Which one?".into(),
-                            first: true,
-                            sent_at: None,
-                        }],
-                        cx,
-                    )
-                });
-                assert_eq!(view.last_assistant_text(cx), "Which one?");
-            })
+            .update(cx, |view, _, _| view.controls = Some(send))
             .unwrap();
-    }
-
-    #[gpui::test]
-    fn the_pending_question_is_the_front_card(cx: &mut TestAppContext) {
-        let window = conversation(cx);
-        window
-            .update(cx, |view, _, cx| {
-                assert_eq!(view.pending_question(cx), None);
-                view.push_question(question("first"), cx);
-                view.push_question(question("second"), cx);
-                assert_eq!(view.pending_question(cx), Some(question("first")));
-                assert!(view.needs_approval());
-            })
-            .unwrap();
+        (window, receive)
     }
 
     #[gpui::test]
     fn answering_sends_the_labels_and_settles_the_question(cx: &mut TestAppContext) {
-        let (window, controls, settled, _events) = listening(cx);
+        let (window, controls) = listening(cx);
         window
             .update(cx, |view, _, cx| {
                 view.push_question(question("first"), cx);
@@ -291,36 +183,31 @@ mod tests {
                 };
                 assert_eq!(sent, answers);
                 // The next question moves to the front.
-                assert_eq!(view.pending_question(cx), Some(question("second")));
+                assert_eq!(view.questions.front().unwrap().0.read(cx).id(), "second");
                 assert_eq!(view.status, "Waiting for your answer");
             })
             .unwrap();
-        assert_eq!(
-            *settled.borrow(),
-            [("first".to_string(), Outcome::Answered)]
-        );
     }
 
     #[gpui::test]
     fn skipping_denies_the_question(cx: &mut TestAppContext) {
-        let (window, controls, settled, _events) = listening(cx);
+        let (window, controls) = listening(cx);
         window
             .update(cx, |view, _, cx| {
                 view.push_question(question("only"), cx);
                 view.answer_question("only", None, cx).unwrap();
                 let control = controls.try_recv().unwrap();
                 assert!(matches!(control.decision, Decision::Deny));
-                assert_eq!(view.pending_question(cx), None);
+                assert!(view.questions.is_empty());
                 assert!(!view.needs_approval());
                 assert_eq!(view.status, "Working…");
             })
             .unwrap();
-        assert_eq!(*settled.borrow(), [("only".to_string(), Outcome::Skipped)]);
     }
 
     #[gpui::test]
     fn an_answer_that_does_not_fit_leaves_the_question_open(cx: &mut TestAppContext) {
-        let (window, controls, settled, _events) = listening(cx);
+        let (window, controls) = listening(cx);
         window
             .update(cx, |view, _, cx| {
                 view.push_question(question("first"), cx);
@@ -332,15 +219,14 @@ mod tests {
                 let short = Some(vec![vec!["First".to_string()]]);
                 assert!(view.answer_question("first", short, cx).is_err());
                 assert!(controls.try_recv().is_err());
-                assert_eq!(view.pending_question(cx), Some(question("first")));
+                assert_eq!(view.questions.front().unwrap().0.read(cx).id(), "first");
             })
             .unwrap();
-        assert!(settled.borrow().is_empty());
     }
 
     #[gpui::test]
     fn a_provider_that_stopped_listening_is_reported(cx: &mut TestAppContext) {
-        let (window, controls, settled, _events) = listening(cx);
+        let (window, controls) = listening(cx);
         drop(controls);
         window
             .update(cx, |view, _, cx| {
@@ -348,17 +234,16 @@ mod tests {
                 let error = view.answer_question("only", None, cx).unwrap_err();
                 assert_eq!(error, "The provider is no longer waiting for this answer");
                 assert_eq!(view.status, error);
-                assert_eq!(view.pending_question(cx), Some(question("only")));
+                assert_eq!(view.questions.front().unwrap().0.read(cx).id(), "only");
                 view.controls = None;
                 assert!(view.answer_question("only", None, cx).is_err());
             })
             .unwrap();
-        assert!(settled.borrow().is_empty());
     }
 
     #[gpui::test]
     fn the_card_and_the_api_share_one_path(cx: &mut TestAppContext) {
-        let (window, controls, settled, _events) = listening(cx);
+        let (window, controls) = listening(cx);
         let card = window
             .update(cx, |view, _, cx| {
                 view.push_question(question("first"), cx);
@@ -390,15 +275,11 @@ mod tests {
             })
             .unwrap();
         assert!(controls.try_recv().is_err());
-        assert_eq!(
-            *settled.borrow(),
-            [("first".to_string(), Outcome::Answered)]
-        );
     }
 
     #[gpui::test]
     fn a_dismissed_card_settles_as_skipped(cx: &mut TestAppContext) {
-        let (window, controls, settled, _events) = listening(cx);
+        let (window, controls) = listening(cx);
         let card = window
             .update(cx, |view, _, cx| {
                 view.push_question(question("first"), cx);
@@ -419,12 +300,11 @@ mod tests {
             controls.try_recv().unwrap().decision,
             Decision::Deny
         ));
-        assert_eq!(*settled.borrow(), [("first".to_string(), Outcome::Skipped)]);
     }
 
     #[gpui::test]
-    fn questions_that_end_without_an_answer_settle_as_cancelled(cx: &mut TestAppContext) {
-        let (window, _controls, settled, _events) = listening(cx);
+    fn questions_that_end_without_an_answer_are_dropped(cx: &mut TestAppContext) {
+        let (window, _controls) = listening(cx);
         window
             .update(cx, |view, _, cx| {
                 view.push_question(question("a"), cx);
@@ -434,18 +314,9 @@ mod tests {
                 view.drop_resolved_questions(vec!["b".into(), "unknown".into()], cx);
                 assert_eq!(view.questions.len(), 2);
                 // The turn ended or was stopped.
-                view.cancel_questions(cx);
+                view.cancel_questions();
                 assert!(view.questions.is_empty());
-                assert_eq!(view.pending_question(cx), None);
             })
             .unwrap();
-        assert_eq!(
-            *settled.borrow(),
-            [
-                ("b".to_string(), Outcome::Cancelled),
-                ("a".to_string(), Outcome::Cancelled),
-                ("c".to_string(), Outcome::Cancelled),
-            ]
-        );
     }
 }

@@ -210,7 +210,7 @@ title, body, actions, buttons) above Settings.
   in the selected packs, an id the library does not have, an image file that is gone, or a library that is not loaded yet.
   Tokens inside code blocks and inline code stay as text.
 - The token is an empty-text run, so selection copy and search see nothing. "Copy response",
-  "Save as note", "Quote response" and outward reply text (Telegram, phone) strip tokens with
+  "Save as note", "Quote response" and outward reply text (phone) strip tokens with
   a code-aware stripper in core.
 - While streaming, an unfinished trailing `:emo[...` is hidden.
 

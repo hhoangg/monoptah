@@ -526,7 +526,6 @@ fn copy_and_outward_text_carry_no_token_and_no_double_space(cx: &mut TestAppCont
                 cx,
             );
             assert_eq!(view.response_text(1), "Nice work\nEnd");
-            assert_eq!(view.last_assistant_text(), "Nice work\nEnd");
         })
         .unwrap();
 }

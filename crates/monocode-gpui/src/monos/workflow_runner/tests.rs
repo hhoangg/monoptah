@@ -1591,7 +1591,7 @@ fn command_result(code: Option<i32>, stdout: &str, stderr: &str) -> CommandResul
     }
 }
 
-// --- quitting, deleting a Mono, Telegram context ----------------------------------------------
+// --- quitting, deleting a Mono ----------------------------------------------
 
 #[gpui::test]
 fn quitting_leaves_a_run_running_in_the_file_for_the_next_start_to_interrupt(
@@ -1739,63 +1739,4 @@ fn stopping_a_monos_runs_leaves_the_runs_of_other_monos_going(cx: &mut TestAppCo
     hold.close();
     cx.run_until_parked();
     assert!(!rig.runner.is_running("wf-first000"));
-}
-
-#[gpui::test]
-fn a_session_knows_its_workflow_and_node_while_the_run_lasts(cx: &mut TestAppContext) {
-    let rig = Rig::new(&["ok"]);
-    let hold = rig.fake.hold();
-    let mut def = simple(json!({}));
-    def.nodes.iter_mut().find(|n| n.id == "dev").unwrap().title = Some("Build it".into());
-    rig.start(cx, &def);
-    cx.run_until_parked();
-    let context = rig
-        .runner
-        .context("s1")
-        .expect("known once the session id is");
-    assert_eq!(context.workflow_name, "Ship it");
-    assert_eq!(context.node_title, "Build it");
-    assert_eq!((context.item_id, context.round), (None, None));
-    assert!(rig.runner.context("s2").is_none());
-    hold.close();
-    cx.run_until_parked();
-    assert_eq!(rig.last_run().status, RunStatus::Done);
-    assert!(rig.runner.context("s1").is_none(), "gone with the run");
-}
-
-#[gpui::test]
-fn a_loop_item_and_round_reach_the_context_of_its_session(cx: &mut TestAppContext) {
-    let def = workflow(
-        vec![
-            trigger(),
-            session("fetch", json!({"tickets": {"type": "list"}}), json!({})),
-            json!({"id": "each", "type": "forEach", "in": "{{fetch.tickets}}", "as": "item"}),
-            session("work", json!({}), json!({"parent": "each"})),
-            report(),
-        ],
-        vec![
-            edge("trigger", "fetch"),
-            edge("fetch", "each"),
-            edge("each", "report"),
-        ],
-    );
-    let rig = Rig::new(&[
-        &fenced(json!({"tickets": [{"key": "A-1", "title": "One"}]})),
-        "done",
-    ]);
-    // Hold the session that works the item, not the one that fetched it.
-    let gate = rig.fake.start_gate_for(2);
-    rig.start(cx, &def);
-    cx.run_until_parked();
-    assert!(rig.runner.context("s1").is_some());
-    gate.close();
-    let hold = rig.fake.hold();
-    cx.run_until_parked();
-    let context = rig.runner.context("s2").expect("the item session");
-    assert_eq!(context.node_title, "work");
-    assert_eq!(context.item_id.as_deref(), Some("A-1"));
-    assert_eq!(context.item_label.as_deref(), Some("One"));
-    hold.close();
-    cx.run_until_parked();
-    assert!(rig.runner.context("s2").is_none());
 }

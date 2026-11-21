@@ -680,12 +680,10 @@ impl Shell {
             item.project_path.clone()
         };
         let title = format!("{} · {}", item.reference(), item.title);
-        let ticket = monocode_core::telegram::forward::inbox_ticket(&item);
         self.start_work_session(
             cwd,
             title,
             Some(item.work_item()),
-            Some(ticket),
             Start::Send(prompt),
             "Choose a project folder before starting work on this item",
             cx,
@@ -712,7 +710,6 @@ impl Shell {
             cwd,
             task.title.clone(),
             None,
-            None,
             start,
             "Choose a project folder before starting work on this task",
             cx,
@@ -725,7 +722,6 @@ impl Shell {
         cwd: String,
         title: String,
         work_item: Option<monocode_core::session_groups::WorkItem>,
-        ticket: Option<String>,
         start: Start,
         missing_folder: &'static str,
         cx: &mut Context<Self>,
@@ -772,9 +768,6 @@ impl Shell {
                 Ok((summary, settings, start)) => {
                     let id = summary.id;
                     let terminal = summary.surface.is_tui();
-                    if let Some(ticket) = ticket {
-                        this.session_tickets.insert(id, ticket);
-                    }
                     this.add(summary, cx);
                     let activate = match start {
                         Start::Send(prompt) => {
@@ -967,42 +960,6 @@ mod tests {
                 let ids = since(shell, &before);
                 assert_eq!(ids.len(), 1);
                 assert_chat(shell, ids[0]);
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn start_work_remembers_the_ticket_for_telegram(cx: &mut TestAppContext) {
-        let _clis = NoClis::new();
-        let (window, _, _) = crate::shell::tests::window(cx);
-        let project = dir();
-        let before = window
-            .update(cx, |shell, _, cx| {
-                shell.workspace.preferences.default_provider = Some("claude".into());
-                let before = known(shell);
-                let tracker = monocode_core::inbox::Item {
-                    provider: "linear".into(),
-                    identifier: " ENG-42 ".into(),
-                    number: 42,
-                    title: "Fix login".into(),
-                    ..item(&project)
-                };
-                shell.start_inbox_session(tracker, "Work on it".into(), cx);
-                shell.start_inbox_session(item(&project), "Work on it".into(), cx);
-                before
-            })
-            .unwrap();
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, _| {
-                let mut tickets: Vec<_> = since(shell, &before)
-                    .iter()
-                    .map(|id| shell.session_tickets[id].clone())
-                    .collect();
-                tickets.sort();
-                assert_eq!(tickets, ["#7", "ENG-42"]);
-                // Sessions that did not start from an inbox item have none.
-                assert_eq!(shell.session_tickets.len(), 2);
             })
             .unwrap();
     }

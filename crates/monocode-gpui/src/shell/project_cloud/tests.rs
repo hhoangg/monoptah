@@ -86,16 +86,13 @@ fn the_project_menu_has_one_cloud_settings_item_for_local_projects_only(cx: &mut
                 .position(|l| l == "Cloud settings…")
                 .expect("Cloud settings");
             assert_eq!(names[at - 1], "Background image");
-            // The overview of what is running is the footer chip's drawer, not a menu item, and
-            // Telegram is hidden for now.
+            // The overview of what is running is the footer chip's drawer, not a menu item.
+            assert!(!names.iter().any(|l| l == "Cloud workspaces…"), "{names:?}");
             assert!(
-                !names
+                !items
                     .iter()
-                    .any(|l| l == "Cloud workspaces…" || l == "Telegram…"),
-                "{names:?}"
+                    .any(|i| matches!(i, MenuItem::Action(a) if a.id == "cloud-workspaces"))
             );
-            assert!(!items.iter().any(|i| matches!(i, MenuItem::Action(a)
-                if a.id == "cloud-workspaces" || a.id == "telegram")));
             let Some(MenuItem::Action(item)) = items
                 .iter()
                 .find(|i| matches!(i, MenuItem::Action(a) if a.id == "cloud-settings"))

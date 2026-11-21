@@ -167,10 +167,7 @@ pub fn ask_context_chips(
         hint: None,
     };
     let mut chips = vec![
-        fixed(
-            AskChipId::Project,
-            crate::telegram::forward::project_name(project),
-        ),
+        fixed(AskChipId::Project, project_name(project)),
         fixed(AskChipId::Branch, model.raw.branch.clone()),
         fixed(AskChipId::Period, model.period.label.clone()),
     ];
@@ -339,7 +336,7 @@ pub struct AskSnapshotInput<'a> {
 fn build_ask_snapshot_parts(input: &AskSnapshotInput) -> Built {
     let (model, scope, options) = (input.model, &input.scope, input.options);
     let mut snapshot = build_snapshot(&SnapshotInput {
-        project: &crate::telegram::forward::project_name(input.project),
+        project: &project_name(input.project),
         branch: &model.raw.branch,
         period: &model.period,
         scores: &model.current,
@@ -514,7 +511,7 @@ pub fn build_ask_request(input: &AskRequestInput) -> AskAgentRequest {
         scope: &built.scope,
         file_name: &file_name,
         allow_tools: input.options.allow_tools,
-        project_name: &crate::telegram::forward::project_name(input.project),
+        project_name: &project_name(input.project),
         period_label: &model.period.label,
         person_name: built.person_name.as_deref(),
         contains: Some(&contains),
@@ -528,6 +525,40 @@ pub fn build_ask_request(input: &AskRequestInput) -> AskAgentRequest {
         harness: input.harness,
         scope: input.scope.clone(),
     }
+}
+
+/// The folder name shown for a project; `~` for the home folder.
+fn project_name(cwd: &str) -> String {
+    let windows = {
+        let b = cwd.as_bytes();
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+            || cwd.starts_with("\\\\")
+            || cwd.starts_with("//")
+    };
+    let slashed = if windows {
+        cwd.replace('\\', "/")
+    } else {
+        cwd.to_string()
+    };
+    let trimmed = match slashed.trim_end_matches('/') {
+        "" if slashed.is_empty() => return "~".into(),
+        "" => "/",
+        t => t,
+    };
+    let parts: Vec<&str> = trimmed.split('/').filter(|p| !p.is_empty()).collect();
+    let drive = |part: &str| {
+        part.len() == 2 && part.as_bytes()[0].is_ascii_alphabetic() && part.ends_with(':')
+    };
+    let home = trimmed == "~"
+        || (parts.len() == 2 && matches!(parts[0], "Users" | "home"))
+        || (parts.len() == 3 && drive(parts[0]) && parts[1] == "Users");
+    if home {
+        return "~".into();
+    }
+    if drive(trimmed) {
+        return trimmed.to_string();
+    }
+    parts.last().map_or(trimmed, |last| last).to_string()
 }
 
 #[cfg(test)]
@@ -1161,5 +1192,20 @@ mod tests {
         ] {
             assert!(!text.contains(gone), "{gone}");
         }
+    }
+
+    #[test]
+    fn project_name_follows_the_display_rules() {
+        assert_eq!(project_name("/work/acme"), "acme");
+        assert_eq!(project_name("/work/acme/"), "acme");
+        assert_eq!(project_name(""), "~");
+        assert_eq!(project_name("~"), "~");
+        assert_eq!(project_name("/Users/me"), "~");
+        assert_eq!(project_name("/home/me"), "~");
+        assert_eq!(project_name("/Users/me/code"), "code");
+        assert_eq!(project_name("C:\\Users\\me"), "~");
+        assert_eq!(project_name("C:\\work\\acme"), "acme");
+        assert_eq!(project_name("C:/"), "C:");
+        assert_eq!(project_name("/"), "/");
     }
 }

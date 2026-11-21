@@ -24,10 +24,8 @@ use monocode_core::mono::workflows::{
     ordered::{Json, OrderedMap, js_number_text},
     output::{output_reask, parse_workflow_output},
     report::{ask_mono_prompt, compose_report, parse_mono_decision},
-    session_context::session_context,
     template::render_template,
 };
-use monocode_core::telegram::forward::Workflow as SessionContext;
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
@@ -52,11 +50,6 @@ pub(super) use host::Live;
 use text::{cap_map, cap_string, clip, run_folder_name, utf16_tail};
 
 pub(crate) type Fut<T> = Pin<Box<dyn Future<Output = T>>>;
-
-/// Where each session a live run uses came from (workflow, node, item, round), by persisted
-/// session id, for the Telegram forwarder. Set once the node's session id is known and cleared
-/// when the run ends.
-type Contexts = Rc<RefCell<HashMap<String, SessionContext>>>;
 
 const STOPPED_BY_USER: &str = "Stopped by the user.";
 /// A cancel can beat the host registering the command, so it is retried briefly.
@@ -103,7 +96,6 @@ struct Exec {
     starts: Gate,
     registry: Registry,
     signals: Arc<Signals>,
-    contexts: Contexts,
     /// The app is quitting: the run writes nothing more, so the file keeps saying
     /// `running` and the next start interrupts it (resumable) instead of failing or stopping it.
     quitting: Cell<bool>,
@@ -793,10 +785,6 @@ impl Exec {
         };
         let session = session_id.clone();
         self.patch_node(&node_id, &branch, |n| n.session_id = Some(session));
-        let context = session_context(&self.state.borrow().run, &node_id, &branch);
-        self.contexts
-            .borrow_mut()
-            .insert(session_id.clone(), context);
 
         let mut outcome = self
             .watch_turn(&node_id, &branch, &session_id, turn, timeout_ms)
@@ -1293,7 +1281,6 @@ impl Exec {
         for id in sessions {
             self.host.end_approvals(id);
             self.host.release_session(id);
-            self.contexts.borrow_mut().remove(id);
         }
         self.signals.set_running(&self.workflow_id, false);
         self.registry.borrow_mut().remove(&self.workflow_id);
@@ -1310,7 +1297,6 @@ pub(crate) struct WorkflowRunner {
     live: Registry,
     signals: Arc<Signals>,
     limits: Limits,
-    contexts: Contexts,
     /// The app is quitting: nothing new starts.
     quitting: Rc<Cell<bool>>,
 }
@@ -1321,7 +1307,6 @@ impl WorkflowRunner {
             live: Default::default(),
             signals,
             limits: Limits::default(),
-            contexts: Default::default(),
             quitting: Default::default(),
         }
     }
@@ -1393,7 +1378,6 @@ impl WorkflowRunner {
             starts: Gate::default(),
             registry: self.live.clone(),
             signals: self.signals.clone(),
-            contexts: self.contexts.clone(),
             quitting: Cell::new(false),
         });
         self.live
@@ -1453,11 +1437,6 @@ impl WorkflowRunner {
     pub(crate) fn is_quitting(&self) -> bool {
         self.quitting.get()
     }
-
-    /// Where the session came from, while a live run uses it.
-    pub(crate) fn context(&self, persisted_session_id: &str) -> Option<SessionContext> {
-        self.contexts.borrow().get(persisted_session_id).cloned()
-    }
 }
 
 // --- what the scheduler calls -------------------------------------------------------------------
@@ -1476,20 +1455,6 @@ impl super::Monos {
         for session in asks {
             self.workflow_ask_end(session, Err("The Mono was deleted".into()), cx);
         }
-    }
-
-    /// A live run's session context, as the run sets it (the Telegram tests have no run).
-    #[cfg(test)]
-    pub(crate) fn remember_workflow_context(&mut self, persisted: String, context: SessionContext) {
-        self.workflows
-            .contexts
-            .borrow_mut()
-            .insert(persisted, context);
-    }
-
-    /// Where a session a live workflow run uses came from, for Telegram.
-    pub(crate) fn workflow_context(&self, persisted_session_id: &str) -> Option<SessionContext> {
-        self.workflows.context(persisted_session_id)
     }
 
     /// Runs `run` for the Mono. False when the workflow already has a run going.

@@ -37,7 +37,6 @@ pub mod run_graph_model;
 #[cfg(test)]
 mod run_graph_model_tests;
 pub mod schedule;
-pub mod session_context;
 pub mod store;
 #[cfg(test)]
 mod store_tests;
