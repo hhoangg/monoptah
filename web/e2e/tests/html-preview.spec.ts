@@ -312,7 +312,9 @@ test.describe("html preview on the web app", () => {
     let slow = true;
     await page.route("**/api/transfers/**", async (route) => {
       if (slow) await new Promise((resolve) => setTimeout(resolve, 2_500));
-      await route.continue();
+      // fallback, not continue: the WebKit context above has its own route that adds the session cookie (the cookie is Secure and
+      // the run is plain http, which Linux WebKit does not send itself). continue() would skip it and the Worker answers 401.
+      await route.fallback();
     });
     try {
       await page.locator('button[data-testid="file-mention"][data-path$="gallery.html"]').first().click();
