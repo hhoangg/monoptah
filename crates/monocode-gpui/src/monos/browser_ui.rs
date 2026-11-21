@@ -14,7 +14,8 @@ use crate::{
 };
 use gpui::{Div, Stateful};
 use monocode_core::mono::browser::{
-    self, AuditEntry, Check, ChromeProfile, MonoBrowser, MonoBrowserStore, PrereqEnv, Prerequisites,
+    self, AuditEntry, BrowserTrust, Check, ChromeProfile, MonoBrowser, MonoBrowserStore, PrereqEnv,
+    Prerequisites,
 };
 use std::sync::Arc;
 
@@ -22,6 +23,68 @@ use std::sync::Arc;
 fn stop_server(id: &str) {
     let id = id.to_owned();
     std::thread::spawn(move || browser::server::servers().stop(&id));
+}
+
+/// The selector id of a trust level's row (tests click it).
+pub(super) fn trust_selector(trust: BrowserTrust) -> &'static str {
+    match trust {
+        BrowserTrust::ReadOnly => "mono-browser-trust-read-only",
+        BrowserTrust::AskRisky => "mono-browser-trust-ask-risky",
+        BrowserTrust::Autonomous => "mono-browser-trust-autonomous",
+    }
+}
+const TRUST_SUBTITLE: &str = "How far this Mono may act in your Chrome. Change it any time; it applies from the next message.";
+
+/// One level of the trust selector: a radio dot, the level's name and what it means.
+fn trust_row(trust: BrowserTrust, selected: bool, cx: &mut Context<Monos>) -> AnyElement {
+    let selector = trust_selector(trust);
+    div()
+        .id(selector)
+        .debug_selector(move || selector.into())
+        .role(Role::RadioButton)
+        .aria_label(trust.label())
+        .aria_selected(selected)
+        .flex()
+        .items_start()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .cursor_pointer()
+        .hover(|s| s.bg(content(0.04)))
+        .on_click(cx.listener(move |this, _, _, cx| this.browser_set_trust(trust, cx)))
+        .child(
+            div()
+                .mt(px(3.))
+                .size(px(14.))
+                .flex_shrink_0()
+                .rounded_full()
+                .border_1()
+                .border_color(if selected {
+                    accent_color()
+                } else {
+                    content(0.3)
+                })
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |d| {
+                    d.child(div().size(px(8.)).rounded_full().bg(accent_color()))
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .line_height(px(20.))
+                        .text_color(content(0.9))
+                        .child(trust.label()),
+                )
+                .child(note(format!("{selector}-text"), trust.explanation(), 0.5)),
+        )
+        .into_any_element()
 }
 
 const SELECT_PRIORITY: usize = 90;
@@ -234,14 +297,24 @@ impl Monos {
         change(setting);
         setting.normalize();
         // The server starts again with the new setting on the next run, with a new tab group.
-        // A change that does not shape the server (ask before acting) keeps it and its group.
+        // A change that does not shape the server (the trust level) keeps it and its group; the
+        // running gate takes the new level at once.
         if before.server_key() != setting.server_key() {
             stop_server(&id);
         }
+        browser::server::servers().update_policy(
+            &id,
+            browser::gate::Policy::new(setting.trust, setting.blocked_origins.clone()),
+        );
         self.save(cx);
         self.configure_chat_with(&id, false, cx);
         self.browser_ui.error = None;
         cx.notify();
+    }
+
+    /// A level row was chosen.
+    pub(super) fn browser_set_trust(&mut self, trust: BrowserTrust, cx: &mut Context<Self>) {
+        self.browser_edit(cx, |b| b.trust = trust);
     }
 
     fn browser_toggle(&mut self, cx: &mut Context<Self>) {
@@ -936,42 +1009,27 @@ impl Monos {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let confirm = switch_track(
-            "mono-browser-confirm",
-            "Ask before send, post, delete or pay",
-            setting_.confirm_actions,
-        )
-        .debug_selector(|| "mono-browser-confirm".into())
-        .cursor_pointer()
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.browser_edit(cx, |b| b.confirm_actions = !b.confirm_actions)
-        }));
-        let full_access = self.chat().is_some_and(|chat| {
-            !browser::claude_mode_prompts(chat.read(cx).settings.access.claude())
-        });
+        let rows: Vec<AnyElement> = BrowserTrust::ALL
+            .into_iter()
+            .map(|trust| trust_row(trust, setting_.trust == trust, cx))
+            .collect();
         let blocked = self.browser_origin_card(false, &setting_.blocked_origins, window, cx);
         let allowed = self.browser_origin_card(true, &setting_.allowed_origins, window, cx);
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(heading(
-                "Safety",
-                Some("The Mono only reads unless your request asks for an action."),
-            ))
-            .when(full_access && setting_.confirm_actions, |d| {
-                d.child(note(
-                    "mono-browser-full-access-note",
-                    "In this access mode Claude never asks, so while this is on it is not offered click, type and other page-changing tools (Codex refuses them in Full Access). Turn it off or use Supervised or Auto-accept edits to use them.",
-                    0.75,
-                ))
-            })
-            .child(card().child(switch_setting(
-                "Ask before send, post, delete or pay",
-                "Actions that change something wait for your approval.",
-                false,
-                confirm.into_any_element(),
-            )))
+            .child(heading("Trust level", Some(TRUST_SUBTITLE)))
+            .child(card().children(rows))
+            .child(
+                note(
+                    "mono-browser-trust-note",
+                    BrowserTrust::ENFORCEMENT_NOTE,
+                    0.5,
+                )
+                .px_1()
+                .pb_2(),
+            )
             .child(blocked)
             .child(allowed)
             .into_any_element()
