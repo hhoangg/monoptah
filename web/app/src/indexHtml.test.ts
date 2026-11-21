@@ -18,3 +18,15 @@ describe("index.html iOS home-screen meta", () => {
     expect(meta("viewport")).toContain("viewport-fit=cover");
   });
 });
+
+describe("index.html favicon links", () => {
+  const hrefs = [...html.matchAll(/<link\s[^>]*rel="(?:icon|apple-touch-icon)"[^>]*>/g)].map((m) => /href="([^"]+)"/.exec(m[0])?.[1] as string);
+  it("links the ico, svg and apple-touch icons", () => {
+    expect(hrefs).toEqual(["/favicon.ico", "/favicon.svg", "/apple-touch-icon.png"]);
+  });
+  // A link to a file that is not in public/ would fall through to the SPA fallback and return the shell as the icon.
+  const manifest = JSON.parse(readFileSync(resolve(import.meta.dirname, "..", "public", "manifest.webmanifest"), "utf8")) as { icons: { src: string }[] };
+  it("points every link at a file in public/", () => {
+    for (const href of [...hrefs, ...manifest.icons.map((i) => i.src)]) expect(() => readFileSync(resolve(import.meta.dirname, "..", "public", href.slice(1)))).not.toThrow();
+  });
+});
