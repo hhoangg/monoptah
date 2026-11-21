@@ -74,6 +74,7 @@ export const RATE_LIMIT_AUDIT_GROUPS = [
   "pair-poll",
   "push-notify",
   "push-test",
+  "terminal-ticket",
   "invite",
   "handle",
   "session",
@@ -124,6 +125,10 @@ export const AUDIT_ACTIONS = {
   "selection.ticket": spec(["user"], { deviceId: Id, desktopId: Id }),
   /** The desktop consumed such a ticket: the widening is going ahead. */
   "selection.widen": spec(["desktop"], { deviceId: Id, desktopId: Id }),
+  /** A web device got a single-use ticket to open a terminal on a desktop (fresh passkey re-auth, bound to one project). */
+  "terminal.ticket": spec(["user"], { deviceId: Id, desktopId: Id }),
+  /** The desktop consumed such a ticket: the terminal is about to open. */
+  "terminal.ticket.consumed": spec(["desktop"], { deviceId: Id, desktopId: Id }),
   // Admin
   "user.block": spec(["admin"], { cascade: z.boolean(), count: Count }),
   "user.unblock": spec(["admin"], { cascade: z.boolean().optional() }),

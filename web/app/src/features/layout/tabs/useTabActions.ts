@@ -3,6 +3,8 @@
 import { useRouter } from "@tanstack/react-router";
 import { useLayoutEffect, useMemo, useRef } from "react";
 import { useCatalog } from "@/data";
+import { guardTerminalClose } from "@/features/terminal/sessions";
+import { useLinkConnection } from "@/link";
 import {
   activateTab,
   canSplit,
@@ -48,6 +50,7 @@ export interface TabActions {
 
 export function useTabActions(desktopId: string, size: Size | null): TabActions {
   const router = useRouter();
+  const connection = useLinkConnection();
   const catalog = useCatalog().data;
   // The commands are read at call time (a keyboard handler outlives the render that made it).
   const live = useRef({ catalog, size });
@@ -87,6 +90,12 @@ export function useTabActions(desktopId: string, size: Size | null): TabActions 
       void router.navigate(projectId ? { to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId } } : { to: "/d/$desktopId", params: { desktopId } });
     };
 
+    /** The ids of the terminal tabs among `keys`. */
+    const terminalIds = (keys: readonly TabKey[]) => keys.flatMap((key) => {
+        const tab = parseTab(key);
+        return tab?.kind === "terminal" ? [tab.id] : [];
+      });
+
     const update = (change: Parameters<typeof updateWorkspace>[1]) => updateWorkspace(desktopId, change);
     const focusedPane = () => {
       const ws = getWorkspace(desktopId);
@@ -103,17 +112,22 @@ export function useTabActions(desktopId: string, size: Size | null): TabActions 
         sync();
       },
       close: (paneId, key) => {
-        update((ws) => closeTab(ws, paneId, key));
-        leaveClosed([key]);
+        // A running shell asks first; closing a terminal tab kills its shell.
+        guardTerminalClose(connection, terminalIds([key]), () => {
+          update((ws) => closeTab(ws, paneId, key));
+          leaveClosed([key]);
+        });
       },
       closePane: (paneId) => {
         const before = getWorkspace(desktopId);
         const keys = before.panes[paneId]?.tabs ?? [];
         // The focused pane shows the page of the URL when it is not a tab: that page goes with the pane.
         const showedPage = before.focused === paneId && urlKey() === null;
-        update((ws) => removePane(ws, paneId));
-        if (showedPage) sync();
-        else leaveClosed(keys);
+        guardTerminalClose(connection, terminalIds(keys), () => {
+          update((ws) => removePane(ws, paneId));
+          if (showedPage) sync();
+          else leaveClosed(keys);
+        });
       },
       canSplit: (dir, paneId) => canSplit(getWorkspace(desktopId), dir, live.current.size, paneId),
       split: (dir) => {
@@ -167,5 +181,5 @@ export function useTabActions(desktopId: string, size: Size | null): TabActions 
       },
     };
     return actions;
-  }, [desktopId, router]);
+  }, [desktopId, router, connection]);
 }

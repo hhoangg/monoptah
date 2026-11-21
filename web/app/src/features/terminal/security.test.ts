@@ -27,7 +27,7 @@ const BANNED: ReadonlyArray<[string, RegExp]> = [
 
 describe("terminal feature sources", () => {
   it("has the files this test is meant to guard", () => {
-    expect(sources).toEqual(expect.arrayContaining(["controller.ts", "xtermScreen.ts", "TerminalView.tsx", "TerminalPage.tsx", "CodeDialog.tsx", "KeyboardRow.tsx", "resume.ts"]));
+    expect(sources).toEqual(expect.arrayContaining(["controller.ts", "xtermScreen.ts", "TerminalPane.tsx", "TerminalDrawer.tsx", "TerminalChooser.tsx", "session.ts", "sessions.ts", "KeyboardRow.tsx", "resume.ts"]));
   });
 
   it.each(sources)("%s uses no HTML, script or iframe sink", (name) => {
@@ -44,6 +44,11 @@ describe("terminal feature sources", () => {
     },
     30_000,
   );
+
+  it("has no one-time code UI or code step any more: the passkey ticket replaced it", () => {
+    expect(files).not.toContain("CodeDialog.tsx");
+    for (const name of sources) expect(code(name), name).not.toMatch(/challengeId|submitCode|CodeDialog|codeLength|terminal-code/);
+  });
 
   it("never persists output: no local storage, IndexedDB or cache API in the terminal feature", () => {
     for (const name of sources) expect(/localStorage|indexedDB|\bcaches\b|CacheStorage|openDatabase/.test(code(name)), name).toBe(false);

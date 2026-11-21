@@ -29,6 +29,8 @@ const SAMPLES: { [A in AuditAction]: Record<string, unknown> } = {
   "grant.change": { deviceId: "dev-1", desktopId: "desk-1", state: "revoked", permission: "read", requestedPermission: "control" },
   "selection.ticket": { deviceId: "dev-1", desktopId: "desk-1" },
   "selection.widen": { deviceId: "dev-1", desktopId: "desk-1" },
+  "terminal.ticket": { deviceId: "dev-1", desktopId: "desk-1" },
+  "terminal.ticket.consumed": { deviceId: "dev-1", desktopId: "desk-1" },
   "user.block": { cascade: true, count: 4 },
   "user.unblock": { cascade: false },
   "admin.settings_change": { invitesPaused: true },
@@ -54,6 +56,8 @@ const SECURITY_MD_10_EVENTS = [
   "pairing.approve", "desktop.create", "desktop.revoke", "device.create", "device.revoke", "grant.change",
   // web selection widening: ticket minted (user), ticket consumed by the desktop
   "selection.ticket", "selection.widen",
+  // web terminal: ticket minted (user), ticket consumed by the desktop
+  "terminal.ticket", "terminal.ticket.consumed",
   // block/unblock, admin actions (settings, grant invites)
   "user.block", "user.unblock", "admin.settings_change", "admin.invites_grant",
   // rate-limit breach, session revoke and logout, deploy

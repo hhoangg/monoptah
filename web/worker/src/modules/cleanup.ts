@@ -24,6 +24,8 @@ export const RETENTION = {
   rateLimits: DAY,
   /** `selection_tickets`: removed 1 hour after they expire (used tickets go with them). */
   selectionTickets: HOUR,
+  /** `terminal_tickets`: removed 1 hour after they expire (used tickets go with them). */
+  terminalTickets: HOUR,
   /** `audit_log`: 180 days. */
   auditLog: 180 * DAY,
 } as const;

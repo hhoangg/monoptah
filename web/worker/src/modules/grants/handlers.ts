@@ -5,6 +5,9 @@ import type { Handler } from "hono";
 import {
   DesktopGrantStateBody,
   DesktopSelectionTicketBody,
+  DesktopTerminalTicketBody,
+  TerminalTicketBody,
+  TerminalTicketResponse,
   SelectionTicketResponse,
   DesktopGrantsResponse,
   GrantResponse,
@@ -16,8 +19,10 @@ import { apiError, respond, type AppContext, type AppEnv } from "../../http.ts";
 import { randomToken, sha256Hex } from "../../lib/crypto.ts";
 import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth, requireFresh } from "../../middleware/auth.ts";
+import { identifierHash } from "../../lib/ip.ts";
 import { notifyGrants, revokeInRooms, setGrantStateInRooms } from "../../relay/rooms.ts";
 import { auditStatement, PREVIOUS_CHANGED } from "../audit/audit.ts";
+import { auditBreach, consume, LIMITS, rateLimitKey } from "../ratelimit/index.ts";
 import { requireDesktopToken } from "../desktops/token.ts";
 
 const REVOKED = 4003;
@@ -282,5 +287,67 @@ export const consumeSelectionTicket: Handler<AppEnv> = async (c) => {
   const used = await c.env.DB.prepare(CONSUME_SELECTION_TICKET_SQL).bind(now, await sha256Hex(body.data.ticket), auth.desktopId, deviceId).run();
   if (used.meta.changes !== 1) return apiError(c, 404, "not_found", "Ticket not found");
   await auditStatement(c.env, { action: "selection.widen", actorKind: "desktop", actorUserId: auth.userId, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId: auth.desktopId } }).run();
+  return c.json({ ok: true as const });
+};
+
+/** Lifetime of a terminal ticket, seconds. It is sent to the desktop right after it is minted. */
+export const TERMINAL_TICKET_TTL_SECONDS = 60;
+/** How recent the passkey re-auth must be to mint a terminal ticket, seconds (same rule as a selection ticket). */
+export const TERMINAL_TICKET_REAUTH_SECONDS = 60;
+export const INSERT_TERMINAL_TICKET_SQL =
+  "INSERT INTO terminal_tickets (token_hash, user_id, desktop_id, device_id, project_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+/** Single use: only one caller changes the row, and only for the desktop, device and project it was made for. */
+export const CONSUME_TERMINAL_TICKET_SQL =
+  "UPDATE terminal_tickets SET used_at = ?1 WHERE token_hash = ?2 AND desktop_id = ?3 AND device_id = ?4 AND project_id = ?5 AND used_at IS NULL AND expires_at >= ?1 AND EXISTS (SELECT 1 FROM device_grants g JOIN devices dv ON dv.id = g.device_id WHERE g.desktop_id = terminal_tickets.desktop_id AND g.device_id = terminal_tickets.device_id AND dv.revoked_at IS NULL AND g.state = 'confirmed' AND g.permission = 'control')";
+
+/**
+ * `POST /api/desktops/:id/grants/:deviceId/terminal-ticket {projectId}` (fresh session): a single-use ticket that
+ * proves a passkey re-auth to the desktop before it opens a terminal in that project. Only the SHA-256 is stored.
+ * 20 per user per 10 minutes, counted here because the user is known only after auth.
+ */
+export const createTerminalTicket: Handler<AppEnv> = async (c) => {
+  const { user, session } = requireAuth(c);
+  const desktopId = c.req.param("id") ?? "";
+  const deviceId = c.req.param("deviceId") ?? "";
+  const body = TerminalTicketBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return apiError(c, 400, "invalid", "Invalid terminal ticket request");
+  if (session.reauthAt === null || session.reauthAt < nowSeconds() - TERMINAL_TICKET_REAUTH_SECONDS) return apiError(c, 403, "fresh_required", "Re-authentication required");
+  if (!(await ownsDesktop(c, desktopId, user.id))) return notFound(c);
+  if ((await c.env.DB.prepare(CONTROL_GRANT_SQL).bind(desktopId, deviceId, user.id).first()) === null) return apiError(c, 403, "forbidden", "This device does not have Control access to this desktop");
+
+  // The user id is hashed (salted) so it never appears in `rate_limits`; the breach audit names the user as actor.
+  const limit = await consume(c.env, rateLimitKey("terminal-ticket", "user", await identifierHash(c.env, "user", user.id)), LIMITS["terminal-ticket"].limit, LIMITS["terminal-ticket"].windowSeconds);
+  if (!limit.ok) {
+    if (limit.firstBreach) await auditBreach(c, "terminal-ticket", LIMITS["terminal-ticket"], user.id);
+    c.header("Retry-After", String(limit.retryAfter));
+    return apiError(c, 429, "rate_limited", "Too many requests");
+  }
+
+  const ticket = randomToken(32);
+  const now = nowSeconds();
+  const expiresAt = now + TERMINAL_TICKET_TTL_SECONDS;
+  await c.env.DB.batch([
+    c.env.DB.prepare(INSERT_TERMINAL_TICKET_SQL).bind(await sha256Hex(ticket), user.id, desktopId, deviceId, body.data.projectId, now, expiresAt),
+    auditStatement(c.env, { action: "terminal.ticket", actorUserId: user.id, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId } }),
+  ]);
+  return respond(c, TerminalTicketResponse, { ticket, expiresAt });
+};
+
+/**
+ * `POST /api/desktop/grants/:deviceId/terminal-ticket {ticket, projectId}` (token `grants`): the desktop asks
+ * whether a ticket the web sent with `terminal.open` is valid for this desktop, device and project, and consumes
+ * it. 200 once; any failure is 404. Refusals are not audited here: a desktop token could otherwise turn them
+ * into a D1 write flood, and the desktop records its own refusal.
+ */
+export const consumeTerminalTicket: Handler<AppEnv> = async (c) => {
+  const auth = await requireDesktopToken(c, "grants");
+  if (auth instanceof Response) return auth;
+  const deviceId = c.req.param("deviceId") ?? "";
+  const body = DesktopTerminalTicketBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return apiError(c, 400, "invalid", "Invalid ticket");
+  const now = nowSeconds();
+  const used = await c.env.DB.prepare(CONSUME_TERMINAL_TICKET_SQL).bind(now, await sha256Hex(body.data.ticket), auth.desktopId, deviceId, body.data.projectId).run();
+  if (used.meta.changes !== 1) return apiError(c, 404, "not_found", "Ticket not found");
+  await auditStatement(c.env, { action: "terminal.ticket.consumed", actorKind: "desktop", actorUserId: auth.userId, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId: auth.desktopId } }).run();
   return c.json({ ok: true as const });
 };

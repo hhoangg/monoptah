@@ -15,6 +15,12 @@ export const CLEANUP_QUERIES: readonly CleanupQuery[] = [
     sql: "DELETE FROM selection_tickets WHERE expires_at < ?1",
     bind: (now) => [now - RETENTION.selectionTickets],
   },
+  {
+    // Same for terminal tickets. Uses `terminal_tickets_expires_at_idx`.
+    name: "terminal_tickets",
+    sql: "DELETE FROM terminal_tickets WHERE expires_at < ?1",
+    bind: (now) => [now - RETENTION.terminalTickets],
+  },
 ];
 
 export const cleanup: Cleanup = (env, now) => runCleanupQueries(env.DB, CLEANUP_QUERIES, now);

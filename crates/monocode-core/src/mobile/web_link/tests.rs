@@ -10,6 +10,7 @@ use super::{WebLink, WebState, WebStatus};
 use crate::mobile::host::{Device, Event, MobileHost, Push};
 use crate::mobile::identity_store::WebIdentity;
 use crate::mobile::policy::{DeviceKind, Permission};
+use crate::mobile::terminal::TicketCheck;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{future::Future, time::Duration};
@@ -2165,6 +2166,44 @@ mod seam {
             "dev-1",
             "tkt"
         ));
+    }
+
+    #[test]
+    fn a_terminal_ticket_counts_only_when_the_server_answers_200_and_names_the_project() {
+        let verify = |status: u16, device: &str| {
+            let handler: Handler = Arc::new(move |_| (status, r#"{"ok":true}"#.into()));
+            let stub = world(handler, false);
+            let base = format!("http://127.0.0.1:{}", stub.hub.port);
+            let accepted =
+                desktop_api::verify_terminal_ticket(&base, TOKEN, device, "tkt", "proj-1");
+            let sent = stub.hub.requests(
+                "POST",
+                &format!("/api/desktop/grants/{device}/terminal-ticket"),
+            );
+            (accepted, sent)
+        };
+        let (accepted, sent) = verify(200, "dev-1");
+        assert_eq!(accepted, TicketCheck::Accepted);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].auth, bearer());
+        assert_eq!(sent[0].body["ticket"], "tkt");
+        assert_eq!(sent[0].body["projectId"], "proj-1");
+        assert_eq!(verify(404, "dev-1").0, TicketCheck::Rejected);
+        assert_eq!(verify(500, "dev-1").0, TicketCheck::Unreachable);
+        // A device id that is not a plain id never reaches the network.
+        let (accepted, _) = verify(200, "../x");
+        assert_eq!(accepted, TicketCheck::NoIdentity);
+        // Nothing listens on port 1: no answer is a refusal.
+        assert_eq!(
+            desktop_api::verify_terminal_ticket(
+                "http://127.0.0.1:1",
+                TOKEN,
+                "dev-1",
+                "tkt",
+                "proj-1"
+            ),
+            TicketCheck::Unreachable
+        );
     }
 
     #[tokio::test]

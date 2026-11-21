@@ -1,5 +1,6 @@
 use super::*;
 use crate::mobile::terminal::tests::FakeSpawner;
+use crate::mobile::terminal::TicketCheck;
 use crate::mobile::web_link::{desktop_api::ServerGrant, noise};
 use std::sync::atomic::Ordering;
 
@@ -30,7 +31,11 @@ fn encode_id(path: &str) -> String {
         .collect()
 }
 
+/// What the server was asked: (server device id, ticket, project id).
+type Asked = Arc<Mutex<Vec<(String, String, String)>>>;
+
 struct World {
+    asked: Asked,
     // The runtime lives inside the host; the host drops first.
     host: MobileHost,
     spawner: Arc<FakeSpawner>,
@@ -49,11 +54,28 @@ fn world(permission: Permission) -> World {
     let host = MobileHost::open(dir.path().join("mobile-access.json"))
         .unwrap()
         .0
-        // No wait between two codes: these tests ask for many.
-        .with_terminal_limits(terminal::Limits {
-            code_gap_ms: 0,
-            ..terminal::Limits::default()
+        .with_terminal_limits(terminal::Limits::default());
+    // Like the server: a ticket is accepted once, then it is gone. Tickets
+    // that start with "bad" or "expired" are never accepted.
+    let asked: Asked = Arc::default();
+    {
+        let (asked, used) = (asked.clone(), Mutex::new(std::collections::HashSet::new()));
+        host.set_terminal_ticket_verifier(move |relay, ticket, project| {
+            asked.lock().unwrap().push((relay, ticket.clone(), project));
+            if ticket.starts_with("unreachable") {
+                TicketCheck::Unreachable
+            } else if ticket.starts_with("noid") {
+                TicketCheck::NoIdentity
+            } else if !ticket.starts_with("bad")
+                && !ticket.starts_with("expired")
+                && used.lock().unwrap().insert(ticket)
+            {
+                TicketCheck::Accepted
+            } else {
+                TicketCheck::Rejected
+            }
         });
+    }
     host.set_flags_for_test(true, true);
     let spawner = Arc::new(FakeSpawner::default());
     host.set_shell_spawner(spawner.clone());
@@ -76,6 +98,7 @@ fn world(permission: Permission) -> World {
     host.inner.lock().unwrap().catalog =
         json!({"projects":[{"id": project, "name": "Proj"}],"monos":[],"sessions":[]});
     World {
+        asked,
         host,
         spawner,
         dir,
@@ -102,26 +125,36 @@ impl World {
             .unwrap();
     }
 
-    fn code(&self) -> String {
-        self.host.terminal_status().codes[0].code.clone()
+    /// A ticket the fake server has not seen before.
+    fn ticket(&self) -> String {
+        format!("ticket-{}", uuid::Uuid::new_v4())
     }
 
-    async fn open_with(&self, extra: Value) -> Result<String, Failure> {
+    fn open_params(&self, extra: Value) -> Value {
         let mut params = json!({"projectId": self.project, "cols": 80, "rows": 24});
         params
             .as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        let step = self.call("terminal.open", params.clone()).await?;
-        let challenge = step["challengeId"].as_str().unwrap().to_owned();
-        params["challengeId"] = json!(challenge);
-        params["code"] = json!(self.code());
+        params
+    }
+
+    /// Opens with a fresh ticket unless `extra` brings its own.
+    async fn open_with(&self, extra: Value) -> Result<String, Failure> {
+        let mut params = self.open_params(extra);
+        if params.get("ticket").is_none() {
+            params["ticket"] = json!(self.ticket());
+        }
         let opened = self.call("terminal.open", params).await?;
         Ok(opened["terminalId"].as_str().unwrap().to_owned())
     }
 
     async fn open(&self) -> String {
         self.open_with(json!({})).await.unwrap()
+    }
+
+    fn spawned(&self) -> usize {
+        self.spawner.shells.lock().unwrap().len()
     }
 
     fn kills(&self) -> Vec<usize> {
@@ -173,10 +206,7 @@ fn every_terminal_call_is_refused_until_the_desktop_allows_that_device() {
                 .unwrap_err();
             assert_eq!(code_of(&failure), "disabled", "{method}");
         }
-        assert!(
-            w.host.terminal_status().codes.is_empty(),
-            "no code was shown"
-        );
+        assert!(w.asked.lock().unwrap().is_empty(), "no ticket was asked");
         assert!(w.spawner.shells.lock().unwrap().is_empty());
     });
 }
@@ -233,43 +263,30 @@ fn a_quic_phone_never_reaches_the_terminal_and_unknown_methods_fail_closed() {
 }
 
 #[test]
-fn the_two_step_open_shows_a_code_only_on_the_desktop_and_a_shell_echoes_through_the_relay_calls() {
+fn a_ticket_opens_a_shell_in_one_step_and_it_echoes_through_the_relay_calls() {
     run(async {
         let w = world(Permission::Control);
         w.allow();
-        let step = w
-            .call(
-                "terminal.open",
-                json!({"projectId": w.project, "cols": 80, "rows": 24}),
-            )
-            .await
-            .unwrap();
-        // The answer holds the challenge, never the code.
-        assert_eq!(step["codeLength"], 6);
-        assert_eq!(step["attempts"], 3);
-        let wire = step.to_string();
-        assert!(!wire.contains(&w.code()), "the code stays on the desktop");
-        assert!(w.spawner.shells.lock().unwrap().is_empty(), "no shell yet");
-        // A wrong code is retyped, a right one opens.
-        let params = |code: &str| json!({"projectId": w.project, "cols": 80, "rows": 24, "challengeId": step["challengeId"], "code": code});
-        let wrong = if w.code() == "AAAAAA" {
-            "BBBBBB"
-        } else {
-            "AAAAAA"
-        };
-        let failure = w.call("terminal.open", params(wrong)).await.unwrap_err();
-        assert_eq!(code_of(&failure), "reauth_failed");
-        let right = w.code();
-        let opened = w.call("terminal.open", params(&right)).await.unwrap();
+        let ticket = w.ticket();
+        let params = w.open_params(json!({"ticket": ticket}));
+        let opened = w.call("terminal.open", params.clone()).await.unwrap();
+        // One step: the answer is the shell, there is no challenge.
+        assert!(opened.get("challengeId").is_none() && opened.get("codeLength").is_none());
         let id = opened["terminalId"].as_str().unwrap().to_owned();
         assert_eq!(opened["cwd"], "Proj");
         assert_eq!(opened["idleTimeoutMs"], 900_000);
         assert_eq!(opened["maxDurationMs"], 28_800_000);
         let cwd = w.spawner.cwds.lock().unwrap()[0].clone();
         assert!(cwd.ends_with("proj"), "{cwd:?}");
-        // The code was single use.
-        let replay = w.call("terminal.open", params(&right)).await.unwrap_err();
-        assert_eq!(code_of(&replay), "reauth_required");
+        // The server was asked once, for this grant, ticket and project.
+        assert_eq!(
+            *w.asked.lock().unwrap(),
+            [(w.relay.clone(), ticket, w.project.clone())]
+        );
+        // The ticket was single use: the server refuses a replay.
+        let replay = w.call("terminal.open", params).await.unwrap_err();
+        assert_eq!(code_of(&replay), "fresh_required");
+        assert_eq!(w.spawned(), 1);
         w.call(
             "terminal.write",
             json!({"terminalId": id, "data": "bHMNCg=="}),
@@ -304,6 +321,151 @@ fn the_two_step_open_shows_a_code_only_on_the_desktop_and_a_shell_echoes_through
             .await
             .unwrap();
         assert_eq!(after["exited"]["reason"], "closed");
+    });
+}
+
+#[test]
+fn a_missing_or_empty_ticket_is_refused_before_the_server_or_a_shell() {
+    run(async {
+        let w = world(Permission::Control);
+        w.allow();
+        for extra in [json!({}), json!({"ticket": ""}), json!({"ticket": 5})] {
+            let failure = w
+                .call("terminal.open", w.open_params(extra.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(code_of(&failure), "fresh_required", "{extra}");
+        }
+        assert!(w.asked.lock().unwrap().is_empty());
+        assert_eq!(w.spawned(), 0);
+    });
+}
+
+#[test]
+fn a_refused_or_expired_ticket_spawns_nothing() {
+    run(async {
+        let w = world(Permission::Control);
+        w.allow();
+        for ticket in ["bad-ticket", "expired-ticket"] {
+            let failure = w.open_with(json!({"ticket": ticket})).await.unwrap_err();
+            assert_eq!(code_of(&failure), "fresh_required", "{ticket}");
+        }
+        assert_eq!(w.asked.lock().unwrap().len(), 2, "the server decided");
+        assert_eq!(w.spawned(), 0);
+        assert!(w.host.terminal_status().open.is_empty());
+        // The slots are free: a good ticket still opens.
+        w.open().await;
+        assert_eq!(w.spawned(), 1);
+    });
+}
+
+#[test]
+fn an_unreachable_server_fails_closed() {
+    run(async {
+        let w = world(Permission::Control);
+        w.allow();
+        // No fake: the real check runs, finds no web identity or token or no
+        // server, and says no.
+        *w.host.selection.terminal_verifier.lock().unwrap() = None;
+        let failure = w.open_with(json!({})).await.unwrap_err();
+        assert_eq!(code_of(&failure), "fresh_required");
+        assert_eq!(w.spawned(), 0);
+    });
+}
+
+#[test]
+fn locally_refused_opens_never_burn_a_ticket() {
+    run(async {
+        let w = world(Permission::Control);
+        w.allow();
+        // Invalid subdir and size, then the limits.
+        w.open_with(json!({"subdir": "../x"})).await.unwrap_err();
+        w.call(
+            "terminal.open",
+            w.open_params(json!({"cols": 1, "ticket": "t"})),
+        )
+        .await
+        .unwrap_err();
+        assert!(w.asked.lock().unwrap().is_empty());
+        w.open().await;
+        w.open().await;
+        let before = w.asked.lock().unwrap().len();
+        let failure = w.open_with(json!({})).await.unwrap_err();
+        assert_eq!(code_of(&failure), "busy");
+        assert_eq!(
+            w.asked.lock().unwrap().len(),
+            before,
+            "not asked at the limit"
+        );
+    });
+}
+
+#[test]
+fn concurrent_opens_each_need_their_own_ticket() {
+    run(async {
+        let w = world(Permission::Control);
+        w.allow();
+        let same = w.ticket();
+        let (a, b) = tokio::join!(
+            w.open_with(json!({"ticket": same})),
+            w.open_with(json!({"ticket": same}))
+        );
+        assert_eq!(
+            [a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(),
+            1,
+            "one ticket, one shell"
+        );
+        assert_eq!(w.spawned(), 1);
+    });
+}
+
+#[test]
+fn only_the_same_device_reattaches_inside_the_grace_window_and_a_new_open_needs_a_ticket() {
+    run(async {
+        let w = world(Permission::Control);
+        w.allow();
+        let id = w.open().await;
+        w.host.terminals().link_closed(&w.relay);
+        assert!(w.host.terminal_status().open[0].detached);
+        let asked = w.asked.lock().unwrap().len();
+        // The same device reads on: no ticket is asked for.
+        w.call(
+            "terminal.read",
+            json!({"terminalId": id, "from": 0, "waitMs": 0}),
+        )
+        .await
+        .unwrap();
+        assert!(!w.host.terminal_status().open[0].detached);
+        assert_eq!(w.asked.lock().unwrap().len(), asked);
+        // A second device that learned the id gets nothing.
+        let other = format!("other-{}", uuid::Uuid::new_v4());
+        let fingerprint = noise::fingerprint(&[7; 32]);
+        w.host.add_device_for_test(Device {
+            id: other.clone(),
+            name: "Other".into(),
+            fingerprint: fingerprint.clone(),
+            push: None,
+            kind: DeviceKind::Web,
+            permission: Permission::Control,
+            projects: None,
+            monos: None,
+            server_device_id: Some("other-relay".into()),
+            created_at: None,
+            last_seen: None,
+        });
+        w.host.web_set_terminal_allowed(&other, true).unwrap();
+        let stolen = w
+            .host
+            .handle_web(
+                &fingerprint,
+                json!({"version":VERSION,"id":"c2","method":"terminal.read",
+                    "params":{"terminalId": id, "from": 0, "waitMs": 0}}),
+            )
+            .await;
+        assert!(stolen.is_err());
+        // A new open by anyone needs a ticket.
+        let failure = w.call("terminal.open", w.open_params(json!({}))).await;
+        assert_eq!(code_of(&failure.unwrap_err()), "fresh_required");
     });
 }
 
@@ -694,6 +856,7 @@ fn opening_and_closing_are_audited_with_the_reason_and_reads_are_not() {
         let w = world(Permission::Control);
         w.allow();
         let id = w.open().await;
+        w.open_with(json!({"ticket": "bad-one"})).await.unwrap_err();
         w.call(
             "terminal.read",
             json!({"terminalId": id, "from": 0, "waitMs": 0}),
@@ -712,7 +875,8 @@ fn opening_and_closing_are_audited_with_the_reason_and_reads_are_not() {
             .collect();
         for wanted in [
             "terminal_toggle",
-            "terminal_challenge",
+            "terminal_ticket_accepted",
+            "terminal_ticket_refused",
             "terminal_open",
             "terminal_close",
         ] {
@@ -727,8 +891,79 @@ fn opening_and_closing_are_audited_with_the_reason_and_reads_are_not() {
             .unwrap();
         assert_eq!(closed["detail"], "killed");
         assert_eq!(closed["transport"], "web");
-        // No parameters, no output and no code ever reach the log.
+        // No parameters, no output and no ticket ever reach the log.
         let text = serde_json::to_string(&lines).unwrap();
         assert!(!text.contains("terminal.read"), "polls are not written");
+        assert!(!text.contains("bad-one"));
+        for (_, ticket, _) in w.asked.lock().unwrap().iter() {
+            assert!(
+                !text.contains(ticket.as_str()),
+                "the ticket is never logged"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_refused_ticket_is_audited_once_with_its_reason_and_spawns_nothing() {
+    use crate::mobile::audit;
+    run(async {
+        let log = tempfile::tempdir().unwrap();
+        let _turn = audit::test_log(log.path());
+        let w = world(Permission::Control);
+        w.allow();
+        for (ticket, detail) in [
+            ("bad-1", "rejected"),
+            ("unreachable-1", "unreachable"),
+            ("noid-1", "no_identity"),
+        ] {
+            let failure = w.open_with(json!({"ticket": ticket})).await.unwrap_err();
+            assert_eq!(code_of(&failure), "fresh_required", "{ticket}");
+            let lines = audit::read_recent(log.path(), 100);
+            let refused: Vec<_> = lines
+                .iter()
+                .filter(|line| {
+                    line["deviceId"] == w.device.as_str()
+                        && line["event"] == "terminal_ticket_refused"
+                        && line["detail"] == detail
+                })
+                .collect();
+            assert_eq!(refused.len(), 1, "{detail}: {lines:?}");
+            assert_eq!(w.spawned(), 0, "{detail}");
+        }
+        let lines = audit::read_recent(log.path(), 100);
+        let total = lines
+            .iter()
+            .filter(|line| {
+                line["deviceId"] == w.device.as_str() && line["event"] == "terminal_ticket_refused"
+            })
+            .count();
+        assert_eq!(total, 3, "exactly one record per refusal");
+        let text = serde_json::to_string(&lines).unwrap();
+        for ticket in ["bad-1", "unreachable-1", "noid-1"] {
+            assert!(!text.contains(ticket), "the ticket is never logged");
+        }
+    });
+}
+
+#[test]
+fn a_project_id_is_limited_to_256_characters() {
+    run(async {
+        let w = world(Permission::Control);
+        w.allow();
+        let invalid = "Invalid mobile parameters";
+        for (len, accepted_by_limit) in [(256, true), (257, false)] {
+            let id = "a".repeat(len);
+            w.host.inner.lock().unwrap().catalog =
+                json!({"projects":[{"id": id, "name": "Proj"}],"monos":[],"sessions":[]});
+            let failure = w.open_with(json!({"projectId": id})).await.unwrap_err();
+            assert_eq!(
+                failure.error != invalid,
+                accepted_by_limit,
+                "{len}: {}",
+                failure.error
+            );
+        }
+        assert_eq!(w.spawned(), 0);
     });
 }

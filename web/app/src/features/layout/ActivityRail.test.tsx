@@ -180,12 +180,12 @@ describe("activity rail", () => {
     expect(within(actions).getByRole("link", { name: "Desktop settings" })).toHaveAttribute("href", "/d/d1/settings");
   });
 
-  it("adds Terminal between Cloud and Desktop settings only when the desktop advertises it for this device", async () => {
+  it("has no Terminal entry even when the desktop advertises it (the terminal is the footer chip now)", async () => {
     h.terminal = true;
     mountSlot(<Rail />);
     const actions = await screen.findByTestId("rail-actions");
-    expect([...actions.querySelectorAll("a, button")].map((el) => el.getAttribute("aria-label"))).toEqual(["Cloud", "Terminal", "Desktop settings", "Account"]);
-    expect(within(actions).getByRole("link", { name: "Terminal" })).toHaveAttribute("href", "/d/d1/terminal");
+    expect([...actions.querySelectorAll("a, button")].map((el) => el.getAttribute("aria-label"))).toEqual(["Cloud", "Desktop settings", "Account"]);
+    expect(within(actions).queryByRole("link", { name: "Terminal" })).toBeNull();
   });
 
   it("leaves Cloud out when the desktop has no cloud capability", async () => {

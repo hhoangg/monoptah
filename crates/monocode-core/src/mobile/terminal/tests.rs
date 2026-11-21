@@ -87,11 +87,7 @@ fn fixture_with(limits: Limits) -> Fixture {
 }
 
 fn fixture() -> Fixture {
-    fixture_with(Limits {
-        // No gap between codes unless a test asks for it.
-        code_gap_ms: 0,
-        ..Limits::default()
-    })
+    fixture_with(Limits::default())
 }
 
 fn owner(device: &str) -> Owner {
@@ -103,33 +99,21 @@ fn owner(device: &str) -> Owner {
     }
 }
 
-fn request(challenge: &ChallengeInfo, code: &str) -> OpenRequest {
+fn request() -> OpenRequest {
     OpenRequest {
         project: "p1".into(),
         label: "Project".into(),
         cwd: PathBuf::from("/tmp"),
         cols: 80,
         rows: 24,
-        challenge_id: challenge.challenge_id.clone(),
-        code: code.into(),
     }
 }
 
-/// The code the desktop shows for the device's challenge.
-fn shown_code(hub: &Hub, owner: &Owner) -> String {
-    hub.status()
-        .codes
-        .iter()
-        .find(|c| c.device_name == owner.name)
-        .expect("a code is shown")
-        .code
-        .clone()
-}
-
+/// Opens a shell whose ticket the server accepts.
 fn open_shell(f: &Fixture, who: &Owner) -> Opened {
-    let challenge = f.hub.challenge(who, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, who);
-    f.hub.open(who, request(&challenge, &code)).unwrap()
+    f.hub
+        .open(who, request(), || TicketCheck::Accepted)
+        .unwrap()
 }
 
 fn code_of(failure: &Failure) -> Option<&str> {
@@ -147,17 +131,6 @@ fn kills(f: &Fixture) -> Vec<usize> {
 }
 
 #[test]
-fn a_code_is_six_characters_from_the_unambiguous_alphabet() {
-    for _ in 0..200 {
-        let code = random_code();
-        assert_eq!(code.len(), CODE_LEN);
-        assert!(code.bytes().all(|b| CODE_ALPHABET.contains(&b)));
-    }
-    assert_eq!(CODE_ALPHABET.len(), 31);
-    assert!(!CODE_ALPHABET.contains(&b'0') && !CODE_ALPHABET.contains(&b'O'));
-}
-
-#[test]
 fn constant_time_eq_compares_content_and_length() {
     assert!(constant_time_eq(b"ABC234", b"ABC234"));
     assert!(!constant_time_eq(b"ABC234", b"ABC235"));
@@ -166,135 +139,99 @@ fn constant_time_eq_compares_content_and_length() {
 }
 
 #[test]
-fn nothing_is_shown_or_opened_without_a_shell_backend() {
+fn nothing_is_opened_or_asked_without_a_shell_backend() {
     let hub = Hub::new(ManualClock::new(), Limits::default());
-    let failure = hub.challenge(&owner("a"), "p1", "Project").unwrap_err();
+    let asked = AtomicUsize::new(0);
+    let failure = hub
+        .open(&owner("a"), request(), || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            TicketCheck::Accepted
+        })
+        .unwrap_err();
     assert_eq!(code_of(&failure), Some("unsupported"));
-    assert!(hub.status().codes.is_empty());
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "no ticket is spent");
 }
 
 #[test]
-fn the_right_code_opens_a_shell_in_the_asked_folder_and_the_code_is_gone() {
+fn an_accepted_ticket_opens_a_shell_in_the_asked_folder() {
     let f = fixture();
     let who = owner("a");
-    let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-    assert_eq!(challenge.attempts, 3);
-    assert_eq!(challenge.expires_in_ms, 60_000);
-    let code = shown_code(&f.hub, &who);
-    // Typed in lower case with a space: still the same code.
-    let typed = format!("{} {}", &code[..3], &code[3..]).to_lowercase();
-    let opened = f.hub.open(&who, request(&challenge, &typed)).unwrap();
+    let opened = open_shell(&f, &who);
     assert_eq!((opened.cols, opened.rows), (80, 24));
     assert_eq!(opened.idle_ms, 15 * 60_000);
     assert_eq!(opened.max_ms, 8 * 60 * 60_000);
     assert_eq!(f.spawner.cwds.lock().unwrap()[0], PathBuf::from("/tmp"));
-    assert!(f.hub.status().codes.is_empty());
     assert_eq!(f.hub.status().open[0].device_name, who.name);
 }
 
 #[test]
-fn a_code_works_once_and_a_replay_needs_a_new_one() {
+fn a_refused_ticket_spawns_nothing_and_gives_its_slot_back() {
     let f = fixture();
     let who = owner("a");
-    let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, &who);
-    f.hub.open(&who, request(&challenge, &code)).unwrap();
-    let replay = f.hub.open(&who, request(&challenge, &code)).unwrap_err();
-    assert_eq!(code_of(&replay), Some("reauth_required"));
-    assert_eq!(f.spawner.shells.lock().unwrap().len(), 1);
-}
-
-#[test]
-fn a_wrong_code_may_be_retyped_but_three_wrong_ones_use_the_challenge_up() {
-    let f = fixture();
-    let who = owner("a");
-    let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-    let real = shown_code(&f.hub, &who);
-    let wrong = if real == "AAAAAA" { "BBBBBB" } else { "AAAAAA" };
-    for _ in 0..2 {
-        let failure = f.hub.open(&who, request(&challenge, wrong)).unwrap_err();
-        assert_eq!(code_of(&failure), Some("reauth_failed"));
+    for _ in 0..3 {
+        let failure = f
+            .hub
+            .open(&who, request(), || TicketCheck::Rejected)
+            .unwrap_err();
+        assert_eq!(code_of(&failure), Some("fresh_required"));
     }
-    let third = f.hub.open(&who, request(&challenge, wrong)).unwrap_err();
-    assert_eq!(code_of(&third), Some("reauth_required"));
-    // The right code no longer works on the used-up challenge.
-    let late = f.hub.open(&who, request(&challenge, &real)).unwrap_err();
-    assert_eq!(code_of(&late), Some("reauth_required"));
     assert!(f.spawner.shells.lock().unwrap().is_empty());
+    assert!(f.hub.status().open.is_empty());
+    // The slots are free again.
+    open_shell(&f, &who);
+    open_shell(&f, &who);
 }
 
 #[test]
-fn a_code_expires() {
+fn a_ticket_that_the_server_consumed_cannot_open_a_second_shell() {
     let f = fixture();
     let who = owner("a");
-    let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, &who);
-    f.clock.advance(59_999);
-    assert_eq!(f.hub.status().codes.len(), 1);
-    f.clock.advance(1);
-    let failure = f.hub.open(&who, request(&challenge, &code)).unwrap_err();
-    assert_eq!(code_of(&failure), Some("reauth_required"));
-    assert!(f.hub.status().codes.is_empty());
-}
-
-#[test]
-fn a_code_belongs_to_one_device_and_one_project() {
-    let f = fixture();
-    let (a, b) = (owner("a"), owner("b"));
-    let challenge = f.hub.challenge(&a, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, &a);
-    // Another device cannot use the id and code it somehow learned.
-    let stolen = f.hub.open(&b, request(&challenge, &code)).unwrap_err();
-    assert_eq!(code_of(&stolen), Some("reauth_required"));
-    // The challenge is gone with that attempt: the owner asks again.
-    let again = f.hub.challenge(&a, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, &a);
-    let mut other_project = request(&again, &code);
-    other_project.project = "p2".into();
-    let failure = f.hub.open(&a, other_project).unwrap_err();
-    assert_eq!(code_of(&failure), Some("reauth_required"));
-    assert!(f.spawner.shells.lock().unwrap().is_empty());
-}
-
-#[test]
-fn repeated_wrong_codes_lock_the_device_out_for_a_while() {
-    let f = fixture();
-    let who = owner("a");
-    // Two challenges used up with three wrong codes each: six failures.
-    for _ in 0..2 {
-        let challenge = f.hub.challenge(&who, "p1", "Project").unwrap_or_else(|_| {
-            panic!("a code was refused too early");
-        });
-        for _ in 0..3 {
-            if f.hub.open(&who, request(&challenge, "WRONG2")).is_ok() {
-                panic!("a wrong code opened a shell");
-            }
+    // Like the server: a ticket is accepted once, then it is gone.
+    let used = Mutex::new(std::collections::HashSet::new());
+    let server = |ticket: &str| {
+        if used.lock().unwrap().insert(ticket.to_owned()) {
+            TicketCheck::Accepted
+        } else {
+            TicketCheck::Rejected
         }
-    }
-    let locked = f.hub.challenge(&who, "p1", "Project").unwrap_err();
-    assert_eq!(code_of(&locked), Some("busy"));
-    // Other devices are not affected.
-    assert!(f.hub.challenge(&owner("b"), "p1", "Project").is_ok());
-    f.clock.advance(Limits::default().lockout_ms);
-    assert!(f.hub.challenge(&who, "p1", "Project").is_ok());
+    };
+    f.hub.open(&who, request(), || server("t1")).unwrap();
+    let replay = f.hub.open(&who, request(), || server("t1")).unwrap_err();
+    assert_eq!(code_of(&replay), Some("fresh_required"));
+    assert_eq!(f.spawner.shells.lock().unwrap().len(), 1);
+    f.hub.open(&who, request(), || server("t2")).unwrap();
+    assert_eq!(f.spawner.shells.lock().unwrap().len(), 2);
 }
 
 #[test]
-fn codes_are_rationed_per_device_and_overall() {
-    let f = fixture_with(Limits::default());
+fn a_locally_refused_open_never_asks_the_server() {
+    let f = fixture();
     let who = owner("a");
-    f.hub.challenge(&who, "p1", "Project").unwrap();
-    let quick = f.hub.challenge(&who, "p1", "Project").unwrap_err();
-    assert_eq!(code_of(&quick), Some("busy"));
-    f.clock.advance(Limits::default().code_gap_ms);
-    // A new code replaces the old: one code per device.
-    f.hub.challenge(&who, "p1", "Project").unwrap();
-    assert_eq!(f.hub.status().codes.len(), 1);
-    for name in ["b", "c", "d"] {
-        f.hub.challenge(&owner(name), "p1", "Project").unwrap();
-    }
-    let full = f.hub.challenge(&owner("e"), "p1", "Project").unwrap_err();
-    assert_eq!(code_of(&full), Some("busy"));
+    open_shell(&f, &who);
+    open_shell(&f, &who);
+    let asked = AtomicUsize::new(0);
+    let failure = f
+        .hub
+        .open(&who, request(), || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            TicketCheck::Accepted
+        })
+        .unwrap_err();
+    assert_eq!(code_of(&failure), Some("busy"));
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "the ticket is not burned");
+    // The same holds overall.
+    let (b, c) = (owner("b"), owner("c"));
+    open_shell(&f, &b);
+    open_shell(&f, &b);
+    let failure = f
+        .hub
+        .open(&c, request(), || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            TicketCheck::Accepted
+        })
+        .unwrap_err();
+    assert_eq!(code_of(&failure), Some("busy"));
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -303,8 +240,58 @@ fn a_device_holds_a_limited_number_of_shells() {
     let who = owner("a");
     open_shell(&f, &who);
     open_shell(&f, &who);
-    let failure = f.hub.challenge(&who, "p1", "Project").unwrap_err();
+    let failure = f
+        .hub
+        .open(&who, request(), || TicketCheck::Accepted)
+        .unwrap_err();
     assert_eq!(code_of(&failure), Some("busy"));
+}
+
+#[test]
+fn opens_waiting_on_the_server_count_against_the_limits_and_each_needs_its_own_ticket() {
+    let f = fixture();
+    let who = owner("a");
+    let entered = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut waiting = Vec::new();
+    for (want, ticket) in [(1, "t1"), (2, "t2")] {
+        let (hub, who) = (f.hub.clone(), who.clone());
+        let (inside, release, seen) = (entered.clone(), release.clone(), seen.clone());
+        waiting.push(std::thread::spawn(move || {
+            hub.open(&who, request(), || {
+                seen.lock().unwrap().push(ticket);
+                inside.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                TicketCheck::Accepted
+            })
+        }));
+        while entered.load(Ordering::SeqCst) < want {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    // Two tickets are being checked and no shell exists yet: a third open is
+    // already refused and its ticket is not asked about.
+    let asked = AtomicUsize::new(0);
+    let third = f
+        .hub
+        .open(&who, request(), || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            TicketCheck::Accepted
+        })
+        .unwrap_err();
+    assert_eq!(code_of(&third), Some("busy"));
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    release.store(true, Ordering::SeqCst);
+    for thread in waiting {
+        thread.join().unwrap().unwrap();
+    }
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(seen, ["t1", "t2"]);
+    assert_eq!(f.hub.status().open.len(), 2);
 }
 
 /// A spawner that waits inside `spawn` until released, like a slow pty start.
@@ -336,19 +323,20 @@ fn shells_still_starting_count_against_the_per_device_limit() {
     let who = owner("a");
     let mut starting = Vec::new();
     for want in 1..=2 {
-        let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-        let req = request(&challenge, &shown_code(&f.hub, &who));
         let (hub, who) = (f.hub.clone(), who.clone());
-        starting.push(std::thread::spawn(move || hub.open(&who, req)));
+        starting.push(std::thread::spawn(move || {
+            hub.open(&who, request(), || TicketCheck::Accepted)
+        }));
         while gate.entered.load(Ordering::SeqCst) < want {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
     // Two shells are starting and none is registered yet: a third open must
     // already be refused.
-    let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, &who);
-    let failure = f.hub.open(&who, request(&challenge, &code)).unwrap_err();
+    let failure = f
+        .hub
+        .open(&who, request(), || TicketCheck::Accepted)
+        .unwrap_err();
     assert_eq!(code_of(&failure), Some("busy"));
     gate.release.store(true, Ordering::SeqCst);
     for thread in starting {
@@ -371,11 +359,10 @@ fn a_panicking_spawner_gives_its_slot_back() {
     let who = owner("a");
     f.hub.set_spawner(Arc::new(PanickingSpawner));
     for _ in 0..3 {
-        let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-        let req = request(&challenge, &shown_code(&f.hub, &who));
         let hub = f.hub.clone();
         let who = who.clone();
-        let joined = std::thread::spawn(move || hub.open(&who, req)).join();
+        let joined =
+            std::thread::spawn(move || hub.open(&who, request(), || TicketCheck::Accepted)).join();
         assert!(joined.is_err(), "the spawner panicked");
     }
     f.hub.set_spawner(f.spawner.clone());
@@ -389,9 +376,9 @@ fn a_failed_spawn_gives_its_slot_back() {
     let who = owner("a");
     f.spawner.fail.store(true, Ordering::SeqCst);
     for _ in 0..3 {
-        let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-        let code = shown_code(&f.hub, &who);
-        f.hub.open(&who, request(&challenge, &code)).unwrap_err();
+        f.hub
+            .open(&who, request(), || TicketCheck::Accepted)
+            .unwrap_err();
     }
     f.spawner.fail.store(false, Ordering::SeqCst);
     open_shell(&f, &who);
@@ -403,9 +390,10 @@ fn a_failed_spawn_opens_nothing() {
     let f = fixture();
     let who = owner("a");
     f.spawner.fail.store(true, Ordering::SeqCst);
-    let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, &who);
-    let failure = f.hub.open(&who, request(&challenge, &code)).unwrap_err();
+    let failure = f
+        .hub
+        .open(&who, request(), || TicketCheck::Accepted)
+        .unwrap_err();
     assert_eq!(failure.error, "no shell");
     assert!(f.hub.status().open.is_empty());
 }
@@ -598,16 +586,13 @@ fn the_kill_button_ends_one_shell_and_only_that_one() {
 }
 
 #[test]
-fn killing_a_device_ends_its_shells_and_drops_its_waiting_codes() {
+fn killing_a_device_ends_its_shells() {
     let f = fixture();
     let (a, b) = (owner("a"), owner("b"));
     open_shell(&f, &a);
     open_shell(&f, &b);
-    f.hub.challenge(&a, "p1", "Project").unwrap();
-    assert_eq!(f.hub.status().codes.len(), 1);
     assert_eq!(f.hub.kill_device("a", Reason::Revoked), 1);
     assert_eq!(kills(&f), [1, 0]);
-    assert!(f.hub.status().codes.is_empty());
     assert_eq!(f.hub.open_count("a"), 0);
     assert_eq!(f.hub.open_count("b"), 1);
 }
@@ -764,9 +749,10 @@ fn a_device_revoked_while_its_shell_starts_gets_no_shell() {
     let f = fixture();
     f.hub.set_rights(Arc::new(|_| Standing::Revoked));
     let who = owner("a");
-    let challenge = f.hub.challenge(&who, "p1", "Project").unwrap();
-    let code = shown_code(&f.hub, &who);
-    let failure = f.hub.open(&who, request(&challenge, &code)).unwrap_err();
+    let failure = f
+        .hub
+        .open(&who, request(), || TicketCheck::Accepted)
+        .unwrap_err();
     assert_eq!(code_of(&failure), Some("revoked"));
     assert_eq!(kills(&f), [1], "the shell that was started is killed");
     assert!(f.hub.status().open.is_empty());

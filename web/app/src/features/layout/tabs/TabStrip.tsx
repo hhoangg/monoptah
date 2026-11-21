@@ -9,6 +9,8 @@ import { useCatalog } from "@/data";
 import { cn } from "@/lib/utils";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { Icon } from "@/ui/Icon";
+import { ensureSession, terminalTitle, useTerminalsVersion } from "@/features/terminal/sessions";
+import { useLinkConnection, useLinkDesktopId } from "@/link";
 import { IconTip } from "@/ui/tooltip";
 import { isMac } from "../shortcuts";
 import { parseTab, type Pane, type TabKey } from "./paneTree";
@@ -23,15 +25,27 @@ const iconButton =
 /** The title and icon of a tab, from the catalog; a tab the catalog does not list yet (or any more) keeps a plain name. */
 function useTabTitle() {
   const catalog = useCatalog().data;
-  return (key: TabKey): { title: string; known: boolean; mono: boolean } => {
+  const connection = useLinkConnection();
+  // A terminal tab's title and dot follow its session.
+  useTerminalsVersion();
+  return (key: TabKey): { title: string; known: boolean; mono: boolean; terminal: "on" | "off" | null } => {
     const tab = parseTab(key);
+    if (tab?.kind === "terminal") {
+      const info = terminalTitle(connection, tab.id);
+      return { title: info.title, known: true, mono: false, terminal: info.connected ? "on" : "off" };
+    }
     if (tab?.kind === "mono") {
       const mono = catalog?.monos.find((candidate) => candidate.id === tab.id);
-      return { title: mono?.name ?? "Mono", known: !!mono, mono: true };
+      return { title: mono?.name ?? "Mono", known: !!mono, mono: true, terminal: null };
     }
     const session = catalog?.sessions.find((candidate) => candidate.id === tab?.id);
-    return { title: session?.title || "Session", known: !!session, mono: false };
+    return { title: session?.title || "Session", known: !!session, mono: false, terminal: null };
   };
+}
+
+/** Green while the shell is connected, grey while it is not (reconnecting, ended, or not opened yet). */
+function TerminalDot({ state }: { state: "on" | "off" }) {
+  return <span role="img" aria-label={state === "on" ? "Connected" : "Not connected"} data-testid="terminal-dot" data-state={state} className={cn("size-2 shrink-0 rounded-full", state === "on" ? "bg-additions" : "bg-faint")} />;
 }
 
 export interface TabStripProps {
@@ -52,6 +66,15 @@ export interface TabStripProps {
 export function TabStrip({ desktopId, pane, number, paneCount, focused, selected, hiddenPanes, canSplit, actions }: TabStripProps) {
   const titleOf = useTabTitle();
   const listRef = useRef<HTMLDivElement>(null);
+  // A terminal tab that is not the active one still names its project and shows its dot (a reload reattaches from the resume entry).
+  const connection = useLinkConnection();
+  const linkDesktopId = useLinkDesktopId();
+  useEffect(() => {
+    for (const key of pane.tabs) {
+      const tab = parseTab(key);
+      if (tab?.kind === "terminal") ensureSession(connection, linkDesktopId, tab.id);
+    }
+  }, [pane.tabs, connection, linkDesktopId]);
   const [dropAt, setDropAt] = useState<number | null>(null);
   // Which sides have tabs scrolled out of sight (the strip overflows), for the edge fades and the "All tabs" menu.
   const [overflow, setOverflow] = useState({ left: false, right: false });
@@ -237,8 +260,9 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
                   !info.known && "italic",
                 )}
               >
-                <Icon name={info.mono ? "bot" : "chat"} size={16} className="shrink-0" />
+                <Icon name={info.terminal ? "terminal" : info.mono ? "bot" : "chat"} size={16} className="shrink-0" />
                 <span className="min-w-0 flex-1 truncate">{info.title}</span>
+                {info.terminal ? <TerminalDot state={info.terminal} /> : null}
               </button>
               <button
                 type="button"
@@ -275,8 +299,9 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
                 const info = titleOf(key);
                 return (
                   <DropdownMenuItem key={key} aria-current={key === selected ? "true" : undefined} onSelect={() => actions.activate(pane.id, key)}>
-                    <Icon name={info.mono ? "bot" : "chat"} size={16} className="shrink-0" />
+                    <Icon name={info.terminal ? "terminal" : info.mono ? "bot" : "chat"} size={16} className="shrink-0" />
                     <span className={cn("min-w-0 flex-1 truncate", key === selected && "font-semibold", !info.known && "italic")}>{info.title}</span>
+                    {info.terminal ? <TerminalDot state={info.terminal} /> : null}
                     {key === selected ? <Icon name="check" size={16} className="shrink-0 text-brand-text" /> : null}
                   </DropdownMenuItem>
                 );

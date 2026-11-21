@@ -28,6 +28,7 @@ import { Route as DDesktopIdCloudIndexRouteImport } from './routes/d/$desktopId/
 import { Route as DDesktopIdMonosIndexRouteImport } from './routes/d/$desktopId/monos/index'
 import { Route as DDesktopIdSSessionIdRouteImport } from './routes/d/$desktopId/s/$sessionId'
 import { Route as DDesktopIdSettingsIndexRouteImport } from './routes/d/$desktopId/settings/index'
+import { Route as DDesktopIdTTerminalIdRouteImport } from './routes/d/$desktopId/t/$terminalId'
 import { Route as DDesktopIdTerminalIndexRouteImport } from './routes/d/$desktopId/terminal/index'
 import { Route as DDesktopIdMonosMonoIdIndexRouteImport } from './routes/d/$desktopId/monos/$monoId/index'
 import { Route as DDesktopIdPProjectIdIndexRouteImport } from './routes/d/$desktopId/p/$projectId/index'
@@ -136,6 +137,11 @@ const DDesktopIdSettingsIndexRoute = DDesktopIdSettingsIndexRouteImport.update({
   path: '/settings/',
   getParentRoute: () => DDesktopIdRouteRoute,
 } as any)
+const DDesktopIdTTerminalIdRoute = DDesktopIdTTerminalIdRouteImport.update({
+  id: '/t/$terminalId',
+  path: '/t/$terminalId',
+  getParentRoute: () => DDesktopIdRouteRoute,
+} as any)
 const DDesktopIdTerminalIndexRoute = DDesktopIdTerminalIndexRouteImport.update({
   id: '/terminal/',
   path: '/terminal/',
@@ -223,6 +229,7 @@ export interface FileRoutesByFullPath {
   '/d/$desktopId/': typeof DDesktopIdIndexRoute
   '/desktops/$id/': typeof DesktopsIdIndexRoute
   '/d/$desktopId/s/$sessionId': typeof DDesktopIdSSessionIdRoute
+  '/d/$desktopId/t/$terminalId': typeof DDesktopIdTTerminalIdRoute
   '/d/$desktopId/cloud/': typeof DDesktopIdCloudIndexRoute
   '/d/$desktopId/monos/': typeof DDesktopIdMonosIndexRoute
   '/d/$desktopId/settings/': typeof DDesktopIdSettingsIndexRoute
@@ -255,6 +262,7 @@ export interface FileRoutesByTo {
   '/d/$desktopId': typeof DDesktopIdIndexRoute
   '/desktops/$id': typeof DesktopsIdIndexRoute
   '/d/$desktopId/s/$sessionId': typeof DDesktopIdSSessionIdRoute
+  '/d/$desktopId/t/$terminalId': typeof DDesktopIdTTerminalIdRoute
   '/d/$desktopId/cloud': typeof DDesktopIdCloudIndexRoute
   '/d/$desktopId/monos': typeof DDesktopIdMonosIndexRoute
   '/d/$desktopId/settings': typeof DDesktopIdSettingsIndexRoute
@@ -289,6 +297,7 @@ export interface FileRoutesById {
   '/d/$desktopId/': typeof DDesktopIdIndexRoute
   '/desktops/$id/': typeof DesktopsIdIndexRoute
   '/d/$desktopId/s/$sessionId': typeof DDesktopIdSSessionIdRoute
+  '/d/$desktopId/t/$terminalId': typeof DDesktopIdTTerminalIdRoute
   '/d/$desktopId/cloud/': typeof DDesktopIdCloudIndexRoute
   '/d/$desktopId/monos/': typeof DDesktopIdMonosIndexRoute
   '/d/$desktopId/settings/': typeof DDesktopIdSettingsIndexRoute
@@ -324,6 +333,7 @@ export interface FileRouteTypes {
     | '/d/$desktopId/'
     | '/desktops/$id/'
     | '/d/$desktopId/s/$sessionId'
+    | '/d/$desktopId/t/$terminalId'
     | '/d/$desktopId/cloud/'
     | '/d/$desktopId/monos/'
     | '/d/$desktopId/settings/'
@@ -356,6 +366,7 @@ export interface FileRouteTypes {
     | '/d/$desktopId'
     | '/desktops/$id'
     | '/d/$desktopId/s/$sessionId'
+    | '/d/$desktopId/t/$terminalId'
     | '/d/$desktopId/cloud'
     | '/d/$desktopId/monos'
     | '/d/$desktopId/settings'
@@ -389,6 +400,7 @@ export interface FileRouteTypes {
     | '/d/$desktopId/'
     | '/desktops/$id/'
     | '/d/$desktopId/s/$sessionId'
+    | '/d/$desktopId/t/$terminalId'
     | '/d/$desktopId/cloud/'
     | '/d/$desktopId/monos/'
     | '/d/$desktopId/settings/'
@@ -558,6 +570,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DDesktopIdSettingsIndexRouteImport
       parentRoute: typeof DDesktopIdRouteRoute
     }
+    '/d/$desktopId/t/$terminalId': {
+      id: '/d/$desktopId/t/$terminalId'
+      path: '/t/$terminalId'
+      fullPath: '/d/$desktopId/t/$terminalId'
+      preLoaderRoute: typeof DDesktopIdTTerminalIdRouteImport
+      parentRoute: typeof DDesktopIdRouteRoute
+    }
     '/d/$desktopId/terminal/': {
       id: '/d/$desktopId/terminal/'
       path: '/terminal'
@@ -648,6 +667,7 @@ declare module '@tanstack/react-router' {
 interface DDesktopIdRouteRouteChildren {
   DDesktopIdIndexRoute: typeof DDesktopIdIndexRoute
   DDesktopIdSSessionIdRoute: typeof DDesktopIdSSessionIdRoute
+  DDesktopIdTTerminalIdRoute: typeof DDesktopIdTTerminalIdRoute
   DDesktopIdCloudIndexRoute: typeof DDesktopIdCloudIndexRoute
   DDesktopIdMonosIndexRoute: typeof DDesktopIdMonosIndexRoute
   DDesktopIdSettingsIndexRoute: typeof DDesktopIdSettingsIndexRoute
@@ -668,6 +688,7 @@ interface DDesktopIdRouteRouteChildren {
 const DDesktopIdRouteRouteChildren: DDesktopIdRouteRouteChildren = {
   DDesktopIdIndexRoute: DDesktopIdIndexRoute,
   DDesktopIdSSessionIdRoute: DDesktopIdSSessionIdRoute,
+  DDesktopIdTTerminalIdRoute: DDesktopIdTTerminalIdRoute,
   DDesktopIdCloudIndexRoute: DDesktopIdCloudIndexRoute,
   DDesktopIdMonosIndexRoute: DDesktopIdMonosIndexRoute,
   DDesktopIdSettingsIndexRoute: DDesktopIdSettingsIndexRoute,

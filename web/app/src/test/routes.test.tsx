@@ -1,6 +1,6 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
@@ -103,7 +103,6 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
     fullPath: "/d/$desktopId/monos/$monoId/profile/file/$name",
   },
   { url: "/d/dk1/cloud", route: "/d/:desktopId/cloud", params: { desktopId: "dk1" }, fullPath: "/d/$desktopId/cloud/" },
-  { url: "/d/dk1/terminal", route: "/d/:desktopId/terminal", params: { desktopId: "dk1" }, fullPath: "/d/$desktopId/terminal/" },
   {
     url: "/d/dk1/settings",
     route: "/d/:desktopId/settings",
@@ -160,9 +159,6 @@ const SCREENS: Record<string, string> = {
   // U-17 (WS-C): the cloud instance list, framed by the workspace with its "Cloud" h1.
   "/d/dk1/cloud": "Cloud",
   "/d/:desktopId/cloud": "Cloud",
-  // The terminal page (N-26), framed by the workspace with its "Terminal" h1.
-  "/d/dk1/terminal": "Terminal",
-  "/d/:desktopId/terminal": "Terminal",
   // U-05 (WS-P): the file browser, with its "Files" h1 (the splat stays in the route params).
   "/d/dk1/p/p1/files/src/main.rs": "Files",
   "/d/:desktopId/p/:projectId/files/*": "Files",
@@ -236,6 +232,20 @@ describe("route stubs", () => {
     else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
   });
 
+  it("sends the old /d/:desktopId/terminal URL to the workspace home (the terminal is a footer chip now)", async () => {
+    const router = await renderAt("/d/dk1");
+    await act(async () => {
+      await router.navigate({ to: "/d/$desktopId/terminal", params: { desktopId: "dk1" } });
+    });
+    await waitFor(() => expect(router.state.location.pathname).toBe("/d/dk1"));
+    expect(router.state.matches.at(-1)?.fullPath).toBe("/d/$desktopId/");
+  });
+
+  it("has the terminal tab route /d/:desktopId/t/:terminalId", async () => {
+    const router = await renderAt("/d/dk1");
+    expect(Object.values(router.routesById).map((route) => route.fullPath)).toContain("/d/$desktopId/t/$terminalId");
+  });
+
   it("keeps the brand a link home everywhere, and /install offers a way back into the app", async () => {
     await renderAt("/install");
     expect(screen.getByRole("link", { name: "Monoptah" })).toHaveAttribute("href", "/");
@@ -280,7 +290,9 @@ describe("route stubs", () => {
     const generated = Object.values(router.routesById).map((r) => r.fullPath);
     const covered = new Set(CASES.map((c) => c.fullPath));
     // Pathless layouts (root, the d/$desktopId layout) render through their children.
-    const layouts = new Set(["/", "/d/$desktopId"]);
+    // The terminal tab URL renders nothing itself (the tabbed chat draws the tab) and the old /terminal URL redirects:
+    // both have their own tests above.
+    const layouts = new Set(["/", "/d/$desktopId", "/d/$desktopId/t/$terminalId", "/d/$desktopId/terminal/"]);
     const missing = [...new Set(generated)].filter((p) => !covered.has(p) && !layouts.has(p));
     expect(missing).toEqual([]);
   });

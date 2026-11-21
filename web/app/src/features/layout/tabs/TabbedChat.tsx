@@ -16,6 +16,8 @@ import { createPortal } from "react-dom";
 import { MonoScreen } from "@/features/monos/MonoScreen";
 import "@/features/sessions/register";
 import { SessionScreen } from "@/features/sessions/SessionScreen";
+import { TerminalCloseConfirm } from "@/features/terminal/TerminalCloseConfirm";
+import { TerminalTab } from "@/features/terminal/TerminalTab";
 import { PaneHosts } from "./paneHosts";
 import { PaneContext } from "./PaneContext";
 import { PaneDivider } from "./PaneDivider";
@@ -30,6 +32,7 @@ import { useTabActions, type Size, type TabActions } from "./useTabActions";
 function TabScreen({ desktopId, tabKey }: { desktopId: string; tabKey: TabKey }) {
   const tab = parseTab(tabKey);
   if (!tab) return null;
+  if (tab.kind === "terminal") return <TerminalTab key={tab.id} id={tab.id} />;
   return tab.kind === "session" ? <SessionScreen key={tab.id} desktopId={desktopId} sessionId={tab.id} /> : <MonoScreen key={tab.id} desktopId={desktopId} monoId={tab.id} />;
 }
 
@@ -188,6 +191,7 @@ export function TabbedChat({ desktopId, children }: { desktopId: string; childre
   return (
     <div ref={ref} data-testid="tabbed-chat" data-panes={visible.length} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
       <Tree node={root} path={[]} context={context} hosts={hosts} />
+      <TerminalCloseConfirm />
       {visible.map((id) => {
         const pane = ws.panes[id];
         return pane ? createPortal(<PaneView pane={pane} context={context} />, hosts.of(id), id) : null;

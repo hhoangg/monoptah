@@ -17,6 +17,8 @@ import {
   PutGrantBody,
   RequestGrantBody,
   SelectionTicketResponse,
+  TerminalTicketBody,
+  TerminalTicketResponse,
 } from "@monoptah/protocol";
 import { queryOptions, useQuery, type QueryClient } from "@tanstack/react-query";
 import { apiFetch, endpoint, isApiError } from "@/features/accounts/api";
@@ -48,6 +50,7 @@ export const desktopEndpoints = {
   requestGrant: endpoint("POST", "/api/desktops/:id/grants", GrantResponse, RequestGrantBody),
   putGrant: endpoint("PUT", "/api/desktops/:id/grants/:deviceId", GrantResponse, PutGrantBody),
   selectionTicket: endpoint("POST", "/api/desktops/:id/grants/:deviceId/selection-ticket", SelectionTicketResponse),
+  terminalTicket: endpoint("POST", "/api/desktops/:id/grants/:deviceId/terminal-ticket", TerminalTicketResponse, TerminalTicketBody),
 };
 
 // --- Query keys ---
@@ -226,6 +229,16 @@ export async function revokeGrant(queryClient: QueryClient, desktopId: string, d
  */
 export async function requestSelectionTicket(desktopId: string, deviceId: string): Promise<string> {
   const { ticket } = await withFreshAuth(() => apiFetch(desktopEndpoints.selectionTicket, { params: { id: desktopId, deviceId } }));
+  return ticket;
+}
+
+/**
+ * A single-use ticket (60 s) that proves a fresh passkey re-auth to the desktop for opening a terminal in `projectId`.
+ * Fresh route, like `requestSelectionTicket`: the passkey prompt shows when the server asks for it. The ticket is bound
+ * to this user, desktop, device and project, travels to the desktop inside `terminal.open` and is never stored or logged.
+ */
+export async function requestTerminalTicket(desktopId: string, deviceId: string, projectId: string): Promise<string> {
+  const { ticket } = await withFreshAuth(() => apiFetch(desktopEndpoints.terminalTicket, { params: { id: desktopId, deviceId }, body: { projectId } }));
   return ticket;
 }
 

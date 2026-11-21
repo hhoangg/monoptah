@@ -301,6 +301,12 @@ export const DesktopGrantsResponse = z.object({ grants: z.array(DesktopGrantSche
 export const SelectionTicketResponse = z.object({ ticket: z.string().min(1).max(256), expiresAt: z.number() });
 /** `POST /api/desktop/grants/:deviceId/selection-ticket`: the desktop verifies (and consumes) a ticket the web sent it. */
 export const DesktopSelectionTicketBody = z.object({ ticket: z.string().min(1).max(256) });
+/** `POST /api/desktops/:id/grants/:deviceId/terminal-ticket`: the project the terminal will open in (the ticket is bound to it). */
+export const TerminalTicketBody = z.object({ projectId: z.string().min(1).max(256) });
+/** Same shape as a selection ticket: single use, 60 s, bound to one user, desktop, device and project. */
+export const TerminalTicketResponse = SelectionTicketResponse;
+/** `POST /api/desktop/grants/:deviceId/terminal-ticket`: the desktop verifies (and consumes) a ticket the web sent over E2E with `terminal.open`. */
+export const DesktopTerminalTicketBody = z.object({ ticket: z.string().min(1).max(256), projectId: z.string().min(1).max(256) });
 /** The desktop reports what it applied. `revoked` calls `room.revoke` for the device. */
 export const DesktopGrantStateBody = z.object({ state: GrantState, permission: Permission.optional() });
 
@@ -537,6 +543,8 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "GET", path: "/api/desktop/grants", auth: "token:grants", module: "grants", request: {}, response: DesktopGrantsResponse }),
   r({ method: "POST", path: "/api/desktops/:id/grants/:deviceId/selection-ticket", auth: "fresh", module: "grants", owner: true, request: { params: desktopDeviceParams }, response: SelectionTicketResponse }),
   r({ method: "POST", path: "/api/desktop/grants/:deviceId/selection-ticket", auth: "token:grants", module: "grants", request: { params: deviceIdParam, body: DesktopSelectionTicketBody }, response: Ok }),
+  r({ method: "POST", path: "/api/desktops/:id/grants/:deviceId/terminal-ticket", auth: "fresh", module: "grants", owner: true, request: { params: desktopDeviceParams, body: TerminalTicketBody }, response: TerminalTicketResponse }),
+  r({ method: "POST", path: "/api/desktop/grants/:deviceId/terminal-ticket", auth: "token:grants", module: "grants", request: { params: deviceIdParam, body: DesktopTerminalTicketBody }, response: Ok }),
   r({ method: "POST", path: "/api/desktop/grants/:deviceId/state", auth: "token:grants", module: "grants", request: { params: deviceIdParam, body: DesktopGrantStateBody }, response: Ok }),
 
   r({ method: "GET", path: "/api/push/vapid-key", auth: "public", module: "push", request: {}, response: VapidKeyResponse }),

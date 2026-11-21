@@ -4,9 +4,9 @@ import { TerminalController } from "./controller";
 import { INPUT_DROPPED_NOTICE, INPUT_LOST_NOTICE } from "./copy";
 import { fromBase64 } from "./input";
 import type { ResumeEntry, ResumeStore } from "./resume";
+import { ReauthCancelledError } from "@/features/accounts/queries";
 import { FakeError, FakeLink, FakeScreen, b64, readResult } from "./testing";
 
-const CHALLENGE = { challengeId: "chal-1", expiresInMs: 60_000, codeLength: 6, attempts: 3 };
 const OPENED = { terminalId: "term-1", cols: 80, rows: 24, cwd: "Example Alpha", idleTimeoutMs: 900_000, maxDurationMs: 28_800_000 };
 
 class MemoryStore implements ResumeStore {
@@ -26,6 +26,8 @@ const advance = async (ms: number): Promise<void> => {
 };
 
 interface Rig {
+  tickets: string[];
+  requestTicket: ReturnType<typeof vi.fn<(projectId: string) => Promise<string>>>;
   link: FakeLink;
   screen: FakeScreen;
   store: MemoryStore;
@@ -36,18 +38,19 @@ function rig(): Rig {
   const link = new FakeLink();
   const screen = new FakeScreen();
   const store = new MemoryStore();
-  const controller = new TerminalController({ link, store });
+  const tickets: string[] = [];
+  const requestTicket = vi.fn(async (projectId: string) => {
+    tickets.push(projectId);
+    return "ticket-1";
+  });
+  const controller = new TerminalController({ link, store, requestTicket });
   controller.attachScreen(screen);
-  return { link, screen, store, controller };
+  return { tickets, requestTicket, link, screen, store, controller };
 }
 
 /** Walks the open flow to a running shell and leaves its first read waiting. */
 async function running(r: Rig): Promise<void> {
   void r.controller.begin({ projectId: "p1" });
-  await settle();
-  r.link.open("terminal.open")[0]!.resolve(CHALLENGE);
-  await settle();
-  void r.controller.submitCode("ab23cd");
   await settle();
   r.link.open("terminal.open")[0]!.resolve(OPENED);
   await settle();
@@ -61,119 +64,82 @@ afterEach(() => {
 });
 
 describe("open flow", () => {
-  it("step 1 sends the project, folder and window size and waits for the code; step 2 sends challenge and code in capitals", async () => {
+  it("asks for a passkey ticket for the project, then opens in one step with the ticket, the folder and the window size", async () => {
     const r = rig();
     r.screen.dims = { cols: 120, rows: 40 };
     r.controller.attachScreen(r.screen);
     void r.controller.begin({ projectId: "p1", subdir: " src/app " });
     await settle();
     expect(r.controller.getSnapshot().phase).toBe("starting");
-    const first = r.link.open("terminal.open")[0]!;
-    expect(first.params).toEqual({ projectId: "p1", subdir: "src/app", cols: 120, rows: 40 });
-    first.resolve(CHALLENGE);
-    await settle();
-    const waiting = r.controller.getSnapshot();
-    expect(waiting.phase).toBe("code");
-    expect(waiting.challenge).toMatchObject({ challengeId: "chal-1", codeLength: 6, attempts: 3, attemptsLeft: 3, expiresAt: 1_060_000 });
-    void r.controller.submitCode(" ab 23cd ");
-    await settle();
-    expect(r.controller.getSnapshot().phase).toBe("verifying");
-    const second = r.link.open("terminal.open")[0]!;
-    expect(second.params).toEqual({ projectId: "p1", subdir: "src/app", cols: 120, rows: 40, challengeId: "chal-1", code: "AB23CD" });
-    second.resolve(OPENED);
+    expect(r.tickets).toEqual(["p1"]);
+    const open = r.link.open("terminal.open");
+    expect(open).toHaveLength(1);
+    expect(open[0]!.params).toEqual({ projectId: "p1", subdir: "src/app", cols: 120, rows: 40, ticket: "ticket-1" });
+    open[0]!.resolve(OPENED);
     await settle();
     expect(r.controller.getSnapshot()).toMatchObject({ phase: "running", session: { terminalId: "term-1", cwd: "Example Alpha" } });
     expect(r.store.entry).toMatchObject({ terminalId: "term-1", next: 0 });
+  });
+
+  it("sends nothing to the desktop while the passkey prompt is open, and nothing at all when it is cancelled", async () => {
+    const r = rig();
+    let release: (ticket: string) => void = () => undefined;
+    r.requestTicket.mockImplementationOnce(() => new Promise<string>((resolve) => (release = resolve)));
+    void r.controller.begin({ projectId: "p1" });
+    await settle();
+    expect(r.controller.getSnapshot().phase).toBe("starting");
+    expect(r.link.calls).toHaveLength(0);
+    release("ticket-9");
+    await settle();
+    expect(r.link.open("terminal.open")[0]!.params).toMatchObject({ ticket: "ticket-9" });
+
+    const cancelled = rig();
+    cancelled.requestTicket.mockRejectedValueOnce(new ReauthCancelledError());
+    await cancelled.controller.begin({ projectId: "p1" });
+    expect(cancelled.link.calls).toHaveLength(0);
+    expect(cancelled.controller.getSnapshot()).toMatchObject({ phase: "failed", error: expect.stringContaining("cancelled") });
+  });
+
+  it("a refused ticket request (forbidden) fails with a message and never calls the desktop", async () => {
+    const r = rig();
+    r.requestTicket.mockRejectedValueOnce(new FakeError("forbidden"));
+    await r.controller.begin({ projectId: "p1" });
+    expect(r.link.calls).toHaveLength(0);
+    expect(r.controller.getSnapshot()).toMatchObject({ phase: "failed", error: expect.stringContaining("not allowed") });
+  });
+
+  it("every open asks for its own ticket", async () => {
+    const r = rig();
+    r.requestTicket.mockResolvedValueOnce("first").mockResolvedValueOnce("second");
+    void r.controller.begin({ projectId: "p1" });
+    await settle();
+    r.link.open("terminal.open")[0]!.reject(new FakeError("busy"));
+    await settle();
+    void r.controller.begin({ projectId: "p1" });
+    await settle();
+    expect(r.link.all("terminal.open").map((call) => call.params["ticket"])).toEqual(["first", "second"]);
   });
 
   it("leaves an empty folder out and refuses an unsafe one before any request", async () => {
     const r = rig();
     void r.controller.begin({ projectId: "p1", subdir: "  " });
     await settle();
-    expect(r.link.open("terminal.open")[0]!.params).toEqual({ projectId: "p1", cols: 80, rows: 24 });
+    expect(r.link.open("terminal.open")[0]!.params).toEqual({ projectId: "p1", cols: 80, rows: 24, ticket: "ticket-1" });
     const other = rig();
     await other.controller.begin({ projectId: "p1", subdir: "../etc" });
     expect(other.link.calls).toHaveLength(0);
+    expect(other.requestTicket).not.toHaveBeenCalled();
     expect(other.controller.getSnapshot()).toMatchObject({ phase: "failed", error: expect.stringContaining("not allowed") });
   });
 
-  it("does not send a code of the wrong length: it would burn an attempt", async () => {
-    const r = rig();
-    void r.controller.begin({ projectId: "p1" });
-    await settle();
-    r.link.open("terminal.open")[0]!.resolve(CHALLENGE);
-    await settle();
-    await r.controller.submitCode("AB2");
-    expect(r.link.open("terminal.open")).toHaveLength(0);
-    expect(r.controller.getSnapshot()).toMatchObject({ phase: "code", notice: "Enter all 6 characters of the code." });
-  });
-
-  it("reauth_failed keeps the challenge, counts the tries down and lets the user retype", async () => {
-    const r = rig();
-    void r.controller.begin({ projectId: "p1" });
-    await settle();
-    r.link.open("terminal.open")[0]!.resolve(CHALLENGE);
-    await settle();
-    void r.controller.submitCode("WRONG1");
-    await settle();
-    r.link.open("terminal.open")[0]!.reject(new FakeError("reauth_failed"));
-    await settle();
-    expect(r.controller.getSnapshot()).toMatchObject({ phase: "code", notice: "That code is not right. 2 tries left.", challenge: { challengeId: "chal-1", attemptsLeft: 2 } });
-    void r.controller.submitCode("WRONG2");
-    await settle();
-    r.link.open("terminal.open")[0]!.reject(new FakeError("reauth_failed"));
-    await settle();
-    expect(r.controller.getSnapshot().notice).toBe("That code is not right. 1 try left.");
-    void r.controller.submitCode("AB23CD");
-    await settle();
-    expect(r.link.all("terminal.open").at(-1)!.params).toMatchObject({ challengeId: "chal-1", code: "AB23CD" });
-    r.link.open("terminal.open")[0]!.resolve(OPENED);
-    await settle();
-    expect(r.controller.getSnapshot().phase).toBe("running");
-  });
-
-  it("reauth_required restarts with a new challenge and says so", async () => {
-    const r = rig();
-    void r.controller.begin({ projectId: "p1", subdir: "src" });
-    await settle();
-    r.link.open("terminal.open")[0]!.resolve(CHALLENGE);
-    await settle();
-    void r.controller.submitCode("WRONG3");
-    await settle();
-    r.link.open("terminal.open")[0]!.reject(new FakeError("reauth_required"));
-    await settle();
-    // The restart is step 1 again, same project and folder, with no code.
-    const restart = r.link.open("terminal.open")[0]!;
-    expect(restart.params).toEqual({ projectId: "p1", subdir: "src", cols: 80, rows: 24 });
-    restart.resolve({ ...CHALLENGE, challengeId: "chal-2" });
-    await settle();
-    expect(r.controller.getSnapshot()).toMatchObject({ phase: "code", challenge: { challengeId: "chal-2", attemptsLeft: 3 }, notice: expect.stringContaining("new code") });
-  });
-
-  it("a code that runs out of time is marked expired, is not sent, and restart() asks for a new one", async () => {
-    const r = rig();
-    void r.controller.begin({ projectId: "p1" });
-    await settle();
-    r.link.open("terminal.open")[0]!.resolve(CHALLENGE);
-    await settle();
-    await advance(60_001);
-    expect(r.controller.getSnapshot().codeExpired).toBe(true);
-    await r.controller.submitCode("AB23CD");
-    expect(r.link.open("terminal.open")).toHaveLength(0);
-    void r.controller.restart();
-    await settle();
-    r.link.open("terminal.open")[0]!.resolve({ ...CHALLENGE, challengeId: "chal-2" });
-    await settle();
-    expect(r.controller.getSnapshot()).toMatchObject({ phase: "code", codeExpired: false, challenge: { challengeId: "chal-2" } });
-  });
-
   it.each([
+    ["fresh_required", "passkey"],
     ["disabled", "Allow web terminal"],
     ["read_only", "only read"],
     ["not_selected", "not shared"],
     ["busy", "too many"],
     ["unsupported", "Update Monoptah"],
-  ])("a refused step 1 (%s) fails with a message that says what to do", async (code, text) => {
+  ])("a refused open (%s) fails with a message that says what to do", async (code, text) => {
     const r = rig();
     void r.controller.begin({ projectId: "p1" });
     await settle();
@@ -182,24 +148,41 @@ describe("open flow", () => {
     expect(r.controller.getSnapshot()).toMatchObject({ phase: "failed", error: expect.stringContaining(text) });
   });
 
-  it("never accepts a shell from step 1 (no code asked for)", async () => {
-    const r = rig();
-    void r.controller.begin({ projectId: "p1" });
-    await settle();
-    r.link.open("terminal.open")[0]!.resolve(OPENED);
-    await settle();
-    expect(r.controller.getSnapshot().phase).toBe("failed");
-    expect(r.link.open("terminal.read")).toHaveLength(0);
-  });
-
-  it("cancel goes back to idle and a late answer changes nothing", async () => {
+  it("cancel goes back to idle and a late ticket or answer changes nothing", async () => {
     const r = rig();
     void r.controller.begin({ projectId: "p1" });
     await settle();
     r.controller.cancel();
-    r.link.open("terminal.open")[0]!.resolve(CHALLENGE);
+    r.link.open("terminal.open")[0]!.resolve(OPENED);
     await settle();
     expect(r.controller.getSnapshot().phase).toBe("idle");
+    expect(r.link.open("terminal.read")).toHaveLength(0);
+    expect(r.link.all("terminal.close").map((c) => c.params)).toEqual([{ terminalId: "term-1" }]);
+
+    const late = rig();
+    let release: (ticket: string) => void = () => undefined;
+    late.requestTicket.mockImplementationOnce(() => new Promise<string>((resolve) => (release = resolve)));
+    void late.controller.begin({ projectId: "p1" });
+    await settle();
+    late.controller.cancel();
+    release("late");
+    await settle();
+    expect(late.link.calls).toHaveLength(0);
+    expect(late.controller.getSnapshot().phase).toBe("idle");
+  });
+});
+
+describe("closing while the open is in flight", () => {
+  it("close sends terminal.close for the shell that answers late and leaves no session", async () => {
+    const r = rig();
+    void r.controller.begin({ projectId: "p1" });
+    await settle();
+    await r.controller.close();
+    r.link.open("terminal.open")[0]!.resolve(OPENED);
+    await settle();
+    expect(r.link.all("terminal.close").map((c) => c.params)).toEqual([{ terminalId: "term-1" }]);
+    expect(r.controller.getSnapshot().phase).toBe("idle");
+    expect(r.link.open("terminal.read")).toHaveLength(0);
   });
 });
 
@@ -471,7 +454,7 @@ describe("a dropped link", () => {
 
   it("does not wait for a screen it does not have before reading", async () => {
     const link = new FakeLink();
-    const controller = new TerminalController({ link });
+    const controller = new TerminalController({ link, requestTicket: async () => "ticket" });
     controller.resume({ terminalId: "term-9", next: 0, cwd: "x", idleTimeoutMs: 1, maxDurationMs: 1, openedAt: 1 });
     await settle();
     expect(link.open("terminal.read")).toHaveLength(0);

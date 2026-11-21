@@ -29,6 +29,8 @@ import { CommandPalette } from "./CommandPalette";
 import { SessionListPane } from "@/features/sessions/SessionListPane";
 import { ActivityRail } from "./ActivityRail";
 import { ChatPane } from "./ChatPane";
+import { FooterBar } from "./FooterBar";
+import { TerminalDrawer } from "@/features/terminal/TerminalDrawer";
 import { PANEL_WIDTH, SESSION_LIST_WIDTH, SIDEBAR_WIDTH, TABLET_SIDEBAR_WIDTH, dockedPanelMax, sessionListMax, useLayoutPrefs } from "./layoutPrefs";
 import { openCommandPalette } from "./palette";
 import { setPanelScope } from "./panels";
@@ -153,6 +155,8 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
   const visiblePanel = useVisiblePanel(desktopId, projectId);
   // The project routes have no title in the chat pane (the New session page), so the session list names the project (h1).
   const projectRoute = useRouterState({ select: (state) => /\/p\/[^/]+(\/new)?\/?$/.test(state.location.pathname) });
+  // On a phone the footer belongs to the workspace screen (the home of the desktop); from 640px it is on every screen.
+  const workspaceHome = useRouterState({ select: (state) => state.location.pathname.replace(/\/$/, "") === `/d/${desktopId}` });
   useGlobalShortcuts();
 
   useEffect(() => {
@@ -187,6 +191,8 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
         <ChatPane desktopId={desktopId}>{children}</ChatPane>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}
       </div>
+      {wide || workspaceHome ? <FooterBar desktopId={desktopId} tabbed={wide} /> : null}
+      {wide ? null : <TerminalDrawer />}
       {mode === "docked" ? null : <RightPanel mode={mode} desktopId={desktopId} projectId={projectId} />}
       <CommandPalette desktopId={desktopId} />
       <BackgroundDialog />

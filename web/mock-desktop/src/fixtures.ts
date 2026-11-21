@@ -680,8 +680,8 @@ export interface HandlerContext {
 
 type ParamsFor<M extends MethodName> = z.output<(typeof METHODS)[M]["params"]>;
 export type FixtureHandler<M extends MethodName> = (params: ParamsFor<M>, ctx: HandlerContext) => ResultOf<M>;
-/** `file.prepare` answers after the upload to the server and `terminal.read` is a long poll, so their handlers are async. */
-type AsyncFixtureMethod = "file.prepare" | "terminal.read";
+/** `file.prepare` answers after the upload to the server, `terminal.open` after the ticket check with the Worker and `terminal.read` is a long poll, so their handlers are async. */
+type AsyncFixtureMethod = "file.prepare" | "terminal.open" | "terminal.read";
 type HandlerOf<M extends MethodName> = M extends AsyncFixtureMethod ? (params: ParamsFor<M>, ctx: HandlerContext) => Promise<ResultOf<M>> : FixtureHandler<M>;
 
 function project(world: MockWorld, projectId: string): void {
@@ -1015,7 +1015,7 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: HandlerOf<M> } = {
   "cloud.moveToCloud": (p, { world }) => world.startMove(p.sessionId, true),
   "cloud.moveToLocal": (p, { world }) => world.startMove(p.sessionId, false),
   "cloud.cancelMove": (p, { world }) => world.cancelMove(p.sessionId),
-  "terminal.open": (p, ctx) => {
+  "terminal.open": async (p, ctx) => {
     folderProject(ctx, p.projectId);
     const name = ctx.world.projects().find((project) => project.id === p.projectId)?.name ?? p.projectId;
     return terminalsOf(ctx).open(ctx.device.fingerprint, p, name);

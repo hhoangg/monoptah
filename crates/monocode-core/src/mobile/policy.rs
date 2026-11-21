@@ -286,7 +286,7 @@ impl Code {
             Code::NotPending => "Approval is no longer pending",
             Code::NeedsDesktop => "Answer this request on the desktop",
             Code::WakeRequired => "Sending wakes the stopped cloud instance; confirm to continue",
-            Code::FreshRequired => "Confirm with your passkey again to add projects",
+            Code::FreshRequired => "Confirm with your passkey again",
             Code::ReauthRequired => "Ask for a new code on the desktop",
             Code::ReauthFailed => "That code is not right",
         }

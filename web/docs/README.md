@@ -123,7 +123,7 @@ The old Tauri React app (`src/`) may be reused, but its source will be deleted l
 | Device confirmation | A human approves a new device on the desktop by name and fingerprint |
 | Fingerprint | Lowercase hex SHA-256 of a public key; shown as the first 32 hex chars (128 bits) in 8 groups of 4 |
 | Read-only / control | Per-device permission on the desktop: read methods only, or also mutating methods |
-| Terminal class | Methods `terminal.*`: a real shell on the desktop. Not implied by control: it also needs the desktop-side toggle "Allow web terminal" (default off) and a one-time code shown on the desktop at every open (security.md "Terminal") |
+| Terminal class | Methods `terminal.*`: a real shell on the desktop. Not implied by control: it also needs the desktop-side toggle "Allow web terminal" (default off) and a passkey re-auth proven by a single-use server ticket at every open (security.md "Terminal") |
 | Invite code | One-time code from an existing user that allows registration (expiry, 3 per user by default) |
 | Invite branch | A user and every descendant they invited (`users.invited_by`); admins can block a whole branch |
 | Recovery code | One of 10 one-time codes shown once at registration, stored as HMAC hashes; used to regain access and add a passkey |

@@ -7,15 +7,17 @@
 // the focused pane drives the URL. This follows the VS Code editor-group model; the native app keeps one pane tree per
 // tab instead (crates/monocode-gpui/src/pane_layout.rs), see the "Native parity" note in design-system.md.
 
-/** `s:<sessionId>` or `m:<monoId>`. */
+/** `s:<sessionId>`, `m:<monoId>` or `t:<terminalId>` (a terminal tab; the id is made by the browser). */
 export type TabKey = string;
 
 export const sessionTab = (id: string): TabKey => `s:${id}`;
 export const monoTab = (id: string): TabKey => `m:${id}`;
+export const terminalTab = (id: string): TabKey => `t:${id}`;
 
-export function parseTab(key: TabKey): { kind: "session" | "mono"; id: string } | null {
+export function parseTab(key: TabKey): { kind: "session" | "mono" | "terminal"; id: string } | null {
   if (key.startsWith("s:") && key.length > 2) return { kind: "session", id: key.slice(2) };
   if (key.startsWith("m:") && key.length > 2) return { kind: "mono", id: key.slice(2) };
+  if (key.startsWith("t:") && key.length > 2) return { kind: "terminal", id: key.slice(2) };
   return null;
 }
 

@@ -28,6 +28,7 @@ const ANONYMOUS_ANSWERS = new Map<string, { status: number; code?: string }>([
   ["GET /api/desktop/grants", { status: 401, code: "unauthorized" }],
   ["POST /api/desktop/grants/:deviceId/state", { status: 401, code: "unauthorized" }],
   ["POST /api/desktop/grants/:deviceId/selection-ticket", { status: 401, code: "unauthorized" }],
+  ["POST /api/desktop/grants/:deviceId/terminal-ticket", { status: 401, code: "unauthorized" }],
   ["POST /api/push/notify", { status: 401, code: "unauthorized" }],
   ["GET /relay/desktop/:desktopId", { status: 426, code: "invalid" }],
 ]);

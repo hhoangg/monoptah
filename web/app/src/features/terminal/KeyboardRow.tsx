@@ -10,6 +10,8 @@ export interface KeyboardRowProps {
   /** The text of a key; the caller applies the modifiers and clears them. */
   onSend: (text: string) => void;
   applicationCursor: () => boolean;
+  /** Adds a Paste key at the end of the row (a phone has no paste shortcut). */
+  onPaste?: (() => void) | undefined;
 }
 
 const KEY =
@@ -25,7 +27,7 @@ const ARROWS: ReadonlyArray<{ arrow: Arrow; label: string; glyph: string }> = [
   { arrow: "right", label: "Right arrow", glyph: "→" },
 ];
 
-export function KeyboardRow({ modifiers, onModifiers, onSend, applicationCursor }: KeyboardRowProps) {
+export function KeyboardRow({ modifiers, onModifiers, onSend, applicationCursor, onPaste }: KeyboardRowProps) {
   const key = (label: string, text: string, content?: ReactNode, name = label) => (
     <button key={name} type="button" aria-label={name} data-key={name} className={KEY} onMouseDown={keepFocus} onClick={() => onSend(text)}>
       {content ?? label}
@@ -56,6 +58,11 @@ export function KeyboardRow({ modifiers, onModifiers, onSend, applicationCursor 
         </button>
       ))}
       {SYMBOL_KEYS.map((symbol) => key(symbol, symbol, undefined, `Symbol ${symbol}`))}
+      {onPaste ? (
+        <button type="button" aria-label="Paste" data-key="Paste" className={KEY} onMouseDown={keepFocus} onClick={onPaste}>
+          Paste
+        </button>
+      ) : null}
     </div>
   );
 }

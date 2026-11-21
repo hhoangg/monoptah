@@ -44,6 +44,8 @@ const AUDIT_TITLES: Record<string, string> = {
   "grant.change": "Device access changed",
   "selection.ticket": "Passkey confirmed to add projects to a device",
   "selection.widen": "Selection ticket used",
+  "terminal.ticket": "Passkey confirmed to open a terminal",
+  "terminal.ticket.consumed": "Terminal passkey ticket used",
   "session.logout": "Signed out",
   "session.revoke": "Sessions ended",
   "ratelimit.breach": "Too many requests blocked",

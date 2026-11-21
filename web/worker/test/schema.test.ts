@@ -17,6 +17,7 @@ const SPEC_COLUMNS: Record<string, string[]> = {
   devices: ["id", "user_id", "name", "public_key", "fingerprint", "created_at", "last_seen_at", "revoked_at"],
   device_grants: ["device_id", "desktop_id", "state", "permission", "requested_permission", "confirmed_at", "updated_at"],
   selection_tickets: ["token_hash", "user_id", "desktop_id", "device_id", "created_at", "expires_at", "used_at"],
+  terminal_tickets: ["token_hash", "user_id", "desktop_id", "device_id", "project_id", "created_at", "expires_at", "used_at"],
   push_subscriptions: ["id", "user_id", "device_id", "endpoint", "p256dh", "auth", "vapid_key_id", "ua", "created_at", "last_success_at", "failures"],
   push_prefs: ["user_id", "desktop_id", "enabled", "categories"],
   pairing_requests: ["id", "user_code", "device_code_hash", "challenge", "desktop_public_key", "machine_name", "os", "app_version", "confirmation_code", "status", "user_id", "desktop_id", "created_at", "expires_at", "last_polled_at", "ip_hash"],
@@ -68,6 +69,14 @@ const MIGRATION_0006_INDEXES: [string, string[]][] = [
   ["selection_tickets", ["desktop_id"]],
   ["selection_tickets", ["device_id"]],
   ["selection_tickets", ["expires_at"]],
+];
+
+// Single-use terminal tickets (migration 0007): same index set as the selection tickets.
+const MIGRATION_0007_INDEXES: [string, string[]][] = [
+  ["terminal_tickets", ["user_id"]],
+  ["terminal_tickets", ["desktop_id"]],
+  ["terminal_tickets", ["device_id"]],
+  ["terminal_tickets", ["expires_at"]],
 ];
 
 interface TableInfoRow {
@@ -157,7 +166,7 @@ describe("D1 schema = architecture.md 4.3", () => {
   });
 
   it("has every index of the spec and the cleanup indexes", async () => {
-    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES, ...MIGRATION_0003_INDEXES, ...MIGRATION_0004_INDEXES, ...MIGRATION_0006_INDEXES]) {
+    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES, ...MIGRATION_0003_INDEXES, ...MIGRATION_0004_INDEXES, ...MIGRATION_0006_INDEXES, ...MIGRATION_0007_INDEXES]) {
       const found = await indexes(table);
       expect(found.some((i) => i.columns.join() === columns.join()), `${table}(${columns.join()})`).toBe(true);
     }
