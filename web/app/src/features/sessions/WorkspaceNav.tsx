@@ -7,6 +7,7 @@ import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useCatalog } from "@/data";
 import { requestCreateMono } from "@/features/monos/createRequest";
+import { MonoAvatar } from "@/features/monos/MonoAvatar";
 import { useLinkState } from "@/link";
 import { useCapability } from "@/version";
 import { safeHexColor } from "@/lib/color";
@@ -95,13 +96,7 @@ export function MonoRow({
       aria-current={active ? "page" : undefined}
       className={cn("flex min-h-16 items-center gap-3.5 rounded-[16px] px-2.5 py-2.5 hover:bg-content-a04", active && "bg-selection hover:bg-selection")}
     >
-      <span
-        aria-hidden="true"
-        className="flex size-10 shrink-0 items-center justify-center rounded-pill text-body font-semibold text-white"
-        style={{ backgroundColor: accentFor(mono.name, mono.color) }}
-      >
-        {(mono.name.trim().charAt(0) || "M").toUpperCase()}
-      </span>
+      <MonoAvatar monoId={mono.id} name={mono.name} mascot={mono.mascot} color={mono.color} working={mono.status === "working"} size={40} />
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
         <span className="flex items-center gap-2">
           <span className="min-w-0 flex-1 truncate text-row font-semibold" title={mono.name}>{mono.name}</span>

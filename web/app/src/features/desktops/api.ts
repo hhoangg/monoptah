@@ -146,6 +146,16 @@ export async function setDesktopColor(queryClient: QueryClient, id: string, colo
   return desktop;
 }
 
+/** What a client sends to set the avatar: the emoji, or the base64 of a re-encoded image. Null goes back to initials. */
+export type AvatarChoice = { kind: "emoji"; emoji: string } | { kind: "image"; mime: "image/png" | "image/jpeg" | "image/webp"; data: string } | null;
+
+/** Sets (or clears, with null) the avatar of a desktop, for every web device of the account. */
+export async function setDesktopAvatar(queryClient: QueryClient, id: string, avatar: AvatarChoice): Promise<DesktopSummary> {
+  const { desktop } = await apiFetch(desktopEndpoints.patch, { params: { id }, body: { avatar } });
+  await refreshDesktop(queryClient, id);
+  return desktop;
+}
+
 export interface RevokeDesktopOptions {
   /**
    * Runs after the server revoked the desktop and before its queries are removed. The detail screen

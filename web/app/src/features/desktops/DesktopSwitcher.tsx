@@ -26,6 +26,7 @@ import { requestGrantAndRefresh, useDesktopGrants, useDesktops, type DesktopSumm
 import { safeName } from "./format";
 import { useBlockingLayerShown } from "./blockingLayer";
 import { isLinkBlocking } from "./linkStateModel";
+import { DesktopAvatarBubble } from "./DesktopAvatarFace";
 import { ColorDot, desktopErrorMessage } from "./parts";
 import { markGrantRequested, readLastUsed, sortByLastUsed, touchLastUsed } from "./storage";
 import { useThisDevice } from "./thisDevice";
@@ -104,7 +105,7 @@ export function DesktopSwitcher() {
         onClick={() => setOpen(true)}
         className="flex min-h-11 min-w-0 max-w-full items-center gap-2 rounded-row px-2 text-label font-semibold text-content hover:bg-selection active:opacity-60 pointer-fine:min-h-9"
       >
-        <ColorDot color={current?.color ?? null} />
+        {current?.avatar ? <DesktopAvatarBubble desktop={current} className="size-6" /> : <ColorDot color={current?.color ?? null} />}
         <span className="min-w-0 truncate">{name}</span>
         <OnlineDot online={online} />
         <Icon name="chevronDown" size={16} className="shrink-0 text-faint" />
@@ -157,7 +158,7 @@ function SwitcherRow({ desktop, current, deviceId, onClose }: { desktop: Desktop
         aria-label={current ? `${name}, current desktop` : `Open ${name}`}
         className={cn("flex min-h-11 min-w-0 flex-[1_1_12rem] items-center gap-3 rounded-row px-2 py-1.5 hover:bg-selection active:opacity-60", current && "bg-selection")}
       >
-        <ColorDot color={desktop.color} />
+        {desktop.avatar ? <DesktopAvatarBubble desktop={desktop} /> : <ColorDot color={desktop.color} />}
         <span className="min-w-0 flex-1 text-row wrap-anywhere text-content">{name}</span>
         <OnlineDot online={desktop.online} />
         {current ? <Icon name="check" size={18} className="shrink-0 text-brand-text" /> : null}

@@ -226,10 +226,34 @@ export const PairApproveResponse = z.object({ desktopId: Id, name: z.string() })
 
 // --- Desktops ---
 
+/** Largest decoded avatar image the Worker stores (the browser sends 128 px, a few KiB). */
+export const DESKTOP_AVATAR_MAX_BYTES = 20 * 1024;
+/** Base64 length of `DESKTOP_AVATAR_MAX_BYTES`, so the JSON body stays under the 32 KiB limit. */
+export const DESKTOP_AVATAR_MAX_BASE64 = Math.ceil(DESKTOP_AVATAR_MAX_BYTES / 3) * 4;
+/** The only image formats an avatar may have (never SVG); the Worker checks the magic bytes too. */
+export const DESKTOP_AVATAR_MIMES = ["image/png", "image/jpeg", "image/webp"] as const;
+/** One emoji (pictographs joined by ZWJ, with variation selectors, skin tones and keycap marks), at most 16 UTF-16 units. */
+export const DESKTOP_AVATAR_EMOJI = /^\p{Extended_Pictographic}(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\u200d|\ufe0f|\u20e3)*$/u;
+
+/** The avatar a desktop shows in the activity rail and the switcher: an emoji, or an image served by `GET /api/desktops/:id/avatar?v=<hash>`. */
+export const DesktopAvatarSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("emoji"), emoji: z.string().max(16).regex(DESKTOP_AVATAR_EMOJI) }),
+  z.object({ kind: z.literal("image"), hash: z.string().regex(/^[0-9a-f]{16}$/) }),
+]);
+export type DesktopAvatar = z.infer<typeof DesktopAvatarSchema>;
+
+/** What a client sends: the emoji itself, or the bytes of the re-encoded image in base64 (no `data:` prefix). */
+export const DesktopAvatarInput = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("emoji"), emoji: z.string().max(16).regex(DESKTOP_AVATAR_EMOJI) }),
+  z.object({ kind: z.literal("image"), mime: z.enum(DESKTOP_AVATAR_MIMES), data: z.string().min(1).max(DESKTOP_AVATAR_MAX_BASE64).regex(/^[A-Za-z0-9+/]+={0,2}$/) }),
+]);
+
 export const DesktopSummarySchema = z.object({
   id: Id,
   name: z.string(),
   color: z.string().nullable(),
+  /** Null (or absent from an older Worker) shows the initials. */
+  avatar: DesktopAvatarSchema.nullable().optional(),
   online: z.boolean(),
   /** Pending device confirmations. */
   pendingCount: z.number().int().nonnegative(),
@@ -245,7 +269,12 @@ export const DesktopDirectoryResponse = DesktopSummarySchema.extend({
   /** Full lowercase hex SHA-256 of the public key. */
   fingerprint: z.string(),
 });
-export const PatchDesktopBody = z.object({ name: z.string().trim().min(1).max(64).optional(), color: z.string().max(32).nullable().optional() });
+export const PatchDesktopBody = z.object({
+  name: z.string().trim().min(1).max(64).optional(),
+  color: z.string().max(32).nullable().optional(),
+  /** Null clears the avatar (back to initials). */
+  avatar: DesktopAvatarInput.nullable().optional(),
+});
 export const PatchDesktopResponse = z.object({ desktop: DesktopSummarySchema });
 
 // --- Devices (browsers) ---
@@ -527,6 +556,8 @@ export const API_ROUTES: readonly ApiRoute[] = [
   r({ method: "GET", path: "/api/desktops", auth: "session", module: "desktops", request: {}, response: DesktopsResponse }),
   r({ method: "GET", path: "/api/desktops/:id", auth: "session", module: "desktops", owner: true, request: { params: idParam }, response: DesktopDirectoryResponse }),
   r({ method: "PATCH", path: "/api/desktops/:id", auth: "session", module: "desktops", owner: true, request: { params: idParam, body: PatchDesktopBody }, response: PatchDesktopResponse }),
+  // Binary answer (the stored PNG, JPEG or WebP), not JSON: `response` is only a placeholder.
+  r({ method: "GET", path: "/api/desktops/:id/avatar", auth: "session", module: "desktops", owner: true, request: { params: idParam }, response: z.null() }),
   r({ method: "DELETE", path: "/api/desktops/:id", auth: "fresh", module: "desktops", owner: true, request: { params: idParam }, response: Ok }),
 
   r({ method: "POST", path: "/api/devices", auth: "session", module: "devices", request: { body: RegisterDeviceBody }, response: RegisterDeviceResponse }),

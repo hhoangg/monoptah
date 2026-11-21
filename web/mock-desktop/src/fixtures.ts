@@ -126,7 +126,8 @@ const PROJECTS = [
   { id: "proj-beta", name: "Example Beta", path: "/example/beta", machine: "example-machine", branch: "main", color: "#e0894a", defaultHarness: "claude", defaultModel: "example-model-1" },
 ] as const;
 
-const MONOS = [{ id: "mono-example", name: "Example Mono", projectIds: ["proj-alpha"], unread: 0, status: "idle" }] as const;
+// `mascot` and `color` are what the desktop sends for every Mono (a pixel mascot name and `#rrggbb`).
+const MONOS = [{ id: "mono-example", name: "Example Mono", mascot: "frog", color: "#39c363", projectIds: ["proj-alpha"], unread: 0, status: "idle" }] as const;
 
 export class MockWorld {
   readonly now: () => number;

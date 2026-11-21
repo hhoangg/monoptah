@@ -50,6 +50,11 @@ export function onAvatarColor(hex: string): string {
   return dark >= light ? "var(--on-swatch-dark)" : "var(--on-swatch-light)";
 }
 
+/** The URL of a desktop's image avatar; the hash is the cache key (an image never changes under one hash). */
+export function desktopAvatarUrl(id: string, hash: string): string {
+  return `/api/desktops/${encodeURIComponent(id)}/avatar?v=${encodeURIComponent(hash)}`;
+}
+
 export type GrantCue = "pending" | "revoked" | "none";
 
 /**

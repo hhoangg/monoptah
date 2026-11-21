@@ -6,7 +6,11 @@ import type { DocumentItem, NoticeItem } from "./turnItems";
 
 /** Who a Mono's turns are by, in place of the model and provider mark. */
 export interface TranscriptAgent {
+  /** The Mono's id: the sprite of a Mono is drawn from it and `mascot`. */
+  id?: string;
   name: string;
+  /** The desktop's mascot name; absent (an older desktop) or unknown shows the initial. */
+  mascot?: string;
   /** `#rrggbb`; anything else is ignored. */
   color?: string;
 }

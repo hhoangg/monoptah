@@ -3,12 +3,18 @@
 //   monoptah.layout.sidebarWidth      px, clamped to 320-360 (desktop, resizable)
 //   monoptah.layout.sessionListWidth px, clamped to 240-560 (desktop, resizable: the project's session list, as in the native classic layout)
 //   monoptah.layout.panelWidth        px, clamped to 380-480 (docked right panel, resizable)
+//   monoptah.layout.mode              "classic" | "focused" (the native Appearance > Layout picker): classic shows the
+//                                     session-list column from 1024px, focused leaves it out (the project page is its own screen)
 import { create } from "zustand";
 
 export const SIDEBAR_COLLAPSED_KEY = "monoptah.layout.sidebarCollapsed";
 export const SIDEBAR_WIDTH_KEY = "monoptah.layout.sidebarWidth";
 export const SESSION_LIST_WIDTH_KEY = "monoptah.layout.sessionListWidth";
 export const PANEL_WIDTH_KEY = "monoptah.layout.panelWidth";
+export const LAYOUT_MODE_KEY = "monoptah.layout.mode";
+
+export type LayoutMode = "classic" | "focused";
+export const LAYOUT_MODES: readonly LayoutMode[] = ["classic", "focused"];
 
 export const SIDEBAR_WIDTH = { min: 320, max: 360, default: 320 } as const;
 /**
@@ -77,6 +83,8 @@ interface LayoutPrefsState {
   sidebarWidth: number;
   sessionListWidth: number;
   panelWidth: number;
+  layoutMode: LayoutMode;
+  setLayoutMode: (mode: LayoutMode) => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setSidebarWidth: (width: number) => void;
   setSessionListWidth: (width: number) => void;
@@ -87,8 +95,14 @@ interface LayoutPrefsState {
   persistPanelWidth: () => void;
 }
 
-function load(): Pick<LayoutPrefsState, "sidebarCollapsed" | "sidebarWidth" | "sessionListWidth" | "panelWidth"> {
+/** A stored layout mode; anything but "focused" (missing, unknown) is the classic layout the web shipped with. */
+function readMode(): LayoutMode {
+  return read(LAYOUT_MODE_KEY) === "focused" ? "focused" : "classic";
+}
+
+function load(): Pick<LayoutPrefsState, "sidebarCollapsed" | "sidebarWidth" | "sessionListWidth" | "panelWidth" | "layoutMode"> {
   return {
+    layoutMode: readMode(),
     sidebarCollapsed: read(SIDEBAR_COLLAPSED_KEY) === "1",
     sidebarWidth: readWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_WIDTH),
     sessionListWidth: readWidth(SESSION_LIST_WIDTH_KEY, SESSION_LIST_WIDTH),
@@ -98,6 +112,10 @@ function load(): Pick<LayoutPrefsState, "sidebarCollapsed" | "sidebarWidth" | "s
 
 export const useLayoutPrefs = create<LayoutPrefsState>((set, get) => ({
   ...load(),
+  setLayoutMode: (mode) => {
+    write(LAYOUT_MODE_KEY, mode);
+    set({ layoutMode: mode });
+  },
   setSidebarCollapsed: (collapsed) => {
     write(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
     set({ sidebarCollapsed: collapsed });

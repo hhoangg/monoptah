@@ -17,6 +17,8 @@ export interface SegmentedControlProps<T extends string> {
   value: T;
   onChange: (value: T) => void;
   className?: string;
+  /** The choice does not apply here: every option is inert and the group says so to assistive technology. */
+  disabled?: boolean;
 }
 
 /**
@@ -24,7 +26,7 @@ export interface SegmentedControlProps<T extends string> {
  * that slides in 240ms. It is a single choice, so it is a `radiogroup` with a roving tabindex and
  * Left/Right/Home/End keys, not a tablist (there are no panels to switch).
  */
-export function SegmentedControl<T extends string>({ label, options, value, onChange, className }: SegmentedControlProps<T>) {
+export function SegmentedControl<T extends string>({ label, options, value, onChange, className, disabled = false }: SegmentedControlProps<T>) {
   const group = useId();
   const refs = useRef<Array<HTMLButtonElement | null>>([]);
   const reduceMotion = useReducedMotion();
@@ -55,7 +57,7 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
   }
 
   return (
-    <div role="radiogroup" aria-label={label} className={cn("flex min-h-13 w-full gap-1 rounded-pill bg-fill p-1 pointer-fine:min-h-11 max-[19.9rem]:flex-col max-[19.9rem]:rounded-card", className)}>
+    <div role="radiogroup" aria-label={label} aria-disabled={disabled || undefined} className={cn(disabled && "opacity-50", "flex min-h-13 w-full gap-1 rounded-pill bg-fill p-1 pointer-fine:min-h-11 max-[19.9rem]:flex-col max-[19.9rem]:rounded-card", className)}>
       {options.map((option, index) => {
         const selected = option.value === value;
         return (
@@ -67,6 +69,7 @@ export function SegmentedControl<T extends string>({ label, options, value, onCh
             type="button"
             role="radio"
             aria-checked={selected}
+            disabled={disabled}
             tabIndex={selected ? 0 : -1}
             onClick={() => select(index)}
             onKeyDown={(event) => onKeyDown(event, index)}

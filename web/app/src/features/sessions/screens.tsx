@@ -3,6 +3,7 @@ import { Link } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useCatalog } from "@/data";
+import { useLayoutPrefs } from "@/features/layout/layoutPrefs";
 import { ProjectBar } from "@/features/layout/ProjectBar";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
@@ -125,7 +126,10 @@ export const SPLIT_QUERY = "(min-width: 64rem)";
  * a rotation or a window resize keeps the typed draft, the attachments and the chosen model.
  */
 export function ProjectRoute({ desktopId, projectId, page }: { desktopId: string; projectId: string; page: "sessions" | "new" }) {
-  const split = useMediaQuery(SPLIT_QUERY);
+  const wideEnough = useMediaQuery(SPLIT_QUERY);
+  const classic = useLayoutPrefs((state) => state.layoutMode) === "classic";
+  // The focused layout keeps the project page and New session as separate pages, like a tablet.
+  const split = wideEnough && classic;
   // The element of the host that holds focus. React removes the old slot (and the host with it) before the new slot's
   // ref runs, which drops the focus, so it is remembered here and given back once the host is placed again. A blur
   // while the host is still in the document is a real one and clears it.

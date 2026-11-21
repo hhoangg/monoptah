@@ -287,6 +287,9 @@ const SESSION_TITLE: &str = "E2E session";
 /// The Mono published when `WEB_LINK_HEADLESS_MONO` is set, and its conversation id (`mono:<id>`).
 const MONO_ID: &str = "e2e-mono";
 const MONO_CONVERSATION: &str = "mono:e2e-mono";
+/// The look of the published Mono (web/e2e/lib/catalog.ts): one of the ten project mascots, in a Mono swatch.
+const MONO_MASCOT: &str = "frog";
+const MONO_COLOR: &str = "#39c363";
 
 /// Whether the environment asks for the Mono (see the module docs).
 fn mono_enabled() -> bool {
@@ -522,10 +525,17 @@ impl Conversation {
 
 /// The catalog the fake app publishes (the values of `web/e2e/lib/catalog.ts`).
 fn e2e_catalog() -> Value {
-    let monos = if mono_enabled() {
+    catalog_with_mono(mono_enabled())
+}
+
+fn catalog_with_mono(with_mono: bool) -> Value {
+    let monos = if with_mono {
         json!([{
             "id": MONO_ID,
             "name": "E2E Mono",
+            // What the app sends for every Mono: a pixel mascot name and a `#rrggbb` color (`mobile_host.rs`).
+            "mascot": MONO_MASCOT,
+            "color": MONO_COLOR,
             "projectIds": [PROJECT_ID],
             "unread": 0,
             "status": "idle",
@@ -1532,6 +1542,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_published_mono_carries_a_known_mascot_and_a_hex_color_like_the_app() {
+        let catalog = catalog_with_mono(true);
+        let mono = &catalog["monos"][0];
+        let mascot = mono["mascot"].as_str().expect("mascot");
+        assert!(monocode_core::project_appearance::MASCOTS.contains(&mascot));
+        let color = mono["color"].as_str().expect("color");
+        assert!(
+            color.len() == 7
+                && color.starts_with('#')
+                && color[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        );
+        assert_eq!(catalog_with_mono(false)["monos"], json!([]));
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

@@ -227,6 +227,10 @@ Outside every project the same credential places are also refused as folders or 
 
 The user can add patterns per project; the defaults cannot be removed by a remote device. The matcher runs in core so it is unit-tested once and reaches every caller (project rule "fix in the shared component").
 
+### Desktop avatar uploads
+
+`PATCH /api/desktops/:id` takes an `avatar` (an emoji, or the base64 of an image) and `GET /api/desktops/:id/avatar` serves it. Both are owner-only session routes with the usual Origin and CSRF checks. The browser re-encodes the picture to 128 px; the Worker does not trust that. It decodes the base64, refuses more than 20 KiB, accepts only a PNG, JPEG or WebP by its magic bytes (SVG, HTML and GIF are refused whatever `mime` says; the claimed `mime` is ignored), stores the text in D1 (`desktops.avatar_image`) and answers with the `Content-Type` of the sniffed bytes, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox` and `Cache-Control: no-store`. The page only ever shows it through `<img src>` (CSP `img-src 'self'`), never inline, so no script can run. An emoji must match one pictograph sequence (at most 16 UTF-16 units). The list answers carry a 16-hex hash instead of the bytes.
+
 ### File transfers
 
 `file.prepare` (capability `fileTransfer`) replaced streaming file content through the relay for the web (images, html previews

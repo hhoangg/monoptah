@@ -23,6 +23,7 @@ vi.mock("@/version", () => ({ useCapability: (name: string) => (name === "termin
 import { ActivityRail } from "./ActivityRail";
 
 let restore: (() => void) | undefined;
+let fake: ReturnType<typeof createFakeServer>;
 
 function Rail() {
   const { desktopId } = useParams({ strict: false }) as { desktopId: string };
@@ -36,7 +37,7 @@ beforeEach(() => {
   localStorage.clear();
   resetLinkStore("d1");
   getLinkStore("d1").setState({ status: "ready", desktopName: "Studio Mac", presence: "online" });
-  const server = createFakeServer({
+  const server = (fake = createFakeServer({
     desktops: [
       desktop({ id: "d1", name: "Studio Mac", online: true, color: "#459cf7" }),
       desktop({ id: "d2", name: "Linux box", color: null, online: false }),
@@ -47,12 +48,35 @@ beforeEach(() => {
       d2: [grant({ deviceId: "dev1", state: "confirmed" })],
       d3: [grant({ deviceId: "dev1", state: "confirmed" })],
     },
-  });
+  }));
   restore = setApiTransport(server.transport);
 });
 afterEach(() => {
   restore?.();
   vi.clearAllMocks();
+});
+
+describe("desktop avatars in the rail", () => {
+  it("shows the chosen emoji and the uploaded image (an <img>, no initials), and initials for the rest", async () => {
+    const [studio, linux, office] = fake.desktops;
+    if (!studio || !linux || !office) throw new Error("fixture");
+    linux.avatar = { kind: "emoji", emoji: "\u{1F680}" };
+    office.avatar = { kind: "image", hash: "0123456789abcdef" };
+    mountSlot(<Rail />);
+    const list = await screen.findByRole("list", { name: "Desktops" });
+    await within(list).findByRole("link", { name: "Office PC, online" });
+    const links = within(list).getAllByRole("link");
+    // Initials stay for the desktop without an avatar.
+    expect(links[0]).toHaveTextContent("SM");
+    expect(within(links[1] as HTMLElement).getByTestId("avatar-emoji")).toHaveTextContent("\u{1F680}");
+    expect(links[1]).not.toHaveTextContent("LB");
+    const image = within(links[2] as HTMLElement).getByTestId("avatar-image");
+    expect(image.tagName).toBe("IMG");
+    expect(image).toHaveAttribute("src", "/api/desktops/d3/avatar?v=0123456789abcdef");
+    expect(image).toHaveAttribute("alt", "");
+    // The accessible name stays the desktop's name, whatever the picture.
+    expect(links[2]).toHaveAccessibleName("Office PC, online");
+  });
 });
 
 describe("activity rail", () => {

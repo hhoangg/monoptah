@@ -15,7 +15,7 @@ import { HarnessIcon } from "@/ui/HarnessIcon";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { MonoDocumentRows } from "./MonoDocumentRows";
-import { MonoMascot } from "./MonoMascot";
+import { MonoAvatar } from "./MonoAvatar";
 import { BACK_LINK_CLASS, BackIcon, Group, MonoPage, RefreshButton } from "./MonoPage";
 import { useMonoProfile, type MonoProfile } from "./profile";
 
@@ -41,7 +41,7 @@ export function MonoProfileScreen({ desktopId, monoId }: { desktopId: string; mo
       actions={<RefreshButton onRefresh={refresh} refreshing={refreshing} />}
     >
       <section aria-label="Identity" className="flex flex-col items-center gap-2 py-2 text-center">
-        <MonoMascot monoId={monoId} mascot={mono?.mascot} color={mono?.color} working={working} size={88} />
+        <MonoAvatar monoId={monoId} name={mono?.name ?? "Mono"} mascot={mono?.mascot} color={mono?.color} working={working} size={88} />
         <h2 className="max-w-full truncate text-headline font-semibold">{mono?.name ?? "Mono"}</h2>
         {profile?.status ? <p className="text-small text-muted-text">{profile.status}</p> : null}
         {mono?.model ? (

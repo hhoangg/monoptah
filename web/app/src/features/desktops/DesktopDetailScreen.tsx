@@ -32,6 +32,7 @@ import {
   type Grant,
 } from "./api";
 import { DESKTOP_COLORS, findDesktopColor } from "./colors";
+import { DesktopAvatarSection } from "./DesktopAvatarSection";
 import { grantStateLabel, lastSeenLabel, permissionLabel, safeName, versionLabel } from "./format";
 import { useKeyStatus } from "./keyStatus";
 import { ColorDot, desktopErrorMessage, Fingerprint, FingerprintLines, PresenceBadge } from "./parts";
@@ -100,6 +101,7 @@ function DesktopDetail({ desktop }: { desktop: DesktopDirectory }) {
       </SettingsCard>
       <RenameSection desktop={desktop} />
       <ColorSection desktop={desktop} />
+      <DesktopAvatarSection desktop={desktop} />
       <DevicesSection desktop={desktop} name={name} />
       <AddDeviceSection />
       <DangerZone desktop={desktop} name={name} />
