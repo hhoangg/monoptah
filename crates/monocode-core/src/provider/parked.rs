@@ -314,6 +314,13 @@ pub(super) fn key(request: &Request) -> String {
             .mono
             .as_ref()
             .map(|mono| (&mono.root, &mono.mono.id)),
+        // The browser's level and server shape are fixed in the launch (tool lists, gate URL).
+        request
+            .settings
+            .mono
+            .as_ref()
+            .and_then(|mono| mono.mono.browser.as_ref())
+            .map(|b| (b.trust, b.server_key())),
         request.settings.disable_claude_hooks,
         crate::accounts::claude_entrypoint()
     ])

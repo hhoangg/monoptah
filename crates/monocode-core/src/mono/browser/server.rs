@@ -1,29 +1,24 @@
 //! One long-lived `@playwright/mcp` server per Mono with a browser.
 //!
 //! Why: the extension makes one Chrome tab group per connection and greys the group when the
-//! connection ends (`TabGroupManager.orphan`), never reusing it. A stdio server lives as long as
-//! one agent process, so every Mono turn made a new group. Here the app runs the server in HTTP
-//! mode and keeps it across turns; each run only connects an MCP client to it. With
-//! `--shared-browser-context` every client shares the extension connection that the first client
-//! opened, but the server closes that connection when its last client leaves. So the app keeps one
-//! client of its own connected (the keeper, legacy SSE transport, which has no heartbeat): the
-//! extension connection, and with it the Mono's tab group, outlives the turns.
+//! connection ends (`TabGroupManager.orphan`), never reusing it. A server that lived as long as one
+//! agent process made a new group every Mono turn. Here the app starts the server once per Mono
+//! and keeps it across turns, speaking MCP to it over its stdin and stdout. The only client is the
+//! Mono's gate (see [`super::gate`]), which holds one MCP session for the server's life, so the
+//! extension connection, and with it the Mono's tab group, outlives the turns. Because the server
+//! has no port, no other process (the agent's shell included) can reach it and skip the gate.
 //!
 //! Facts and the residual risk: `docs/superpowers/specs/2026-11-22-browser-all-tabs-research.md`.
+use super::gate::{self, Gate};
 use super::{ServerSpec, TOKEN_ENV};
 use crate::git_credentials::Secret;
-use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// A server nobody has asked for in this long is stopped.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// The first start may download the package with `npx`.
-const READY_TIMEOUT: Duration = Duration::from_secs(120);
-const LOOPBACK: &str = "127.0.0.1";
 
 /// What starts a server: the command, its arguments (no port flags yet) and the token.
 pub struct ServerLaunch<'a> {
@@ -46,11 +41,16 @@ impl ServerLaunch<'_> {
 
 /// A started server.
 pub trait RunningServer: Send {
-    /// The MCP endpoint clients connect to.
+    /// Names this server instance. A new instance has a new name; the gate starts a new MCP
+    /// session when it changes.
     fn url(&self) -> String;
+    /// How the gate reaches this server, when it is not the default HTTP client.
+    fn upstream(&self) -> Option<Arc<dyn gate::Upstream>> {
+        None
+    }
     /// The process is still running.
     fn is_alive(&mut self) -> bool;
-    /// Makes sure the app's own client is connected, so the browser connection stays open.
+    /// Nothing to do for a stdio server: the gate's own session keeps the browser connection open.
     fn keep_connected(&mut self);
     fn stop(&mut self);
 }
@@ -120,6 +120,10 @@ pub struct BrowserServers {
     /// One lock per Mono: while a server starts, a second run of that Mono waits for it and
     /// reuses it instead of starting (and later killing) another.
     starting: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// One gate per Mono (see [`gate`]): the agent talks to it, never to the server directly.
+    gates: Mutex<HashMap<String, Arc<Gate>>>,
+    /// How a gate reaches the server; tests replace it.
+    upstream: Arc<dyn gate::Upstream>,
 }
 impl BrowserServers {
     pub fn new(backend: Arc<dyn ServerBackend>, idle: Duration) -> Self {
@@ -128,7 +132,37 @@ impl BrowserServers {
             idle,
             entries: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
+            upstream: Arc::new(gate::HttpUpstream::new()),
         }
+    }
+    /// Uses `upstream` instead of real HTTP to reach the servers (tests).
+    pub fn with_upstream(mut self, upstream: Arc<dyn gate::Upstream>) -> Self {
+        self.upstream = upstream;
+        self
+    }
+    /// This Mono's gate in front of the server at `upstream_url`: the one it has, updated to the
+    /// current policy and server address, or a new one. Its address stays the same while the
+    /// Mono's browser stays on, so a parked agent process keeps a working URL.
+    pub fn gate_for(
+        &self,
+        mono_id: &str,
+        upstream_url: &str,
+        policy: gate::Policy,
+    ) -> Result<Arc<Gate>, String> {
+        let upstream = self
+            .lock()
+            .get(mono_id)
+            .and_then(|entry| entry.server.upstream())
+            .unwrap_or_else(|| self.upstream.clone());
+        let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(gate) = gates.get(mono_id) {
+            gate.configure(policy, upstream_url, upstream);
+            return Ok(gate.clone());
+        }
+        let gate = Gate::start(upstream, policy, upstream_url)?;
+        gates.insert(mono_id.to_owned(), gate.clone());
+        Ok(gate)
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
@@ -201,13 +235,31 @@ impl BrowserServers {
         Ok((url, lease))
     }
 
+    /// Gives this Mono's gate, if it has one, a new policy at once (the user changed the trust
+    /// level or the blocked origins while a run may be using it).
+    pub fn update_policy(&self, mono_id: &str, policy: gate::Policy) {
+        if let Some(gate) = self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(mono_id)
+        {
+            gate.set_policy(policy);
+        }
+    }
+
     /// Stops this Mono's server (its browser was turned off or changed, or the Mono is gone).
     pub fn stop(&self, mono_id: &str) {
+        self.gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(mono_id);
         let entry = self.lock().remove(mono_id);
         stop_all(entry.map(|e| e.server));
     }
     /// Stops every server (the app quits).
     pub fn stop_everything(&self) {
+        self.gates.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let all: Vec<Entry> = self.lock().drain().map(|(_, e)| e).collect();
         stop_all(all.into_iter().map(|e| e.server));
     }
@@ -229,18 +281,20 @@ pub fn servers() -> &'static BrowserServers {
 
 // ---- The real backend ----
 
+/// Starts `@playwright/mcp` as a child process that speaks MCP over its stdin and stdout. There
+/// is no port at all, so nothing but the gate can reach the server: no process on the machine,
+/// the agent's shell included, can connect to it.
 pub struct NodeBackend;
 impl ServerBackend for NodeBackend {
     fn start(&self, launch: &ServerLaunch) -> Result<Box<dyn RunningServer>, String> {
-        let port = free_port()?;
         let mut command = std::process::Command::new(&launch.spec.command);
         command
-            .args(http_args(&launch.spec.args, port))
+            .args(&launch.spec.args)
             .env("PATH", launch.search_path)
             .env(TOKEN_ENV, launch.token.as_str())
             // The server exits when its stdin closes: if the app dies, so does the server.
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
         crate::process::isolate(&mut command);
         let mut child = command
@@ -248,91 +302,37 @@ impl ServerBackend for NodeBackend {
             .map_err(|_| "Could not start npx. Check that Node.js is installed.".to_owned())?;
         // The token is in the environment only, so the argv record the guard writes is safe.
         let guard = crate::process::guard::arm(&child, &command);
-        let stdin = child.stdin.take();
-        let mut server = NodeServer {
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            crate::process::terminate(&mut child);
+            return Err("Could not talk to the browser server.".into());
+        };
+        Ok(Box::new(NodeServer {
+            key: format!("stdio:{}", child.id()),
+            upstream: gate::StdioUpstream::new(stdin, stdout),
             child,
             guard: Some(guard),
-            _stdin: stdin,
-            port,
-            keeper: Keeper::new(port),
-        };
-        if let Err(error) = wait_until_listening(&mut server.child, port, READY_TIMEOUT) {
-            server.stop();
-            return Err(error);
-        }
-        Ok(Box::new(server))
-    }
-}
-
-/// The base arguments plus the HTTP flags: loopback only, and only the loopback `Host` value of
-/// this port accepted (the server's check against DNS rebinding).
-pub fn http_args(base: &[String], port: u16) -> Vec<String> {
-    let mut args = base.to_vec();
-    args.extend([
-        "--port".to_owned(),
-        port.to_string(),
-        "--host".into(),
-        LOOPBACK.into(),
-        "--allowed-hosts".into(),
-        format!("{LOOPBACK}:{port}"),
-        "--shared-browser-context".into(),
-    ]);
-    args
-}
-
-fn free_port() -> Result<u16, String> {
-    std::net::TcpListener::bind((LOOPBACK, 0))
-        .and_then(|listener| listener.local_addr())
-        .map(|addr| addr.port())
-        .map_err(|_| "Could not find a free port for the browser server.".to_owned())
-}
-
-fn wait_until_listening(
-    child: &mut std::process::Child,
-    port: u16,
-    timeout: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    loop {
-        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok() {
-            // Something answers on the port; make sure it is our child and not another process
-            // that took the port between choosing it and starting the server.
-            return if matches!(child.try_wait(), Ok(None)) {
-                Ok(())
-            } else {
-                Err("The browser server stopped while starting.".into())
-            };
-        }
-        if !matches!(child.try_wait(), Ok(None)) {
-            return Err("The browser server stopped while starting.".into());
-        }
-        if Instant::now() >= deadline {
-            return Err("The browser server did not start in time.".into());
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        }))
     }
 }
 
 struct NodeServer {
     child: std::process::Child,
     guard: Option<crate::process::guard::ChildGuard>,
-    _stdin: Option<std::process::ChildStdin>,
-    port: u16,
-    keeper: Arc<Keeper>,
+    upstream: Arc<gate::StdioUpstream>,
+    key: String,
 }
 impl RunningServer for NodeServer {
     fn url(&self) -> String {
-        format!("http://{LOOPBACK}:{}/mcp", self.port)
+        self.key.clone()
     }
     fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        matches!(self.child.try_wait(), Ok(None)) && self.upstream.is_open()
     }
-    fn keep_connected(&mut self) {
-        Keeper::ensure(&self.keeper);
+    fn upstream(&self) -> Option<Arc<dyn gate::Upstream>> {
+        Some(self.upstream.clone())
     }
+    fn keep_connected(&mut self) {}
     fn stop(&mut self) {
-        self.keeper.stopped.store(true, Ordering::SeqCst);
         match self.guard.take() {
             Some(guard) => guard.finish_with(&mut self.child),
             None => crate::process::terminate(&mut self.child),
@@ -345,152 +345,11 @@ impl Drop for NodeServer {
     }
 }
 
-// ---- The keeper: the app's own client of the server ----
-
-/// A legacy SSE client that stays connected. It opens the browser connection (a first
-/// `browser_tabs` call) and holds it open between turns. If the browser connection is gone (Chrome
-/// quit), the next [`Keeper::ensure`] repeats the call, which opens a new one.
-pub struct Keeper {
-    base: String,
-    /// The POST URL of the live stream, or None while there is none.
-    endpoint: Mutex<Option<String>>,
-    connected: AtomicBool,
-    /// The last call that opened the browser connection worked.
-    warm: AtomicBool,
-    calling: AtomicBool,
-    next_id: AtomicU64,
-    pub stopped: AtomicBool,
-}
-impl Keeper {
-    pub fn new(port: u16) -> Arc<Self> {
-        Self::at(format!("http://{LOOPBACK}:{port}"))
-    }
-    pub fn at(base: String) -> Arc<Self> {
-        Arc::new(Self {
-            base,
-            endpoint: Mutex::new(None),
-            connected: AtomicBool::new(false),
-            warm: AtomicBool::new(false),
-            calling: AtomicBool::new(false),
-            next_id: AtomicU64::new(10),
-            stopped: AtomicBool::new(false),
-        })
-    }
-    pub fn is_warm(&self) -> bool {
-        self.warm.load(Ordering::SeqCst)
-    }
-    pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::SeqCst)
-    }
-    /// Connects when not connected, and repeats the opening call when the last one failed.
-    /// Never blocks: the calls wait for Chrome on their own thread.
-    pub fn ensure(this: &Arc<Self>) {
-        if this.stopped.load(Ordering::SeqCst) {
-            return;
-        }
-        if !this.connected.swap(true, Ordering::SeqCst) {
-            let keeper = Arc::clone(this);
-            std::thread::spawn(move || {
-                let _ = keeper.run();
-                keeper.connected.store(false, Ordering::SeqCst);
-                keeper.warm.store(false, Ordering::SeqCst);
-                keeper.calling.store(false, Ordering::SeqCst);
-                *keeper.endpoint.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            });
-        } else if !this.is_warm() && !this.calling.swap(true, Ordering::SeqCst) {
-            let keeper = Arc::clone(this);
-            std::thread::spawn(move || {
-                let id = keeper.next_id.fetch_add(1, Ordering::SeqCst);
-                if keeper.post(&warm_call(id)).is_err() {
-                    keeper.calling.store(false, Ordering::SeqCst);
-                }
-            });
-        }
-    }
-
-    fn post(&self, message: &Value) -> Result<(), String> {
-        let url = self
-            .endpoint
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or("not connected")?;
-        ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_string(&message.to_string())
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-
-    /// Reads the event stream until it ends.
-    fn run(&self) -> Result<(), String> {
-        let response = ureq::get(&format!("{}/sse", self.base))
-            .set("Accept", "text/event-stream")
-            .call()
-            .map_err(|e| e.to_string())?;
-        let mut event = String::new();
-        let mut data = String::new();
-        for line in BufReader::new(response.into_reader()).lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            if let Some(value) = line.strip_prefix("event:") {
-                event = value.trim().to_owned();
-            } else if let Some(value) = line.strip_prefix("data:") {
-                data = value.trim().to_owned();
-            } else if line.is_empty() {
-                let (kind, payload) = (std::mem::take(&mut event), std::mem::take(&mut data));
-                self.on_event(&kind, &payload)?;
-            }
-        }
-        Ok(())
-    }
-    fn on_event(&self, kind: &str, data: &str) -> Result<(), String> {
-        match kind {
-            "endpoint" => {
-                *self.endpoint.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(format!("{}{data}", self.base));
-                self.post(
-                    &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                    "protocolVersion":"2024-11-05","capabilities":{},
-                    "clientInfo":{"name":"monoptah-keeper","version":env!("CARGO_PKG_VERSION")}}}),
-                )
-            }
-            "message" => {
-                let message: Value = serde_json::from_str(data).unwrap_or(Value::Null);
-                match message["id"].as_u64() {
-                    Some(1) => {
-                        self.post(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))?;
-                        self.calling.store(true, Ordering::SeqCst);
-                        let sent = self.post(&warm_call(2));
-                        if sent.is_err() {
-                            self.calling.store(false, Ordering::SeqCst);
-                        }
-                        sent
-                    }
-                    Some(_) => {
-                        let ok =
-                            message.get("error").is_none() && message["result"]["isError"] != true;
-                        self.warm.store(ok, Ordering::SeqCst);
-                        self.calling.store(false, Ordering::SeqCst);
-                        Ok(())
-                    }
-                    None => Ok(()),
-                }
-            }
-            _ => Ok(()),
-        }
-    }
-}
-/// A cheap call that makes the server open (or reuse) the browser connection.
-fn warm_call(id: u64) -> Value {
-    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
-        "name":"browser_tabs","arguments":{"action":"list"}}})
-}
-
 /// A backend that starts no process: tests count its starts and kill its servers.
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[derive(Default)]
     pub struct FakeBackend {

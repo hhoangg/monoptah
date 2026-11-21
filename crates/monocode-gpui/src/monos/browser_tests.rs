@@ -5,7 +5,7 @@ use super::workflows_ui::tests::click;
 use super::*;
 use crate::monos::tests::{Setup, setup};
 use gpui::{TestAppContext, VisualTestContext};
-use monocode_core::mono::browser::{self, MonoBrowser, MonoBrowserStore, PrereqEnv};
+use monocode_core::mono::browser::{self, BrowserTrust, MonoBrowser, MonoBrowserStore, PrereqEnv};
 use std::sync::{Arc, Mutex as StdMutex};
 
 // Obviously fake: not a real extension token.
@@ -173,7 +173,12 @@ fn turning_it_on_shows_prerequisites_and_the_prefilled_blocklist(cx: &mut TestAp
     let mut page = open_with(cx, false);
     page.enable();
     let setting = page.setting().unwrap();
-    assert!(setting.enabled && !setting.ready && setting.confirm_actions);
+    assert!(setting.enabled && !setting.ready);
+    assert_eq!(
+        setting.trust,
+        BrowserTrust::AskRisky,
+        "new Monos start at Level 2"
+    );
     assert!(
         setting
             .blocked_origins
@@ -185,7 +190,7 @@ fn turning_it_on_shows_prerequisites_and_the_prefilled_blocklist(cx: &mut TestAp
         "mono-browser-prereq-fda",
         "mono-browser-prereq-node",
         "mono-browser-blocked-0",
-        "mono-browser-confirm",
+        browser_ui::trust_selector(BrowserTrust::AskRisky),
     ] {
         assert!(page.on(id), "{id}");
     }
@@ -439,12 +444,59 @@ fn safety_rules_can_be_edited_and_invalid_origins_are_refused(cx: &mut TestAppCo
     );
     page.manager(|m, cx| m.browser_remove_origin(true, 0, cx));
     assert!(page.setting().unwrap().allowed_origins.is_empty());
+}
 
-    assert!(page.setting().unwrap().confirm_actions);
-    page.manager(|m, cx| m.browser_edit(cx, |b| b.confirm_actions = !b.confirm_actions));
-    assert!(!page.setting().unwrap().confirm_actions);
-    page.manager(|m, cx| m.browser_edit(cx, |b| b.confirm_actions = !b.confirm_actions));
-    assert!(page.setting().unwrap().confirm_actions);
+#[gpui::test]
+fn the_trust_selector_shows_three_levels_with_an_explanation_each(cx: &mut TestAppContext) {
+    let mut page = open(cx);
+    page.enable();
+    // The old "ask before send, post, delete or pay" switch and its read-only note are gone.
+    assert!(!page.on("mono-browser-confirm") && !page.on("mono-browser-full-access-note"));
+    for trust in BrowserTrust::ALL {
+        let selector = browser_ui::trust_selector(trust);
+        assert!(page.on(selector), "{selector}");
+    }
+    // Each row has its own explanation, and one note says what is enforced and what is trusted.
+    for selector in [
+        "mono-browser-trust-read-only-text",
+        "mono-browser-trust-ask-risky-text",
+        "mono-browser-trust-autonomous-text",
+        "mono-browser-trust-note",
+    ] {
+        assert!(page.on(selector), "{selector}");
+    }
+    assert_eq!(page.setting().unwrap().trust, BrowserTrust::AskRisky);
+
+    for trust in [
+        BrowserTrust::ReadOnly,
+        BrowserTrust::Autonomous,
+        BrowserTrust::AskRisky,
+    ] {
+        // The rows are far below the fold of the test window, so the row's action is called
+        // directly; the click calls the same method.
+        page.manager(|m, cx| m.browser_set_trust(trust, cx));
+        assert_eq!(page.setting().unwrap().trust, trust);
+    }
+}
+
+#[gpui::test]
+fn changing_the_level_reconfigures_the_gate_and_keeps_the_server(cx: &mut TestAppContext) {
+    use monocode_core::mono::browser::gate::Policy;
+    let mut page = open(cx);
+    page.enable();
+    let before = page.setting().unwrap().server_key().1.to_owned();
+    page.manager(|m, cx| m.browser_edit(cx, |b| b.trust = BrowserTrust::ReadOnly));
+    let setting = page.setting().unwrap();
+    assert_eq!(setting.trust, BrowserTrust::ReadOnly);
+    assert_eq!(setting.server_key().1, before);
+    // The level is not part of the server's shape, so choosing one never restarts the server.
+    let mut other = setting.clone();
+    other.trust = BrowserTrust::Autonomous;
+    assert_eq!(setting.server_key(), other.server_key());
+    assert_eq!(
+        Policy::new(setting.trust, setting.blocked_origins.clone()).trust,
+        BrowserTrust::ReadOnly
+    );
 }
 
 #[gpui::test]
@@ -497,35 +549,4 @@ fn the_install_poll_does_not_decrypt_the_token_again(cx: &mut TestAppContext) {
     page.secrets().remove_token(&page.s.id).unwrap();
     page.manager(|m, cx| m.browser_refresh(cx));
     assert!(page.ui(|u| u.hint.is_none()));
-}
-
-#[gpui::test]
-fn modes_that_never_ask_with_ask_before_on_say_which_tools_are_off(cx: &mut TestAppContext) {
-    let mut page = open(cx);
-    page.enable();
-    // A new Mono's access is Auto, which Claude approves without asking.
-    assert!(page.on("mono-browser-full-access-note"));
-    let chat = page
-        .s
-        .manager
-        .read_with(&page.visual, |m, _| m.chat().unwrap());
-    chat.update(&mut page.visual, |c, _| {
-        c.settings.access = monocode_core::agent::AccessMode::FullAccess
-    });
-    page.manager(|_, cx| cx.notify());
-    assert!(page.on("mono-browser-full-access-note"));
-    for (access, shown) in [
-        (monocode_core::agent::AccessMode::Auto, true),
-        (monocode_core::agent::AccessMode::Supervised, false),
-        (monocode_core::agent::AccessMode::AutoAcceptEdits, false),
-    ] {
-        chat.update(&mut page.visual, |c, _| c.settings.access = access);
-        page.manager(|_, cx| cx.notify());
-        assert_eq!(page.on("mono-browser-full-access-note"), shown);
-    }
-    chat.update(&mut page.visual, |c, _| {
-        c.settings.access = monocode_core::agent::AccessMode::FullAccess
-    });
-    page.manager(|m, cx| m.browser_edit(cx, |b| b.confirm_actions = false));
-    assert!(!page.on("mono-browser-full-access-note"));
 }

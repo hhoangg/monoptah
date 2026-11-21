@@ -98,6 +98,7 @@ impl Protocol {
             CONTROL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
         self.interrupt_id = Some(interrupt_id.clone());
+        self.gate_clear();
         match self.request.kind {
             Kind::Codex => {
                 self.approvals.clear();

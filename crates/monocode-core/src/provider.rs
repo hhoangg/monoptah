@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod acp;
+mod browser_gate;
 mod commands;
 pub use commands::{
     compact, discover_commands, native_invocation, native_prompt, prepare_prompt, supports_compact,
@@ -298,6 +299,8 @@ struct Protocol {
     claude_tools: HashMap<u64, (String, String)>,
     text_key: Option<String>,
     approvals: HashMap<String, (Value, String, Value)>,
+    /// Open approval requests of the Mono's browser gate, by card id.
+    gate_asks: HashMap<String, browser_gate::Open>,
     metrics: TurnMetrics,
     usage_total: u64,
     acp: acp::State,
@@ -338,6 +341,7 @@ impl Protocol {
             claude_tools: HashMap::new(),
             text_key: None,
             approvals: HashMap::new(),
+            gate_asks: HashMap::new(),
             metrics: TurnMetrics::default(),
             usage_total: 0,
             acp: Default::default(),
@@ -1167,6 +1171,9 @@ impl Protocol {
             }
             return questions::respond(stdin, wire, &kind, &request, &question, control.decision);
         }
+        if self.gate_respond(&control.id, &control.decision) {
+            return Ok(());
+        }
         let Some((wire, kind, request)) = self.approvals.remove(&control.id) else {
             return Ok(());
         };
@@ -1469,6 +1476,10 @@ fn run_operation(
         .filter(|_| !request.settings.text_only)
         .and_then(crate::mono::browser::resolve);
     request.settings.browser_available = browser.is_some();
+    // The gate's approval cards for this run. Held until the run ends: dropping it detaches the run.
+    let gate_asks = browser
+        .as_ref()
+        .and_then(crate::mono::browser::Runtime::attach_approver);
     let mut command = Command::new(&request.binary);
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);
@@ -1553,7 +1564,7 @@ fn run_operation(
                     browser.claude_server(),
                 );
                 allowed.push(browser.claude_allowed());
-                disallowed.push(browser.claude_disallowed(mode));
+                disallowed.push(browser.claude_disallowed());
                 browser.apply_env(&mut command);
             }
             let mut system = Vec::new();
@@ -1734,6 +1745,15 @@ fn run_operation(
         let mut ready_emitted = false;
         let mut interrupted = false;
         loop {
+            // A gate request is answered by this run: shown as a card while a user can answer it,
+            // denied otherwise.
+            if let Some(asks) = &gate_asks {
+                while let Ok(ask) = asks.try_recv() {
+                    let can_answer = controls.is_some() && !interrupted;
+                    pending.extend(protocol.gate_ask(ask, can_answer));
+                }
+                pending.extend(protocol.gate_expire());
+            }
             if cancel.load(Ordering::Relaxed) && !interrupted {
                 interrupted = true;
                 if !protocol.interrupt(&mut stdin)? {
@@ -1929,6 +1949,8 @@ fn run_operation(
             }
         }
     })();
+    // A card still open when the turn ends can no longer be answered.
+    protocol.gate_clear();
     // Cancellation can arrive while publishing an event batch. Its callback
     // then returns Stopped before the next receive-loop iteration can interrupt.
     if cancel.load(Ordering::Relaxed) && protocol.interrupt_id.is_none() {
@@ -2189,6 +2211,159 @@ mod tests {
             )
             .unwrap_err()
             .contains("Resume failed"));
+    }
+    fn gate_ask(
+        p: &mut Protocol,
+        can_answer: bool,
+    ) -> (
+        Vec<Event>,
+        mpsc::Receiver<bool>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::mono::browser::gate::{ApprovalRequest, Ask, Category};
+        let (reply, answer) = mpsc::channel();
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = p.gate_ask(
+            Ask {
+                request: ApprovalRequest {
+                    category: Category::Code,
+                    action: "Run JavaScript in the page".into(),
+                    url: "https://shop.example".into(),
+                    details: String::new(),
+                    code: Some("() => document.title".into()),
+                    explanation: "Read the title".into(),
+                },
+                reply,
+                abandoned: abandoned.clone(),
+            },
+            can_answer,
+        );
+        (events, answer, abandoned)
+    }
+    #[test]
+    fn browser_gate_cards_are_shown_in_every_access_mode_including_auto_and_full_access() {
+        for kind in [Kind::Claude, Kind::Codex] {
+            for access in [
+                AccessMode::Supervised,
+                AccessMode::AutoAcceptEdits,
+                AccessMode::Auto,
+                AccessMode::FullAccess,
+            ] {
+                let mut p = protocol(kind);
+                p.request.settings.access = access;
+                let (events, answer, _) = gate_ask(&mut p, true);
+                let [Event::Approval(card)] = events.as_slice() else {
+                    panic!("{kind:?} {access:?}: expected one approval card, got {events:?}")
+                };
+                // Nothing was answered for the user.
+                assert!(answer.try_recv().is_err(), "{access:?}");
+                assert!(card.id.starts_with("browser-gate-"));
+                assert_eq!(card.title, "Allow the browser to run code?");
+                for needle in [
+                    "Running code",
+                    "https://shop.example",
+                    "() => document.title",
+                    "Why: Read the title",
+                ] {
+                    assert!(card.detail.contains(needle), "{needle}");
+                }
+                assert!(card.can_allow_once && !card.can_remember);
+                // The user's decision reaches the gate; the provider's stdin is not touched.
+                let mut sink = Vec::new();
+                p.respond(
+                    Control {
+                        id: card.id.clone(),
+                        decision: Decision::Allow,
+                    },
+                    &mut sink,
+                )
+                .unwrap();
+                assert!(sink.is_empty());
+                assert!(answer.recv().unwrap());
+                assert!(p.gate_asks.is_empty());
+            }
+        }
+    }
+    #[test]
+    fn browser_gate_cards_are_denied_when_nobody_can_answer_and_when_the_user_denies() {
+        // A planning turn, a read-only session, and a run without controls or being stopped.
+        for edit in [
+            (|p: &mut Protocol| p.request.settings.plan = true) as fn(&mut Protocol),
+            |p| p.request.settings.access = AccessMode::ReadOnly,
+        ] {
+            let mut p = protocol(Kind::Claude);
+            edit(&mut p);
+            let (events, answer, _) = gate_ask(&mut p, true);
+            assert!(events.is_empty());
+            assert!(!answer.recv().unwrap());
+        }
+        let mut p = protocol(Kind::Claude);
+        let (events, answer, _) = gate_ask(&mut p, false);
+        assert!(events.is_empty());
+        assert!(!answer.recv().unwrap());
+
+        // Deny, and Stop, and the end of the turn.
+        for end in 0..3 {
+            let mut p = protocol(Kind::Claude);
+            let (events, answer, _) = gate_ask(&mut p, true);
+            let Event::Approval(card) = &events[0] else {
+                panic!("card")
+            };
+            let mut sink = Vec::new();
+            match end {
+                0 => p
+                    .respond(
+                        Control {
+                            id: card.id.clone(),
+                            decision: Decision::Deny,
+                        },
+                        &mut sink,
+                    )
+                    .unwrap(),
+                1 => {
+                    p.interrupt(&mut sink).unwrap();
+                }
+                _ => p.gate_clear(),
+            }
+            assert!(!answer.recv().unwrap(), "{end}");
+        }
+    }
+    #[test]
+    fn a_gate_card_whose_request_timed_out_is_withdrawn() {
+        let mut p = protocol(Kind::Claude);
+        let (events, _answer, abandoned) = gate_ask(&mut p, true);
+        let Event::Approval(card) = &events[0] else {
+            panic!("card")
+        };
+        assert!(p.gate_expire().is_empty());
+        abandoned.store(true, std::sync::atomic::Ordering::SeqCst);
+        let withdrawn = p.gate_expire();
+        assert!(matches!(withdrawn.as_slice(), [Event::ApprovalResolved(id)] if id == &card.id));
+        assert!(p.gate_asks.is_empty());
+    }
+    #[test]
+    fn a_warm_process_is_reused_only_at_the_same_browser_level() {
+        use crate::mono::browser::{BrowserTrust, MonoBrowser};
+        let mono = crate::mono::Mono::default();
+        let key = |trust| {
+            let mut request = protocol(Kind::Claude).request;
+            request.settings.mono = Some(crate::agent::MonoContext {
+                mono: crate::mono::Mono {
+                    browser: Some(MonoBrowser {
+                        trust,
+                        ..Default::default()
+                    }),
+                    ..mono.clone()
+                },
+                root: "/tmp/mono".into(),
+                executable: "/bin/app".into(),
+                browser_database: None,
+            });
+            parked::key(&request)
+        };
+        assert_eq!(key(BrowserTrust::AskRisky), key(BrowserTrust::AskRisky));
+        assert_ne!(key(BrowserTrust::AskRisky), key(BrowserTrust::ReadOnly));
+        assert_ne!(key(BrowserTrust::AskRisky), key(BrowserTrust::Autonomous));
     }
     #[test]
     fn approvals_wait_for_a_decision_and_keep_the_requested_input() {
