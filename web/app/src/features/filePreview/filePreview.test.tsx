@@ -3,7 +3,7 @@
 // hidden `.env`, a file that is too large or gone).
 import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { FIXTURE_HANDLERS, FixtureError, MENTION_MESSAGE, MOCK_PAGE_BYTES, type MockDesktop } from "@monoptah/mock-desktop";
 import { IDBFactory } from "fake-indexeddb";
@@ -16,6 +16,7 @@ import { resetHighlighting } from "@/features/markdown/highlight/plugin";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLinkOptions } from "@/features/sessions/dev/mockLink";
 import { resetMonoSeen } from "@/features/sessions/monoSeen";
 import { stubTranscriptLayout, VIEW } from "@/features/transcript/layoutStub";
+import { ASSET_LOADING_URI } from "./mentionedFile";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks } from "@/ui/hooks";
@@ -142,12 +143,16 @@ describe("mentions in a session chat", () => {
     expect(frame.hasAttribute("srcdoc")).toBe(false);
     // An opaque white page: the document inside is transparent unless its own styles say otherwise.
     expect(frame).toHaveClass("bg-[#fff]", "[color-scheme:light]");
+    // The page is there at once; its image comes as its own object URL, never as inlined data.
+    // jsdom never loads the frame: say it has, so the preview may replace the document.
+    await waitFor(async () => (fireEvent.load(frame), expect(await blobText(blobs.get(frame.getAttribute("src") ?? "")!)).not.toContain(ASSET_LOADING_URI)), { timeout: 4000 });
     const src = frame.getAttribute("src") ?? "";
     expect(src).toMatch(/^blob:/);
     const html = await blobText(blobs.get(src)!);
     expect(blobs.get(src)!.type).toBe("text/html;charset=utf-8");
     expect(html).toContain('<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src-attr \'unsafe-inline\'; font-src data:; media-src data:">');
     expect(html).not.toContain("monoptah-asset:");
+    // The one asset is used twice by the page (an img and a css url): both carry its data URI.
     expect(html.match(/data:image\/png;base64,[A-Za-z0-9+/=]+/g)).toHaveLength(2);
     expect(html).toContain("Example report");
     expect(requests.map((request) => request.asset)).toEqual([undefined, "img/chart.png"]);
@@ -227,7 +232,9 @@ describe("mentions in a session chat", () => {
     const body = await within(await dialog()).findByTestId("preview-markdown");
     expect(within(body).getByText("Example findings")).toBeInTheDocument();
     const image = await within(body).findByTestId("preview-md-image");
-    expect(image.getAttribute("src")).toMatch(/^data:image\/png;base64,[A-Za-z0-9+/=]+$/);
+    // An object URL of the image, not a data: string of its bytes.
+    expect(image.getAttribute("src")).toMatch(/^blob:https:\/\/app\.test\/\d+$/);
+    expect(blobs.get(image.getAttribute("src")!)!.type).toBe("image/png");
     expect(image).toHaveAttribute("alt", "chart");
     expect(body.querySelectorAll("img")).toHaveLength(1);
     expect(body.querySelector('[src*="example.invalid"], [href*="example.invalid"]')).toBeNull();
@@ -340,7 +347,7 @@ describe("mentions in a session chat", () => {
     expect(await dialog()).toHaveTextContent("This file is hidden by Monoptah");
   });
 
-  it("offers Try again on a busy desktop, and shows the file when it works again", async () => {
+  it("waits on a busy desktop instead of failing, says so, and shows the file when it works again", async () => {
     const user = userEvent.setup();
     const handler = FIXTURE_HANDLERS["chat.mentionedFile"];
     let busy = true;
@@ -350,12 +357,31 @@ describe("mentions in a session chat", () => {
     }) as never;
     mount(`/s/${SESSION}`);
     await user.click(await mentionChip("bin/tool.bin"));
-    const problem = await within(await dialog()).findByTestId("file-preview-error");
-    expect(problem).toHaveAttribute("data-problem", "busy");
+    expect(await within(await dialog()).findByTestId("file-preview-waiting", {}, { timeout: 4000 })).toHaveTextContent("Waiting for your desktop");
+    expect(within(await dialog()).queryByTestId("file-preview-error")).toBeNull();
     busy = false;
-    await user.click(within(problem).getByRole("button", { name: "Try again" }));
-    expect(await within(await dialog()).findByTestId("preview-binary")).toBeInTheDocument();
-  });
+    expect(await within(await dialog()).findByTestId("preview-binary", {}, { timeout: 6000 })).toBeInTheDocument();
+  }, 15_000);
+
+  it("while the desktop is busy with an html report's image, keeps loading and says it waits, then shows the report with its image", async () => {
+    const user = userEvent.setup();
+    const handler = FIXTURE_HANDLERS["chat.mentionedFile"];
+    let busyFor = 2;
+    FIXTURE_HANDLERS["chat.mentionedFile"] = ((params: { asset?: string }, ctx: never) => {
+      if (params.asset && busyFor-- > 0) throw new FixtureError("Busy", "busy");
+      return (handler as (p: unknown, c: unknown) => unknown)(params, ctx);
+    }) as never;
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("report.html"));
+    // The page is shown while the image waits.
+    expect(await within(await dialog()).findByTestId("file-preview-waiting", {}, { timeout: 4000 })).toHaveTextContent("Waiting...");
+    expect(within(await dialog()).getByTestId("preview-html")).toBeInTheDocument();
+    const frame = await within(await dialog()).findByTestId("preview-html", {}, { timeout: 8000 });
+    await waitFor(async () => (fireEvent.load(frame), expect(await blobText(blobs.get(frame.getAttribute("src") ?? "")!)).not.toContain(ASSET_LOADING_URI)), { timeout: 8000 });
+    const html = await blobText(blobs.get(frame.getAttribute("src") ?? "")!);
+    expect(html.match(/data:image\/png;base64,[A-Za-z0-9+/=]+/g)).toHaveLength(2);
+    expect(within(await dialog()).queryByTestId("preview-skipped-notice")).toBeNull();
+  }, 15_000);
 
   it("tells an old desktop's refusal apart: forbidden without mentionedFiles2 says to update the desktop", async () => {
     const user = userEvent.setup();
@@ -445,5 +471,88 @@ describe("mentions in a Mono chat", () => {
     expect(offsets).toEqual(offsets.map((_, index) => index * MOCK_PAGE_BYTES));
     // The list is virtualized: its height is the whole file, 400 lines of 20px.
     expect(lines.firstElementChild).toHaveStyle({ height: "8000px" });
+  });
+});
+
+describe("downloads from the preview", () => {
+  const saved: Array<{ name: string; href: string }> = [];
+  beforeEach(() => {
+    saved.length = 0;
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      saved.push({ name: this.download, href: this.href });
+    });
+  });
+  const savedBlob = () => blobs.get(saved.at(-1)!.href)!;
+  const bytesOf = async (blob: Blob) => new Uint8Array(await blob.arrayBuffer());
+
+  it("saves a text file as an octet-stream download of the text already loaded, under its own name", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("~/Documents/x/notes.py"));
+    await user.click(await within(await dialog()).findByTestId("file-preview-download"));
+    expect(saved).toHaveLength(1);
+    expect(saved[0]!.name).toBe("notes.py");
+    expect(savedBlob().type).toBe("application/octet-stream");
+    expect(new TextDecoder().decode(await bytesOf(savedBlob()))).toContain("def ");
+  });
+
+  it("saves an image from the viewer toolbar", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("img/chart.png"));
+    await user.click(await within(await dialog()).findByTestId("preview-image-download"));
+    expect(saved[0]!.name).toBe("chart.png");
+    expect(savedBlob().type).toBe("application/octet-stream");
+    expect((await bytesOf(savedBlob()))[0]).toBe(0x89);
+  });
+
+  it("saves a markdown file, and opens a click on its image in the zoom viewer, with its Download, from the bytes already loaded", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("docs/findings.md"));
+    const box = await dialog();
+    await user.click(await within(box).findByTestId("file-preview-download"));
+    expect(saved[0]!.name).toBe("findings.md");
+    expect(new TextDecoder().decode(await bytesOf(savedBlob()))).toContain("Example findings");
+    const before = requests.length;
+    await user.click(await within(box).findByTestId("preview-md-image-open"));
+    const lightbox = await screen.findByTestId("image-lightbox");
+    expect(within(lightbox).getByTestId("preview-image").getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+    await user.click(within(lightbox).getByTestId("preview-image-download"));
+    expect(saved.at(-1)!.name).toBe("chart.png");
+    expect((await bytesOf(savedBlob()))[0]).toBe(0x89);
+    expect(requests.length).toBe(before);
+  });
+
+  it("lists the images of an html page outside the frame, each to open in the viewer or save, from the bytes already loaded", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("report.html"));
+    const box = await dialog();
+    await user.click(await within(box).findByTestId("preview-html-images-toggle", {}, { timeout: 4000 }));
+    expect(within(box).getByTestId("preview-html-images-toggle")).toHaveTextContent("Images (1)");
+    const row = await within(box).findByTestId("preview-html-image-row");
+    await waitFor(() => expect(row).toHaveAttribute("data-state", "loaded"), { timeout: 4000 });
+    expect(row).toHaveTextContent("chart.png");
+    const before = requests.length;
+    await user.click(within(row).getByTestId("preview-html-image-download"));
+    await waitFor(() => expect(saved).toHaveLength(1));
+    expect(saved[0]!.name).toBe("chart.png");
+    expect(savedBlob().type).toBe("application/octet-stream");
+    expect((await bytesOf(savedBlob()))[0]).toBe(0x89);
+    await user.click(within(row).getByTestId("preview-html-image-open"));
+    const lightbox = await screen.findByTestId("image-lightbox");
+    expect(within(lightbox).getByTestId("preview-image-download")).toBeInTheDocument();
+    expect(requests.length).toBe(before);
+  });
+
+  it("saves the source of an html file, not the sanitized page", async () => {
+    const user = userEvent.setup();
+    mount(`/s/${SESSION}`);
+    await user.click(await mentionChip("report.html"));
+    await user.click(await within(await dialog()).findByTestId("file-preview-download"));
+    await waitFor(() => expect(saved).toHaveLength(1));
+    expect(saved[0]!.name).toBe("report.html");
+    expect(requests.at(-1)).toMatchObject({ path: "report.html", source: true });
   });
 });

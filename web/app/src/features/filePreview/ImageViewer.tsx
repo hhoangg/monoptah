@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Icon } from "@/ui/Icon";
 import { cn } from "@/lib/utils";
+import { SaveButton } from "./download";
 import { concat, imageDataUri } from "./mentionedFile";
 
 const MIN_WIDTH = 24;
@@ -64,6 +65,8 @@ export function ImageViewer({ chunks, mime, name, className }: { chunks: Uint8Ar
         >
           100%
         </button>
+        <span className="ml-auto" />
+        <SaveButton name={name} parts={chunks as BlobPart[]} testId="preview-image-download" />
       </div>
       <div
         ref={pane}

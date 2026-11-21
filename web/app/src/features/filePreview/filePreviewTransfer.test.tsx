@@ -181,7 +181,12 @@ describe("files through encrypted transfers", () => {
     await user.click(await mentionChip("/tmp/large-fixture.bin"));
     const box = await dialog();
     const body = await within(box).findByTestId("preview-binary");
-    expect(within(body).getByTestId("file-preview-download")).toBeInTheDocument();
+    const names: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      names.push(this.download);
+    });
+    await user.click(within(body).getByTestId("file-preview-download"));
+    expect(names).toEqual(["large-fixture.bin"]);
     expect(body).toHaveTextContent("5 MB - /tmp/large-fixture.bin");
     expect(downloads).toHaveLength(1);
   });

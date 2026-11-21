@@ -60,6 +60,8 @@ export const ErrorResponseSchema = z.object({
   error: z.string(),
   /** Kept a string: a newer desktop may add codes. Narrow with `DesktopErrorCodeSchema.safeParse`. */
   code: z.string().optional(),
+  /** Seconds after which the same request may pass (a rate limit or a full queue); only with a `code`. */
+  retryAfter: z.number().int().nonnegative().optional(),
 });
 /** `{rid, ok: true, result}`: a response, or a watch frame when `rid` is an open watch. */
 export const OkResponseSchema = z.object({ rid: RidSchema, ok: z.literal(true), result: z.unknown() });

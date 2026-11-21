@@ -3,12 +3,12 @@ import { useQuery } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLinkConnection, useLinkDesktopId, type LinkRequestError } from "@/link";
 import { useCapability } from "@/version";
-import { asReader, imageMime, loadHtmlDocument, type MentionContent, type MentionRequester, type MentionSource, type ReadOptions } from "./mentionedFile";
+import { imageMime, readAsset, type MentionContent, type MentionRequester, type MentionSource, type ReadOptions } from "./mentionedFile";
 import { transferReader } from "./transfer/reader";
 
 export type PreviewData =
   | { kind: "text" | "markdown"; meta: MentionContent["meta"]; text: string }
-  | { kind: "html"; meta: MentionContent["meta"]; document: string; limited: boolean }
+  | { kind: "html"; meta: MentionContent["meta"]; text: string }
   | { kind: "image"; meta: MentionContent["meta"]; mime: string; chunks: Uint8Array[] }
   /** `chunks` is set when the desktop sent the file (encrypted transfer): it can be saved, not previewed. */
   | { kind: "binary"; meta: MentionContent["meta"]; chunks?: Uint8Array[] };
@@ -49,17 +49,17 @@ export function useMentionSource(conversationId: string): MentionSource {
   }, [transfer, request, connection, desktopId, conversationId]);
 }
 
-async function load(source: MentionSource, path: string, sourceText: boolean, signal: AbortSignal, onProgress: ReadOptions["onProgress"]): Promise<PreviewData> {
-  const read = asReader(source);
-  const content = await read({ path, ...(sourceText ? { source: true } : {}) }, { signal, ...(onProgress ? { onProgress } : {}) });
+async function load(source: MentionSource, path: string, sourceText: boolean, signal: AbortSignal, onProgress: ReadOptions["onProgress"], onWaiting: (waiting: boolean) => void): Promise<PreviewData> {
+  // A busy desktop (its places for `file.prepare` may still be held by work an earlier preview started) is waited for, not shown as an error.
+  const content = await readAsset(source, { path, ...(sourceText ? { source: true } : {}) }, { signal, onWaiting, ...(onProgress ? { onProgress } : {}) });
   const { meta } = content;
   switch (meta.kind) {
     case "text":
     case "markdown":
       return { kind: meta.kind, meta, text: content.text };
     case "html": {
-      const { document, limited } = await loadHtmlDocument(source, path, content, signal);
-      return { kind: "html", meta, document, limited };
+      // The images are read by the preview itself, after it shows the page.
+      return { kind: "html", meta, text: content.text };
     }
     case "image": {
       const mime = imageMime(meta.mime);
@@ -75,11 +75,14 @@ export function useMentionedFile(conversationId: string, path: string, source = 
   const desktopId = useLinkDesktopId();
   const mention = useMentionSource(conversationId);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  // True while the file itself waits for a busy or rate limiting desktop.
+  const [waiting, setWaiting] = useState(false);
   const query = useQuery<PreviewData, LinkRequestError>({
     queryKey: ["link", desktopId, "mentionedFile", conversationId, path, source],
     queryFn: ({ signal }) => {
       setProgress(null);
-      return load(mention, path, source, signal, (received, total) => setProgress({ received, total }));
+      setWaiting(false);
+      return load(mention, path, source, signal, (received, total) => setProgress({ received, total }), setWaiting);
     },
     enabled,
     networkMode: "always",
@@ -91,7 +94,7 @@ export function useMentionedFile(conversationId: string, path: string, source = 
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
   });
-  return { ...query, progress };
+  return { ...query, progress, waiting };
 }
 
 /**

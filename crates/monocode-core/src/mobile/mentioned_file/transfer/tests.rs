@@ -473,7 +473,18 @@ fn the_source_flag_gives_the_raw_text_of_a_page() {
         let prepared = run(&world, Permission::Control, &raw, true).unwrap();
         assert_eq!(prepared.kind, Kind::Text, "{}", path.display());
         assert!(matches!(prepared.source, Source::File(_)));
+        // The very file on disk, byte for byte, not the sanitized page: this is what the web's Download of an html file saves.
+        assert_eq!(
+            prepared.source.len_hint(),
+            std::fs::metadata(path).unwrap().len(),
+            "{}",
+            path.display()
+        );
     }
+    // Without the flag an html page is the sanitized document (its images are placeholders), never the file.
+    let rendered = run(&world, Permission::Control, &asked(&page), true).unwrap();
+    assert_eq!(rendered.kind, Kind::Html);
+    assert!(matches!(rendered.source, Source::Bytes(_)));
 }
 
 #[test]

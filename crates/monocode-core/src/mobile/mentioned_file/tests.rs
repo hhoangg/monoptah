@@ -1313,6 +1313,14 @@ fn a_markdown_file_references_its_images_and_only_those() {
     );
 }
 
+#[test]
+fn a_markdown_file_lists_every_image_it_names_without_a_count_cap() {
+    let source: String = (0..300).map(|n| format!("![i](img/{n}.png)\n")).collect();
+    let listed = markdown_assets(&source);
+    assert_eq!(listed.len(), 300);
+    assert_eq!(listed[299], "img/299.png");
+}
+
 // ---- R6: nothing but a regular file is opened ----
 
 #[cfg(unix)]

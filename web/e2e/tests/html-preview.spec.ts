@@ -4,7 +4,7 @@
 // `web_link_headless serve`. The account is made through the API with a software authenticator and its session cookie
 // is handed to the browser, because WebKit has no virtual WebAuthn authenticator (that one is Chromium CDP only).
 import { deflateSync } from "node:zlib";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test as base, expect, type Page } from "@playwright/test";
@@ -52,6 +52,60 @@ function tinyPng(): Buffer {
 
 const PNG = tinyPng();
 
+/** A valid RGB PNG of about `bytes` bytes: random pixels, stored without compression, so the size is what was asked for. */
+function noisePng(bytes: number, seed: number): Buffer {
+  const side = Math.max(8, Math.floor(Math.sqrt(bytes / 3)));
+  const raw = Buffer.alloc(side * (1 + side * 3));
+  let state = seed >>> 0 || 1;
+  for (let at = 0; at < raw.length; at++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    raw[at] = at % (1 + side * 3) === 0 ? 0 : state >>> 24;
+  }
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (buf: Buffer): number => {
+    let c = 0xffffffff;
+    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff]! ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const sum = Buffer.alloc(4);
+    sum.writeUInt32BE(crc(body));
+    return Buffer.concat([length, body, sum]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(side, 0);
+  header.writeUInt32BE(side, 4);
+  header[8] = 8;
+  header[9] = 2;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", header), chunk("IDAT", deflateSync(raw, { level: 0 })), chunk("IEND", Buffer.alloc(0))]);
+}
+
+/** The eight images of a real report (sizes of the one that failed in practice), the last one about 16 MB. */
+const GALLERY: ReadonlyArray<readonly [string, number]> = [
+  ["composer-before.png", 92_000],
+  ["composer-after.png", 91_000],
+  ["swipe.png", 248_000],
+  ["long-press.png", 244_000],
+  ["rail-desktop.png", 29_000],
+  ["avatar-menu.png", 23_000],
+  ["toast.png", 198_000],
+  ["large-noise-16mb.png", 16 * 1024 * 1024],
+];
+
+const galleryHtml = `<!doctype html>
+<html><head><title>Gallery</title></head><body>
+<h1 id="gallery-title">Gallery report</h1>
+${GALLERY.map(([name], index) => `<img id="g${index}" src="img/${name}" alt="${name}">`).join("\n")}
+</body></html>
+`;
+
 /** A dark report: its look comes from a <style> block, its content is centered in a column, and its images are a relative file, an absolute path, a file:// URL and an inline data: image, plus a ../ one outside its folder. */
 const html = (dir: string): string => `<!doctype html>
 <html><head><title>Report</title>
@@ -82,6 +136,7 @@ test.describe("html preview on the web app", () => {
   test.skip(!probe.run, probe.reason);
 
   let fixtureDir = "";
+  let reportFile = "";
   let pending: PendingPairing | null = null;
   let desktop: HeadlessDesktop | null = null;
   let proxy: CookieProxy | null = null;
@@ -136,8 +191,11 @@ test.describe("html preview on the web app", () => {
     const deep = join(fixtureDir, "casium", "reports", "868mx2djq-fn-list-performance-report-with-a-very-long-name");
     mkdirSync(join(deep, "img"), { recursive: true });
     const dir = join(realpathSync(fixtureDir), "casium", "reports", "868mx2djq-fn-list-performance-report-with-a-very-long-name");
-    writeFileSync(join(deep, "report.html"), html(dir));
+    reportFile = join(deep, "report.html");
+    writeFileSync(reportFile, html(dir));
     writeFileSync(join(deep, "img", "chart.png"), PNG);
+    writeFileSync(join(deep, "gallery.html"), galleryHtml);
+    GALLERY.forEach(([name, bytes], index) => writeFileSync(join(deep, "img", name), noisePng(bytes, index + 1)));
     // Beside the report's folder, so a `../` reference reaches a real image that must still be refused (not a project here).
     writeFileSync(join(deep, "..", "outside.png"), PNG);
 
@@ -155,7 +213,7 @@ test.describe("html preview on the web app", () => {
     expect((await owner.call("POST", `/api/pair/${userCode}/approve`, { body: {} })).status).toBe(200);
     expect(await pending.process.exited, pending.process.stderr()).toBe(0);
 
-    const text = `The report is \`${dir}/report.html\`.`;
+    const text = `The report is \`${dir}/report.html\` and the gallery is \`${dir}/gallery.html\`.`;
     process.env["WEB_LINK_HEADLESS_MENTION_DIR"] = deep;
     process.env["WEB_LINK_HEADLESS_MENTION_TEXT"] = text.replaceAll(dir, "{dir}");
     process.env["WEB_LINK_HEADLESS_MENTION_TOOL_TEXT"] = "";
@@ -240,9 +298,84 @@ test.describe("html preview on the web app", () => {
     for (const id of ["relative", "inline", "absolute", "fileurl"]) {
       await expect.poll(() => inner().locator(`#${id}`).evaluate((el) => (el as HTMLImageElement).naturalWidth), { message: `${id} image` }).toBe(8);
     }
-    // Outside the document's folder (no project holds it here): refused, so the image stays empty.
-    expect(await inner().locator("#escape").evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBe(0);
+    // Outside the document's folder (no project holds it here): refused, so it shows the "Image not loaded" placeholder (not the picture, not a broken image) and the notice counts it.
+    expect(await inner().locator("#escape").evaluate((el) => (el as HTMLImageElement).src.startsWith("data:image/svg+xml;base64,"))).toBe(true);
+    expect(await inner().locator("#escape").evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBe(240);
+    await expect(page.getByTestId("preview-skipped-notice")).toContainText("1 not loaded");
     expect(await inner().locator("body").getAttribute("data-script-ran")).toBeNull();
+  });
+
+  test("a page with 8 relative images, one of 16 MB, shows every one of them: none is dropped or left broken", async () => {
+    test.setTimeout(180_000);
+    await page.setViewportSize({ width: 1100, height: 760 });
+    // Every download waits 2.5 s: the page must be on screen long before its images are.
+    let slow = true;
+    await page.route("**/api/transfers/**", async (route) => {
+      if (slow) await new Promise((resolve) => setTimeout(resolve, 2_500));
+      // fallback, not continue: the WebKit context above has its own route that adds the session cookie (the cookie is Secure and
+      // the run is plain http, which Linux WebKit does not send itself). continue() would skip it and the Worker answers 401.
+      await route.fallback();
+    });
+    try {
+      await page.locator('button[data-testid="file-mention"][data-path$="gallery.html"]').first().click();
+      await expect(dialog()).toBeVisible();
+      await expect(inner().locator("#gallery-title")).toHaveText("Gallery report", { timeout: 20_000 });
+      // Text first: at this moment no image has arrived, each one is a data: placeholder (loading), not a broken picture.
+      expect(await inner().locator("img").evaluateAll((images) => images.length > 0 && images.every((img) => (img as HTMLImageElement).src.startsWith("data:image/svg+xml") && (img as HTMLImageElement).naturalWidth === 240))).toBe(true);
+    } finally {
+      // Later downloads go at full speed; the ones already waiting still finish.
+      slow = false;
+    }
+    for (let index = 0; index < GALLERY.length; index++) {
+      const name = GALLERY[index]![0];
+      // Swapped in as it arrives: the real picture (a png data URI that decodes), no longer the loading placeholder.
+      await expect
+        .poll(async () => {
+          // On a touch screen the frame stops reloading by itself after a few seconds (nothing inside it can tell the app the reader is scrolling): the ready images wait behind Show.
+          const show = page.getByTestId("preview-html-ready-show");
+          if (await show.isVisible()) await show.click();
+          // The frame navigates to the next document as images arrive: a read that lands in between is simply asked again.
+          return inner()
+            .locator(`#g${index}`)
+            .evaluate((el) => ((el as HTMLImageElement).src.startsWith("data:image/png") ? (el as HTMLImageElement).naturalWidth : 0))
+            .catch(() => 0);
+        }, { message: name, timeout: 120_000 })
+        .toBeGreaterThan(0);
+    }
+    expect(await inner().locator("img").evaluateAll((images) => images.every((img) => (img as HTMLImageElement).src.startsWith("data:image/png")))).toBe(true);
+    await expect(page.getByTestId("preview-skipped-notice")).toHaveCount(0);
+    await page.unroute("**/api/transfers/**", undefined);
+  });
+
+  test("Download of an html file saves the file as it is on disk, not the sanitized page", async () => {
+    await openReport();
+    const [download] = await Promise.all([page.waitForEvent("download"), page.getByTestId("file-preview-download").click()]);
+    expect(download.suggestedFilename()).toBe("report.html");
+    const saved = readFileSync(await download.path());
+    expect(saved.equals(readFileSync(reportFile))).toBe(true);
+    // The script and the relative image references the sanitizer removes or rewrites are all still there.
+    expect(saved.toString("utf8")).toContain("data-script-ran");
+    expect(saved.toString("utf8")).not.toContain("monoptah-asset:");
+  });
+
+  test("the page's images are listed outside the frame, and each downloads or opens in the zoom viewer", async () => {
+    await page.setViewportSize({ width: 1100, height: 760 });
+    await openReport();
+    // A click inside the sandboxed frame cannot reach the app: the list beside it is how an image is reached.
+    await page.getByTestId("preview-html-images-toggle").click();
+    const row = page.getByTestId("preview-html-image-row").filter({ hasText: "chart.png" }).first();
+    await expect(row).toHaveAttribute("data-state", "loaded", { timeout: 20_000 });
+    const [download] = await Promise.all([page.waitForEvent("download"), row.getByTestId("preview-html-image-download").click()]);
+    expect(download.suggestedFilename()).toBe("chart.png");
+    expect(readFileSync(await download.path()).subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    await row.getByTestId("preview-html-image-open").click();
+    const lightbox = page.getByTestId("image-lightbox");
+    await expect(lightbox.getByTestId("preview-image")).toBeVisible();
+    await expect(lightbox.getByTestId("preview-image-download")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(lightbox).toHaveCount(0);
+    // The sandbox is untouched.
+    expect(await page.getByTestId("preview-html").getAttribute("sandbox")).toBe("");
   });
 
   test("the dialog fits a 320 px wide screen: no sideways overflow, the title and path truncate, the close button is clear, the report column is on screen", async () => {

@@ -1388,8 +1388,8 @@ impl Shell {
             }
         };
         // Budget and shape first: a device over budget, or a malformed request, gathers nothing.
-        if let Err(code) = mention::budget::admit(&request.device.id) {
-            let error = code.failure();
+        if mention::budget::admit(&request.device.id).is_err() {
+            let error = mention::budget::busy(&request.device.id, 0);
             audited.record(
                 &Err(error.clone()),
                 &audited.path,

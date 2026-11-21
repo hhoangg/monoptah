@@ -50,10 +50,13 @@ export type LinkErrorCode = (typeof LINK_ERROR_CODES)[number];
 /** A request or watch failed. `code` is a desktop code (`read_only`, `busy`, ...) or one of `LINK_ERROR_CODES`. */
 export class LinkRequestError extends Error {
   readonly code: string | undefined;
-  constructor(message: string, code?: string) {
+  /** Seconds the desktop asks to wait before the same request is made again (`busy` from a rate limit). */
+  readonly retryAfter: number | undefined;
+  constructor(message: string, code?: string, retryAfter?: number) {
     super(message);
     this.name = "LinkRequestError";
     this.code = code;
+    this.retryAfter = retryAfter;
   }
 }
 
@@ -573,14 +576,14 @@ export class LinkSession {
     if (!pending) return; // late answer to a timed-out or aborted request
     this.#pending.delete(response.rid);
     pending.cleanup();
-    if (!response.ok) pending.reject(new LinkRequestError(response.error, response.code));
+    if (!response.ok) pending.reject(new LinkRequestError(response.error, response.code, response.retryAfter));
     else if ("result" in response) pending.resolve(response.result);
     else pending.reject(new LinkRequestError("Unexpected response", "invalid_frame"));
   }
 
   #onWatchResponse(watch: WatchEntry, response: EnvelopeResponse): void {
     if (!response.ok) {
-      const error = new LinkRequestError(response.error, response.code);
+      const error = new LinkRequestError(response.error, response.code, response.retryAfter);
       const ack = watch.ack;
       this.#stopWatch(watch, false);
       if (ack) ack.reject(error);

@@ -33,18 +33,32 @@ pub type LinkResult<T> = Result<T, String>;
 pub struct Failure {
     pub error: String,
     pub code: Option<String>,
+    /// Seconds after which the same request may succeed (a rate limit or a full queue), written as `retryAfter`
+    /// next to a `code`; absent when the desktop cannot tell.
+    pub retry_after: Option<u64>,
 }
 impl Failure {
     pub fn coded(code: &str, error: impl Into<String>) -> Self {
         Self {
             error: error.into(),
             code: Some(code.to_owned()),
+            retry_after: None,
         }
+    }
+
+    /// This failure with a hint of how many seconds to wait before asking again.
+    pub fn retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds);
+        self
     }
 }
 impl From<String> for Failure {
     fn from(error: String) -> Self {
-        Self { error, code: None }
+        Self {
+            error,
+            code: None,
+            retry_after: None,
+        }
     }
 }
 impl From<&str> for Failure {

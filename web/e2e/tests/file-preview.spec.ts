@@ -6,10 +6,10 @@
 // Set FILE_PREVIEW_SCREENSHOTS=<dir> to also save a full-page screenshot per preview kind there.
 import { randomBytes } from "node:crypto";
 import { deflateSync } from "node:zlib";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Page } from "@playwright/test";
+import type { Download, Page } from "@playwright/test";
 import { E2E_CATALOG } from "../lib/catalog.ts";
 import { clearRateLimits, namedInvite } from "../lib/env.ts";
 import { test, expect } from "../lib/fixtures.ts";
@@ -328,7 +328,8 @@ test.describe("file mention previews on the web app", () => {
     await expect(md).toContainText("A chart:");
     const image = page.getByTestId("preview-md-image");
     await expect(image).toBeVisible();
-    expect(await image.getAttribute("src")).toMatch(/^data:image\/png/);
+    // An object URL of the image (the markdown is the app's own DOM), not a data string of its bytes.
+    expect(await image.getAttribute("src")).toMatch(/^blob:/);
     await expect.poll(() => image.evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
     await shot("web-markdown");
   });
@@ -372,6 +373,43 @@ test.describe("file mention previews on the web app", () => {
     await expect(highlighted).toContainText("value12");
     await expect(highlighted).toHaveAttribute("data-index", "11");
     await shot("web-code");
+  });
+
+  /** The bytes of a download Playwright caught. */
+  async function saved(download: Download): Promise<Buffer> {
+    const path = await download.path();
+    return readFileSync(path);
+  }
+
+  test("a text file downloads under its own name as the file's text, without navigating", async () => {
+    await open("code.ts");
+    await expect(page.getByTestId("preview-lines")).toBeVisible();
+    const url = page.url();
+    const [download] = await Promise.all([page.waitForEvent("download"), page.getByTestId("file-preview-download").click()]);
+    expect(download.suggestedFilename()).toBe("code.ts");
+    expect((await saved(download)).toString("utf8")).toContain("value12");
+    expect(page.url()).toBe(url);
+  });
+
+  test("a single image downloads from its viewer as the original bytes", async () => {
+    await open("chart.png");
+    await expect(page.getByTestId("preview-image")).toBeVisible();
+    const [download] = await Promise.all([page.waitForEvent("download"), page.getByTestId("preview-image-download").click()]);
+    expect(download.suggestedFilename()).toBe("chart.png");
+    expect((await saved(download)).subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  });
+
+  test("a click on a markdown image opens the zoom viewer, which downloads the image", async () => {
+    await open("notes.md");
+    await page.getByTestId("preview-md-image-open").click();
+    const lightbox = page.getByTestId("image-lightbox");
+    await expect(lightbox).toBeVisible();
+    await expect(lightbox.getByTestId("preview-image")).toBeVisible();
+    const [download] = await Promise.all([page.waitForEvent("download"), lightbox.getByTestId("preview-image-download").click()]);
+    expect(download.suggestedFilename()).toBe("chart.png");
+    expect((await saved(download)).subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    await page.keyboard.press("Escape");
+    await expect(lightbox).toHaveCount(0);
   });
 
   test("a binary file shows that it cannot be previewed, with its size and path", async () => {
