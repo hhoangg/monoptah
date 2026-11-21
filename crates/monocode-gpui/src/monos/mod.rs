@@ -1,6 +1,9 @@
 //! Mono workspaces: one runtime per identity, shared by the rail, title tabs,
 //! overview, settings and floating windows.
 pub(crate) mod avatar;
+#[cfg(test)]
+mod browser_tests;
+mod browser_ui;
 pub(crate) mod cards;
 mod changes;
 #[cfg(test)]
@@ -127,6 +130,7 @@ pub(crate) struct Monos {
     /// The one emoji library every Mono picks packs from.
     emoji_store: Entity<crate::emoji_library::EmojiStore>,
     emoji_ui: emoji_ui::EmojiUi,
+    browser_ui: browser_ui::BrowserUi,
     notice_region: AnchorSlot,
     pub(crate) details: Entity<overview::Overview>,
     original_chrome: bool,
@@ -458,6 +462,7 @@ impl Monos {
             cleanup: reset::default_cleanup(),
             emoji_store,
             emoji_ui: emoji_ui::EmojiUi::new(),
+            browser_ui: browser_ui::BrowserUi::new(),
             notice_region,
             details,
             original_chrome: false,
@@ -1930,6 +1935,7 @@ impl gpui::Render for Monos {
             .children(self.settings_modal(&mono, window, cx))
             .children(self.reset_modal(window, cx))
             .children(self.emoji_select_popover(cx))
+            .children(self.browser_select_popover(cx))
             .children(self.picker_surface(cx))
             .children(self.options_surface(cx))
             .children(self.background_modal())

@@ -184,3 +184,99 @@ as the last N entries.
   implementation).
 - Whether Codex `env_vars` forwards from the app-server process env as assumed (matches how
   `monocode_app` passes its token today).
+
+## Implementation notes
+
+Status: implemented for the native app. Code: `crates/monocode-core/src/mono/browser.rs`
+(setting, token store, audit, MCP config, prompt block, probe), `crates/monocode-gpui/src/monos/browser_ui.rs`
+(the Browser tab), launch wiring in `provider.rs` and `runtime.rs`.
+
+### Open questions, verified on `@playwright/mcp` 0.0.86 (`playwright-core` 1.66.0-alpha-2026-11-18)
+
+Read from the published packages (`npm pack`, files only read, nothing executed).
+
+- Origin and output env names exist exactly as guessed: `PLAYWRIGHT_MCP_BLOCKED_ORIGINS`,
+  `PLAYWRIGHT_MCP_ALLOWED_ORIGINS` (both `;`-separated), `PLAYWRIGHT_MCP_OUTPUT_DIR`,
+  `PLAYWRIGHT_MCP_PROFILE_DIR_NAME`. The matching flags are `--blocked-origins`, `--allowed-origins`,
+  `--output-dir`, `--profile-dir-name`. The app uses the flags (not secret, same on both harnesses).
+- The token has no flag: it is read only from `process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN`
+  (`CDPRelayServer` constructor). So the token can only travel in the environment.
+- Origin matching: an entry is turned into the glob `<origin>/**` (`originOrHostGlob`); a wildcard
+  such as `*.example.com` is not valid, subdomains are listed one by one. Blocked routes are
+  registered per browser context; an allow-list adds a catch-all `**` abort first. The server's own
+  help says both lists are not a security boundary and do not affect redirects.
+- No tool allow/deny option exists in the server (no `--exclude-tools`). Optional capabilities
+  (`network`, `storage`, `devtools`, `pdf`, `vision`, `testing`) are off unless `--caps` is given, and the
+  app never passes it. Tools that matter for the rules: `browser_run_code_unsafe` (arbitrary
+  code, "RCE-equivalent"), and `browser_route` / `browser_unroute` (network capability). A route added
+  later outranks the origin routes, so these three are denied explicitly (`BLOCKED_TOOLS`).
+- Files: a plain `filename` of a snapshot or screenshot resolves against `--output-dir`, and the
+  output dir is an allowed root, so "save the snapshot to a file by name" works without extra flags.
+- Codex `env_vars`: a name in `mcp_servers.<name>.env_vars` (source `local`, the default) is copied
+  from the Codex process environment into the MCP server's environment (`create_env_for_mcp_server`
+  in `rmcp-client`), next to PATH and HOME. This is what the existing `monocode_app` entry relies on,
+  so the app sets the token on the Codex app-server process and names it in `env_vars`. Codex also
+  supports `disabled_tools` and `startup_timeout_sec` per server, both used.
+- Claude: `${VAR}` in a server `env` map is expanded from the Claude process environment
+  (the CLI has a "Missing environment variables" error for it), `--disallowedTools` exists, and
+  `--strict-mcp-config` is not passed.
+
+### Deviations and decisions
+
+- Pin: `@playwright/mcp@0.0.86` (`PLAYWRIGHT_MCP_VERSION`). It is current `latest`. Bump with the
+  flags re-read from the new version.
+- Origin rules and the output folder use the verified flags in argv instead of env entries. Only
+  the token is an env reference. `--profile-dir-name` is always passed.
+- Denied tools: `browser_run_code_unsafe`, `browser_route`, `browser_unroute`, `browser_evaluate`. Claude gets
+  `--disallowedTools mcp__playwright_browser__<tool>`; Codex gets `disabled_tools`. The origin
+  rules stay best effort (redirects), as the server says.
+- Claude `--allowedTools` for the server holds only read tools (`browser_snapshot`,
+  `browser_take_screenshot`, `browser_console_messages`, `browser_network_requests`, `browser_find`,
+  `browser_wait_for`) while "ask before" is on, and the whole server when it is off. Codex uses `default_tools_approval_mode` `writes` while "ask before" is on and `approve` when it is off.
+- Residual risk: the token is in the provider process environment. That hides it from argv only;
+  other processes of the same user can read an environment (for example `ps eww`), and a shell
+  tool the Mono runs inherits it. Codex drops variables with TOKEN in the name from its shell tool
+  by default; Claude's Bash tool does not. I looked for a Claude setting that scrubs the
+  environment of its Bash tool and found none that is verified for an arbitrary variable
+  (`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` exists but forces the default permission mode, so it is not
+  used). The prompt forbids printing or revealing environment variables, credentials and tokens,
+  and running `env` or `printenv`.
+- "Ask before" and Claude's permission modes: only `default`, `plan` and `acceptEdits` prompt for
+  an MCP tool (`acceptEdits` is described by the CLI as "ask before file changes", so it
+  auto-accepts file edits only). `auto` (a classifier approves without asking, and the default
+  access for Monos) and `bypassPermissions` never ask, so `--allowedTools` cannot make a tool wait.
+  With "ask before" on and any mode other than those three (`claude_mode_prompts`), the
+  page-changing tools (`WRITE_TOOLS`: click, type, fill_form, select_option, press_key,
+  press_sequentially, drag, drop, file_upload, handle_dialog, check and the mouse tools) are added
+  to `--disallowedTools`, so only reading and navigating remain; the Browser tab says so. A user
+  who wants those tools under Auto turns "ask before" off or uses Supervised or Auto-accept edits.
+  No PreToolUse hook was relied on because I could not verify that a hook can force a prompt in
+  these modes. In the prompting modes the tools take the normal permission prompt.
+- Codex: `default_tools_approval_mode = "writes"` makes every tool not marked read-only wait for
+  approval (codex-rs `core/src/mcp_tool_call.rs`, `requires_mcp_tool_approval_for_mode`). When the
+  approval policy is `never` (Full Access, read-only) such a call is denied: the approval step in
+  the same file returns a `ReviewDecision::denied("MCP tool call requires approval, but approval
+  policy is never")` when `approval_policy == AskForApproval::Never`, so it does not run. Auto
+  (`on-request`) and Supervised prompt normally. With "ask before" off the mode is `approve`.
+- `browser_evaluate` is also denied on both providers: page JavaScript can reach origins the rules
+  block. The denied set is `browser_run_code_unsafe`, `browser_route`, `browser_unroute`,
+  `browser_evaluate`.
+- The browser server is resolved once per launch (`run_operation`), and both Claude and Codex get
+  the rules text that matches it (`Settings.browser_available`). The profile name is reduced to
+  letters, digits and a few punctuation marks before it goes into the rules.
+- The setting has a `ready` flag, kept true to the last check by the Browser tab (prerequisites, a
+  profile and a saved token). A launch also re-checks Chrome and read access to `Local State`
+  right before adding the server, and decrypts the token. If any fails the server is not added and
+  the browser paragraph is left out of the rules for that launch (`launch_instructions`). The
+  `mono-context` receipt hash uses the stored setting, so a failure at launch does not change it.
+- Install detection is the folder `Extensions/<id>` or an `extensions.settings.<id>` entry in
+  `Secure Preferences` / `Preferences`; a disabled extension still counts as installed.
+- Test connection spawns the pinned server like a launch does (`npx`, token in env), sends
+  `initialize` and `tools/call browser_tabs {action: list}`, and maps "Invalid token" to
+  "Token needs update". The tab polls every 2 seconds for the install while it is open.
+- The audit records a call once, when it finishes, from the tool name (Claude
+  `mcp__playwright_browser__*`, Codex `playwright_browser:*`). It keeps tool, URL argument and a
+  short action; typed text, form values and selected options are never stored. The URL is only known
+  for tools that take one (navigate).
+- Not done: the read-only overview under Settings > Monos, Linux and Windows profile discovery
+  beyond default paths, and warming the npx cache.

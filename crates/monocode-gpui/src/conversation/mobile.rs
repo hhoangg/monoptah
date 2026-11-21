@@ -933,6 +933,7 @@ mod usage_tests {
                 mono: Default::default(),
                 root: "/fixture".into(),
                 executable: "/fixture/binary".into(),
+                browser_database: None,
             });
             v.settings.usage_limit = Some(Limit {
                 resets_at: Some(usage::now_ms() + 60_000),

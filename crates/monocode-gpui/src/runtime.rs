@@ -692,6 +692,12 @@ fn run_turn_using(
                 prompt = discovery.prepend(prompt);
             }
         }
+        // Which Mono's real-browser calls to log, if its browser is on.
+        let browser_audit_mono = settings
+            .mono
+            .as_ref()
+            .filter(|m| m.mono.browser.as_ref().is_some_and(|b| b.enabled))
+            .map(|m| m.mono.id.clone());
         let request = Request {
             kind,
             binary,
@@ -706,6 +712,7 @@ fn run_turn_using(
             settings,
         };
         let mut tool_rows = std::collections::HashMap::new();
+        let mut audited_browser_calls = std::collections::HashSet::new();
         // The running-work list attributes the provider and its tools to this session.
         let result = monocode_core::process::owned_by(summary.id, || {
             provider::run_with_controls(request, cancel.clone(), Some(controls), |events| {
@@ -850,6 +857,21 @@ fn run_turn_using(
                             start = start.min(ix);
                             pending.changed(ix);
                             contributions::record(&store, summary.id, &summary.cwd, &tool);
+                            // A Mono's real-browser calls are logged once each, when they finish.
+                            if tool.state != monocode_core::tool::ToolState::Running
+                                && let Some(mono_id) = browser_audit_mono.as_ref()
+                                && audited_browser_calls.insert(tool.id.clone())
+                                && let Some(entry) = monocode_core::mono::browser::audit_entry(
+                                    &tool.name,
+                                    &tool.input,
+                                    summary.id,
+                                )
+                                && let Ok(db) = locked(&store)
+                                && let Ok(audit) =
+                                    monocode_core::mono::browser::MonoBrowserStore::for_store(&db)
+                            {
+                                let _ = audit.record(mono_id, &entry);
+                            }
                         }
                         Event::SessionId(id) => {
                             if provider_id.as_ref() != Some(&id) {

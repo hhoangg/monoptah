@@ -3,6 +3,7 @@
 pub mod account_mention;
 pub mod api;
 pub mod bridge;
+pub mod browser;
 pub mod cards;
 pub mod cloud_api;
 mod desktop;
@@ -81,6 +82,9 @@ pub struct Mono {
     /// The switch, frequency and selected packs of the shared emoji library.
     #[serde(skip_serializing_if = "emoji::MonoEmoji::is_default")]
     pub emoji: emoji::MonoEmoji,
+    /// Real Chrome through Playwright MCP. The token is not here, see `browser::MonoBrowserStore`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser: Option<browser::MonoBrowser>,
 }
 
 /// What a Mono's sessions start with when it names no provider, model,
@@ -216,6 +220,7 @@ impl Default for Mono {
             heartbeat_minutes: heartbeat::DEFAULT_MINUTES,
             subsessions: None,
             emoji: emoji::MonoEmoji::default(),
+            browser: None,
         }
     }
 }
@@ -251,6 +256,9 @@ impl Mono {
         }
     }
     pub fn normalize(&mut self) {
+        if let Some(browser) = &mut self.browser {
+            browser.normalize();
+        }
         self.name = self.name.trim().chars().take(40).collect();
         if !MASCOTS.contains(&self.mascot.as_str()) {
             self.mascot = MASCOTS[0].into();
@@ -445,7 +453,7 @@ pub fn instructions(mono: &Mono, executable: &Path) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    format!(
+    let rules = format!(
         "You are {}, a persistent Mono in Monoptah: an agent the user chats with like a person in a messaging app. Work only on the projects assigned to you:\n{projects}\n\n\
 ## Be quick\n\
 This is a live chat, so speed matters more than thoroughness. Think only as much as the message needs:\n\
@@ -468,7 +476,11 @@ Your soul holds the user's standing instructions; they rank below the user's cur
 Save substantial written reports with artifacts.write, kind document, title, summary and complete Markdown body. Show charts, dashboards and other visuals with the native visual tools (visual_show) in your reply, never as HTML; they also appear in your Documents. Cards appear in the chat and overview. Use notes.write only for the user's Notes. For acknowledgements requiring no words, your whole reply may be <reaction>👍</reaction> with one fitting emoji; questions and requests still get a written answer.",
         mono.label(),
         workflows = WORKFLOWS_RULES,
-    )
+    );
+    match mono.browser.as_ref().filter(|b| b.active()) {
+        Some(browser) => format!("{rules}\n\n{}", browser::prompt_block(browser)),
+        None => rules,
+    }
 }
 
 /// Whether this provider takes a Mono's rules as system instructions:

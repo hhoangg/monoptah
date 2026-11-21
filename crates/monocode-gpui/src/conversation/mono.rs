@@ -194,10 +194,16 @@ impl Conversation {
         self.completion.update(cx, |completion, cx| {
             completion.set_mono(mono_root, mono_id, cx)
         });
+        let browser_database = crate::runtime::locked(&self.store).ok().and_then(|store| {
+            monocode_core::mono::browser::MonoBrowserStore::for_store(&store)
+                .ok()
+                .map(|secrets| secrets.database().to_path_buf())
+        });
         self.settings.mono = Some(monocode_core::agent::MonoContext {
             mono,
             root,
             executable: std::env::current_exe().unwrap_or_default(),
+            browser_database,
         });
         self.sync_tool_paths(cx);
         cx.notify();

@@ -91,6 +91,9 @@ pub struct Settings {
     /// Native remote control invocation, never saved as provider configuration.
     #[serde(skip)]
     pub remote_action: Option<serde_json::Value>,
+    /// Set once per launch: the Mono's browser server is really added, so its rules mention it.
+    #[serde(skip)]
+    pub browser_available: bool,
     pub account: crate::accounts::Profile,
     pub usage_limit: Option<crate::usage::Limit>,
     /// The user turned automatic resume off for this session while the global
@@ -176,6 +179,8 @@ pub struct MonoContext {
     pub mono: crate::mono::Mono,
     pub root: std::path::PathBuf,
     pub executable: std::path::PathBuf,
+    /// The database that holds the Mono's browser token. None: no browser server is added.
+    pub browser_database: Option<std::path::PathBuf>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]

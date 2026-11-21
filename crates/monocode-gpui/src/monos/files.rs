@@ -275,6 +275,7 @@ impl Monos {
             self.reset = None;
         }
         self.roster.monos.retain(|m| m.id != id);
+        self.browser_forget(id);
         if self.active.as_deref() == Some(id) {
             self.active = None;
         }
