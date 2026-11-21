@@ -8,6 +8,7 @@ use gpui::{
 use monocode_core::mobile::{
     DeviceKind, Permission, WebState, WebStatus,
     host::Device,
+    terminal::OpenTerminal,
     web_link::{AccessChange, PairTicket, PendingDevice, PermissionRequest},
 };
 use std::{cell::RefCell, rc::Rc};
@@ -49,6 +50,7 @@ fn tag(event: &SettingsEvent) -> Option<String> {
             permission,
         } => format!("permission:{device_id}:{permission:?}"),
         SettingsEvent::WebRevokeDevice(id) => format!("revoke:{id}"),
+        SettingsEvent::WebKillTerminal(id) => format!("kill:{id}"),
         SettingsEvent::WebSetTerminalAllowed { device_id, on } => {
             format!("terminal:{device_id}:{on}")
         }
@@ -153,6 +155,18 @@ fn click(visual: &mut VisualTestContext, selector: &'static str) {
         .debug_bounds(selector)
         .unwrap_or_else(|| panic!("{selector} is not drawn"));
     visual.simulate_click(bounds.center(), Default::default());
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    visual.run_until_parked();
+}
+
+/// A full key press: the test context sends only the key down, and an element
+/// activates on the key up that follows it.
+fn press(visual: &mut VisualTestContext, key: &str) {
+    visual.simulate_keystrokes(key);
+    visual.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse(key).unwrap(),
+    });
     visual.run_until_parked();
     visual.refresh().unwrap();
     visual.run_until_parked();
@@ -429,9 +443,150 @@ fn the_web_terminal_switch_is_per_device_and_only_for_control(cx: &mut TestAppCo
     // Off until the desktop's user says so: a click asks to turn it on.
     click(visual, "web-terminal-term-control");
     assert_eq!(events(&window, visual), ["terminal:term-control:true"]);
-    // A read-only device cannot be given a shell: its button does nothing.
+    // A read-only device cannot be given a shell: its toggle does nothing.
     click(visual, "web-terminal-term-read");
     assert_eq!(events(&window, visual), ["terminal:term-control:true"]);
+}
+
+fn open_terminal(id: &str, device_id: &str, project: &str) -> OpenTerminal {
+    OpenTerminal {
+        id: id.into(),
+        device_id: device_id.into(),
+        device_name: "Work laptop".into(),
+        project: project.into(),
+        opened_unix: 1,
+        idle_minutes: 3,
+        detached: false,
+    }
+}
+
+#[gpui::test]
+fn a_device_row_expands_and_collapses_on_click_but_not_from_its_controls(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![device("dev1", Permission::Control)],
+            ..paired()
+        });
+        ctx.web_projects = choices(&["p1"]);
+    });
+    assert!(
+        visual.debug_bounds("web-projects-dev1").is_none(),
+        "the Projects button is gone"
+    );
+    assert!(visual.debug_bounds("web-terminals-dev1").is_none());
+    click(visual, "web-device-dev1");
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_some());
+    assert!(visual.debug_bounds("web-terminals-dev1").is_some());
+    // A control does its own job and leaves the row as it is.
+    click(visual, "settings-web-perm-dev1-read");
+    click(visual, "web-terminal-dev1");
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_some());
+    click(visual, "web-device-dev1");
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_none());
+    assert!(visual.debug_bounds("web-terminals-dev1").is_none());
+    // Controls do not expand a collapsed row either.
+    click(visual, "settings-web-perm-dev1-control");
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_none());
+    assert_eq!(
+        events(&window, visual),
+        [
+            "permission:dev1:Read",
+            "terminal:dev1:true",
+            "permission:dev1:Control"
+        ]
+    );
+}
+
+#[gpui::test]
+fn a_device_row_lists_its_own_open_terminals_and_kill_emits(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![
+                device("dev1", Permission::Control),
+                device("dev2", Permission::Control),
+            ],
+            ..paired()
+        });
+        ctx.web_terminals = vec![
+            open_terminal("t1", "dev1", "Alpha"),
+            open_terminal("t2", "dev2", "Beta"),
+        ];
+    });
+    assert!(visual.debug_bounds("web-terminal-row-t1").is_none());
+    click(visual, "web-device-dev1");
+    assert!(visual.debug_bounds("web-terminal-row-t1").is_some());
+    assert!(
+        visual.debug_bounds("web-terminal-row-t2").is_none(),
+        "another device's terminal is not listed here"
+    );
+    click(visual, "web-terminal-kill-t1");
+    assert_eq!(events(&window, visual), ["kill:t1"]);
+}
+
+#[gpui::test]
+fn the_permission_icons_switch_and_a_revoke_icon_confirms_or_cancels(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![device("dev1", Permission::Read)],
+            ..paired()
+        });
+    });
+    // Read-only has no shell: the terminal icon does nothing.
+    click(visual, "web-terminal-dev1");
+    assert!(events(&window, visual).is_empty());
+    click(visual, "settings-web-perm-dev1-control");
+    assert_eq!(events(&window, visual), ["permission:dev1:Control"]);
+    click(visual, "web-revoke-dev1");
+    assert!(visual.debug_bounds("web-revoke-dialog").is_some());
+    click(visual, "web-revoke-cancel");
+    assert!(visual.debug_bounds("web-revoke-dialog").is_none());
+    assert_eq!(events(&window, visual).len(), 1, "cancel does not revoke");
+}
+
+#[gpui::test]
+fn the_keyboard_expands_a_row_and_operates_its_icon_controls(cx: &mut TestAppContext) {
+    let window = preview(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    set_web(&window, visual, |ctx| {
+        ctx.web = Some(WebStatus {
+            devices: vec![device("dev1", Permission::Control)],
+            ..paired()
+        });
+        ctx.web_projects = choices(&["p1"]);
+    });
+    // A click focuses the disclosure button (as Tab would); Enter and Space
+    // then activate it.
+    click(visual, "web-device-dev1");
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_some());
+    press(visual, "enter");
+    assert!(
+        visual.debug_bounds("web-project-dev1-p1").is_none(),
+        "Enter on the focused disclosure collapses the row"
+    );
+    press(visual, "space");
+    assert!(
+        visual.debug_bounds("web-project-dev1-p1").is_some(),
+        "Space on the focused disclosure expands it again"
+    );
+    // The same for a focused icon control, and it leaves the row as it is.
+    click(visual, "web-terminal-dev1");
+    press(visual, "enter");
+    press(visual, "space");
+    assert_eq!(
+        events(&window, visual),
+        [
+            "terminal:dev1:true",
+            "terminal:dev1:true",
+            "terminal:dev1:true"
+        ]
+    );
+    assert!(visual.debug_bounds("web-project-dev1-p1").is_some());
 }
 
 #[gpui::test]
@@ -967,14 +1122,14 @@ fn a_web_device_row_narrows_its_projects_from_the_desktop(cx: &mut TestAppContex
         ctx.web_projects = choices(&["p1", "p2"]);
     });
     assert!(visual.debug_bounds("web-project-dev1-p1").is_none());
-    click(visual, "web-projects-dev1");
+    click(visual, "web-device-dev1");
     // A device with no saved selection has every project ticked.
     click(visual, "web-project-dev1-p1");
     assert_eq!(
         events(&window, visual),
         ["web-selection:dev1:Some([\"p2\"]):None"]
     );
-    click(visual, "web-projects-dev1");
+    click(visual, "web-device-dev1");
     assert!(visual.debug_bounds("web-project-dev1-p1").is_none());
 }
 
@@ -993,7 +1148,7 @@ fn a_web_device_row_narrows_its_monos_and_keeps_ids_the_catalog_lost(cx: &mut Te
         ctx.web_projects = choices(&["p1", "p2"]);
         ctx.web_monos = choices(&["m1", "m2"]);
     });
-    click(visual, "web-projects-dev1");
+    click(visual, "web-device-dev1");
     click(visual, "web-mono-dev1-m1");
     assert_eq!(
         events(&window, visual),

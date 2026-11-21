@@ -4,7 +4,7 @@ use super::group_fingerprint;
 use crate::{
     settings::{
         SettingsEvent, SettingsView,
-        widgets::{note, secondary_button},
+        widgets::{icon_action, icon_toggle, note, secondary_button, with_tip},
     },
     theme::*,
 };
@@ -324,6 +324,26 @@ impl SettingsView {
             return page;
         }
         let now = unix_now();
+        let lists_terminals = self.web_app.expanded.as_deref().is_some_and(|open| {
+            self.ctx
+                .web_terminals
+                .iter()
+                .any(|terminal| terminal.device_id == open)
+        });
+        if !lists_terminals {
+            self.web_app.terminals_tick = None;
+        } else if self.web_app.terminals_tick.is_none() {
+            self.web_app.terminals_tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(30))
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
         let rows = devices
             .into_iter()
             .map(|device| {
@@ -336,107 +356,166 @@ impl SettingsView {
                     "read"
                 };
                 let change_id = id.clone();
-                let projects_open = self.web_app.projects_open.as_deref() == Some(id.as_str());
-                let projects = projects_open.then(|| self.web_device_projects(device, cx));
+                let expanded = self.web_app.expanded.as_deref() == Some(id.as_str());
+                let details = expanded.then(|| self.web_device_details(device, now, cx));
+                let control = device.permission == Permission::Control;
+                // Off by default, per device, and only for Control: the
+                // desktop alone decides, nothing the server sends turns it on.
+                let allowed = control && policy::terminal_allowed(&id);
+                let toggled = id.clone();
+                let toggle_id = id.clone();
+                let expand = {
+                    let toggle_id = toggle_id.clone();
+                    cx.listener(move |this, _, _, cx| {
+                        this.web_app.expanded = (this.web_app.expanded.as_deref()
+                            != Some(toggle_id.as_str()))
+                        .then(|| toggle_id.clone());
+                        cx.notify();
+                    })
+                };
+                let expand_row = {
+                    let toggle_id = toggle_id.clone();
+                    cx.listener(move |this, _, _, cx| {
+                        this.web_app.expanded = (this.web_app.expanded.as_deref()
+                            != Some(toggle_id.as_str()))
+                        .then(|| toggle_id.clone());
+                        cx.notify();
+                    })
+                };
                 let row = row_base()
+                    .id(SharedString::from(format!("web-row-{id}")))
+                    .cursor_pointer()
                     .debug_selector({
                         let id = id.clone();
                         move || format!("web-device-{id}")
                     })
-                    .child(name_block(
-                        name,
-                        &device.fingerprint,
-                        last_seen_text(device.last_seen, now),
-                    ))
-                    .child(self.segmented(
-                        format!("web-perm-{id}"),
-                        "Permission",
-                        permission,
-                        &[("read", "Read-only"), ("control", "Control")],
-                        cx,
-                        move |_, option, cx| {
-                            let permission = if option == "control" {
-                                Permission::Control
-                            } else {
-                                Permission::Read
-                            };
-                            cx.emit(SettingsEvent::WebSetPermission {
-                                device_id: change_id.clone(),
-                                permission,
-                            });
-                        },
-                    ))
+                    // Mouse only: the keyboard uses the disclosure button.
+                    .on_click(expand_row)
                     .child(
-                        secondary_button(
-                            SharedString::from(format!("web-projects-{id}")),
-                            "Projects",
-                            false,
-                            false,
-                        )
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("web-projects-{id}")
-                        })
-                        .child("Projects")
-                        .on_click({
-                            let id = id.clone();
-                            cx.listener(move |this, _, _, cx| {
-                                this.web_app.projects_open =
-                                    (this.web_app.projects_open.as_deref() != Some(id.as_str()))
-                                        .then(|| id.clone());
-                                cx.notify();
+                        // The disclosure button holds the labels only; the
+                        // controls are its siblings, never its children.
+                        div()
+                            .id(SharedString::from(format!("web-disclosure-{id}")))
+                            .role(Role::Button)
+                            .aria_label(format!("{name}, show details"))
+                            .aria_expanded(expanded)
+                            .tab_index(0)
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .on_click(move |event, window, cx| {
+                                cx.stop_propagation();
+                                expand(event, window, cx);
                             })
-                        }),
+                            .child(
+                                icon(
+                                    if expanded {
+                                        "chevron-down"
+                                    } else {
+                                        "chevron-right"
+                                    },
+                                    16.,
+                                )
+                                .text_color(content(0.45)),
+                            )
+                            .child(name_block(
+                                name.clone(),
+                                &device.fingerprint,
+                                last_seen_text(device.last_seen, now),
+                            )),
                     )
-                    .child({
-                        // Off by default, per device, and only for Control: the
-                        // desktop alone decides, nothing the server sends turns it on.
-                        let control = device.permission == Permission::Control;
-                        let allowed = control && policy::terminal_allowed(&id);
-                        let label = if allowed {
-                            "Web terminal: on"
-                        } else {
-                            "Web terminal: off"
-                        };
-                        let toggled = id.clone();
-                        secondary_button(
-                            SharedString::from(format!("web-terminal-{id}")),
-                            label,
-                            allowed,
-                            !control,
-                        )
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("web-terminal-{id}")
-                        })
-                        .child(label)
-                        .when(control, |button| {
-                            button.on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(SettingsEvent::WebSetTerminalAllowed {
-                                    device_id: toggled.clone(),
-                                    on: !allowed,
-                                });
-                            }))
-                        })
-                    })
                     .child(
-                        secondary_button(
-                            SharedString::from(format!("web-revoke-{id}")),
-                            "Revoke",
-                            true,
-                            false,
-                        )
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("web-revoke-{id}")
-                        })
-                        .child("Revoke")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.web_app.revoking = Some(revoke.clone());
-                            cx.notify();
-                        })),
+                        // The controls act on their own: a click on them must not
+                        // also expand or collapse the row.
+                        div()
+                            .id(SharedString::from(format!("web-controls-{id}")))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(self.icon_segmented(
+                                format!("web-perm-{id}"),
+                                "Permission",
+                                permission,
+                                &[
+                                    ("read", "eye", "Read-only"),
+                                    ("control", "command", "Control"),
+                                ],
+                                cx,
+                                move |_, option, cx| {
+                                    let permission = if option == "control" {
+                                        Permission::Control
+                                    } else {
+                                        Permission::Read
+                                    };
+                                    cx.emit(SettingsEvent::WebSetPermission {
+                                        device_id: change_id.clone(),
+                                        permission,
+                                    });
+                                },
+                            ))
+                            .child(
+                                icon_toggle(
+                                    SharedString::from(format!("web-terminal-{id}")),
+                                    if allowed {
+                                        "Web terminal: on"
+                                    } else if control {
+                                        "Web terminal: off"
+                                    } else {
+                                        "Web terminal: off (needs Control)"
+                                    },
+                                    if allowed {
+                                        "Web terminal: on"
+                                    } else if control {
+                                        "Web terminal: off"
+                                    } else {
+                                        "Web terminal: off (needs Control)"
+                                    },
+                                    "terminal",
+                                    allowed,
+                                    !control,
+                                )
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("web-terminal-{id}")
+                                })
+                                .when(control, |button| {
+                                    button.on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(SettingsEvent::WebSetTerminalAllowed {
+                                            device_id: toggled.clone(),
+                                            on: !allowed,
+                                        });
+                                    }))
+                                }),
+                            )
+                            .child(with_tip(
+                                icon_action(
+                                    SharedString::from(format!("web-revoke-{id}")),
+                                    format!("Revoke {name}"),
+                                    "trash",
+                                    32.,
+                                    16.,
+                                    0.5,
+                                    false,
+                                )
+                                .debug_selector({
+                                    let id = id.clone();
+                                    move || format!("web-revoke-{id}")
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.web_app.revoking = Some(revoke.clone());
+                                        cx.notify();
+                                    },
+                                )),
+                                "Revoke access",
+                            )),
                     );
-                div().child(row).children(projects).into_any_element()
+                div().child(row).children(details).into_any_element()
             })
             .collect();
         page.push(list(rows));
@@ -452,23 +531,26 @@ impl SettingsView {
         page
     }
 
-    /// The projects and Monos a web device may see, as two checklists. A
-    /// device with no saved selection (`None`) has everything ticked; ticking
-    /// everything again goes back to `None`, so it keeps seeing new items.
-    fn web_device_projects(
+    /// What a row shows when expanded: the projects and Monos the device may
+    /// see, as two checklists (a device with no saved selection, `None`, has
+    /// everything ticked; ticking everything again goes back to `None`, so it
+    /// keeps seeing new items), then its open web terminals.
+    fn web_device_details(
         &self,
         device: &monocode_core::mobile::host::Device,
+        now: u64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let projects = self.web_checklist(device, false, cx);
         let monos = self.web_checklist(device, true, cx);
+        let terminals = self.web_device_terminals(device, now, cx);
         div()
             .id(SharedString::from(format!(
                 "web-project-list-{}",
                 device.id
             )))
             .role(Role::Group)
-            .aria_label("Projects and Monos this web device can see")
+            .aria_label("Projects, Monos and open terminals of this web device")
             .flex()
             .flex_col()
             .gap(px(8.))
@@ -480,6 +562,85 @@ impl SettingsView {
             .text_size(px(13.))
             .child(projects)
             .child(monos)
+            .child(terminals)
+            .into_any_element()
+    }
+
+    /// The device's open web terminals, each with its project, when it was
+    /// opened, how long it has been idle and a Kill action.
+    fn web_device_terminals(
+        &self,
+        device: &monocode_core::mobile::host::Device,
+        now: u64,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open: Vec<_> = self
+            .ctx
+            .web_terminals
+            .iter()
+            .filter(|terminal| terminal.device_id == device.id)
+            .collect();
+        div()
+            .debug_selector({
+                let id = device.id.clone();
+                move || format!("web-terminals-{id}")
+            })
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(div().text_color(content(0.5)).child("Open terminals"))
+            .when(open.is_empty(), |d| {
+                d.text_color(content(0.5)).child("No terminals are open.")
+            })
+            .children(open.into_iter().map(|terminal| {
+                let kill = terminal.id.clone();
+                let idle = if terminal.idle_minutes == 0 {
+                    "Active".to_owned()
+                } else {
+                    format!("Idle {} min", terminal.idle_minutes)
+                };
+                let mut detail = format!("Opened {}, {idle}", ago_text(terminal.opened_unix, now));
+                if terminal.detached {
+                    detail.push_str(", browser disconnected");
+                }
+                div()
+                    .debug_selector({
+                        let id = terminal.id.clone();
+                        move || format!("web-terminal-row-{id}")
+                    })
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(div().truncate().child(terminal.project.clone()))
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_size(px(12.))
+                                    .text_color(content(0.5))
+                                    .child(detail),
+                            ),
+                    )
+                    .child(
+                        secondary_button(
+                            SharedString::from(format!("web-terminal-kill-{}", terminal.id)),
+                            format!("Kill terminal {}", terminal.project),
+                            true,
+                            false,
+                        )
+                        .debug_selector({
+                            let id = terminal.id.clone();
+                            move || format!("web-terminal-kill-{id}")
+                        })
+                        .child("Kill")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(SettingsEvent::WebKillTerminal(kill.clone()));
+                        })),
+                    )
+            }))
             .into_any_element()
     }
 
