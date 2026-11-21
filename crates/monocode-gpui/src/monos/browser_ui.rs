@@ -88,6 +88,7 @@ fn trust_row(trust: BrowserTrust, selected: bool, cx: &mut Context<Monos>) -> An
 }
 
 /// The Full Disk Access pane of System Settings. The scheme has a dot: `x-apple.systempreferences`.
+#[cfg(any(target_os = "macos", test))]
 pub(super) const FULL_DISK_ACCESS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 const SELECT_PRIORITY: usize = 90;
