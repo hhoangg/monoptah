@@ -238,7 +238,9 @@ pub struct MonoBrowser {
     /// How far the Mono may act on its own. Replaces the old "ask before send/post/delete"
     /// switch: a roster saved with that key (`confirmActions`) still loads and reads as Level 2.
     pub trust: BrowserTrust,
-    /// The last check found Chrome, access to its profile data, a profile and a saved token.
+    /// The Browser page's last check found Chrome, node, a profile and a saved token. Shown in
+    /// the UI only: a launch never reads it (a stale value used to drop the server silently), it
+    /// checks the live conditions instead, see [`resolve`].
     pub ready: bool,
 }
 impl Default for MonoBrowser {
@@ -258,9 +260,10 @@ impl Default for MonoBrowser {
     }
 }
 impl MonoBrowser {
-    /// The browser is switched on and set up: the server is added and the prompt mentions it.
+    /// The browser is switched on and has a saved profile: a launch tries to add the server and
+    /// the prompt mentions it. Whether it can be attached right now is decided by [`resolve`].
     pub fn active(&self) -> bool {
-        self.enabled && self.ready && valid_profile_dir(&self.profile_dir)
+        self.enabled && valid_profile_dir(&self.profile_dir)
     }
     /// The part of the setting that shapes the Mono's server. When it changes (or the browser is
     /// switched off) the running server must go. The trust level is not part of it: the gate reads
@@ -503,6 +506,11 @@ pub struct Prerequisites {
 impl Prerequisites {
     pub fn all_ok(&self) -> bool {
         self.chrome.is_ok() && self.full_disk_access.is_ok() && self.node.is_ok()
+    }
+    /// What a launch needs once a profile is saved. Full Disk Access is not part of it: it only
+    /// lets the app list Chrome's profiles, the server takes the saved profile name as it is.
+    pub fn can_attach(&self) -> bool {
+        self.chrome.is_ok() && self.node.is_ok()
     }
 }
 
@@ -1066,28 +1074,79 @@ pub fn output_dir(root: &Path, mono_id: &str) -> PathBuf {
     root.join(mono_id).join("browser")
 }
 
-/// The server for a Mono's launch, or None when its browser is off, not set up, its token does
-/// not open, or Chrome or its profile data are not reachable now (for example Full Disk Access
-/// was revoked).
-pub fn resolve(ctx: &crate::agent::MonoContext) -> Option<Runtime> {
+/// What a launch gets for a Mono's browser.
+#[derive(Debug)]
+pub enum Attach {
+    /// The server is running behind the Mono's gate; add it to the launch.
+    Ready(Runtime),
+    /// The Mono has no browser switched on (or no token store): nothing to add, nothing to say.
+    Off,
+    /// The browser is switched on but cannot be attached now. The reason is one line without
+    /// secrets; the launch tells the Mono and the Browser tab shows it.
+    Unavailable(String),
+}
+impl Attach {
+    pub fn runtime(self) -> Option<Runtime> {
+        match self {
+            Self::Ready(runtime) => Some(runtime),
+            _ => None,
+        }
+    }
+}
+
+/// The server for a Mono's launch. A saved profile is enough to try: Chrome's `Local State`
+/// (Full Disk Access) is only needed to list profiles, so it is not read here, and the stored
+/// `ready` flag is ignored. See [`Attach`].
+pub fn resolve(ctx: &crate::agent::MonoContext) -> Attach {
     resolve_with(ctx, &PrereqEnv::detect(), server::servers())
 }
 /// [`resolve`] with its Chrome environment and server manager given. The Mono's server is started
-/// here when it is not running, so the launch can point the provider at it.
+/// here when it is not running, so the launch can point the provider at it. An unavailable
+/// browser is logged and kept in `servers` (see [`server::BrowserServers::attach_error`]).
 pub fn resolve_with(
     ctx: &crate::agent::MonoContext,
     env: &PrereqEnv,
     servers: &server::BrowserServers,
-) -> Option<Runtime> {
-    let browser = ctx.mono.browser.as_ref().filter(|b| b.active())?;
-    let database = ctx.browser_database.clone()?;
-    if env.chrome().is_none() || read_local_state(env).is_err() {
-        return None;
+) -> Attach {
+    let attach = attach(ctx, env, servers);
+    match &attach {
+        Attach::Unavailable(reason) => {
+            eprintln!("mono browser: unavailable: {reason}");
+            servers.set_attach_error(&ctx.mono.id, Some(reason.clone()));
+        }
+        _ => servers.set_attach_error(&ctx.mono.id, None),
     }
-    let token = MonoBrowserStore::at(database).token(&ctx.mono.id).ok()??;
+    attach
+}
+fn attach(
+    ctx: &crate::agent::MonoContext,
+    env: &PrereqEnv,
+    servers: &server::BrowserServers,
+) -> Attach {
+    let Some(browser) = ctx.mono.browser.as_ref().filter(|b| b.enabled) else {
+        return Attach::Off;
+    };
+    let Some(database) = ctx.browser_database.clone() else {
+        return Attach::Off;
+    };
+    if !valid_profile_dir(&browser.profile_dir) {
+        return Attach::Unavailable("no Chrome profile is chosen".into());
+    }
+    if env.chrome().is_none() {
+        return Attach::Unavailable("Google Chrome was not found".into());
+    }
+    let npx = env.find_tool("npx");
+    if npx.is_none() || env.find_tool("node").is_none() {
+        return Attach::Unavailable("node or npx was not found on PATH".into());
+    }
+    let token = match MonoBrowserStore::at(database).token(&ctx.mono.id) {
+        Ok(Some(token)) => token,
+        Ok(None) => return Attach::Unavailable("no extension token is saved".into()),
+        Err(_) => return Attach::Unavailable("the saved extension token cannot be read".into()),
+    };
     let dir = output_dir(&ctx.root, &ctx.mono.id);
     let _ = std::fs::create_dir_all(&dir);
-    let spec = ServerSpec::new(browser, &dir, env.find_tool("npx").as_deref())
+    let spec = ServerSpec::new(browser, &dir, npx.as_deref())
         .with_session(&group_name(&ctx.mono), session_color(ctx.mono.color));
     let launch = server::ServerLaunch {
         spec: &spec,
@@ -1096,10 +1155,9 @@ pub fn resolve_with(
     };
     let (url, lease) = match servers.ensure(&ctx.mono.id, &launch) {
         Ok(started) => started,
+        // The error text never holds the token (it is only in the server's environment).
         Err(error) => {
-            // The error text never holds the token (it is only in the server's environment).
-            eprintln!("mono browser: server unavailable: {error}");
-            return None;
+            return Attach::Unavailable(format!("the browser server failed to start: {error}"))
         }
     };
     // The agent never talks to the Playwright server itself: it talks to the Mono's gate.
@@ -1107,12 +1165,11 @@ pub fn resolve_with(
     let gate = match servers.gate_for(&ctx.mono.id, &url, policy) {
         Ok(gate) => gate,
         Err(error) => {
-            eprintln!("mono browser: gate unavailable: {error}");
-            return None;
+            return Attach::Unavailable(format!("the browser gate failed to start: {error}"))
         }
     };
     let route = gate.route_for(crate::process::owner());
-    Some(Runtime {
+    Attach::Ready(Runtime {
         spec,
         token,
         trust: browser.trust,
@@ -1132,14 +1189,37 @@ pub fn group_name(mono: &super::Mono) -> String {
     }
 }
 /// A Mono's standing rules as this launch can honor them: the browser paragraph only when the
-/// server is really added.
-pub fn launch_instructions(ctx: &crate::agent::MonoContext, available: bool) -> String {
+/// server is really added. When the browser is switched on but could not be attached
+/// (`unavailable` holds the reason), the Mono is told so instead, so it reports the reason to
+/// the user rather than guessing.
+pub fn launch_instructions(
+    ctx: &crate::agent::MonoContext,
+    available: bool,
+    unavailable: Option<&str>,
+) -> String {
     if available || ctx.mono.browser.is_none() {
         return super::instructions(&ctx.mono, &ctx.executable);
     }
     let mut mono = ctx.mono.clone();
     mono.browser = None;
-    super::instructions(&mono, &ctx.executable)
+    let rules = super::instructions(&mono, &ctx.executable);
+    match unavailable {
+        Some(reason) => format!("{rules}\n\n{}", unavailable_block(reason)),
+        None => rules,
+    }
+}
+
+/// The paragraph for a Mono whose browser is enabled but could not be attached to this run.
+pub fn unavailable_block(reason: &str) -> String {
+    let reason: String = reason
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(300)
+        .collect();
+    format!(
+        "## Browser\nThe user enabled your browser, but it could not be attached to this run, so the `{MCP_SERVER}` tools are not available. Reason: {}. Do not say the tools were removed from your configuration. If the task needs the browser, tell the user this reason and that they can fix it in your Browser settings tab.",
+        reason.trim()
+    )
 }
 
 /// A profile name safe to put inside the rules: no control characters, quotes or markup, one

@@ -561,7 +561,8 @@ impl Protocol {
                                 params["developerInstructions"].as_str().unwrap_or_default(),
                                 crate::mono::browser::launch_instructions(
                                     mono,
-                                    self.request.settings.browser_available
+                                    self.request.settings.browser_available,
+                                    self.request.settings.browser_unavailable.as_deref()
                                 )
                             )
                             .into();
@@ -1436,6 +1437,27 @@ fn run_process(
     run_operation(request, cancel, controls, probe, false, false, emit)
 }
 
+/// Resolves the Mono's browser once and records the outcome in the settings, so the rules the
+/// provider gets agree with what the launch adds (the server, or the reason it is missing).
+fn apply_browser(
+    settings: &mut Settings,
+    resolve: impl FnOnce(&crate::agent::MonoContext) -> crate::mono::browser::Attach,
+) -> Option<crate::mono::browser::Runtime> {
+    use crate::mono::browser::Attach;
+    settings.browser_unavailable = None;
+    let attach = settings
+        .mono
+        .as_ref()
+        .filter(|_| !settings.text_only)
+        .map_or(Attach::Off, resolve);
+    if let Attach::Unavailable(reason) = &attach {
+        settings.browser_unavailable = Some(reason.clone());
+    }
+    let runtime = attach.runtime();
+    settings.browser_available = runtime.is_some();
+    runtime
+}
+
 fn run_operation(
     mut request: Request,
     cancel: Arc<AtomicBool>,
@@ -1469,13 +1491,9 @@ fn run_operation(
         }
     }
     // The browser server is resolved once; the rules the provider gets agree with it.
-    let browser = request
-        .settings
-        .mono
-        .as_ref()
-        .filter(|_| !request.settings.text_only)
-        .and_then(crate::mono::browser::resolve);
-    request.settings.browser_available = browser.is_some();
+    let browser = apply_browser(&mut request.settings, |mono| {
+        crate::mono::browser::resolve(mono)
+    });
     // The gate's approval cards for this run. Held until the run ends: dropping it detaches the run.
     let gate_asks = browser
         .as_ref()
@@ -1572,6 +1590,7 @@ fn run_operation(
                 system.push(crate::mono::browser::launch_instructions(
                     mono,
                     browser.is_some(),
+                    settings.browser_unavailable.as_deref(),
                 ));
             }
             if let Some(server) = visual_server {
@@ -2067,6 +2086,55 @@ mod tests {
             assert_eq!(rules.contains("## Browser"), available);
         }
     }
+    fn browser_mono_context() -> crate::agent::MonoContext {
+        crate::agent::MonoContext {
+            mono: crate::mono::Mono {
+                browser: Some(crate::mono::browser::MonoBrowser {
+                    enabled: true,
+                    ready: false,
+                    profile_dir: "Default".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            root: "/monos".into(),
+            executable: "/bin/monocode-gpui".into(),
+            browser_database: None,
+        }
+    }
+    #[test]
+    fn codex_is_told_why_an_enabled_browser_could_not_be_attached() {
+        use crate::mono::browser::Attach;
+        let mut p = protocol(Kind::Codex);
+        p.request.settings.mono = Some(browser_mono_context());
+        let runtime = apply_browser(&mut p.request.settings, |_| {
+            Attach::Unavailable("no extension token is saved".into())
+        });
+        assert!(runtime.is_none() && !p.request.settings.browser_available);
+        let mut out = Vec::new();
+        p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+        let started: Value = String::from_utf8_lossy(&out)
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|message| message["method"] == "thread/start")
+            .unwrap();
+        let rules = started["params"]["developerInstructions"].as_str().unwrap();
+        assert!(rules.contains("could not be attached"), "{rules}");
+        assert!(rules.contains("no extension token is saved"));
+    }
+    #[test]
+    fn apply_browser_keeps_off_and_text_only_launches_silent() {
+        use crate::mono::browser::Attach;
+        let mut settings = Settings {
+            mono: Some(browser_mono_context()),
+            ..Default::default()
+        };
+        assert!(apply_browser(&mut settings, |_| Attach::Off).is_none());
+        assert!(!settings.browser_available && settings.browser_unavailable.is_none());
+        settings.text_only = true;
+        let runtime = apply_browser(&mut settings, |_| panic!("not resolved for text-only"));
+        assert!(runtime.is_none() && settings.browser_unavailable.is_none());
+    }
     #[test]
     fn operator_thread_access_keeps_the_codex_app_bridge_reachable_on_later_turns() {
         for plan in [false, true] {
@@ -2364,6 +2432,48 @@ mod tests {
         assert_eq!(key(BrowserTrust::AskRisky), key(BrowserTrust::AskRisky));
         assert_ne!(key(BrowserTrust::AskRisky), key(BrowserTrust::ReadOnly));
         assert_ne!(key(BrowserTrust::AskRisky), key(BrowserTrust::Autonomous));
+    }
+    #[test]
+    fn a_warm_process_is_not_reused_across_a_change_of_the_browser_outcome() {
+        let context = browser_mono_context();
+        let key = |available: bool, unavailable: Option<&str>| {
+            let mut request = protocol(Kind::Claude).request;
+            request.settings.mono = Some(context.clone());
+            request.settings.browser_available = available;
+            request.settings.browser_unavailable = unavailable.map(str::to_owned);
+            parked::key(&request)
+        };
+        let attached = key(true, None);
+        let no_token = key(false, Some("no extension token is saved"));
+        let off = key(false, None);
+        assert_eq!(attached, key(true, None));
+        // Token saved after an unavailable run, and the reverse.
+        assert_ne!(no_token, attached);
+        assert_ne!(attached, no_token);
+        assert_ne!(no_token, off);
+        assert_ne!(
+            no_token,
+            key(false, Some("node or npx was not found on PATH"))
+        );
+    }
+    #[test]
+    fn the_unavailable_reason_reaches_the_claude_system_prompt_text() {
+        use crate::mono::browser::Attach;
+        let mut settings = Settings {
+            mono: Some(browser_mono_context()),
+            ..Default::default()
+        };
+        let runtime = apply_browser(&mut settings, |_| {
+            Attach::Unavailable("Google Chrome was not found".into())
+        });
+        // The Claude launch builds its system prompt from exactly these inputs.
+        let rules = crate::mono::browser::launch_instructions(
+            settings.mono.as_ref().unwrap(),
+            runtime.is_some(),
+            settings.browser_unavailable.as_deref(),
+        );
+        assert!(rules.contains("Google Chrome was not found"), "{rules}");
+        assert!(rules.contains("could not be attached"));
     }
     #[test]
     fn approvals_wait_for_a_decision_and_keep_the_requested_input() {

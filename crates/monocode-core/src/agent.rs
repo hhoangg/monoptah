@@ -94,6 +94,9 @@ pub struct Settings {
     /// Set once per launch: the Mono's browser server is really added, so its rules mention it.
     #[serde(skip)]
     pub browser_available: bool,
+    /// Set once per launch: the Mono's browser is on but could not be attached, and why.
+    #[serde(skip)]
+    pub browser_unavailable: Option<String>,
     pub account: crate::accounts::Profile,
     pub usage_limit: Option<crate::usage::Limit>,
     /// The user turned automatic resume off for this session while the global

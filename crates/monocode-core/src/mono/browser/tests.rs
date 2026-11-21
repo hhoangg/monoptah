@@ -521,7 +521,7 @@ fn the_prompt_block_carries_the_safety_rules_only_when_the_browser_is_active() {
     // Switched off, or not set up: no paragraph.
     for edit in [
         |b: &mut MonoBrowser| b.enabled = false,
-        |b: &mut MonoBrowser| b.ready = false,
+        |b: &mut MonoBrowser| b.profile_dir.clear(),
     ] {
         let mut off = browser("Profile 6");
         edit(&mut off);
@@ -612,7 +612,9 @@ fn a_launch_adds_the_server_only_when_everything_is_ready() {
     f.secrets.save_token(&mono.id, TOKEN).unwrap();
     let ctx = context(&f, mono.clone());
 
-    let runtime = resolve_with(&ctx, &env, &fake_servers()).expect("ready");
+    let runtime = resolve_with(&ctx, &env, &fake_servers())
+        .runtime()
+        .expect("ready");
     assert!(runtime.spec.command.ends_with("npx"));
     assert!(runtime.spec.args.iter().any(|a| a == "Profile 6"));
     // The agent gets the Mono's gate, never the Playwright server (41000 in this fake).
@@ -623,64 +625,58 @@ fn a_launch_adds_the_server_only_when_everything_is_ready() {
     assert_eq!(runtime.trust, BrowserTrust::AskRisky);
     assert_eq!(runtime.claude_server()["type"], "http");
     assert!(output_dir(&ctx.root, &mono.id).is_dir());
-    assert!(launch_instructions(&ctx, true).contains("## Browser"));
-    assert!(!launch_instructions(&ctx, false).contains("## Browser"));
+    assert!(launch_instructions(&ctx, true, None).contains("## Browser"));
+    assert!(!launch_instructions(&ctx, false, None).contains("## Browser"));
 
-    // Off, not ready, no token, no database, no Chrome, no access to Chrome's data: no server.
-    let cases: Vec<(&str, crate::agent::MonoContext, &PrereqEnv)> = vec![
-        (
-            "disabled",
-            {
-                let mut c = ctx.clone();
-                c.mono.browser.as_mut().unwrap().enabled = false;
-                c
-            },
-            &env,
-        ),
-        (
-            "not ready",
-            {
-                let mut c = ctx.clone();
-                c.mono.browser.as_mut().unwrap().ready = false;
-                c
-            },
-            &env,
-        ),
-        (
-            "no database",
-            {
-                let mut c = ctx.clone();
-                c.browser_database = None;
-                c
-            },
-            &env,
-        ),
-        (
-            "other mono",
-            {
-                let mut c = ctx.clone();
-                c.mono.id = "someone-else".into();
-                c
-            },
-            &env,
-        ),
-    ];
-    for (name, c, e) in cases {
-        assert!(resolve_with(&c, e, &fake_servers()).is_none(), "{name}");
-    }
+    // Off, no database: nothing to add. A stale `ready: false` no longer blocks the server.
+    let mut off = ctx.clone();
+    off.mono.browser.as_mut().unwrap().enabled = false;
+    assert!(matches!(
+        resolve_with(&off, &env, &fake_servers()),
+        Attach::Off
+    ));
+    let mut no_database = ctx.clone();
+    no_database.browser_database = None;
+    assert!(matches!(
+        resolve_with(&no_database, &env, &fake_servers()),
+        Attach::Off
+    ));
+    let mut stale = ctx.clone();
+    stale.mono.browser.as_mut().unwrap().ready = false;
+    assert!(resolve_with(&stale, &env, &fake_servers())
+        .runtime()
+        .is_some());
+    // Everything else is Unavailable with a reason, never a silent None.
+    let reason =
+        |c: &crate::agent::MonoContext, e: &PrereqEnv| match resolve_with(c, e, &fake_servers()) {
+            Attach::Unavailable(reason) => reason,
+            other => panic!("expected unavailable, got {other:?}"),
+        };
+    let mut other = ctx.clone();
+    other.mono.id = "someone-else".into();
+    assert!(reason(&other, &env).contains("no extension token"));
     let no_chrome = env_in(env_dir.path(), false, true);
     let no_chrome = PrereqEnv {
         chrome_binaries: vec![env_dir.path().join("missing")],
         ..no_chrome
     };
-    assert!(resolve_with(&ctx, &no_chrome, &fake_servers()).is_none());
-    let no_data = PrereqEnv {
-        user_data_dir: env_dir.path().join("revoked"),
+    assert!(reason(&ctx, &no_chrome).contains("Chrome was not found"));
+    let no_node = PrereqEnv {
+        search_path: String::new(),
         ..env.clone()
     };
-    assert!(resolve_with(&ctx, &no_data, &fake_servers()).is_none());
+    assert!(reason(&ctx, &no_node).contains("node or npx"));
+    let mut no_profile = ctx.clone();
+    no_profile
+        .mono
+        .browser
+        .as_mut()
+        .unwrap()
+        .profile_dir
+        .clear();
+    assert!(reason(&no_profile, &env).contains("no Chrome profile"));
     f.secrets.remove_token(&mono.id).unwrap();
-    assert!(resolve_with(&ctx, &env, &fake_servers()).is_none());
+    assert!(reason(&ctx, &env).contains("no extension token"));
 }
 
 #[test]
@@ -1117,7 +1113,9 @@ fn a_launch_wires_the_agent_to_the_gate_at_each_level_and_the_gate_follows_the_m
     };
     mono.browser.as_mut().unwrap().profile_dir = "Profile 6".into();
     f.secrets.save_token(&mono.id, TOKEN).unwrap();
-    let first = resolve_with(&context(&f, mono.clone()), &env, &servers).unwrap();
+    let first = resolve_with(&context(&f, mono.clone()), &env, &servers)
+        .runtime()
+        .unwrap();
     assert_eq!(first.trust, BrowserTrust::ReadOnly);
     assert!(first.claude_disallowed().contains("browser_click"));
     let url = first.endpoint.clone().unwrap();
@@ -1128,7 +1126,9 @@ fn a_launch_wires_the_agent_to_the_gate_at_each_level_and_the_gate_follows_the_m
         .any(|(k, v)| k.ends_with(".url") && v == &format!("\"{url}\"")));
     // The gate carries the level, and it is the same gate (same address) after a level change.
     mono.browser.as_mut().unwrap().trust = BrowserTrust::Autonomous;
-    let second = resolve_with(&context(&f, mono), &env, &servers).unwrap();
+    let second = resolve_with(&context(&f, mono), &env, &servers)
+        .runtime()
+        .unwrap();
     assert_eq!(second.trust, BrowserTrust::Autonomous);
     assert_eq!(second.endpoint, first.endpoint);
     assert!(!second.claude_disallowed().contains("browser_click"));
@@ -1137,4 +1137,114 @@ fn a_launch_wires_the_agent_to_the_gate_at_each_level_and_the_gate_follows_the_m
     assert!(runtime(&at(BrowserTrust::AskRisky))
         .attach_approver()
         .is_none());
+}
+
+/// A set-up Mono whose Chrome profile data cannot be read (Full Disk Access dropped after a
+/// rebuild): no `Local State`, a persisted `ready: false`, but a saved profile and token.
+fn unreadable_setup(f: &Fixture, trust: BrowserTrust) -> crate::agent::MonoContext {
+    let mono = Mono {
+        browser: Some(MonoBrowser {
+            ready: false,
+            ..at(trust)
+        }),
+        ..Default::default()
+    };
+    f.secrets.save_token(&mono.id, TOKEN).unwrap();
+    context(f, mono)
+}
+
+#[test]
+fn a_saved_profile_and_token_attach_the_server_at_every_level_without_local_state() {
+    let f = fixture();
+    let env_dir = tempfile::tempdir().unwrap();
+    let env = env_in(env_dir.path(), true, true);
+    for trust in BrowserTrust::ALL {
+        let ctx = unreadable_setup(&f, trust);
+        assert!(read_local_state(&env).is_err());
+        let servers = fake_servers();
+        let runtime = resolve_with(&ctx, &env, &servers)
+            .runtime()
+            .unwrap_or_else(|| panic!("{trust:?}"));
+        assert_eq!(runtime.trust, trust);
+        // Claude: the server entry, its allow rule and the level's removed tools.
+        assert_eq!(runtime.claude_server()["type"], "http");
+        assert_eq!(runtime.claude_allowed(), format!("mcp__{MCP_SERVER}"));
+        assert_eq!(
+            runtime.claude_disallowed().is_empty(),
+            trust.disabled_tools().is_empty()
+        );
+        // Codex: every override is for this server and it has the URL.
+        let overrides = runtime.codex_overrides();
+        let prefix = format!("mcp_servers.{MCP_SERVER}.");
+        assert!(overrides.iter().all(|(k, _)| k.starts_with(&prefix)));
+        assert!(overrides.iter().any(|(k, _)| k == &format!("{prefix}url")));
+        assert_eq!(servers.attach_error(&ctx.mono.id), None);
+    }
+}
+
+#[test]
+fn rosters_saved_by_the_trust_levels_release_still_attach() {
+    let f = fixture();
+    let env_dir = tempfile::tempdir().unwrap();
+    let env = env_in(env_dir.path(), true, true);
+    for (confirm, ready, trust) in [
+        (Some(true), true, BrowserTrust::AskRisky),
+        (Some(true), false, BrowserTrust::AskRisky),
+        (Some(false), true, BrowserTrust::AskRisky),
+        (Some(false), false, BrowserTrust::AskRisky),
+        (None, false, BrowserTrust::Autonomous),
+    ] {
+        let mut setting = format!(r#""enabled":true,"profileDir":"Default","ready":{ready}"#);
+        match confirm {
+            Some(c) => setting.push_str(&format!(r#","confirmActions":{c}"#)),
+            None => setting.push_str(r#","trust":"autonomous""#),
+        }
+        let mono: Mono =
+            serde_json::from_str(&format!(r#"{{"id":"m","browser":{{{setting}}}}}"#)).unwrap();
+        let loaded = mono.browser.as_ref().unwrap();
+        assert!(loaded.enabled && loaded.profile_dir == "Default" && loaded.active());
+        assert_eq!(loaded.trust, trust);
+        assert_eq!(loaded.ready, ready);
+        f.secrets.save_token(&mono.id, TOKEN).unwrap();
+        let servers = fake_servers();
+        assert!(
+            resolve_with(&context(&f, mono), &env, &servers)
+                .runtime()
+                .is_some(),
+            "{setting}"
+        );
+    }
+}
+
+#[test]
+fn an_unavailable_browser_is_logged_kept_for_the_ui_and_told_to_the_mono() {
+    let f = fixture();
+    let env_dir = tempfile::tempdir().unwrap();
+    let env = env_in(env_dir.path(), true, true);
+    let mono = Mono {
+        browser: Some(at(BrowserTrust::AskRisky)),
+        ..Default::default()
+    };
+    let ctx = context(&f, mono.clone());
+    let servers = fake_servers();
+    // No token saved.
+    let Attach::Unavailable(reason) = resolve_with(&ctx, &env, &servers) else {
+        panic!("unavailable")
+    };
+    assert_eq!(
+        servers.attach_error(&mono.id).as_deref(),
+        Some(reason.as_str())
+    );
+    assert!(!reason.contains(TOKEN));
+    // The Mono is told the reason, in the rules without the browser tools paragraph.
+    let rules = launch_instructions(&ctx, false, Some(&reason));
+    assert!(rules.contains("could not be attached") && rules.contains(&reason));
+    assert!(rules.contains("Do not say the tools were removed"));
+    assert!(!rules.contains("Level 2, ask for risky actions"));
+    // Nothing to say when it is simply off.
+    assert!(!launch_instructions(&ctx, false, None).contains("could not be attached"));
+    // A launch that attaches clears the note.
+    f.secrets.save_token(&mono.id, TOKEN).unwrap();
+    assert!(resolve_with(&ctx, &env, &servers).runtime().is_some());
+    assert_eq!(servers.attach_error(&mono.id), None);
 }

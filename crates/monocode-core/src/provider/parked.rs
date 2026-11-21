@@ -321,6 +321,13 @@ pub(super) fn key(request: &Request) -> String {
             .as_ref()
             .and_then(|mono| mono.mono.browser.as_ref())
             .map(|b| (b.trust, b.server_key())),
+        // What this launch really did about the browser (set before the key is taken): a process
+        // started without the server, or with a "could not attach" notice, must not serve a
+        // launch that has the server, and the other way round.
+        (
+            request.settings.browser_available,
+            &request.settings.browser_unavailable
+        ),
         request.settings.disable_claude_hooks,
         crate::accounts::claude_entrypoint()
     ])
