@@ -354,7 +354,9 @@ describe("the terminal drawer on a phone", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Open terminal" }, { timeout: 10_000 }));
     await screen.findByTestId("terminal-keys", {}, { timeout: 10_000 });
     expect(screen.queryByTestId("terminal-switcher")).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "New terminal" }));
+    expect(screen.queryByRole("button", { name: "End this terminal" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /show terminals/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "New terminal" }));
     const switcher = await screen.findByTestId("terminal-switcher");
     const tabs = within(switcher).getAllByRole("tab");
     expect(tabs).toHaveLength(2);
@@ -363,11 +365,12 @@ describe("the terminal drawer on a phone", () => {
     expect(within(screen.getByTestId("terminal-switcher")).getAllByRole("tab")[0]).toHaveAttribute("aria-selected", "true");
   });
 
-  it("ending the terminal from the drawer asks first and kills the shell", async () => {
+  it("ending a terminal from the switcher asks first and kills the shell", async () => {
     await openDrawer();
     await userEvent.click(await screen.findByRole("button", { name: "Open terminal" }, { timeout: 10_000 }));
     await screen.findByTestId("terminal-keys", {}, { timeout: 10_000 });
-    await userEvent.click(screen.getByRole("button", { name: "End this terminal" }));
+    await userEvent.click(screen.getByRole("button", { name: /show terminals/ }));
+    await userEvent.click(await screen.findByRole("button", { name: /^End / }));
     await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Close terminal" }));
     await waitFor(() => expect(desktop.terminals.liveIds()).toEqual([]), { timeout: 5_000 });
     await waitFor(() => expect(screen.queryByTestId("terminal-drawer")).toBeNull());

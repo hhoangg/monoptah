@@ -386,6 +386,9 @@ test.describe("web terminal", () => {
     const keys = page.getByTestId("terminal-keys");
     await expect(keys).toBeVisible();
     await shot("mobile-drawer");
+    // The header never pushes the close button off a 390px screen.
+    const closeBox = (await page.getByRole("button", { name: "Close drawer" }).boundingBox())!;
+    expect(closeBox.x + closeBox.width).toBeLessThanOrEqual(390);
 
     await type("echo phone");
     await expect(rows()).toContainText("phone");
@@ -425,8 +428,10 @@ test.describe("web terminal", () => {
     await expect(drawer).toBeVisible();
     await expect(rows()).toContainText("phone");
 
-    // The end button asks, then kills the shell.
-    await page.getByRole("button", { name: "End this terminal" }).click();
+    // The header has no end button; the switcher (opened from the project name) ends a shell, after asking.
+    await expect(page.getByRole("button", { name: "End this terminal" })).toHaveCount(0);
+    await page.getByTestId("terminal-drawer-title").getByRole("button").click();
+    await page.getByRole("button", { name: /^End / }).click();
     await page.getByRole("dialog").getByRole("button", { name: "Close terminal" }).click();
     await expect.poll(() => desktop.terminals.liveIds().length).toBe(0);
   });
