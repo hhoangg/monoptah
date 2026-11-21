@@ -1029,12 +1029,57 @@ impl Shell {
         items.push(chip.into_any_element());
         items
     }
+    /// The red footer chip for layouts without the Terminal button (terminals in the
+    /// right panel or title bar, an app view, no project): the web terminal indicator
+    /// alone. Click or right-click opens the same menu as on the Terminal button.
+    pub(super) fn web_terminal_chip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (tip, _) = self.web_terminal_indicator(cx)?;
+        let classic = self.workspace.boxy_layout();
+        Some(
+            footer_button(classic)
+                .id("footer-web-terminals")
+                .debug_selector(|| "footer-web-terminals".into())
+                .role(Role::Button)
+                .aria_label(tip.clone())
+                .text_color(terminal_chip_color(true, false))
+                .hover(|s| s.bg(content(0.1)))
+                .child(icon("terminal", 14.))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| super::project_rail::ProjectTooltip(tip.clone()))
+                        .into()
+                })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        let anchor = Anchor::Point(event.position);
+                        this.open_menu(MenuTarget::WebTerminals, anchor, window, cx);
+                    }),
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.manage_web_terminals(window, cx)))
+                .into_any_element(),
+        )
+    }
     /// UsageFooter's right side: Actions, then the running-terminal chip, else the
     /// Terminal button, then the cloud chip.
     pub(super) fn terminal_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.app_view_open() || self.workspace.project.is_empty() {
             self.live_mark = None;
-            return None;
+            // No terminal controls here, but a web terminal stays visible.
+            let web = self.web_terminal_chip(cx)?;
+            let classic = self.workspace.boxy_layout();
+            let cloud = self.cloud_chip_item(true, cx);
+            return Some(
+                div()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(px(FOOTER_GAP))
+                    .when(!classic, |d| d.mr(px(6.)).pb(px(2.)))
+                    .text_size(px(FOOTER_TEXT_SIZE))
+                    .child(web)
+                    .children(cloud)
+                    .into_any_element(),
+            );
         }
         let running = self.running_terminals(cx);
         let open = self.dock_open(cx);
@@ -1054,10 +1099,20 @@ impl Shell {
         // over the footer's terminal controls.
         if self.terminal_in_panel(cx) || self.terminal_in_title() {
             self.live_mark = None;
-            let cloud = self.cloud_chip_item(has_actions, cx);
-            return Some(group.children(cloud).into_any_element());
+            let web = self.web_terminal_chip(cx);
+            let cloud = self.cloud_chip_item(has_actions || web.is_some(), cx);
+            return Some(
+                group
+                    .when(has_actions && web.is_some(), |d| {
+                        d.child(footer_separator())
+                    })
+                    .children(web)
+                    .children(cloud)
+                    .into_any_element(),
+            );
         }
         let cloud = self.cloud_chip_item(true, cx);
+        let web = self.web_terminal_indicator(cx).map(|(tip, _)| tip);
         if running.is_empty() {
             self.live_mark = None;
             let has_terminals = self
@@ -1084,12 +1139,12 @@ impl Shell {
                             } else {
                                 gpui::Toggled::False
                             })
+                            .text_color(terminal_chip_color(web.is_some(), open))
                             .map(|d| {
-                                if open {
-                                    d.text_color(accent_color()).hover(|s| s.bg(content(0.1)))
+                                if web.is_some() || open {
+                                    d.hover(|s| s.bg(content(0.1)))
                                 } else {
-                                    d.text_color(content(0.4))
-                                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                                    d.hover(|s| s.bg(content(0.1)).text_color(content(1.)))
                                 }
                             })
                             .child(icon("terminal", 14.))
@@ -1098,6 +1153,24 @@ impl Shell {
                                     .debug_selector(|| "footer-terminal-label".into())
                                     .child("Terminal"),
                             )
+                            .when_some(web.clone(), |d, tip| {
+                                d.tooltip(move |_, cx| {
+                                    cx.new(|_| super::project_rail::ProjectTooltip(tip.clone()))
+                                        .into()
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        let anchor = Anchor::Point(event.position);
+                                        this.open_menu(
+                                            MenuTarget::WebTerminals,
+                                            anchor,
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                            })
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
                             ),
@@ -1147,8 +1220,26 @@ impl Shell {
                         .flex_shrink(1.)
                         .max_w(px(256.))
                         .min_w_0()
-                        .text_color(content(0.55))
-                        .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                        .map(|d| {
+                            if web.is_some() {
+                                d.text_color(danger_color()).hover(|s| s.bg(content(0.1)))
+                            } else {
+                                d.text_color(content(0.55))
+                                    .hover(|s| s.bg(content(0.1)).text_color(content(1.)))
+                            }
+                        })
+                        .when_some(web.clone(), |d, tip| {
+                            d.tooltip(move |_, cx| {
+                                cx.new(|_| super::project_rail::ProjectTooltip(tip.clone())).into()
+                            })
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    let anchor = Anchor::Point(event.position);
+                                    this.open_menu(MenuTarget::WebTerminals, anchor, window, cx);
+                                }),
+                            )
+                        })
                         .child(anchor.probe())
                         .child(
                             mark.cached(StyleRefinement::default().w(px(16.)).h(px(10.)).flex_shrink_0()),
@@ -1188,6 +1279,12 @@ impl Shell {
                 160.,
                 MenuStyle::Explorer,
             )),
+            MenuTarget::WebTerminals => Some((
+                "Web terminals".into(),
+                vec![MenuAction::new("manage", "Manage web terminals...").into()],
+                208.,
+                MenuStyle::Explorer,
+            )),
             MenuTarget::RunningTerminals => Some((
                 "Running terminals".into(),
                 self.running_terminals_menu(cx),
@@ -1213,6 +1310,17 @@ pub(super) fn footer_separator() -> gpui::Div {
         .mx(px(3.))
         .rounded_full()
         .bg(content(0.12))
+}
+/// The footer Terminal chip's text: red while a web terminal is open, accent
+/// while the dock is shown, muted otherwise.
+fn terminal_chip_color(web_open: bool, dock_open: bool) -> gpui::Hsla {
+    if web_open {
+        danger_color()
+    } else if dock_open {
+        accent_color()
+    } else {
+        content(0.4)
+    }
 }
 const NEW_TERMINAL_LABEL: &str = if cfg!(target_os = "macos") {
     "New Terminal (⌘`)"
@@ -1288,6 +1396,302 @@ mod tests {
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         visual.run_until_parked();
         assert!(visual.debug_bounds("footer-terminal").is_some());
+    }
+
+    fn web_terminal(
+        id: &str,
+        device: &str,
+        name: &str,
+    ) -> monocode_core::mobile::terminal::OpenTerminal {
+        monocode_core::mobile::terminal::OpenTerminal {
+            id: id.into(),
+            device_id: device.into(),
+            device_name: name.into(),
+            project: "Alpha".into(),
+            opened_unix: 1,
+            idle_minutes: 0,
+            detached: false,
+        }
+    }
+
+    fn set_web_terminals(
+        window: &gpui::WindowHandle<Shell>,
+        cx: &mut gpui::TestAppContext,
+        open: Vec<monocode_core::mobile::terminal::OpenTerminal>,
+    ) {
+        window
+            .update(cx, |shell, _, cx| {
+                shell.set_web_terminals_for_test(
+                    monocode_core::mobile::terminal::TerminalStatus { open },
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn the_terminal_chip_is_red_only_while_a_web_terminal_is_open() {
+        assert_eq!(terminal_chip_color(true, false), danger_color());
+        assert_eq!(terminal_chip_color(true, true), danger_color());
+        assert_eq!(terminal_chip_color(false, true), accent_color());
+        assert_eq!(terminal_chip_color(false, false), content(0.4));
+    }
+
+    #[gpui::test]
+    fn the_indicator_names_the_open_web_terminals_and_follows_them_live(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let tip = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |shell, _, cx| shell.web_terminal_indicator(cx))
+                .unwrap()
+        };
+        assert_eq!(tip(cx), None);
+        set_web_terminals(
+            &window,
+            cx,
+            vec![web_terminal("t1", "dev1", "Safari on iOS")],
+        );
+        assert_eq!(
+            tip(cx),
+            Some(("1 web terminal open: Safari on iOS".into(), "dev1".into()))
+        );
+        set_web_terminals(
+            &window,
+            cx,
+            vec![
+                web_terminal("t1", "dev1", "Safari on iOS"),
+                web_terminal("t2", "dev2", "Chrome on macOS"),
+            ],
+        );
+        assert_eq!(
+            tip(cx),
+            Some((
+                "2 web terminals open: Safari on iOS, Chrome on macOS".into(),
+                "dev1".into()
+            ))
+        );
+        // Closing the first one points Manage at the device that still has one.
+        set_web_terminals(
+            &window,
+            cx,
+            vec![web_terminal("t2", "dev2", "Chrome on macOS")],
+        );
+        assert_eq!(
+            tip(cx),
+            Some(("1 web terminal open: Chrome on macOS".into(), "dev2".into()))
+        );
+        set_web_terminals(&window, cx, Vec::new());
+        assert_eq!(tip(cx), None);
+    }
+
+    #[gpui::test]
+    fn left_click_keeps_toggling_the_dock_and_right_click_manages_web_terminals(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        set_web_terminals(
+            &window,
+            cx,
+            vec![web_terminal("t1", "dev1", "Safari on iOS")],
+        );
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let chip = visual.debug_bounds("footer-terminal").unwrap();
+        visual.simulate_click(chip.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                assert!(shell.menu.is_none(), "left click opens no menu");
+                assert!(shell.settings.is_none());
+                assert!(shell.dock_open(cx), "left click still opens the terminal");
+            })
+            .unwrap();
+        visual.simulate_mouse_down(chip.center(), MouseButton::Right, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(matches!(&shell.menu, Some(m) if m.target == MenuTarget::WebTerminals));
+            })
+            .unwrap();
+        let item = visual.debug_bounds("menu-action-manage").unwrap();
+        visual.simulate_click(item.center(), Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, cx| {
+                let view = shell.settings.clone().expect("Settings opened");
+                assert_eq!(
+                    view.read(cx).section(),
+                    crate::settings::Section::Connections
+                );
+                assert_eq!(view.read(cx).expanded_web_device(), Some("dev1"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn without_a_web_terminal_the_chip_has_no_menu(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        let chip = visual.debug_bounds("footer-terminal").unwrap();
+        visual.simulate_mouse_down(chip.center(), MouseButton::Right, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| assert!(shell.menu.is_none()))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn the_indicator_shows_where_the_terminal_button_does_not(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = crate::shell::tests::window(cx);
+        set_web_terminals(
+            &window,
+            cx,
+            vec![web_terminal("t1", "dev1", "Safari on iOS")],
+        );
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("footer-terminal").is_some());
+        assert!(visual.debug_bounds("footer-web-terminals").is_none());
+        // Terminals in the right panel replace the button.
+        window
+            .update(visual, |shell, window, cx| {
+                cx.set_reduce_motion(true);
+                shell.workspace.classic_layout = false;
+                shell.workspace.new_layout_boxy = true;
+                shell.layout_changed(cx);
+                shell.workspace.preferences.set_terminal_placement("panel");
+                shell.toggle_terminal(window, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("footer-terminal").is_none());
+        let chip = visual.debug_bounds("footer-web-terminals").expect("panel");
+        // Its menu opens like the Terminal button's.
+        visual.simulate_mouse_down(chip.center(), MouseButton::Right, Default::default());
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| {
+                assert!(matches!(&shell.menu, Some(m) if m.target == MenuTarget::WebTerminals));
+                shell.menu = None;
+            })
+            .unwrap();
+        // Terminals in the title bar.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.preferences.set_terminal_placement("title");
+                shell.apply_preferences(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("footer-web-terminals").is_some(),
+            "title"
+        );
+        // An app view hides the terminal controls.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.active_app_view = Some(crate::workspace::AppView::Today);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("footer-web-terminals").is_some(),
+            "app view"
+        );
+        window
+            .update(visual, |shell, _, cx| {
+                shell.active_app_view = None;
+                cx.notify();
+            })
+            .unwrap();
+        // No project: no terminal controls at all.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.project = String::new();
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("footer-web-terminals").is_some(),
+            "no project"
+        );
+        // Classic pages hide the footer: settings, an app view and search keep the chip.
+        window
+            .update(visual, |shell, _, cx| {
+                shell.workspace.classic_layout = true;
+                shell.workspace.project = "/work/monocode".into();
+                shell.workspace.preferences.set_terminal_placement("bottom");
+                shell.apply_preferences(cx);
+                shell.layout_changed(cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("footer-terminal").is_some(),
+            "classic session"
+        );
+        assert!(visual.debug_bounds("classic-web-terminal-strip").is_none());
+        window
+            .update(visual, |shell, _, cx| {
+                shell.active_app_view = Some(crate::workspace::AppView::Today);
+                cx.notify();
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("footer-web-terminals").is_some(),
+            "classic app view"
+        );
+        window
+            .update(visual, |shell, _, cx| {
+                shell.active_app_view = None;
+                cx.notify();
+            })
+            .unwrap();
+        window
+            .update(visual, |shell, window, cx| {
+                shell.workspace.preferences.search_panel = false;
+                shell.open_app_search(window, cx);
+            })
+            .unwrap();
+        visual.run_until_parked();
+        window
+            .update(visual, |shell, _, _| assert!(shell.search_page()))
+            .unwrap();
+        assert!(
+            visual.debug_bounds("footer-web-terminals").is_some(),
+            "classic search"
+        );
+        window
+            .update(visual, |shell, window, cx| {
+                shell.close_app_search(window, cx)
+            })
+            .unwrap();
+        window
+            .update(visual, |shell, window, cx| {
+                shell.open_settings(crate::settings::Section::General, window, cx)
+            })
+            .unwrap();
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("footer-web-terminals").is_some(),
+            "classic settings"
+        );
+        window
+            .update(visual, |shell, window, cx| shell.close_settings(window, cx))
+            .unwrap();
+        visual.run_until_parked();
+        assert!(visual.debug_bounds("footer-web-terminals").is_none());
+        assert!(visual.debug_bounds("footer-terminal").is_some());
+        // Closed, the chip goes.
+        set_web_terminals(&window, visual, Vec::new());
+        assert!(visual.debug_bounds("footer-web-terminals").is_none());
     }
 
     #[test]
