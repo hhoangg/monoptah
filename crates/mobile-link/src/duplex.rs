@@ -63,11 +63,19 @@ impl ServeOptions {
 fn frame(result: Result<Value, Failure>) -> Value {
     match result {
         Ok(value) => json!({"ok":true,"result":value}),
-        Err(Failure { error, code: None }) => json!({"ok":false,"error":error}),
+        Err(Failure {
+            error, code: None, ..
+        }) => json!({"ok":false,"error":error}),
         Err(Failure {
             error,
             code: Some(code),
+            retry_after: None,
         }) => json!({"ok":false,"error":error,"code":code}),
+        Err(Failure {
+            error,
+            code: Some(code),
+            retry_after: Some(seconds),
+        }) => json!({"ok":false,"error":error,"code":code,"retryAfter":seconds}),
     }
 }
 
@@ -247,6 +255,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_coded_failure_writes_its_retry_after_and_a_plain_one_does_not() {
+        let waiting = Failure::coded("busy", "Desktop is busy; try again").retry_after(30);
+        assert_eq!(
+            frame(Err(waiting)),
+            json!({"ok":false,"error":"Desktop is busy; try again","code":"busy","retryAfter":30})
+        );
+        assert_eq!(
+            frame(Err(Failure::coded("busy", "x"))),
+            json!({"ok":false,"error":"x","code":"busy"})
+        );
+        assert_eq!(
+            frame(Err(Failure::from("plain"))),
+            json!({"ok":false,"error":"plain"})
+        );
+    }
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,

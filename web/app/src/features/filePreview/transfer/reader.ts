@@ -3,6 +3,7 @@
 // file has a new hash); the bytes come from the tab cache when this hash was opened before.
 import type { ResultOf } from "@monoptah/protocol";
 import { MAX_PREVIEW_BYTES, PreviewLimitError, type MentionContent, type MentionReader } from "../mentionedFile.ts";
+import { prepareGate } from "../assetGate.ts";
 import { fetchPrepared, TransferError, type PreparedFile } from "./client.ts";
 import type { ContentCache } from "./cache.ts";
 
@@ -38,18 +39,13 @@ export function contentOf(file: PreparedFile, bytes: Uint8Array): MentionContent
 
 export function transferReader(deps: TransferReaderDeps): MentionReader {
   return async (params, options = {}) => {
-    const { signal, budget, onProgress } = options;
-    if (budget && !budget.takeAsset()) throw new PreviewLimitError();
-    let reserved = false;
+    const { signal, onProgress } = options;
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
-      const file = await deps.prepare(params, signal);
-      // A binary file is only offered for download; everything else is shown, so it must fit the preview.
+      // Only the desktop's own work is gated (its allowance of `file.prepare` per device); the download and decrypt are not.
+      const file = await prepareGate(deps.desktopId).run(() => deps.prepare(params, signal), signal);
+      // A binary file is only offered for download; everything else is shown, so it must fit the per-file limit (there is no page total).
       if (file.kind !== "binary" && file.size > MAX_PREVIEW_BYTES) throw new PreviewLimitError();
-      if (budget && !reserved) {
-        if (!budget.reserve(file.size)) throw new PreviewLimitError();
-        reserved = true;
-      }
       try {
         const deviceId = await deps.deviceId();
         const bytes = await fetchPrepared(file, {

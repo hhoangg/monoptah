@@ -1,54 +1,21 @@
 // Reading a file an assistant message mentions (`chat.mentionedFile`, contract in web/docs/features.md F-45).
-// Pages are followed until the file is complete; an html document gets its images as data: URIs; the client
-// stops at 64 assets and 40 MiB per preview. Nothing here touches the DOM, and the html is only ever handled as a
-// string: it is never parsed into the app's document.
+// Pages are followed until the file is complete; an html document gets its images as data: URIs, read a few at a time
+// (the desktop's allowance for one device) and asked again while it is busy. A page has no total cap on its assets: only
+// one file is limited (40 MiB), and an asset that cannot be shown gets a visible placeholder. Nothing here touches the
+// DOM, and the html is only ever handled as a string: it is never parsed into the app's document.
 import type { ResultOf } from "@monoptah/protocol";
 import { hasControl } from "@/features/markdown/fileLinks";
+import { Gate, PREPARE_CONCURRENCY } from "./assetGate.ts";
 import { TransferError } from "./transfer/client.ts";
 
 export type MentionedPage = ResultOf<"chat.mentionedFile">;
 /** `chat.mentionedFile` over the link of one conversation. */
 export type MentionRequester = (params: { path: string; asset?: string; offset?: number; source?: boolean }, signal?: AbortSignal) => Promise<MentionedPage>;
 
-export const MAX_PREVIEW_ASSETS = 64;
+/** The most one file may weigh to be shown in a preview (a binary file is only offered for download). There is no total per page. */
 export const MAX_PREVIEW_BYTES = 40 * 1024 * 1024;
 
-/** What one preview has fetched so far, shared by the html assets or by the images of a markdown file. */
-export class PreviewBudget {
-  assets = 0;
-  bytes = 0;
-  /** True once something was left out because of a cap. */
-  limited = false;
-
-  /** A slot for one more asset; false (and `limited`) beyond the cap. */
-  takeAsset(): boolean {
-    if (this.assets >= MAX_PREVIEW_ASSETS) {
-      this.limited = true;
-      return false;
-    }
-    this.assets++;
-    return true;
-  }
-
-  /** Room for `bytes` more; false (and `limited`) beyond the cap. */
-  reserve(bytes: number): boolean {
-    if (this.bytes + bytes > MAX_PREVIEW_BYTES) {
-      this.limited = true;
-      return false;
-    }
-    this.bytes += bytes;
-    return true;
-  }
-}
-
-/** A budget that already counts the document `text` itself (its UTF-8 bytes), so its assets only get what is left. */
-export function budgetForText(text: string): PreviewBudget {
-  const budget = new PreviewBudget();
-  budget.reserve(new TextEncoder().encode(text).length);
-  return budget;
-}
-
-/** A cap of the budget was hit: the asset is skipped, not an error of the desktop. */
+/** One file is over the per-file limit: it is not shown, and that is not an error of the desktop. */
 export class PreviewLimitError extends Error {
   constructor() {
     super("Preview limit reached");
@@ -88,8 +55,6 @@ export function imageMime(mime: string | undefined): string | null {
 
 export interface ReadOptions {
   signal?: AbortSignal;
-  /** Charged before the data comes (assets only). */
-  budget?: PreviewBudget;
   /** Bytes of the download received so far, and the total (encrypted transfers only). */
   onProgress?: (received: number, total: number) => void;
 }
@@ -115,10 +80,9 @@ export interface MentionContent {
   length: number;
 }
 
-/** Follows `nextOffset` until the file is complete. `budget` (assets only) is charged before the data comes. */
+/** Follows `nextOffset` until the file is complete. */
 export async function readMention(request: MentionRequester, params: { path: string; asset?: string; source?: boolean }, options: ReadOptions = {}): Promise<MentionContent> {
-  const { signal, budget } = options;
-  if (budget && !budget.takeAsset()) throw new PreviewLimitError();
+  const { signal } = options;
   let offset = 0;
   let meta: MentionedPage | undefined;
   let text = "";
@@ -130,9 +94,8 @@ export async function readMention(request: MentionRequester, params: { path: str
     if (page.offset !== offset) throw new Error("The desktop sent a page out of order");
     if (!meta) {
       meta = { ...page, data: "" };
-      // The main document counts against the same 40 MiB as the assets: stop before following its pages.
+      // Stop before following the pages of a file over the per-file limit.
       if (page.total > MAX_PREVIEW_BYTES) throw new PreviewLimitError();
-      if (budget && !budget.reserve(page.total)) throw new PreviewLimitError();
     }
     if (page.encoding === "utf8") {
       text += page.data;
@@ -150,11 +113,24 @@ export async function readMention(request: MentionRequester, params: { path: str
   return { meta, text, chunks, length };
 }
 
-/** The Content-Security-Policy the sandboxed document carries itself: images and fonts inline only, nothing from the net. */
+/**
+ * The Content-Security-Policy the sandboxed document carries itself: images and fonts inline only, nothing from the net.
+ * `blob:` is deliberately not allowed: the frame is `sandbox=""` (an opaque origin), and neither Chromium nor WebKit lets
+ * such a frame load a blob: URL made by the app (measured, see security.md), so images reach it as `data:` URIs.
+ */
 export const PREVIEW_CSP = "default-src 'none'; img-src data:; style-src-attr 'unsafe-inline'; font-src data:; media-src data:";
 const PREVIEW_META = `<meta http-equiv="Content-Security-Policy" content="${PREVIEW_CSP}">`;
-/** What a placeholder becomes when its asset is missing or over the cap. */
-export const EMPTY_DATA_URI = "data:,";
+/**
+ * What a placeholder becomes when its asset could not be loaded (missing, refused, too large, desktop busy): a small grey
+ * picture that says so, never a broken or empty image. An svg inside `<img>` runs no script.
+ */
+export const ASSET_PLACEHOLDER_URI = `data:image/svg+xml;base64,${btoa(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="90" viewBox="0 0 240 90"><rect width="240" height="90" fill="#e6e8eb" stroke="#9aa0a6" stroke-dasharray="6 4"/><text x="120" y="50" font-family="sans-serif" font-size="14" fill="#4b5563" text-anchor="middle">Image not loaded</text></svg>',
+)}`;
+/** What an image shows while its asset is still being read. */
+export const ASSET_LOADING_URI = `data:image/svg+xml;base64,${btoa(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="90" viewBox="0 0 240 90"><rect width="240" height="90" fill="#eef0f2" stroke="#c4c9cf"/><text x="120" y="50" font-family="sans-serif" font-size="14" fill="#6b7280" text-anchor="middle">Loading image...</text></svg>',
+)}`;
 const PLACEHOLDER = /monoptah-asset:(\d+)/g;
 
 /** `data:<image mime>;base64,<payload>`: only an allowed image type and base64 characters, so it cannot close a quote. */
@@ -164,40 +140,271 @@ export function imageDataUri(mime: string, bytes: Uint8Array): string | null {
 }
 
 /**
- * The document the sandboxed iframe loads: the desktop's sanitized html with each `monoptah-asset:<i>` replaced by
- * its data URI (or an empty one), behind a CSP meta. String work only. The meta goes after a leading doctype, so the
- * page keeps standards mode, and before everything else of the document.
+ * The document the sandboxed iframe loads, as the parts of a Blob: the desktop's sanitized html with each
+ * `monoptah-asset:<i>` replaced by what `shown` holds for it (a data URI as a string, or as a Blob that already holds
+ * one), behind a CSP meta. A Blob part is not copied into the JS heap, so a page of many large images is assembled
+ * without ever being one huge string. The meta goes after a leading doctype, so the page keeps standards mode, and before
+ * everything else of the document. Anything `shown` lacks becomes the "Image not loaded" placeholder.
  */
-export function buildPreviewDocument(html: string, dataUris: ReadonlyMap<number, string>): string {
-  const body = html.replace(PLACEHOLDER, (_all, index: string) => dataUris.get(Number(index)) ?? EMPTY_DATA_URI);
-  const doctype = /^\s*<!doctype[^>]*>/i.exec(body);
-  return doctype ? `${doctype[0]}${PREVIEW_META}${body.slice(doctype[0].length)}` : `${PREVIEW_META}${body}`;
+export function buildPreviewParts(html: string, shown: ReadonlyMap<number, string | Blob>): BlobPart[] {
+  const doctype = /^\s*<!doctype[^>]*>/i.exec(html);
+  const rest = doctype ? html.slice(doctype[0].length) : html;
+  const parts: BlobPart[] = [doctype ? doctype[0] : "", PREVIEW_META];
+  let at = 0;
+  for (const match of rest.matchAll(PLACEHOLDER)) {
+    parts.push(rest.slice(at, match.index), shown.get(Number(match[1])) ?? ASSET_PLACEHOLDER_URI);
+    at = match.index + match[0].length;
+  }
+  parts.push(rest.slice(at));
+  return parts;
 }
 
-/** The html and its images: every `assets[i]` fetched (4 at a time) and inlined. */
-export async function loadHtmlDocument(source: MentionSource, path: string, content: MentionContent, signal?: AbortSignal): Promise<{ document: string; limited: boolean }> {
-  // The document counts by its UTF-8 bytes (what the frame holds), not its UTF-16 length.
-  const budget = budgetForText(content.text);
+/** [`buildPreviewParts`] as one string, for documents that hold only small data URIs. String work only. */
+export function buildPreviewDocument(html: string, dataUris: ReadonlyMap<number, string>): string {
+  return buildPreviewParts(html, dataUris).join("");
+}
+
+/** Assets read at once: the desktop answers a device with at most 3 `file.prepare` in flight and refuses the next. */
+export const ASSET_CONCURRENCY = PREPARE_CONCURRENCY;
+/** Pause after a transient failure (no answer in time, a failed download); after the last one the asset gets its placeholder. */
+export const TRANSIENT_RETRY_DELAYS_MS = [1_000, 3_000, 6_000];
+/** The pause after `busy` without a hint from the desktop grows from the first value to the last; with a hint it is the hint, within these bounds. */
+export const BUSY_BACKOFF_MS = { first: 500, last: 15_000, min: 500, max: 60_000 };
+
+/** Gates of the older desktops' paged requesters (the encrypted transfers gate their own `file.prepare`). */
+const legacyGates = new WeakMap<object, Gate>();
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const done = () => {
+      signal?.removeEventListener("abort", stop);
+      resolve();
+    };
+    const stop = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", stop, { once: true });
+  });
+}
+
+function codeOf(error: unknown): string | undefined {
+  return typeof error === "object" && error !== null ? ((error as { code?: unknown }).code as string | undefined) : undefined;
+}
+
+/** The desktop is busy or limits how often files are opened: waiting makes it pass, so the read waits as long as the preview is open. */
+function isBusy(error: unknown): boolean {
+  return codeOf(error) === "busy";
+}
+
+/** Failures that often pass on a second try: no answer in time, the desktop link dropping, a download that failed on the network. */
+function isTransient(error: unknown): boolean {
+  if (error instanceof TransferError) return error.problem === "network";
+  // Codes the link itself raises: no answer in time, a link that dropped or is not ready again yet.
+  const code = codeOf(error);
+  if (code === "timeout" || code === "session_ended" || code === "not_ready") return true;
+  // The host words these two without a `code` (host.rs `Failure::from`), so the text is all there is to tell them by.
+  const message = error instanceof Error ? error.message : "";
+  return code === undefined && (message === "Desktop did not answer" || message === "Desktop is unavailable");
+}
+
+function busyDelay(error: unknown, attempt: number): number {
+  const hint = typeof error === "object" && error !== null ? (error as { retryAfter?: unknown }).retryAfter : undefined;
+  const { first, last, min, max } = BUSY_BACKOFF_MS;
+  if (typeof hint === "number" && hint > 0) return Math.min(max, Math.max(min, hint * 1000));
+  return Math.min(last, first * 2 ** attempt);
+}
+
+/**
+ * Reads one file (an asset of a page or markdown file, or the file itself) through `source`, never giving up while it can still pass:
+ *  - `busy` (a full queue, or the desktop's rate limit, which says `retryAfter`) is waited out for as long as the preview
+ *    is open (`signal` not aborted); `onWaiting` tells the caller so it can show "waiting for the desktop";
+ *  - a transient failure is asked again after a pause, a few times;
+ *  - anything else (not found, refused, too large) is thrown at once.
+ * A paged requester (older desktop) is also limited to [`ASSET_CONCURRENCY`] at a time per requester.
+ */
+export async function readAsset(source: MentionSource, params: { path: string; asset?: string; source?: boolean }, options: ReadOptions & { onWaiting?: (waiting: boolean) => void } = {}): Promise<MentionContent> {
+  const { onWaiting, ...readOptions } = options;
   const read = asReader(source);
-  const assets = content.meta.assets ?? [];
-  const uris = new Map<number, string>();
-  const used = [...new Set([...content.text.matchAll(PLACEHOLDER)].map((match) => Number(match[1])))].filter((index) => index < assets.length);
-  let next = 0;
-  const worker = async () => {
-    while (next < used.length) {
-      const index = used[next++] as number;
+  let gate: Gate | undefined;
+  if (typeof source === "function") {
+    gate = legacyGates.get(source) ?? new Gate(ASSET_CONCURRENCY);
+    legacyGates.set(source, gate);
+  }
+  let busyAttempt = 0;
+  let transientAttempt = 0;
+  for (;;) {
+    try {
+      return await (gate ? gate.run(() => read(params, readOptions), readOptions.signal) : read(params, readOptions));
+    } catch (error) {
+      let delay: number | undefined;
+      if (isBusy(error)) delay = busyDelay(error, busyAttempt++);
+      else if (isTransient(error)) delay = TRANSIENT_RETRY_DELAYS_MS[transientAttempt++];
+      if (delay === undefined || readOptions.signal?.aborted) throw error;
+      const waiting = isBusy(error);
+      if (waiting) onWaiting?.(true);
       try {
-        const asset = await read({ path, asset: assets[index] as string }, { budget, ...(signal ? { signal } : {}) });
-        const uri = asset.meta.kind === "image" ? imageDataUri(asset.meta.mime ?? "", concat(asset.chunks, asset.length)) : null;
-        if (uri) uris.set(index, uri);
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        // A missing, denied or over-the-cap image leaves its place empty; the rest of the page still shows.
+        await sleep(delay, readOptions.signal);
+      } finally {
+        if (waiting) onWaiting?.(false);
       }
     }
+  }
+}
+
+/** What the preview of an html page shows now: the document with each image loaded, loading or failed. */
+export interface HtmlAssetsView {
+  /** The page as a Blob (text/html): the images are parts of it, never held as one string. */
+  document: Blob;
+  /** Images that could not be had, shown as the "Image not loaded" placeholder. */
+  skipped: number;
+  /** Images still being read (or waiting for a busy desktop). */
+  pending: number;
+  /** Some image waits for a busy or rate limiting desktop. */
+  waiting: boolean;
+}
+
+/** One image a page names, for the list of its images. */
+export interface HtmlAssetInfo {
+  /** The key as the desktop lists it (`img/a.png`). */
+  path: string;
+  state: "loading" | "loaded" | "failed";
+  /** Only when loaded: the image's own bytes (type = its image mime) and their count. */
+  blob?: Blob;
+  size?: number;
+}
+
+export interface HtmlAssetsLoad {
+  /** How many images failed, are pending or wait for the desktop, and the list of them: cheap, for a screen that updates at once. */
+  status(): Omit<HtmlAssetsView, "document"> & { assets: HtmlAssetInfo[] };
+  /** The document as it is now. Built on demand (cheap: a Blob of parts), so a caller that updates the screen less often pays for fewer builds. */
+  view(): HtmlAssetsView;
+  /** Settles when every image is loaded or failed, or after `dispose`; never rejects. */
+  done: Promise<void>;
+  /** Stops reading and lets the images go. */
+  dispose(): void;
+}
+
+const HTML_TYPE = "text/html;charset=utf-8";
+
+function viewOf(text: string, used: readonly number[], shown: ReadonlyMap<number, string | Blob>, failed: ReadonlySet<number>, pending: number, waiting: boolean): HtmlAssetsView {
+  const parts = new Map<number, string | Blob>();
+  for (const index of used) parts.set(index, shown.get(index) ?? (failed.has(index) ? ASSET_PLACEHOLDER_URI : ASSET_LOADING_URI));
+  return { document: new Blob(buildPreviewParts(text, parts), { type: HTML_TYPE }), skipped: failed.size, pending, waiting };
+}
+
+function usedAssets(page: { text: string; assets: readonly string[] }): number[] {
+  return [...new Set([...page.text.matchAll(PLACEHOLDER)].map((match) => Number(match[1])))].filter((index) => index < page.assets.length);
+}
+
+/** The page before any image is read: every image the page names shows its loading placeholder. */
+export function pendingHtmlView(page: { text: string; assets: readonly string[] }): HtmlAssetsView {
+  const used = usedAssets(page);
+  return viewOf(page.text, used, new Map(), new Set(), used.length, false);
+}
+
+/**
+ * The images of an html page, read in the background. The document is usable at once (`view()`): each image shows a loading
+ * placeholder until its asset arrives, then the image, or the "Image not loaded" placeholder when it cannot be had.
+ * Assets are read [`ASSET_CONCURRENCY`] at a time with no cap on how many or how big in all; a busy desktop is waited for.
+ * A loaded image is kept as a Blob holding its data URI (the sandboxed frame loads no blob: URL, see [`PREVIEW_CSP`]), so
+ * the bytes sit outside the JS heap and the document is assembled from them without copying.
+ * `onChange` is called after every image settles and when the waiting state changes.
+ */
+export function loadHtmlAssets(
+  source: MentionSource,
+  path: string,
+  page: { text: string; assets: readonly string[] },
+  options: { signal?: AbortSignal; onChange?: () => void } = {},
+): HtmlAssetsLoad {
+  const controller = new AbortController();
+  if (options.signal?.aborted) controller.abort();
+  else options.signal?.addEventListener("abort", () => controller.abort(), { once: true });
+  const loaded = new Map<number, Blob>();
+  const raw = new Map<number, Blob>();
+  const failed = new Set<number>();
+  const used = usedAssets(page);
+  let next = 0;
+  let waiting = 0;
+  const changed = () => {
+    if (!controller.signal.aborted) options.onChange?.();
   };
-  await Promise.all(Array.from({ length: Math.min(4, used.length) }, worker));
-  return { document: buildPreviewDocument(content.text, uris), limited: budget.limited };
+  const tellWaiting = (now: boolean) => {
+    waiting += now ? 1 : -1;
+    changed();
+  };
+  const status = () => ({
+    skipped: failed.size,
+    pending: used.length - loaded.size - failed.size,
+    waiting: waiting > 0,
+    assets: used.map((index): HtmlAssetInfo => {
+      const blob = raw.get(index);
+      const path = page.assets[index] as string;
+      return blob ? { path, state: "loaded", blob, size: blob.size } : { path, state: failed.has(index) ? "failed" : "loading" };
+    }),
+  });
+  const view = (): HtmlAssetsView => viewOf(page.text, used, loaded, failed, used.length - loaded.size - failed.size, waiting > 0);
+  const worker = async () => {
+    while (next < used.length && !controller.signal.aborted) {
+      const index = used[next++] as number;
+      try {
+        const asset = await readAsset(source, { path, asset: page.assets[index] as string }, { signal: controller.signal, onWaiting: tellWaiting });
+        const uri = asset.meta.kind === "image" ? imageDataUri(asset.meta.mime ?? "", concat(asset.chunks, asset.length)) : null;
+        if (controller.signal.aborted) return;
+        if (uri) {
+          loaded.set(index, new Blob([uri]));
+          // The image's own bytes, for opening it in the viewer and saving it: the ones already loaded, never asked again.
+          raw.set(index, new Blob(asset.chunks as BlobPart[], { type: imageMime(asset.meta.mime) ?? "application/octet-stream" }));
+        } else failed.add(index);
+      } catch {
+        if (controller.signal.aborted) return;
+        // A missing, refused or too large image shows its placeholder; the rest of the page still shows.
+        failed.add(index);
+      }
+      changed();
+    }
+  };
+  const done = Promise.all(Array.from({ length: Math.min(ASSET_CONCURRENCY, used.length) }, worker)).then(() => undefined);
+  return {
+    view,
+    status,
+    done,
+    dispose() {
+      controller.abort();
+      loaded.clear();
+      raw.clear();
+    },
+  };
+}
+
+/** The text of a Blob. */
+export function blobText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(blob);
+  });
+}
+
+/** [`loadHtmlAssets`] run to the end, as one string (for tests and small pages: a big page is better kept as the Blob). */
+export async function loadHtmlDocument(
+  source: MentionSource,
+  path: string,
+  content: MentionContent,
+  signal?: AbortSignal,
+  /** Called with true while some asset waits for a busy or rate limiting desktop, and false when none does. */
+  onWaiting?: (waiting: boolean) => void,
+): Promise<{ document: string; skipped: number }> {
+  const load = loadHtmlAssets(source, path, { text: content.text, assets: content.meta.assets ?? [] }, { ...(signal ? { signal } : {}), onChange: () => onWaiting?.(load.view().waiting) });
+  await load.done;
+  if (signal?.aborted) {
+    load.dispose();
+    throw signal.reason;
+  }
+  const { document, skipped } = load.view();
+  return { document: await blobText(document), skipped };
 }
 
 export function concat(chunks: readonly Uint8Array[], length: number): Uint8Array {

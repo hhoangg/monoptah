@@ -284,8 +284,8 @@ pub fn handle(
     store: &dyn crate::mobile::file_transfer::ObjectStore,
     keys: &crate::mobile::file_transfer::keystore::KeyStore,
 ) -> TransferCall {
-    if let Err(code) = super::budget::admit(&device.id) {
-        return TransferCall::refused(params, code.failure(), rule::BUDGET);
+    if super::budget::admit(&device.id).is_err() {
+        return TransferCall::refused(params, super::budget::busy(&device.id, 0), rule::BUDGET);
     }
     let parsed = match Params::from_json(params) {
         Ok(parsed) => parsed,
@@ -298,8 +298,12 @@ pub fn handle(
     // The bytes this call may upload count against the device's window before it starts, so parallel calls cannot
     // together pass it; a reuse or a failure gives them back.
     let reserved = prepared.source.len_hint();
-    if let Err(code) = super::budget::reserve(&device.id, reserved) {
-        return TransferCall::refused(params, code.failure(), rule::BUDGET);
+    if super::budget::reserve(&device.id, reserved).is_err() {
+        return TransferCall::refused(
+            params,
+            super::budget::busy(&device.id, reserved),
+            rule::BUDGET,
+        );
     }
     let published = crate::mobile::file_transfer::publish(&mut prepared.source, store, keys);
     if !matches!(&published, Ok(done) if !done.reused) {

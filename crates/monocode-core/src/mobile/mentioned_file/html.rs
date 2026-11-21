@@ -13,7 +13,7 @@
 //!   text `monoptah-asset:<index>` (index into [`Document::assets`]); whether a key may be read is
 //!   decided when the asset is requested (inside the project of the document, else its folder); an
 //!   `<img src>` may also be an inline raster or svg image `data:image/<type>;base64,<payload>`
-//!   (checked by [`data_image`]: allowed type, base64 characters only, size cap);
+//!   (checked by [`data_image`]: allowed type, base64 characters only, size cap per image);
 //! * a style attribute loses every declaration that carries a URL other than such an image, any
 //!   escape, `expression(`, `@import` or a script scheme, and `url(x.png)` becomes
 //!   `url(monoptah-asset:<index>)`;
@@ -24,18 +24,12 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     panic::AssertUnwindSafe,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, LazyLock, Mutex,
-    },
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use ammonia::{Builder, UrlRelative};
 use css_inline::{CSSInliner, StylesheetResolver};
 use regex::Regex;
-
-/// The most distinct assets one document may name; later references are removed.
-pub const MAX_ASSETS: usize = 256;
 
 /// Image extensions an asset may have.
 pub const IMAGE_EXTENSIONS: &[&str] = &[
@@ -192,7 +186,7 @@ fn filter<'u>(
         ("a", "href") => value.starts_with('#').then(|| Cow::Owned(value.to_owned())),
         ("a", "rel") => Some(Cow::Borrowed(value)),
         ("img", "src") => placeholder(assets, value)
-            .or_else(|| data_image(assets, value))
+            .or_else(|| data_image(value))
             .map(Cow::Owned),
         ("img" | "source", "srcset") => srcset(assets, value).map(Cow::Owned),
         (_, name) if URL_ATTRIBUTES.contains(&name) => None,
@@ -205,15 +199,12 @@ const DATA_IMAGE_TYPES: &[&str] = &[
     "png", "jpeg", "gif", "webp", "avif", "bmp", "svg+xml", "x-icon",
 ];
 
-/// The most base64 characters all the inline images of one document may carry together.
-pub const MAX_DATA_IMAGE_TOTAL_CHARS: usize = 8 * 1024 * 1024;
-
-/// What a document names while it is sanitized: its image keys (placeholder order) and the
-/// characters of inline images kept so far.
+/// What a document names while it is sanitized: its image keys (placeholder order). There is no
+/// total for inline images: the transform runs in the sandbox, whose output is bounded as a whole
+/// ([`super::sandbox::MAX_OUTPUT_BYTES`]), and the web app loads every image on its own.
 #[derive(Default)]
 struct Refs {
     list: Mutex<Vec<String>>,
-    data: AtomicUsize,
 }
 
 /// The most base64 characters one inline image may carry.
@@ -222,7 +213,7 @@ pub const MAX_DATA_IMAGE_CHARS: usize = 4 * 1024 * 1024;
 /// `value` as `data:image/<type>;base64,<payload>` when it is exactly that: an allowed image type,
 /// no parameters, and a payload of base64 characters only (so it cannot close a quote or smuggle
 /// markup). Anything else, `data:text/html` and url-encoded payloads included, is `None`.
-fn data_image(refs: &Refs, value: &str) -> Option<String> {
+fn data_image(value: &str) -> Option<String> {
     let value = value.trim();
     let head_len = "data:image/".len();
     if !value.get(..head_len)?.eq_ignore_ascii_case("data:image/") {
@@ -239,13 +230,6 @@ fn data_image(refs: &Refs, value: &str) -> Option<String> {
     {
         return None;
     }
-    // A stylesheet image is copied by the inliner into every element its rule matches: the document
-    // keeps inline images only up to a total, later ones are dropped (the page still renders).
-    let total = refs.data.fetch_add(payload.len(), Ordering::Relaxed) + payload.len();
-    if total > MAX_DATA_IMAGE_TOTAL_CHARS {
-        refs.data.fetch_sub(payload.len(), Ordering::Relaxed);
-        return None;
-    }
     Some(format!("data:image/{kind};base64,{payload}"))
 }
 
@@ -255,11 +239,12 @@ fn placeholder(assets: &Refs, reference: &str) -> Option<String> {
     let mut assets = assets.list.lock().unwrap_or_else(|e| e.into_inner());
     let index = match assets.iter().position(|known| *known == path) {
         Some(index) => index,
-        None if assets.len() < MAX_ASSETS => {
+        None => {
+            // No count cap: every image the page names is listed. What bounds the list is the document itself (and the
+            // sandbox's output limit), and the web app loads the assets a few at a time.
             assets.push(path);
             assets.len() - 1
         }
-        None => return None,
     };
     Some(format!("monoptah-asset:{index}"))
 }
@@ -396,7 +381,7 @@ fn sanitize_declaration(declaration: &str, assets: &Refs) -> Option<String> {
             })
             .unwrap_or(argument)
             .trim();
-        let id = placeholder(assets, argument).or_else(|| data_image(assets, argument))?;
+        let id = placeholder(assets, argument).or_else(|| data_image(argument))?;
         out.push_str(&value[rest..start]);
         out.push_str(&format!("url({id})"));
         rest = end + 1;
@@ -629,8 +614,8 @@ mod tests {
     }
 
     #[test]
-    fn inline_images_stop_at_a_document_total_and_the_page_still_renders() {
-        // One 3 MiB image copied by a rule into 4 elements: the first two fit under 8 MiB, the rest go.
+    fn inline_images_have_no_document_total() {
+        // One 3 MiB image copied by a rule into 4 elements: every copy stays (12 MiB in all, over the old 8 MiB total).
         let payload = "A".repeat(3 * 1024 * 1024);
         let uri = format!("data:image/png;base64,{payload}");
         struct Owned(String);
@@ -645,11 +630,32 @@ mod tests {
             Arc::new(sheets),
         );
         let kept = doc.html.matches("data:image/png;base64,").count();
-        assert_eq!(kept, 2, "{}", &doc.html[..200.min(doc.html.len())]);
-        assert!(doc.html.len() < MAX_DATA_IMAGE_TOTAL_CHARS + 4096);
+        assert_eq!(kept, 4, "{}", &doc.html[..200.min(doc.html.len())]);
         for n in 1..=4 {
             assert!(doc.html.contains(&format!(">{n}</p>")));
         }
+    }
+
+    #[test]
+    fn a_page_may_name_any_number_of_images_and_none_is_dropped() {
+        // More than the old 256 distinct images: every one is listed and keeps a placeholder.
+        let page: String = (0..300)
+            .map(|n| format!("<img id=i{n} src=\"img/{n}.png\">"))
+            .collect();
+        let doc = run(&page);
+        assert_eq!(doc.assets.len(), 300);
+        assert_eq!(doc.assets[299], "img/299.png");
+        assert!(
+            doc.html.contains("src=\"monoptah-asset:299\""),
+            "{}",
+            doc.html
+        );
+        assert_eq!(doc.html.matches("monoptah-asset:").count(), 300);
+        let reply = super::super::sandbox::encode_reply(&doc);
+        assert_eq!(
+            super::super::sandbox::decode_reply(&reply).map(|d| d.assets.len()),
+            Some(300)
+        );
     }
 
     #[test]

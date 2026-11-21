@@ -160,6 +160,9 @@ describe("envelope (architecture.md 5.5)", () => {
     expect(kinds({ type: "state", state: "pending" })).toBe("state");
   });
   it("narrows an error code only when known", () => {
+    const waiting = EnvelopeResponseSchema.parse({ rid: 1, ok: false, error: "x", code: "busy", retryAfter: 30 });
+    expect(waiting.ok === false && waiting.retryAfter).toBe(30);
+    expect(EnvelopeResponseSchema.safeParse({ rid: 1, ok: false, error: "x", code: "busy", retryAfter: -1 }).success).toBe(false);
     const known = EnvelopeResponseSchema.parse({ rid: 1, ok: false, error: "x", code: "read_only" });
     const unknown = EnvelopeResponseSchema.parse({ rid: 1, ok: false, error: "x", code: "from_the_future" });
     expect(known.ok === false && knownErrorCode(known)).toBe("read_only");

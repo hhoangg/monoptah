@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::super::policy::Code;
+use super::super::policy::{Code, Failure};
 
 /// Calls one device may make in [`CALL_WINDOW`].
 pub const CALLS_PER_WINDOW: usize = 120;
@@ -98,6 +98,39 @@ impl Limiter {
         }
     }
 
+    /// How long until a call that wants `bytes` more could pass the windows (a call counts for one call and at least one
+    /// byte): the time the oldest entries in its way still have to live. Zero when nothing blocks it.
+    pub fn retry_after(&mut self, device: &str, now: Instant, bytes: u64) -> Duration {
+        let Some(usage) = self.devices.get_mut(device) else {
+            return Duration::ZERO;
+        };
+        Self::forget_old(usage, now);
+        let left = |at: Instant, window: Duration| (at + window).saturating_duration_since(now);
+        let mut wait = Duration::ZERO;
+        if usage.calls.len() >= CALLS_PER_WINDOW {
+            wait = wait.max(left(
+                usage.calls[usage.calls.len() - CALLS_PER_WINDOW],
+                CALL_WINDOW,
+            ));
+        }
+        let need = bytes.max(1);
+        let mut served: u64 = usage.bytes.iter().map(|(_, n)| n).sum();
+        if served.saturating_add(need) > BYTES_PER_WINDOW {
+            // Oldest first: the call fits once enough of them have aged out; if even all of them do not make room, the
+            // call is larger than the window and the whole window is the honest answer.
+            let mut freed_at = BYTE_WINDOW;
+            for (at, n) in &usage.bytes {
+                served = served.saturating_sub(*n);
+                if served.saturating_add(need) <= BYTES_PER_WINDOW {
+                    freed_at = left(*at, BYTE_WINDOW);
+                    break;
+                }
+            }
+            wait = wait.max(freed_at);
+        }
+        wait
+    }
+
     /// Adds the bytes of a reply to the device's tally.
     pub fn served(&mut self, device: &str, now: Instant, bytes: u64) {
         if bytes == 0 {
@@ -122,6 +155,16 @@ fn limiter() -> std::sync::MutexGuard<'static, Limiter> {
 /// Counts a call on the process-wide limiter: `Busy` over budget.
 pub fn admit(device: &str) -> Result<(), Code> {
     limiter().admit(device, Instant::now())
+}
+
+/// The `busy` refusal of a call that wants `bytes` more, with the seconds until it could pass (at least 1, at most one
+/// byte window), so a client waits that long instead of asking again at once.
+pub fn busy(device: &str, bytes: u64) -> Failure {
+    let wait = limiter().retry_after(device, Instant::now(), bytes);
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    Code::Busy
+        .failure()
+        .retry_after(seconds.clamp(1, BYTE_WINDOW.as_secs()))
 }
 
 /// Adds the bytes of a reply on the process-wide limiter.
@@ -204,6 +247,52 @@ mod tests {
             limiter.reserve("d", now + BYTE_WINDOW + Duration::from_secs(1), half),
             Ok(())
         );
+    }
+
+    #[test]
+    fn a_refusal_says_how_long_until_the_call_could_pass() {
+        let mut limiter = Limiter::new();
+        let start = Instant::now();
+        // Nothing in the way: no wait.
+        assert_eq!(limiter.retry_after("d", start, 1), Duration::ZERO);
+        // The call window: the 121st call waits for the oldest one to age out.
+        for i in 0..CALLS_PER_WINDOW {
+            limiter
+                .admit("d", start + Duration::from_secs(i as u64 % 10))
+                .unwrap();
+        }
+        let now = start + Duration::from_secs(20);
+        assert_eq!(
+            limiter.retry_after("d", now, 1),
+            CALL_WINDOW - Duration::from_secs(20)
+        );
+        // The byte window: room for 10 MiB comes when the first reservation (taken at `start`) ages out.
+        let mut bytes = Limiter::new();
+        bytes.reserve("d", start, BYTES_PER_WINDOW - 5).unwrap();
+        bytes
+            .reserve("d", start + Duration::from_secs(100), 5)
+            .unwrap();
+        let later = start + Duration::from_secs(200);
+        assert_eq!(
+            bytes.retry_after("d", later, 10),
+            BYTE_WINDOW - Duration::from_secs(200)
+        );
+        // A call larger than the whole window never fits: the whole window is the answer.
+        assert_eq!(
+            bytes.retry_after("d", later, BYTES_PER_WINDOW + 1),
+            BYTE_WINDOW
+        );
+    }
+
+    #[test]
+    fn the_busy_failure_of_a_full_window_carries_retry_after() {
+        let device = "retry-after-device";
+        served(device, BYTES_PER_WINDOW);
+        let failure = busy(device, 1);
+        assert_eq!(failure.code.as_deref(), Some("busy"));
+        let seconds = failure.retry_after.expect("a hint");
+        assert!((1..=BYTE_WINDOW.as_secs()).contains(&seconds), "{seconds}");
+        forget_device(device);
     }
 
     #[test]

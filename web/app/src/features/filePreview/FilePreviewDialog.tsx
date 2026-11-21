@@ -16,10 +16,11 @@ import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { cn } from "@/lib/utils";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { Icon } from "@/ui/Icon";
+import { SaveButton } from "./download";
 import { HtmlPreview } from "./HtmlPreview";
 import { ImageViewer } from "./ImageViewer";
 import { MarkdownPreview } from "./MarkdownPreview";
-import { formatSize, previewProblem } from "./mentionedFile";
+import { formatSize, previewProblem, readAsset } from "./mentionedFile";
 import { useMentionSource, useMentionedFile, type DownloadProgress, type PreviewData } from "./useMentionedFile";
 
 export interface PreviewTarget {
@@ -113,30 +114,6 @@ function DownloadBar({ progress }: { progress: DownloadProgress | null }) {
   );
 }
 
-function SaveFile({ name, chunks }: { name: string; chunks: Uint8Array[] }) {
-  return (
-    <Button
-      type="button"
-      variant="outline"
-      size="sm"
-      data-testid="file-preview-download"
-      onClick={() => {
-        // A download only: the bytes never become a page of this origin.
-        const url = URL.createObjectURL(new Blob(chunks as BlobPart[], { type: "application/octet-stream" }));
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = name;
-        link.rel = "noopener";
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(url), 10_000);
-      }}
-    >
-      <Icon name="download" size={16} />
-      Download
-    </Button>
-  );
-}
-
 function CopyPath({ path }: { path: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -159,12 +136,13 @@ function CopyPath({ path }: { path: string }) {
   );
 }
 
-function PathLine({ path }: { path: string }) {
+function PathLine({ path, download }: { path: string; download?: React.ReactNode }) {
   return (
     <div className="mb-2 flex min-w-0 shrink-0 items-center gap-2">
       <p data-testid="file-preview-path" title={path} className="min-w-0 flex-1 truncate text-small text-muted-text [unicode-bidi:isolate]">
         {path}
       </p>
+      {download}
       <CopyPath path={path} />
     </div>
   );
@@ -203,7 +181,11 @@ function PreviewContent({ conversationId, target }: { conversationId: string; ta
       <div className="m-6 flex flex-col items-center gap-3 self-center">
         <DelayedSpinner label="Loading file" />
         <DownloadBar progress={query.progress} />
-        {fileTransfer && !query.progress ? (
+        {query.waiting ? (
+          <p data-testid="file-preview-waiting" className="max-w-56 text-center text-small text-muted-text">
+            Waiting for your desktop. It is busy or limiting how fast files open; the file opens when it is ready.
+          </p>
+        ) : fileTransfer && !query.progress ? (
           // The desktop reads, hashes and uploads the file before the download starts: a large file takes a while.
           <p data-testid="file-preview-preparing" className="max-w-56 text-center text-small text-muted-text">
             Your desktop is preparing this file. A large file can take a minute.
@@ -214,11 +196,36 @@ function PreviewContent({ conversationId, target }: { conversationId: string; ta
   }
   return (
     <>
-      {query.data.kind === "binary" ? null : <PathLine path={query.data.meta.path} />}
+      {query.data.kind === "binary" ? null : <PathLine path={query.data.meta.path} download={<DownloadOfKind conversationId={conversationId} target={target} data={query.data} />} />}
       <PreviewKind key={`${target.path}:${query.dataUpdatedAt}`} conversationId={conversationId} target={target} data={query.data} />
     </>
   );
 }
+
+/**
+ * The Download of the path line: text and markdown save the text already loaded; an html file saves its own source (what is
+ * loaded is the sanitized page, not the file), read when pressed, from the tab cache when this content was opened before;
+ * an image has its Download in its viewer, a binary file in its panel.
+ */
+function DownloadOfKind({ conversationId, target, data }: { conversationId: string; target: PreviewTarget; data: PreviewData }) {
+  const source = useMentionSource(conversationId);
+  const name = data.meta.name;
+  if (data.kind === "text" || data.kind === "markdown") return <SaveButton name={name} parts={[new TextEncoder().encode(data.text)]} />;
+  if (data.kind === "html") {
+    return (
+      <SaveButton
+        name={name}
+        parts={async ({ signal, setWaiting }) => {
+          const raw = await readAsset(source, { path: target.path, source: true }, { signal, onWaiting: setWaiting });
+          return raw.text ? [new TextEncoder().encode(raw.text)] : (raw.chunks as BlobPart[]);
+        }}
+      />
+    );
+  }
+  return null;
+}
+
+const NO_ASSETS: readonly string[] = [];
 
 function PreviewKind({ conversationId, target, data }: { conversationId: string; target: PreviewTarget; data: PreviewData }) {
   const request = useMentionSource(conversationId);
@@ -233,7 +240,7 @@ function PreviewKind({ conversationId, target, data }: { conversationId: string;
     case "markdown":
       return <MarkdownPreview text={data.text} path={target.path} request={request} cacheKey={cacheKey} />;
     case "html":
-      return <HtmlPreview document={data.document} name={name} limited={data.limited} />;
+      return <HtmlPreview source={request} path={target.path} name={name} text={data.text} assets={data.meta.assets ?? NO_ASSETS} />;
     case "image":
       return <ImageViewer chunks={data.chunks} mime={data.mime} name={name} />;
     case "binary":
@@ -243,7 +250,7 @@ function PreviewKind({ conversationId, target, data }: { conversationId: string;
             title="Cannot preview this file"
             actions={
               <>
-                {data.chunks ? <SaveFile name={data.meta.name} chunks={data.chunks} /> : null}
+                {data.chunks ? <SaveButton name={data.meta.name} parts={data.chunks as BlobPart[]} /> : null}
                 <CopyPath path={data.meta.path} />
               </>
             }

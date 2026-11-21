@@ -235,9 +235,7 @@ pub fn decode_reply(data: &[u8]) -> Option<html::Document> {
     let mut cursor = Cursor::new(data, REPLY_MAGIC)?;
     let html = cursor.text()?;
     let count = cursor.number()?;
-    if count > html::MAX_ASSETS {
-        return None;
-    }
+    // No count cap: each asset must be present in the reply, which is bounded as a whole by MAX_OUTPUT_BYTES.
     let mut assets = Vec::new();
     for _ in 0..count {
         assets.push(cursor.text()?);

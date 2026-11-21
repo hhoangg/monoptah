@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  EMPTY_DATA_URI,
-  MAX_PREVIEW_ASSETS,
+  ASSET_LOADING_URI,
+  ASSET_PLACEHOLDER_URI,
+  loadHtmlAssets,
+  buildPreviewParts,
+  blobText,
   MAX_PREVIEW_BYTES,
   PREVIEW_CSP,
-  PreviewBudget,
-  budgetForText,
   PreviewLimitError,
   assetPath,
   buildPreviewDocument,
@@ -101,7 +102,7 @@ describe("buildPreviewDocument", () => {
     const out = buildPreviewDocument(html, uris);
     expect(out).not.toContain("monoptah-asset:");
     expect(out.match(/data:image\/png;base64,AAAA/g)).toHaveLength(3);
-    expect(out).toContain(`src="${EMPTY_DATA_URI}"`);
+    expect(out).toContain(`src="${ASSET_PLACEHOLDER_URI}"`);
   });
 
   it("matches the whole index, so asset:1 never eats the start of asset:10", () => {
@@ -138,83 +139,301 @@ describe("buildPreviewDocument", () => {
   });
 });
 
+describe("loadHtmlAssets", () => {
+  const png = encodeBase64(new Uint8Array([137, 80, 78, 71]));
+  const imagePage = () => page({ kind: "image", mime: "image/png", encoding: "base64", data: png, total: 4 });
+  const htmlOf = (n: number) => Array.from({ length: n }, (_, i) => `<img src="monoptah-asset:${i}">`).join("");
+
+  it("has the document at once, with a loading placeholder per pending image, before any asset has finished", async () => {
+    const release: Array<() => void> = [];
+    const request: MentionRequester = (params) =>
+      params.asset ? new Promise((resolve) => release.push(() => resolve(imagePage()))) : Promise.resolve(page({ kind: "html", data: htmlOf(2), total: 1, assets: ["a.png", "b.png"] }));
+    const changes = vi.fn();
+    const load = loadHtmlAssets(request, "r.html", { text: `<p>Report text</p>${htmlOf(2)}`, assets: ["a.png", "b.png"] }, { onChange: changes });
+    const first = load.view();
+    const firstHtml = await blobText(first.document);
+    expect(first.document.type).toBe("text/html;charset=utf-8");
+    expect(firstHtml).toContain("Report text");
+    expect(firstHtml.split(`src="${ASSET_LOADING_URI}"`)).toHaveLength(3);
+    expect(first).toMatchObject({ pending: 2, skipped: 0 });
+    await vi.waitFor(() => expect(release).toHaveLength(2));
+    release[0]!();
+    await vi.waitFor(() => expect(load.view().pending).toBe(1));
+    const second = await blobText(load.view().document);
+    expect(second).toContain(`src="data:image/png;base64,${png}"`);
+    expect(second.split(`src="${ASSET_LOADING_URI}"`)).toHaveLength(2);
+    expect(changes).toHaveBeenCalled();
+    release[1]!();
+    await load.done;
+    expect(load.view()).toMatchObject({ pending: 0, skipped: 0 });
+    load.dispose();
+  });
+
+  it("keeps the image bytes out of one big string: the document is a Blob assembled from a Blob per image", async () => {
+    const big = encodeBase64(new Uint8Array(2_000_000));
+    const request: MentionRequester = async () => page({ kind: "image", mime: "image/png", encoding: "base64", data: big, total: 2_000_000 });
+    const assets = Array.from({ length: 30 }, (_, i) => `i${i}.png`);
+    const load = loadHtmlAssets(request, "r.html", { text: htmlOf(30), assets });
+    await load.done;
+    const { document } = load.view();
+    expect(document).toBeInstanceOf(Blob);
+    // 30 images of about 2.7 MB of base64 each: far over anything a page string could carry, and nothing is dropped.
+    expect(document.size).toBeGreaterThan(30 * big.length);
+    expect(load.view()).toMatchObject({ pending: 0, skipped: 0 });
+    load.dispose();
+  });
+
+  it("assembles the parts without copying: buildPreviewParts keeps a Blob as a part", () => {
+    const image = new Blob(["data:image/png;base64,AAAA"]);
+    const parts = buildPreviewParts("<!doctype html><p>a</p><img src='monoptah-asset:0'><img src='monoptah-asset:9'>", new Map([[0, image]]));
+    expect(parts).toContain(image);
+    expect(parts.join("")).toContain(ASSET_PLACEHOLDER_URI);
+    expect(String(parts[0])).toBe("<!doctype html>");
+  });
+
+  it("shows a failed image as the Image not loaded placeholder and counts it live", async () => {
+    const request: MentionRequester = async (params) => {
+      if (params.asset === "gone.png") throw Object.assign(new Error("x"), { code: "not_found" });
+      return imagePage();
+    };
+    const load = loadHtmlAssets(request, "r.html", { text: htmlOf(2), assets: ["gone.png", "ok.png"] });
+    await load.done;
+    expect(load.view()).toMatchObject({ skipped: 1, pending: 0 });
+    const html = await blobText(load.view().document);
+    expect(html).toContain(`src="${ASSET_PLACEHOLDER_URI}"`);
+    expect(html).toContain(`src="data:image/png;base64,${png}"`);
+    load.dispose();
+  });
+
+  it("stops and keeps nothing for an asset that arrives after dispose", async () => {
+    let release: () => void = () => undefined;
+    const request: MentionRequester = (params) => (params.asset ? new Promise((resolve) => (release = () => resolve(imagePage()))) : Promise.resolve(page({ kind: "html", total: 1 })));
+    const changes = vi.fn();
+    const load = loadHtmlAssets(request, "r.html", { text: htmlOf(1), assets: ["a.png"] }, { onChange: changes });
+    await vi.waitFor(() => expect(release).not.toBe(undefined));
+    load.dispose();
+    release();
+    await load.done;
+    expect(changes).not.toHaveBeenCalled();
+    expect(load.view().pending).toBe(1);
+  });
+});
+
 describe("loadHtmlDocument", () => {
   const png = encodeBase64(new Uint8Array([137, 80, 78, 71]));
   const htmlPage = (assets: string[], html: string) => page({ kind: "html", data: html, total: html.length, assets });
+  const imagePage = () => page({ kind: "image", mime: "image/png", encoding: "base64", data: png, total: 4 });
 
   it("fetches each used asset once through the asset param and inlines it", async () => {
     const seen: Array<string | undefined> = [];
     const request: MentionRequester = async (params) => {
       seen.push(params.asset);
-      return params.asset ? page({ kind: "image", mime: "image/png", encoding: "base64", data: png, total: 4 }) : htmlPage(["a.png", "b.png"], "");
+      return params.asset ? imagePage() : htmlPage(["a.png", "b.png"], "");
     };
     const content = await readMention(async () => htmlPage(["a.png", "b.png"], '<img src="monoptah-asset:0"><img src="monoptah-asset:0">'), { path: "r.html" });
-    const { document, limited } = await loadHtmlDocument(request, "r.html", content);
+    const { document, skipped } = await loadHtmlDocument(request, "r.html", content);
     expect(seen).toEqual(["a.png"]);
     expect(document).toContain(`src="data:image/png;base64,${png}"`);
-    expect(limited).toBe(false);
+    expect(skipped).toBe(0);
   });
 
-  it("counts the document by its UTF-8 bytes, so a multibyte page leaves its images less room", async () => {
-    // Under the cap in UTF-16 units, 2 bytes below it in UTF-8: the 4-byte image no longer fits.
-    const text = `${"é".repeat((MAX_PREVIEW_BYTES - 30) / 2)}<img src="monoptah-asset:0">`;
-    const request: MentionRequester = async (params) =>
-      params.asset ? page({ kind: "image", mime: "image/png", encoding: "base64", data: png, total: 4 }) : htmlPage(["a.png"], text);
-    const content = await readMention(async () => htmlPage(["a.png"], text), { path: "r.html" });
-    const { limited } = await loadHtmlDocument(request, "r.html", content);
-    expect(limited).toBe(true);
-  });
-
-  it("leaves an empty image for an asset that fails or is not an image, without failing the page", async () => {
+  it("puts a visible placeholder, not an empty or broken image, where an asset fails or is not an image, and counts it", async () => {
     const request: MentionRequester = async (params) => {
       if (params.asset === "gone.png") throw Object.assign(new Error("x"), { code: "not_found" });
       return page({ kind: "binary", encoding: "none", total: 3 });
     };
     const content = await readMention(async () => htmlPage(["gone.png", "bin.dat"], '<img src="monoptah-asset:0"><img src="monoptah-asset:1">'), { path: "r.html" });
-    const { document } = await loadHtmlDocument(request, "r.html", content);
-    expect(document.match(/src="data:,"/g)).toHaveLength(2);
+    const { document, skipped } = await loadHtmlDocument(request, "r.html", content);
+    expect(document.split(`src="${ASSET_PLACEHOLDER_URI}"`)).toHaveLength(3);
+    expect(document).not.toContain('src="data:,"');
+    expect(skipped).toBe(2);
   });
 
-  it("caps a preview at 64 assets and says so", async () => {
+  it("has no page cap: 70 assets and a page of many megabytes all load", async () => {
     const assets = Array.from({ length: 70 }, (_, i) => `i${i}.png`);
     const html = assets.map((_, i) => `<img src="monoptah-asset:${i}">`).join("");
-    const request: MentionRequester = async (params) => (params.asset ? page({ kind: "image", mime: "image/png", encoding: "base64", data: png, total: 4 }) : htmlPage(assets, html));
+    const big = encodeBase64(new Uint8Array(1_000_000));
+    // 70 images of 1 MB each: far over the old 40 MiB page total, each one still inside the per-file limit.
+    const request: MentionRequester = async (params) => (params.asset ? page({ kind: "image", mime: "image/png", encoding: "base64", data: big, total: 1_000_000 }) : htmlPage(assets, html));
     const content = await readMention(request, { path: "r.html" });
-    const { document, limited } = await loadHtmlDocument(request, "r.html", content);
-    expect(limited).toBe(true);
-    expect(document.match(/data:image\/png;base64/g)).toHaveLength(MAX_PREVIEW_ASSETS);
-    expect(document.match(/src="data:,"/g)).toHaveLength(6);
-  });
-});
-
-describe("PreviewBudget", () => {
-  it("allows 64 assets and 40 MiB", () => {
-    const budget = new PreviewBudget();
-    for (let i = 0; i < MAX_PREVIEW_ASSETS; i++) expect(budget.takeAsset()).toBe(true);
-    expect(budget.takeAsset()).toBe(false);
-    expect(budget.limited).toBe(true);
-    const bytes = new PreviewBudget();
-    expect(bytes.reserve(MAX_PREVIEW_BYTES)).toBe(true);
-    expect(bytes.reserve(1)).toBe(false);
-    expect(bytes.limited).toBe(true);
+    const { document, skipped } = await loadHtmlDocument(request, "r.html", content);
+    expect(skipped).toBe(0);
+    expect(document.match(/data:image\/png;base64/g)).toHaveLength(70);
+    expect(document).not.toContain(ASSET_PLACEHOLDER_URI);
   });
 
-  it("makes readMention skip an asset over the byte cap before its data is read", async () => {
-    const budget = new PreviewBudget();
-    budget.reserve(MAX_PREVIEW_BYTES - 10);
-    const request = vi.fn(async () => page({ kind: "image", encoding: "base64", data: "", total: 100, nextOffset: 50 }));
-    await expect(readMention(request, { path: "a.html", asset: "x.png" }, { budget })).rejects.toBeInstanceOf(PreviewLimitError);
-    expect(request).toHaveBeenCalledTimes(1);
+  it("reads at most 3 assets at a time, the desktop's allowance for one device", async () => {
+    const assets = Array.from({ length: 8 }, (_, i) => `i${i}.png`);
+    const html = assets.map((_, i) => `<img src="monoptah-asset:${i}">`).join("");
+    let flying = 0;
+    let most = 0;
+    const request: MentionRequester = async (params) => {
+      if (!params.asset) return htmlPage(assets, html);
+      flying++;
+      most = Math.max(most, flying);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      flying--;
+      return imagePage();
+    };
+    const content = await readMention(request, { path: "r.html" });
+    const { skipped } = await loadHtmlDocument(request, "r.html", content);
+    expect(skipped).toBe(0);
+    expect(most).toBe(3);
   });
-});
 
-describe("budgetForText", () => {
-  it("reserves the UTF-8 bytes of the document, so its images get only the rest", () => {
-    const budget = budgetForText("héllo");
-    expect(budget.bytes).toBe(6);
-    expect(budget.reserve(MAX_PREVIEW_BYTES - 6)).toBe(true);
-    expect(budget.reserve(1)).toBe(false);
-    expect(budget.limited).toBe(true);
+  it("asks again when the desktop says busy, and keeps every asset", async () => {
+    vi.useFakeTimers();
+    try {
+      const assets = ["a.png", "b.png", "c.png"];
+      const html = assets.map((_, i) => `<img src="monoptah-asset:${i}">`).join("");
+      const refused = new Map<string, number>();
+      const request: MentionRequester = async (params) => {
+        if (!params.asset) return htmlPage(assets, html);
+        const times = refused.get(params.asset) ?? 0;
+        refused.set(params.asset, times + 1);
+        if (times < 2) throw Object.assign(new Error("Desktop is busy"), { code: "busy" });
+        return imagePage();
+      };
+      const content = await readMention(request, { path: "r.html" });
+      const loading = loadHtmlDocument(request, "r.html", content);
+      await vi.runAllTimersAsync();
+      const { document, skipped } = await loading;
+      expect(skipped).toBe(0);
+      expect(document.match(/data:image\/png;base64/g)).toHaveLength(3);
+      expect([...refused.values()]).toEqual([3, 3, 3]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits for a desktop that stays busy for as long as the preview is open, says so, and never turns the image into a placeholder", async () => {
+    vi.useFakeTimers();
+    try {
+      const assets = ["a.png", "b.png"];
+      const html = assets.map((_, i) => `<img src="monoptah-asset:${i}">`).join("");
+      let busyFor = 40;
+      const request: MentionRequester = async (params) => {
+        if (!params.asset) return htmlPage(assets, html);
+        if (params.asset === "a.png" && busyFor-- > 0) throw Object.assign(new Error("Desktop is busy"), { code: "busy" });
+        return imagePage();
+      };
+      const content = await readMention(request, { path: "r.html" });
+      const waiting: boolean[] = [];
+      const loading = loadHtmlDocument(request, "r.html", content, undefined, (now) => waiting.push(now));
+      // Far longer than the old 24 s of retries.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const { document, skipped } = await loading;
+      expect(skipped).toBe(0);
+      expect(document).not.toContain(ASSET_PLACEHOLDER_URI);
+      expect(waiting[0]).toBe(true);
+      expect(waiting.at(-1)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honours the retryAfter the desktop gives, within bounds", async () => {
+    vi.useFakeTimers();
+    try {
+      const assets = ["a.png"];
+      const html = '<img src="monoptah-asset:0">';
+      const asked: number[] = [];
+      const request: MentionRequester = async (params) => {
+        if (!params.asset) return htmlPage(assets, html);
+        asked.push(Date.now());
+        if (asked.length === 1) throw Object.assign(new Error("Desktop is busy"), { code: "busy", retryAfter: 90 });
+        return imagePage();
+      };
+      const content = await readMention(request, { path: "r.html" });
+      const loading = loadHtmlDocument(request, "r.html", content);
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(asked).toHaveLength(1);
+      // 90 s asked, the pause is capped at 60 s so the desktop is asked again with a fresh answer.
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect((await loading).skipped).toBe(0);
+      expect(asked).toHaveLength(2);
+      expect(asked[1]! - asked[0]!).toBe(60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops waiting the moment the preview closes", async () => {
+    const assets = ["a.png"];
+    const request: MentionRequester = async (params) => {
+      if (!params.asset) return htmlPage(assets, '<img src="monoptah-asset:0">');
+      throw Object.assign(new Error("Desktop is busy"), { code: "busy" });
+    };
+    const content = await readMention(request, { path: "r.html" });
+    const controller = new AbortController();
+    const loading = loadHtmlDocument(request, "r.html", content, controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    controller.abort();
+    await expect(loading).rejects.toBeDefined();
+  });
+
+  it("asks again after a transient failure (no answer, a network error) and keeps the image", async () => {
+    vi.useFakeTimers();
+    try {
+      const assets = ["a.png", "b.png"];
+      const html = assets.map((_, i) => `<img src="monoptah-asset:${i}">`).join("");
+      const tried = new Map<string, number>();
+      const request: MentionRequester = async (params) => {
+        if (!params.asset) return htmlPage(assets, html);
+        const n = (tried.get(params.asset) ?? 0) + 1;
+        tried.set(params.asset, n);
+        if (n === 1) throw new Error("Desktop did not answer");
+        if (n === 2 && params.asset === "b.png") throw Object.assign(new Error("The desktop did not answer in time"), { code: "timeout" });
+        return imagePage();
+      };
+      const content = await readMention(request, { path: "r.html" });
+      const loading = loadHtmlDocument(request, "r.html", content);
+      await vi.advanceTimersByTimeAsync(30_000);
+      const { document, skipped } = await loading;
+      expect(skipped).toBe(0);
+      expect(document.match(/data:image\/png;base64/g)).toHaveLength(2);
+      expect(tried.get("b.png")).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives a transient failure that never passes a few tries, then a placeholder, and does not retry a refusal", async () => {
+    vi.useFakeTimers();
+    try {
+      const assets = ["flaky.png", "denied.png"];
+      const html = assets.map((_, i) => `<img src="monoptah-asset:${i}">`).join("");
+      const tried = new Map<string, number>();
+      const request: MentionRequester = async (params) => {
+        if (!params.asset) return htmlPage(assets, html);
+        tried.set(params.asset, (tried.get(params.asset) ?? 0) + 1);
+        throw params.asset === "flaky.png" ? new Error("Desktop did not answer") : Object.assign(new Error("hidden"), { code: "path_denied" });
+      };
+      const content = await readMention(request, { path: "r.html" });
+      const loading = loadHtmlDocument(request, "r.html", content);
+      await vi.advanceTimersByTimeAsync(60_000);
+      const { document, skipped } = await loading;
+      expect(skipped).toBe(2);
+      expect(tried.get("flaky.png")).toBe(4);
+      expect(tried.get("denied.png")).toBe(1);
+      expect(document.split(`src="${ASSET_PLACEHOLDER_URI}"`)).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a placeholder for an asset over the per-file limit, and loads the others", async () => {
+    const assets = ["huge.png", "ok.png"];
+    const html = assets.map((_, i) => `<img src="monoptah-asset:${i}">`).join("");
+    const request: MentionRequester = async (params) => {
+      if (!params.asset) return htmlPage(assets, html);
+      return params.asset === "huge.png" ? page({ kind: "image", mime: "image/png", encoding: "base64", data: "", total: MAX_PREVIEW_BYTES + 1, nextOffset: 1 }) : imagePage();
+    };
+    const content = await readMention(request, { path: "r.html" });
+    const { document, skipped } = await loadHtmlDocument(request, "r.html", content);
+    expect(skipped).toBe(1);
+    expect(document).toContain(`src="${ASSET_PLACEHOLDER_URI}"`);
+    expect(document).toContain(`src="data:image/png;base64,${png}"`);
   });
 });
 

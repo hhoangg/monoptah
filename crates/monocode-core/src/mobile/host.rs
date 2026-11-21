@@ -111,8 +111,41 @@ const MAX_PREPARES_TOTAL: usize = 6;
 static PREPARES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// One in-flight `file.prepare` of a device; released on drop.
-pub(crate) struct PrepareSlot(String);
+/// The longest a `file.prepare` place may be held. The app's own worst case is about 5.5 minutes (hash, up to 60 seconds
+/// waiting for a same-content upload, an upload of at most 4 minutes), which is [`LONG_REPLY_WAIT`]; the place is only
+/// taken back after twice that, so no honest work loses it. It exists because the place lives as long as the app's
+/// request: an app thread that hangs for good would otherwise keep it until restart, and the 6 places of the whole desktop
+/// would block every device.
+const PREPARE_WATCHDOG: Duration = Duration::from_secs(2 * (5 * 60 + 30));
+
+/// What a place is: its device, and whether it still counts. Releasing is once only, so the watchdog and the drop of the
+/// place never take it back twice (a second release would free the place of a later call).
+struct SlotState {
+    device: String,
+    held: std::sync::atomic::AtomicBool,
+}
+
+impl SlotState {
+    fn release(&self) -> bool {
+        if !self.held.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        let mut flying = PREPARES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = flying.get_mut(&self.device) {
+            *count -= 1;
+            if *count == 0 {
+                flying.remove(&self.device);
+            }
+        }
+        true
+    }
+}
+
+/// One in-flight `file.prepare` of a device; released on drop, or by [`PrepareSlot::watch`] when it is held too long.
+pub(crate) struct PrepareSlot {
+    state: Arc<SlotState>,
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+}
 
 impl PrepareSlot {
     /// A slot, or `None` when the device (or the desktop) already has the most it may.
@@ -124,18 +157,39 @@ impl PrepareSlot {
             return None;
         }
         *flying.entry(device.to_owned()).or_default() += 1;
-        Some(Self(device.to_owned()))
+        Some(Self {
+            state: Arc::new(SlotState {
+                device: device.to_owned(),
+                held: std::sync::atomic::AtomicBool::new(true),
+            }),
+            watchdog: None,
+        })
+    }
+
+    /// Takes the place back after `after` if it is still held (a hung app thread). A no-op outside a runtime.
+    fn watch(mut self, after: Duration) -> Self {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let state = self.state.clone();
+            self.watchdog = Some(runtime.spawn(async move {
+                tokio::time::sleep(after).await;
+                if state.release() {
+                    eprintln!(
+                        "mobile host: a file.prepare place of {} was held for {}s and was taken back",
+                        state.device,
+                        after.as_secs()
+                    );
+                }
+            }));
+        }
+        self
     }
 }
 
 impl Drop for PrepareSlot {
     fn drop(&mut self) {
-        let mut flying = PREPARES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = flying.get_mut(&self.0) {
-            *count -= 1;
-            if *count == 0 {
-                flying.remove(&self.0);
-            }
+        self.state.release();
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
         }
     }
 }
@@ -294,6 +348,10 @@ pub struct Request {
     /// Who asked, for the app to check what it alone can resolve.
     pub device: DeviceContext,
     reply: oneshot::Sender<Result<Value, Failure>>,
+    /// The `file.prepare` allowance this request holds. It lives as long as the request, which the app keeps until its
+    /// work ended (the host may have stopped waiting by then), so a call that timed out cannot free its place while
+    /// its thread still hashes or uploads.
+    _prepare_slot: Option<PrepareSlot>,
 }
 impl Request {
     /// A request and the receiver of its answer, for driving the app's own
@@ -311,6 +369,7 @@ impl Request {
             params,
             device,
             reply,
+            _prepare_slot: None,
         };
         (request, receive)
     }
@@ -1268,7 +1327,11 @@ impl MobileHost {
             .ok_or("Missing command ID")?;
         // A `file.prepare` has its own small allowance; every other method shares `MAX_PENDING`.
         let prepare_slot = if method == "file.prepare" {
-            Some(PrepareSlot::take(&device.id).ok_or_else(busy)?)
+            Some(
+                PrepareSlot::take(&device.id)
+                    .ok_or_else(busy)?
+                    .watch(PREPARE_WATCHDOG),
+            )
         } else {
             None
         };
@@ -1286,6 +1349,7 @@ impl MobileHost {
                 params,
                 device,
                 reply,
+                _prepare_slot: prepare_slot,
             }))
             .is_ok();
         let response = if sent {
@@ -1299,7 +1363,6 @@ impl MobileHost {
         if counted {
             self.pending.fetch_sub(1, Ordering::SeqCst);
         }
-        drop(prepare_slot);
         // The app wrote its own audit line for the calls it audits, and only a reply proves it
         // got this one: a request that was never delivered, or whose reply channel was dropped,
         // leaves the host's line as the only record.
@@ -4094,6 +4157,78 @@ mod tests {
             json!({"version":VERSION,"method":"conversation.watch","params":{"conversationId":"c"}}),
             sink,
         )
+    }
+
+    /// The host stops waiting for `file.prepare` after [`LONG_REPLY_WAIT`], but the app's thread may still hash or
+    /// upload: the slot must stay taken until the app answers, or a stuck upload lets the device start more work than
+    /// the allowance.
+    #[tokio::test(start_paused = true)]
+    async fn a_prepare_slot_stays_taken_after_the_host_stops_waiting_until_the_app_answers() {
+        let (host, events, _phone) = paired();
+        host.set_flags_for_test(true, true);
+        let mut control = web_row("slot-owner", "web-slot-owner");
+        control.permission = Permission::Control;
+        host.add_device_for_test(control);
+        let held = || {
+            PREPARES
+                .lock()
+                .unwrap()
+                .get("slot-owner")
+                .copied()
+                .unwrap_or(0)
+        };
+        let call = json!({"version":VERSION,"id":"x","method":"file.prepare","params":{"path":"/tmp/a.png"}});
+        let failure = host.handle_web("web-slot-owner", call).await.unwrap_err();
+        assert_eq!(failure.error, "Desktop did not answer");
+        assert_eq!(held(), 1, "the work is still running in the app");
+        let Ok(Event::Request(request)) = events.try_recv() else {
+            panic!("the app got the request");
+        };
+        request.reply(Ok(json!({})));
+        assert_eq!(held(), 0, "answered: the place is free again");
+    }
+
+    /// An app thread that never answers must not keep its place for ever: after [`PREPARE_WATCHDOG`] (twice the host's
+    /// own wait) the place is taken back, and when the app finally drops the request it frees nothing a later call holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_prepare_slot_of_a_hung_app_is_taken_back_by_the_watchdog_once() {
+        let (host, events, _phone) = paired();
+        host.set_flags_for_test(true, true);
+        let mut control = web_row("hung-owner", "web-hung-owner");
+        control.permission = Permission::Control;
+        host.add_device_for_test(control);
+        let held = || {
+            PREPARES
+                .lock()
+                .unwrap()
+                .get("hung-owner")
+                .copied()
+                .unwrap_or(0)
+        };
+        let call = json!({"version":VERSION,"id":"h","method":"file.prepare","params":{"path":"/tmp/a.png"}});
+        let failure = host.handle_web("web-hung-owner", call).await.unwrap_err();
+        assert_eq!(failure.error, "Desktop did not answer");
+        assert_eq!(
+            held(),
+            1,
+            "the host stopped waiting, the app has not answered"
+        );
+        // Honest work keeps its place until the watchdog bound.
+        tokio::time::advance(PREPARE_WATCHDOG - LONG_REPLY_WAIT - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(held(), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(held(), 0, "a hung app does not keep the place for ever");
+        // A later call takes a place; the hung request finally dropping must not free that one.
+        let later = PrepareSlot::take("hung-owner").unwrap();
+        let Ok(Event::Request(request)) = events.try_recv() else {
+            panic!("the app got the request");
+        };
+        drop(request);
+        assert_eq!(held(), 1, "the late drop freed only what it still held");
+        drop(later);
+        assert_eq!(held(), 0);
     }
 
     /// Every refusal the host words reaches a web device with its stable code,

@@ -467,8 +467,8 @@ impl Call {
 /// The headless E2E desktop answers through it; the app admits first (so it gathers nothing for
 /// a device over budget) and calls [`handle_admitted`].
 pub fn handle(device: &str, params: &Value, ctx: &Context) -> Call {
-    if let Err(code) = budget::admit(device) {
-        return Call::refused(params, code.failure(), rule::BUDGET);
+    if budget::admit(device).is_err() {
+        return Call::refused(params, budget::busy(device, 0), rule::BUDGET);
     }
     handle_admitted(device, params, ctx)
 }
@@ -1685,7 +1685,7 @@ fn markdown_assets(source: &str) -> Vec<String> {
     ) {
         if let Event::Start(Tag::Image { dest_url, .. }) = event {
             if let Some(key) = html::normalize_reference(&dest_url) {
-                if !assets.contains(&key) && assets.len() < html::MAX_ASSETS {
+                if !assets.contains(&key) {
                     assets.push(key);
                 }
             }
