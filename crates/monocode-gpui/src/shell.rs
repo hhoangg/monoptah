@@ -95,7 +95,6 @@ mod space_reorder;
 mod started_rail;
 #[cfg(test)]
 pub(crate) mod surface_tests;
-mod telegram;
 mod terminal_dock;
 mod terminal_panes;
 use terminal_panes::terminal_drag_ghost;
@@ -338,9 +337,6 @@ pub(crate) fn bind_keys(cx: &mut App) {
 /// that Linux tests get from server decorations.
 #[cfg(target_os = "windows")]
 const WINDOWS_CONTROLS: bool = cfg!(not(test));
-/// Whether the project menu lists "Telegram…". Hidden until Telegram is in use; the dialog, its
-/// "telegram" menu action and the bridge stay in place, so flipping this brings the item back.
-const SHOW_TELEGRAM_MENU_ITEM: bool = false;
 
 pub(crate) fn client_controls_width(window: &Window) -> f32 {
     #[cfg(target_os = "linux")]
@@ -686,9 +682,6 @@ pub(crate) struct Shell {
     orchestration_summaries: HashMap<i64, monocode_core::orchestration::Summary>,
     /// Sessions an /operator thread started, by the session that started them.
     started_by: HashMap<i64, i64>,
-    /// Ticket id of the inbox item a session was started from, which Telegram questions name.
-    session_tickets: HashMap<i64, String>,
-    telegram: telegram::Telegram,
     cloud_settings: Option<project_cloud::OpenProjectCloud>,
     cloud_workspaces: Option<cloud_workspaces::OpenCloudWorkspaces>,
     /// The sidebar rails under orchestrators and /operator threads.
@@ -1257,8 +1250,6 @@ impl Shell {
             orchestrations: HashMap::new(),
             orchestration_summaries: sidebar_metadata.orchestrations,
             started_by: sidebar_metadata.started_by,
-            session_tickets: HashMap::new(),
-            telegram: telegram::Telegram::new(),
             cloud_settings: None,
             cloud_workspaces: None,
             rails: Default::default(),
@@ -1625,10 +1616,6 @@ impl Shell {
         this.monos = Some(monos);
         this.bind_notices(cx);
         this.init_app_bridge(cx);
-        let telegram_dir = locked(&this.store)
-            .ok()
-            .and_then(|store| store.data_dir().map(std::path::Path::to_path_buf));
-        this.telegram_start(telegram_dir, cx);
         for summary in summaries {
             if this
                 .monos
@@ -1964,7 +1951,6 @@ impl Shell {
             }));
         self.observe_orchestration(&view, id, cx);
         self.observe_session_folders(&view, id, cx);
-        self.observe_telegram(&view, id, cx);
         self.sessions.insert(id, view);
         if !self.order.contains(&id) {
             self.order.push(id);
@@ -5979,10 +5965,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.close_preview(cx);
-        if matches!(target, MenuTarget::Session(_)) {
-            // The menu reads what the last look found; look again for the next time.
-            self.telegram_refresh_linkable(cx);
-        }
         // Close the previous menu first, so the new one remembers the focus
         // that was there before either opened.
         self.menu = None;
@@ -6411,13 +6393,6 @@ impl Shell {
                         .into(),
                 ];
                 if !path.starts_with(monocode_core::remote::REMOTE_PATH_PREFIX) {
-                    if SHOW_TELEGRAM_MENU_ITEM {
-                        items.push(
-                            MenuAction::new("telegram", "Telegram…")
-                                .icon("paper-plane")
-                                .into(),
-                        );
-                    }
                     items.push(
                         MenuAction::new("cloud-settings", "Cloud settings…")
                             .icon("cloud-upload")
@@ -6624,8 +6599,6 @@ impl Shell {
                     self.open_project_theme(path, window, cx);
                 } else if action == "background" {
                     self.open_background_dialog(path, window, cx);
-                } else if action == "telegram" {
-                    self.open_telegram_dialog(path, window, cx);
                 } else if action == "cloud-settings" {
                     self.open_cloud_settings(path, None, window, cx);
                 } else if action == "archive" {
@@ -9944,14 +9917,6 @@ impl Render for Shell {
                     this.close_link_dialog(window, cx);
                     return;
                 }
-                if this.telegram.dialog.is_some() {
-                    this.close_telegram_dialog(window, cx);
-                    return;
-                }
-                if this.telegram.topic.is_some() {
-                    this.close_telegram_topic(window, cx);
-                    return;
-                }
                 if this.cloud_settings.is_some() {
                     this.cloud_settings_escape(window, cx);
                     return;
@@ -10184,8 +10149,6 @@ impl Render for Shell {
             .children(self.drag_ghost(cx))
             .children(self.background_modal(window, cx))
             .children(self.link_modal(window, cx))
-            .children(self.telegram_modal(window, cx))
-            .children(self.telegram_topic_modal(window, cx))
             .children(self.cloud_settings_modal(window, cx))
             .children(self.fix_terminal_modal(window, cx))
             .children(self.cloud_workspaces_drawer(window, cx))

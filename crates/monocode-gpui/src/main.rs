@@ -114,7 +114,6 @@ mod syntax;
 mod tab_label;
 mod tab_motion;
 mod tab_tile;
-mod telegram_dialog;
 mod terminal;
 mod theme;
 mod today;

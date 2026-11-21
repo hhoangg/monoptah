@@ -621,7 +621,6 @@ impl Shell {
                         .into(),
                 );
             }
-            items.extend(self.telegram_topic_item(id, cx));
             items.extend(self.cloud_move_menu_item(id));
             items.extend(self.continue_backup_items(id));
             items.extend(self.return_cleanup_items(id));
@@ -786,7 +785,6 @@ impl Shell {
             }
             "rename" => self.start_rename(RenameTarget::Session(id), window, cx),
             "link-work-item" => self.open_link_dialog(id, window, cx),
-            "link-telegram-topic" => self.open_telegram_topic(id, window, cx),
             "reminder:cancel" => {
                 let occurrences: Vec<_> = self
                     .reminders

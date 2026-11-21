@@ -43,7 +43,6 @@ pub mod session_title;
 pub mod session_worktree;
 pub mod store;
 pub mod surface;
-pub mod telegram;
 pub mod time;
 pub mod today;
 pub mod tool;

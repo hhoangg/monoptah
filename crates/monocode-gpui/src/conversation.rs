@@ -5,6 +5,8 @@ mod auto_stop;
 mod background_tasks;
 mod btw;
 mod changes_shelf;
+pub(crate) mod cloud_branches;
+mod cloud_location;
 mod cloud_start_panel;
 #[cfg(test)]
 mod cloud_start_tests;
@@ -24,9 +26,6 @@ mod mobile_pending_send;
 mod mono;
 mod notifications;
 mod question_api;
-pub(crate) use question_api::{QuestionAsked, QuestionSettled};
-pub(crate) mod cloud_branches;
-mod cloud_location;
 pub(crate) use cloud_location::CloudLocationReset;
 mod cloud_move;
 pub(crate) use auto_stop::AUTO_STOPPING;
@@ -1515,7 +1514,7 @@ impl Conversation {
         let (controls, control_rx) = std::sync::mpsc::channel();
         self.controls = Some(controls);
         self.approvals.clear();
-        self.cancel_questions(cx);
+        self.cancel_questions();
         let (tx, rx) = async_channel::bounded(8);
         let mut turn_model_id = settings
             .turn_model
@@ -1770,7 +1769,7 @@ impl Conversation {
                                 this.save_follow_ups(cx);
                             }
                             this.approvals.clear();
-                            this.cancel_questions(cx);
+                            this.cancel_questions();
                             this.controls = None;
                             this.transcript.update(cx, |v, cx| v.streaming(false, cx));
                             let model_id = turn_model_id.clone();
@@ -3097,7 +3096,7 @@ impl Conversation {
         self.follow_ups.ready = false;
         self.clear_background();
         self.approvals.clear();
-        self.cancel_questions(cx);
+        self.cancel_questions();
         self.controls = None;
         self.status = "Ready".into();
         self.transcript
