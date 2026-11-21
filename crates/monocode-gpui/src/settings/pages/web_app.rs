@@ -162,6 +162,23 @@ impl SettingsView {
         }
     }
 
+    /// Settings > Connections > Web app, with one device's row expanded.
+    pub(crate) fn show_web_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        self.select_section(crate::settings::Section::Connections, cx);
+        self.web_app.expanded = Some(device_id);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn section(&self) -> crate::settings::Section {
+        self.section
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expanded_web_device(&self) -> Option<&str> {
+        self.web_app.expanded.as_deref()
+    }
+
     /// Leaving the page closes its code, as unmounting the page did.
     pub(in crate::settings) fn leave_web_app(&mut self, cx: &mut Context<Self>) {
         if self.ctx.web_pairing.is_some() {

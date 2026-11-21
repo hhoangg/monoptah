@@ -445,6 +445,8 @@ pub(crate) enum MenuTarget {
     TerminalTab(usize),
     /// The footer chip's list of terminals running a process.
     RunningTerminals,
+    /// The footer terminal chip's context menu while a web terminal is open.
+    WebTerminals,
     /// The footer Actions button's list of saved commands.
     Actions,
     /// The title strip's new-tab button, when terminals open in the title bar.
@@ -6057,9 +6059,9 @@ impl Shell {
         };
         match target {
             // Answered by terminal_menu_items above.
-            MenuTarget::TerminalTab(_) | MenuTarget::RunningTerminals => {
-                ("".into(), Vec::new(), 160., MenuStyle::Explorer)
-            }
+            MenuTarget::TerminalTab(_)
+            | MenuTarget::RunningTerminals
+            | MenuTarget::WebTerminals => ("".into(), Vec::new(), 160., MenuStyle::Explorer),
             MenuTarget::Actions => (
                 "Actions".into(),
                 self.actions_menu(),
@@ -6524,6 +6526,7 @@ impl Shell {
         match target {
             MenuTarget::TerminalTab(ix) => self.run_terminal_tab_menu(ix, action, window, cx),
             MenuTarget::RunningTerminals => self.run_running_terminals_menu(action, window, cx),
+            MenuTarget::WebTerminals => self.manage_web_terminals(window, cx),
             MenuTarget::Actions => self.run_actions_menu(action, window, cx),
             MenuTarget::NewTab => match action {
                 "terminal" => self.new_title_terminal(window, cx),

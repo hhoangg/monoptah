@@ -364,7 +364,23 @@ impl Shell {
             .clone()
             .filter(|_| right_shown && self.settings.is_none())
             .map(|panel| self.right_panel_frame(panel, right_width, full, window, cx));
-        let footer = self.classic_footer_shown().then(|| self.footer_row(cx));
+        let footer = if self.classic_footer_shown() {
+            Some(self.footer_row(cx))
+        } else {
+            // A Classic page hides the footer, but an open web terminal stays visible.
+            self.web_terminal_chip(cx).map(|chip| {
+                div()
+                    .debug_selector(|| "classic-web-terminal-strip".into())
+                    .w_full()
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .pr(px(12.))
+                    .child(chip)
+            })
+        };
         let spans_window = self.classic_titlebar_spans_window(cx);
         let original = self.workspace.classic_layout;
         let compact_surface = cfg!(target_os = "macos")

@@ -4,7 +4,7 @@
 //! devices that wait for confirmation while Settings is closed.
 use super::*;
 use crate::notifications::platform;
-use crate::settings::{SettingsEvent, WebPolicyFlag};
+use crate::settings::{Section, SettingsEvent, WebPolicyFlag};
 use gpui::{Global, Task};
 use monocode_core::mobile::{
     AccessChange, DeviceKind, WebStatus,
@@ -217,8 +217,18 @@ impl Shell {
         bridge.terminals = terminals;
         if changed {
             self.sync_settings(cx);
+            self.invalidate_chrome(cx);
             cx.notify();
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_web_terminals_for_test(
+        &mut self,
+        terminals: TerminalStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.web_terminals_watched(terminals, cx);
     }
 
     /// The Kill button of an open web terminal.
@@ -246,6 +256,38 @@ impl Shell {
         cx.try_global::<WebBridge>()
             .map(|bridge| bridge.terminals.open.clone())
             .unwrap_or_default()
+    }
+
+    /// The footer indicator while a remote web shell is open: the tooltip
+    /// ("2 web terminals open: Safari on iOS, Chrome on macOS") and the first
+    /// device with an open terminal, whose row Manage opens.
+    pub(super) fn web_terminal_indicator(&self, cx: &App) -> Option<(String, String)> {
+        let open = cx.try_global::<WebBridge>().map(|b| &b.terminals.open)?;
+        let first = open.first()?;
+        let mut names: Vec<&str> = Vec::new();
+        for terminal in open {
+            if !names.contains(&terminal.device_name.as_str()) {
+                names.push(terminal.device_name.as_str());
+            }
+        }
+        let count = open.len();
+        let noun = if count == 1 { "terminal" } else { "terminals" };
+        Some((
+            format!("{count} web {noun} open: {}", names.join(", ")),
+            first.device_id.clone(),
+        ))
+    }
+
+    /// The footer menu's Manage item: Settings > Connections > Web app with
+    /// the row of the first device that has an open terminal expanded.
+    pub(super) fn manage_web_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, device_id)) = self.web_terminal_indicator(cx) else {
+            return;
+        };
+        self.open_settings(Section::Connections, window, cx);
+        if let Some(view) = self.settings.clone() {
+            view.update(cx, |view, cx| view.show_web_device(device_id, cx));
+        }
     }
 
     /// How many devices and requests wait for the user, for the Connections
