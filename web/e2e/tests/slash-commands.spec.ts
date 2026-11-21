@@ -150,7 +150,7 @@ test.describe("the / menu of a session composer", () => {
     await expect(field()).toHaveValue("/review ");
     await page.keyboard.type("the parser");
     await page.keyboard.press("Enter");
-    await expect(page.getByText("/review the parser")).toBeVisible();
+    await expect(page.getByTestId("transcript-scroller").getByText("/review the parser")).toBeVisible();
   });
 
   test("on a phone the menu is a bottom sheet and a press chooses a row", async () => {
