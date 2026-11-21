@@ -555,7 +555,10 @@ impl Protocol {
                             params["developerInstructions"] = format!(
                                 "{}\n\n{}",
                                 params["developerInstructions"].as_str().unwrap_or_default(),
-                                crate::mono::instructions(&mono.mono, &mono.executable)
+                                crate::mono::browser::launch_instructions(
+                                    mono,
+                                    self.request.settings.browser_available
+                                )
                             )
                             .into();
                         }
@@ -1427,7 +1430,7 @@ fn run_process(
 }
 
 fn run_operation(
-    request: Request,
+    mut request: Request,
     cancel: Arc<AtomicBool>,
     controls: Option<mpsc::Receiver<Control>>,
     probe: bool,
@@ -1458,6 +1461,14 @@ fn run_operation(
             );
         }
     }
+    // The browser server is resolved once; the rules the provider gets agree with it.
+    let browser = request
+        .settings
+        .mono
+        .as_ref()
+        .filter(|_| !request.settings.text_only)
+        .and_then(crate::mono::browser::resolve);
+    request.settings.browser_available = browser.is_some();
     let mut command = Command::new(&request.binary);
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);
@@ -1471,6 +1482,9 @@ fn run_operation(
                 request.settings.mono.as_ref(),
                 &request.settings.environment,
             );
+            if let Some(browser) = &browser {
+                browser.configure_codex(&mut command);
+            }
             if let Some(mono) = &request.settings.mono {
                 if let Some(home) =
                     crate::mono::codex_home(&mono.root, &request.settings.account.id)?
@@ -1517,10 +1531,10 @@ fn run_operation(
             let visual_server = (!settings.text_only)
                 .then(|| crate::visual_bridge::mcp_server(&settings.environment))
                 .flatten();
-            let mut allowed = Vec::new();
+            let mut allowed: Vec<String> = Vec::new();
             if !settings.text_only && settings.access == AccessMode::ReadOnly {
                 command.args(["--tools", "Read,Glob,Grep,Bash"]);
-                allowed.push("Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)");
+                allowed.push("Read,Glob,Grep,Bash(git status *),Bash(git diff *),Bash(git log *),Bash(git show *),Bash(pwd),Bash(ls *),Bash(rg *)".into());
             }
             let app_server = (!settings.text_only)
                 .then(|| {
@@ -1530,15 +1544,28 @@ fn run_operation(
             let mut servers = serde_json::Map::new();
             if let Some(server) = app_server {
                 servers.insert(crate::mono::bridge::MCP_SERVER.into(), server);
-                allowed.push(crate::mono::bridge::CLAUDE_ALLOWED_TOOLS);
+                allowed.push(crate::mono::bridge::CLAUDE_ALLOWED_TOOLS.into());
+            }
+            let mut disallowed: Vec<String> = Vec::new();
+            if let Some(browser) = &browser {
+                servers.insert(
+                    crate::mono::browser::MCP_SERVER.into(),
+                    browser.claude_server(),
+                );
+                allowed.push(browser.claude_allowed());
+                disallowed.push(browser.claude_disallowed(mode));
+                browser.apply_env(&mut command);
             }
             let mut system = Vec::new();
             if let Some(mono) = settings.mono.as_ref().filter(|_| !settings.text_only) {
-                system.push(crate::mono::instructions(&mono.mono, &mono.executable));
+                system.push(crate::mono::browser::launch_instructions(
+                    mono,
+                    browser.is_some(),
+                ));
             }
             if let Some(server) = visual_server {
                 servers.insert("monocode_visual".into(), server);
-                allowed.push(crate::visual_bridge::CLAUDE_ALLOWED_TOOLS);
+                allowed.push(crate::visual_bridge::CLAUDE_ALLOWED_TOOLS.into());
                 if let Some(instructions) =
                     crate::visual_bridge::instructions(&settings.environment, true)
                 {
@@ -1553,6 +1580,9 @@ fn run_operation(
             }
             if !allowed.is_empty() {
                 command.args(["--allowedTools", &allowed.join(",")]);
+            }
+            if !disallowed.is_empty() {
+                command.args(["--disallowedTools", &disallowed.join(",")]);
             }
             if mode == "bypassPermissions" {
                 command.arg("--allow-dangerously-skip-permissions");
@@ -1971,6 +2001,7 @@ mod tests {
             },
             root: "/monos".into(),
             executable: "/bin/monocode-gpui".into(),
+            browser_database: None,
         });
         let mut out = Vec::new();
         p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
@@ -1983,6 +2014,36 @@ mod tests {
         assert!(instructions.starts_with("You are the coding agent in Monoptah."));
         assert!(instructions.contains("## Be quick"));
         assert!(instructions.contains("- /repo"));
+    }
+    #[test]
+    fn codex_rules_mention_the_browser_only_when_the_launch_added_its_server() {
+        for available in [true, false] {
+            let mut p = protocol(Kind::Codex);
+            p.request.settings.browser_available = available;
+            p.request.settings.mono = Some(crate::agent::MonoContext {
+                mono: crate::mono::Mono {
+                    browser: Some(crate::mono::browser::MonoBrowser {
+                        enabled: true,
+                        ready: true,
+                        profile_dir: "Default".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                root: "/monos".into(),
+                executable: "/bin/monocode-gpui".into(),
+                browser_database: None,
+            });
+            let mut out = Vec::new();
+            p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+            let started: Value = String::from_utf8_lossy(&out)
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|message| message["method"] == "thread/start")
+                .unwrap();
+            let rules = started["params"]["developerInstructions"].as_str().unwrap();
+            assert_eq!(rules.contains("## Browser"), available);
+        }
     }
     #[test]
     fn operator_thread_access_keeps_the_codex_app_bridge_reachable_on_later_turns() {

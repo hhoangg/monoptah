@@ -24,6 +24,7 @@ pub(super) enum SettingsSection {
     Soul,
     Memory,
     Emoji,
+    Browser,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Route {
@@ -1680,6 +1681,7 @@ impl Monos {
             SettingsSection::Soul => self.soul_page(mono, cx),
             SettingsSection::Memory => self.memory_page(mono, window, cx),
             SettingsSection::Emoji => self.emoji_page(mono, window, cx),
+            SettingsSection::Browser => self.browser_page(mono, window, cx),
         };
         self.bind_settings_blurs(window, cx);
         let weak = cx.weak_entity();
@@ -1765,6 +1767,7 @@ impl Monos {
                                             (SettingsSection::Soul, "Soul", "sparkles"),
                                             (SettingsSection::Memory, "Memory", "sticky-note"),
                                             (SettingsSection::Emoji, "Emoji", "smile"),
+                                            (SettingsSection::Browser, "Browser", "globe"),
                                         ]
                                         .into_iter()
                                         .map(
@@ -1838,6 +1841,9 @@ impl Monos {
                                                             this.save_open_file(cx);
                                                             this.settings = Some(tab);
                                                             this.note_settings_model(cx);
+                                                            if tab == SettingsSection::Browser {
+                                                                this.browser_refresh(cx);
+                                                            }
                                                             window.focus(&this.settings_focus, cx);
                                                             cx.notify();
                                                         },

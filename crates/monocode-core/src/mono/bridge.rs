@@ -511,6 +511,7 @@ mod capability_tests {
             mono: Default::default(),
             root: "/monos".into(),
             executable: "/bin/monocode-gpui".into(),
+            browser_database: None,
         };
         let (server, _rx) = Server::start().unwrap();
         let environment = server.environment(7);

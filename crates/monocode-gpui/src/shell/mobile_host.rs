@@ -5388,7 +5388,7 @@ mod tests {
             assert!(shell.mobile_session_command(&phone(), "session.resumeUsageAtReset", &params, window, cx).unwrap_err().error.contains("changed"));
             shell.sessions[&id].update(cx, |v, _| {
                 v.settings.usage_limit.as_mut().unwrap().resets_at = None;
-                v.settings.mono = Some(monocode_core::agent::MonoContext { mono: Default::default(), root: "/fixture".into(), executable: "/fixture/binary".into() });
+                v.settings.mono = Some(monocode_core::agent::MonoContext { mono: Default::default(), root: "/fixture".into(), executable: "/fixture/binary".into(), browser_database: None });
             });
             let token = shell.sessions[&id].read(cx).mobile_usage_limit(cx)["token"].clone();
             let params = json!({"conversationId":conversation, "token":token});
