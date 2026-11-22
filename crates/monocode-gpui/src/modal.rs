@@ -32,15 +32,19 @@ pub(crate) fn scrim_color() -> Hsla {
 
 /// Fades a full-window scrim in. The caller sizes and positions `scrim`
 /// (usually `absolute().inset_0()`), and wires dismissal.
-pub(crate) fn backdrop<E: Styled + IntoElement + 'static>(
+pub(crate) fn backdrop<E: Styled + InteractiveElement + IntoElement + 'static>(
     id: impl Into<ElementId>,
     scrim: E,
 ) -> AnimationElement<E> {
-    scrim.with_animation(id, Animation::new(ENTER).with_easing(ease_out), |el, t| {
-        let mut color = scrim_color();
-        color.a *= t;
-        el.bg(color)
-    })
+    // Occluding here, in the one place every scrim goes through, keeps hover, click and
+    // scroll wheel from reaching the window behind any modal that uses it.
+    scrim
+        .occlude()
+        .with_animation(id, Animation::new(ENTER).with_easing(ease_out), |el, t| {
+            let mut color = scrim_color();
+            color.a *= t;
+            el.bg(color)
+        })
 }
 
 /// A full-window scrim layer, for a modal parent that is already
@@ -838,5 +842,129 @@ mod tests {
         let row = bounds(visual, "tall-row-0");
         wheel(visual, row.center(), -100.);
         assert_eq!(bounds(visual, "tall-row-0"), row);
+    }
+
+    /// A list that scrolls far (100 rows), under whatever `modal` puts on top.
+    struct Behind {
+        list: gpui::ListState,
+        modal: Option<fn() -> gpui::AnyElement>,
+    }
+
+    impl Render for Behind {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    gpui::list(self.list.clone(), |_, _, _| {
+                        div().h(px(20.)).w_full().into_any()
+                    })
+                    .size_full(),
+                )
+                .children(self.modal.map(|modal| modal()))
+        }
+    }
+
+    fn list_top(
+        window: gpui::WindowHandle<Behind>,
+        v: &mut gpui::VisualTestContext,
+    ) -> (usize, gpui::Pixels) {
+        window
+            .update(v, |b, _, _| {
+                let top = b.list.logical_scroll_top();
+                (top.item_ix, top.offset_in_item)
+            })
+            .unwrap()
+    }
+
+    /// Moves the pointer to `at` first, as a real wheel turn always follows pointer motion
+    /// (the window hit-tests the pointer position, not the wheel event's).
+    fn hover_wheel(v: &mut gpui::VisualTestContext, at: gpui::Point<gpui::Pixels>, dy: f32) {
+        v.simulate_mouse_move(at, None, Default::default());
+        v.run_until_parked();
+        v.refresh().unwrap();
+        wheel(v, at, dy);
+    }
+
+    #[gpui::test]
+    fn a_modal_overlay_keeps_wheel_scrolling_off_the_list_behind_it(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let list = gpui::ListState::new(100, gpui::ListAlignment::Top, px(10.)).measure_all();
+        let window = cx.add_window(|_, _| Behind { list, modal: None });
+        let v = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        v.run_until_parked();
+        v.refresh().unwrap();
+        // Without a modal the wheel moves the list: the probe works.
+        wheel(v, gpui::point(px(5.), px(5.)), -60.);
+        let start = list_top(window, v);
+        assert_ne!(start, (0, px(0.)), "the list must scroll without a modal");
+
+        fn modal() -> gpui::AnyElement {
+            let rows = (0..60).map(|ix| div().h(px(20.)).child(format!("Row {ix}")));
+            let card = scroll_card(
+                "wheel-card",
+                200.,
+                div().h(px(30.)),
+                div().flex().flex_col().children(rows),
+                div().h(px(30.)),
+            )
+            .w(px(300.))
+            .debug_selector(|| "wheel-card-box".into());
+            overlay("wheel", card, |_, _| {}).into_any_element()
+        }
+        window
+            .update(v, |b, _, cx| {
+                b.modal = Some(modal);
+                cx.notify();
+            })
+            .unwrap();
+        v.run_until_parked();
+        v.refresh().unwrap();
+        let card = bounds(v, "wheel-card-box");
+
+        // On the card, down past its end and back up past its start: the list stays put.
+        for dy in [-40., -4000., -4000., 40., 4000., 4000.] {
+            hover_wheel(v, card.center(), dy);
+            assert_eq!(list_top(window, v), start, "card, dy {dy}");
+        }
+        // On the dimmed backdrop outside the card, both ways.
+        for at in [gpui::point(px(5.), px(5.)), gpui::point(px(900.), px(700.))] {
+            for dy in [-60., 60.] {
+                hover_wheel(v, at, dy);
+                assert_eq!(list_top(window, v), start, "backdrop {at:?}, dy {dy}");
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn a_scrim_alone_occludes_the_list_behind_it(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let list = gpui::ListState::new(100, gpui::ListAlignment::Top, px(10.)).measure_all();
+        let window = cx.add_window(|_, _| Behind { list, modal: None });
+        let v = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        v.run_until_parked();
+        v.refresh().unwrap();
+        let at = gpui::point(px(5.), px(5.));
+        // Without the scrim the wheel moves the list: the probe works.
+        hover_wheel(v, at, -60.);
+        let start = list_top(window, v);
+        assert_ne!(start, (0, px(0.)), "the list must scroll without a scrim");
+        window
+            .update(v, |b, _, cx| {
+                b.modal = Some(|| {
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(scrim("alone-scrim"))
+                        .into_any_element()
+                });
+                cx.notify();
+            })
+            .unwrap();
+        v.run_until_parked();
+        v.refresh().unwrap();
+        for dy in [-60., 60.] {
+            hover_wheel(v, at, dy);
+            assert_eq!(list_top(window, v), start, "dy {dy}");
+        }
     }
 }

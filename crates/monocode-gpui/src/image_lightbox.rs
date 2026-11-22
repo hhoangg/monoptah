@@ -273,6 +273,7 @@ impl Render for ImageLightbox {
             .w(self.viewport.width)
             .h(self.viewport.height)
             .overflow_hidden()
+            .occlude()
             .on_action(cx.listener(|this, _: &Close, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_key(KEY_ZOOM_STEP, cx)))
             .on_action(
