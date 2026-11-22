@@ -53,6 +53,12 @@ pub struct Options {
     /// Probe every candidate of every click and extract scope, and report which are unique (the
     /// recorder's check). A normal run stops at the first unique one.
     pub verify_candidates: bool,
+    /// Start at this step (0 based): a repair re-runs from the failing step, not from the start.
+    pub start_at: usize,
+    /// What the steps before `start_at` extracted in the run that failed (step index and items).
+    pub carried: Vec<(usize, Vec<Value>)>,
+    /// The audit tag of every step row; none means `recipe:<id>@<version>`.
+    pub audit_tag: Option<String>,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -61,6 +67,9 @@ impl Default for Options {
             wait: Duration::from_secs(5),
             poll: Duration::from_millis(250),
             verify_candidates: false,
+            start_at: 0,
+            carried: Vec::new(),
+            audit_tag: None,
         }
     }
 }
@@ -75,6 +84,9 @@ pub struct Failure {
     pub expected: String,
     pub observed: String,
     pub needs_login: bool,
+    /// The page or an assertion did not match (a locator, a check, a wait that timed out): the
+    /// kind of failure a repair can try to fix. A refusal by the policy or a sign-in page is not.
+    pub repairable: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -88,6 +100,9 @@ pub struct Outcome {
     /// With [`Options::verify_candidates`]: per step index, the candidate indices that matched
     /// exactly one element.
     pub unique: BTreeMap<usize, Vec<usize>>,
+    /// What the steps that ran extracted, by step index (kept on a failure so a repair can carry
+    /// it into the re-run).
+    pub extracts: Vec<(usize, Vec<Value>)>,
 }
 impl Outcome {
     pub fn ok(&self) -> bool {
@@ -163,6 +178,10 @@ struct Runner<'a> {
 /// Runs `recipe` with `given` parameters. Never panics on page content.
 pub fn run(host: &dyn Host, recipe: &Recipe, given: &Map<String, Value>, opts: Options) -> Outcome {
     let started = Instant::now();
+    let tag = opts
+        .audit_tag
+        .clone()
+        .unwrap_or_else(|| format!("recipe:{}@{}", recipe.id, recipe.version));
     let mut runner = Runner {
         host,
         recipe,
@@ -172,7 +191,7 @@ pub fn run(host: &dyn Host, recipe: &Recipe, given: &Map<String, Value>, opts: O
             data: Value::Null,
             ..Outcome::default()
         },
-        tag: format!("recipe:{}@{}", recipe.id, recipe.version),
+        tag,
     };
     let failure = runner.run_all(given);
     runner.outcome.failure = failure.map(|f| *f);
@@ -190,6 +209,7 @@ impl Runner<'_> {
             expected: String::new(),
             observed: String::new(),
             needs_login: false,
+            repairable: false,
         })
     }
 
@@ -222,8 +242,9 @@ impl Runner<'_> {
                 "This recipe's site is on the Mono's blocked list or is a bank or payment site, so recipes do not run there.",
             ));
         }
-        let mut extracts = Vec::new();
-        for (index, step) in recipe.steps.iter().enumerate() {
+        let mut extracts = self.opts.carried.clone();
+        let start = self.opts.start_at.min(recipe.steps.len());
+        for (index, step) in recipe.steps.iter().enumerate().skip(start) {
             let number = index + 1;
             // One audit row per step, however many probes and polls it took.
             let failure = self.step(index, number, step, &mut extracts).or_else(|| {
@@ -237,9 +258,11 @@ impl Runner<'_> {
                 &format!("{} step {number} {} {verdict}", self.tag, step.op()),
             );
             if failure.is_some() {
+                self.outcome.extracts = extracts;
                 return failure;
             }
         }
+        self.outcome.extracts = extracts.clone();
         self.finish(extracts);
         None
     }
@@ -396,7 +419,10 @@ impl Runner<'_> {
             json!({"target": resolved.selector, "element": label}),
         )?;
         if output.is_error {
-            return Err(self.refuse(number, "click", clip(&output.text, 300)));
+            let mut failure = self.refuse(number, "click", clip(&output.text, 300));
+            failure.needs_login = looks_like_login(&failure.url);
+            failure.repairable = !failure.needs_login;
+            return Err(failure);
         }
         self.assert_all(number, "click", expect, None)
     }
@@ -431,6 +457,8 @@ impl Runner<'_> {
                 .clone()
                 .or_else(|| text_gone.clone())
                 .unwrap_or_default();
+            failure.needs_login = looks_like_login(&failure.url);
+            failure.repairable = !failure.needs_login;
             return Err(failure);
         }
         Ok(())
@@ -535,6 +563,7 @@ impl Runner<'_> {
                     .unwrap_or_default();
                 failure.observed = self.observed();
                 failure.needs_login = looks_like_login(&failure.url);
+                failure.repairable = !failure.needs_login;
                 return Err(failure);
             }
             self.host.pause(self.opts.poll);
@@ -569,6 +598,7 @@ impl Runner<'_> {
                     op: op.to_owned(),
                     reason: "A check after the step failed.".into(),
                     needs_login: looks_like_login(&url),
+                    repairable: !looks_like_login(&url),
                     url,
                     expected: clip(&what, 300),
                     observed: self.observed(),

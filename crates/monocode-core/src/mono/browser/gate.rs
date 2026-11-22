@@ -589,6 +589,8 @@ struct Inner {
     workspace: Mutex<Option<Workspace>>,
     /// The browser calls of each route (app session) since its last saved recipe, in memory only.
     traces: Mutex<std::collections::HashMap<String, Trace>>,
+    /// Failed recipe runs waiting for the Mono's repair patch (in memory, with an expiry).
+    repairs: recipe::repair::Book,
     calls: AtomicU64,
     generation: AtomicU64,
     next_id: AtomicU64,
@@ -651,6 +653,7 @@ impl Gate {
             run: Mutex::new(()),
             workspace: Mutex::new(None),
             traces: Mutex::new(Default::default()),
+            repairs: Default::default(),
             calls: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             next_id: AtomicU64::new(100),
@@ -1031,7 +1034,10 @@ impl Inner {
                 true,
             );
         }
-        let uses_browser = matches!(name, recipe::tools::RUN | recipe::tools::RECORD);
+        let uses_browser = matches!(
+            name,
+            recipe::tools::RUN | recipe::tools::RECORD | recipe::tools::REPAIR
+        );
         let _one_at_a_time =
             uses_browser.then(|| self.run.lock().unwrap_or_else(|e| e.into_inner()));
         let store = recipe::store::RecipeStore::new(workspace.recipes_dir.clone());
@@ -1057,6 +1063,7 @@ impl Inner {
             ask: &ask,
             trace: &trace,
             options: workspace.recipe_options.clone(),
+            repairs: &self.repairs,
         };
         let reply = recipe::tools::call(name, args, &context);
         if uses_browser {
@@ -1241,7 +1248,7 @@ fn approval_tool_definition() -> Value {
 
 /// What the audit log keeps of a page address: origin and path, never the query or fragment
 /// (they can carry tokens). An address that does not parse is not logged.
-fn audit_url(url: &str) -> String {
+pub fn audit_url(url: &str) -> String {
     url::Url::parse(url)
         .map(|u| format!("{}{}", u.origin().ascii_serialization(), u.path()))
         .unwrap_or_default()

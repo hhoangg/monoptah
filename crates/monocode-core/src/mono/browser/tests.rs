@@ -875,6 +875,14 @@ fn the_audit_keeps_the_url_and_action_but_never_typed_values() {
         (go.url.as_str(), go.summary.as_str()),
         ("https://a.example/x", "navigate")
     );
+    // A token in the query or the fragment never reaches the audit log: origin and path only.
+    let secret = audit_entry(
+        "mcp__playwright_browser__browser_navigate",
+        r#"{"url":"https://a.example/x/y?token=abc123#frag"}"#,
+        7,
+    )
+    .unwrap();
+    assert_eq!(secret.url, "https://a.example/x/y");
     let form = audit_entry(
         "mcp__playwright_browser__browser_fill_form",
         r#"{"fields":[{"name":"a","value":"hunter2"},{"name":"b","value":"x"}]}"#,

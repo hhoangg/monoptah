@@ -320,6 +320,39 @@ On any step failure or failed assertion the runner stops and starts repair for t
    "refresh locators" suggestion rather than an immediate repair, so a redesign that still works
    does not cost tokens.
 
+**Phase 2 as built.** The "small LLM call" of step 2 is a request back to the Mono's own turn
+(see Open question 3), not a separate model call:
+
+- `recipe_run` fails on a locator, an assertion or a timed-out wait (not on a policy refusal, a
+  sign-in page, or at Level 1): the result is `{ok:false, step, expected, repair:{token,
+  attempts_left, allowed_ops, schema}, observation}`. The observation is a `browser_find` around
+  the expected name, else a depth-3 snapshot of the nearest named ancestor, else only the
+  depth-1 outline; at most 6,000 characters, fenced as untrusted page data. Never a full-page
+  snapshot.
+- The pending repair lives in the gate (memory, 15 minute expiry, one per recipe), bound to the
+  recipe id, version, content hash, the failing step and the page the failure left. The Mono
+  holds only the token, so it cannot patch another step; a patch has no field to name one.
+- `recipe_repair {token, patch}` takes one patch. Ops: `replace_candidates` (same role and same
+  kind of name, checked by code), `add_wait`, `insert_step` (a wait, scroll or link/tab click,
+  right before the failing step), `change_assertion`, `give_up`. The schema is closed, the
+  patched recipe must pass the full `Recipe::validate`, and every other step must stay
+  byte-identical. Only a same-class locator fix of a read step, or a wait, keeps the earlier
+  approval; `insert_step` and `change_assertion` (and any change to a step that changes things, or
+  sits next to an `approve` step once Phase 3 adds them) show the user a card first, and the new
+  hash is approved only through that card.
+- Caps: 2 attempts per run, 5 attempts per recipe per UTC day (kept in `stats`, inherited by new
+  versions). A refused patch costs an attempt. Past the cap the result says repairs are paused.
+- A re-run starts at the failing step (extracts of earlier steps are carried over). If the step
+  and every later step pass, version + 1 is saved with `parent`, `reason: repair` and a diff
+  summary; otherwise the old version stays current and the result is `needs_exploration:true`.
+- Flaky: the last 20 runs, fail rate above 30 percent with at least 5 runs. A repaired version is
+  `repaired` until 3 clean runs; 2 failed runs in a row before that roll back to the parent and
+  mark the recipe flaky. `recipe_find` ranks flaky recipes last and says so. `recipe_rollback`
+  restores a version, and it runs again only if the user approved that exact content before (a
+  table of every approved hash, in the store database, never rebuilt from files).
+- Audit rows (`recipe_repair`, `recipe_rollback`, steps tagged `recipe:<id>@<v>+repair`) hold
+  origin and path only, never a locator name, a parameter value or a query string.
+
 This is the main difference from Stagehand and Skyvern as documented: repair is local to one step,
 verified by assertions, versioned and reversible, instead of "re-run the whole agent and overwrite
 the cache".
@@ -643,6 +676,12 @@ portable, a fake `Upstream` for the runner (the gate tests already do this), no 
 3. Where does the LLM for the compile and repair calls come from: the Mono's own harness (an extra
    turn), or a small separate call with a cheaper model? The first is simpler; the second is
    cheaper. A setting could allow a cheaper model.
+   **Answered (Phase 2, repair):** the Mono's own turn, as a scoped request back to it. Failed
+   `recipe_run` returns the failing step, the expectation, a capped observation and a one-use
+   token; the Mono answers with `recipe_repair` and one patch. This works the same for the Claude
+   and the Codex harness, needs no model client or key in core, and every browser call of the
+   re-run still goes through the gate. A cheaper separate model stays a later option. The compile
+   pass is still the Mono's own call (Phase 1).
 4. Should read recipes be allowed at Level 1 when a recipe has `click` steps? A click can still
    change state (a "Mark all read" button). Proposed: Level 1 runs only recipes whose every step is
    `open`, `wait`, `scroll`, `extract`. Level 1 cannot run click steps at all today (the gate
