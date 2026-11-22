@@ -439,7 +439,7 @@ added per launch, capped at 10 lines, so the Mono does not need to call `recipe_
 
 ## Budget estimates
 
-Numbers below are **estimates from stated assumptions, not measurements**. They exist to size the
+The table below holds **estimates from stated assumptions**; the Phase 0 measurements follow in "Measured", which supersede assumptions A and D. They exist to size the
 benefit and to be replaced by measured values (see "Metrics").
 
 Assumptions (typical authenticated web app, 12 steps, one list extraction):
@@ -473,6 +473,95 @@ snapshot tokens re-read across turns.
 
 Break-even: compile pass plus one confirm costs about one first run, so a recipe pays back at
 about 2 uses.
+
+### Measured (Phase 0 spike, 2026-11-22)
+
+Environment: macOS, the user's real Chrome 157 (one profile), Playwright MCP Bridge extension,
+`@playwright/mcp@0.0.86 --extension --session-name PoC`, driven over stdio by a throwaway Node
+runner (not merged). Tokens are counted with `cl100k_base` (js-tiktoken), an approximation of
+the Claude tokenizer. Two public read-only tasks; the logged-in task was skipped because the
+profile with a working extension token had no signed-in session for the chosen app.
+
+- **T1** Hacker News: top 10 front-page stories (rank, title, URL). 1 open + 1 extract.
+- **T2** GitHub: latest 3 releases of `microsoft/playwright-mcp` (tag, date, commit).
+  1 open + 1 navigation click + 1 extract.
+
+Raw sizes and latencies (median of 3 explore runs and 5 recipe runs):
+
+| Observation | Bytes | Tokens | Latency |
+|---|---|---|---|
+| Full `browser_snapshot`, HN front page | 47,312 | 12,200 | 40 ms |
+| Full `browser_snapshot`, GitHub repo page | 86,000 | 20,700-22,400 | 120 ms |
+| Full `browser_snapshot`, GitHub releases page | 131,600 | 28,800-31,900 | 100-180 ms |
+| `browser_find` result (6 matches with context) | 1,457 | 450 | 90-100 ms |
+| `browser_snapshot` with `target` (one element, locator probe) | 84-440 | 20-140 | 4-25 ms |
+| `browser_navigate` (response only, no inline snapshot) | 240-380 | 80-130 | 300-800 ms HN, 450-2,350 ms GitHub |
+| `browser_click` on a navigating link | ~300 | 95 | 1.4-1.6 s, bimodal to 6.3 s in 4 of 8 runs |
+| Playwright MCP `tools/list` (26 tools) | - | 4,484 | - |
+
+Explore vs recipe vs repair. "Model input" counts only what the browser adds to the context,
+re-read on every later turn (each turn input = base prompt + all earlier tool results); add the
+base prompt (at least the 4,484-token tool list) once per turn. "Browser time" is MCP time only;
+LLM turn time is not measured here (assumption D, 3-10 s per turn, still applies).
+
+| Run | Task | LLM turns | Browser calls | Model input added by browser (cumulative) | Model sees per result | Browser time |
+|---|---|---|---|---|---|---|
+| Explore | T1 | 3 | 2 | 12,400 | 12,200 snapshot | 0.36-0.75 s |
+| Explore | T2 | 6 | 5 | 116,500 | 20,700 + 31,900 snapshots | 2.2-2.7 s |
+| Recipe | T1 | 2 | 3 (runner) | 390 | 388 compact JSON | 0.42-0.76 s |
+| Recipe | T2 | 2 | 6-8 (runner) | 95 | 95 compact JSON | 2.1-2.4 s, 7.0 s when the click is slow |
+| Recipe, first candidate broken, fallback resolves | T2 | 2 | 8-10 | 95 | 95 | 2.3-6.9 s (+0.1 s for the fallback probe, plus the probe wait) |
+| Repair observation, all candidates broken | T2 | +1 | 1-2 | 140-450 | `browser_find` regex 447, named heading scope 142 | +5.2 s to detect (wait timeout) + 0.1 s |
+
+With a 4,484-token base per turn: T1 explore about 25,800 input vs recipe about 9,400 (64 percent
+less); T2 explore about 143,000 vs recipe about 9,100 (94 percent less). Excluding the base, the
+browser part drops 97 percent (T1) and 99.9 percent (T2). Two turns of LLM time saved (T1) and
+four (T2) dominate wall time; the browser time of explore and recipe is about the same, because
+the recipe runs the same navigations.
+
+Runner-internal (never sent to the model): the extract scope snapshot was 11,500 tokens (HN,
+no landmarks, CSS scope `#bigbox`) and about 29,900 tokens (GitHub `region "Releases results"`,
+which contains the full release notes); parsing and field extraction took 110-200 ms per step.
+
+Assumption A was low: full snapshots are 12,000-32,000 tokens, not 3,000-10,000, and a landmark
+"scoped" snapshot is not small: GitHub `main` is 21,200 tokens (95 percent of the page),
+`main` at `depth: 8` 9,100, at `depth: 4` 430 but without the target. Assumption D holds for
+navigation (0.3-2.4 s) but MCP snapshot calls are faster (5-180 ms) and navigating clicks are
+slower (1.4-6.3 s).
+
+Surprises that change the design:
+
+1. **`browser_snapshot` takes `target` (a ref or a Playwright selector, strict) and `depth`.**
+   `internal:role=link[name="Releases"s]` resolves in 4-25 ms and returns 20-140 tokens; a
+   non-unique selector returns a strict-mode error. Locator resolution should be one cheap
+   targeted probe per candidate, using Playwright's own role engine, not a full snapshot parsed
+   in Rust. Rust still parses the extract scope.
+2. **No `browser_mouse_wheel` in 0.0.86** (26 tools: no mouse tools without `--caps`). The
+   `scroll` mapping and the Level 1 step set must change: scroll via `browser_press_key` (Level
+   2 and 3) or drop scroll from Level 1.
+3. **`browser_navigate` and `browser_click` no longer inline a snapshot**: they return a link
+   to a `.playwright-mcp/page-*.yml` file written into the server's working directory (47 files
+   after the spike). Page content lands on disk: the gate must set an output dir inside the Mono
+   data dir with retention, and treat those files as sensitive.
+4. **Locators need auto-wait.** Once, right after `browser_navigate` on GitHub, a present link
+   did not resolve yet (hydration). The runner polls each step's candidates for up to a timeout
+   (5 s in the spike); that timeout is also the detection cost of a broken locator.
+5. **Hand-written fallbacks fail.** A CSS fallback `a[href$='/releases']` matched nothing via
+   `target`, and text-only candidates hit strict-mode violations (two matches). A scoped chain
+   `internal:role=heading[name=/^Releases/] >> internal:role=link[name="Releases"s]` worked.
+   Candidates must be generated from the recorded node and each checked unique at record time.
+6. **Landmarks are missing or huge.** HN has no landmarks (table layout), so extractors need
+   structural matching (`each: row has cell /^\d+\.$/`, innermost match, `not_name`), and the
+   repair observation must be `browser_find` or a named-ancestor scope (140-450 tokens), not the
+   nearest landmark (up to 21,200).
+7. **Navigating clicks are slow and bimodal** (1.4 s or 6.3 s through the extension relay). When
+   a click only follows a link, the recorder should store the link URL and emit an `open` step
+   (0.45 s) with the click as fallback.
+8. **Refs are not stable** across navigations and connections (the same link was `e1509`,
+   `f1e1509`, `e1376`), confirming "never store the ref".
+
+Caveats: one machine, one network, two simple public read tasks, n = 3-5 runs; no logged-in
+app; LLM turn time and real model usage not measured; the tokenizer is not Claude's.
 
 **Metrics to ship with MVP** (so the numbers above get replaced): per run, record the mode
 (`explore`, `recipe`, `repair`), model input and output tokens (from the provider usage that
@@ -543,8 +632,11 @@ portable, a fake `Upstream` for the runner (the gate tests already do this), no 
 1. Does `@playwright/mcp` 0.0.86 offer a way to snapshot a subtree by role and name (the `browser_find`
    tool, or a `selector` argument to `browser_snapshot`)? If not, the runner takes a full snapshot
    and filters locally (token cost off-model, but more bytes on the wire). Verify in the spike.
+   **Answered (Phase 0):** yes, `browser_snapshot` takes `target` (ref or strict Playwright
+   selector such as `internal:role=link[name="X"s]`) and `depth`; see "Measured".
 2. Is `ref` stable within one snapshot-to-action pair only? (Believed yes.) Confirm it cannot be
    reused across a navigation, so the runner always re-resolves.
+   **Answered (Phase 0):** refs changed across navigations and connections; always re-resolve.
 3. Where does the LLM for the compile and repair calls come from: the Mono's own harness (an extra
    turn), or a small separate call with a cheaper model? The first is simpler; the second is
    cheaper. A setting could allow a cheaper model.
@@ -617,5 +709,4 @@ Unverified or only partly verified:
 - workflow-use step schema, "7 fallback strategies", and any measured savings.
 - Skyvern cache key, drift detection and the 3-5x and 70 percent figures (vendor claim).
 - AgentQL caching and every self-healing claim (no data, no independent benchmark).
-- Any exact token or latency number in this spec: all are estimates from stated assumptions.
-- Playwright MCP 0.0.86 subtree snapshot support (open question 1).
+- Any exact token or latency number in this spec outside "Measured": those are estimates from stated assumptions.
