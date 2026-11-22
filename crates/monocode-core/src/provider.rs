@@ -1498,6 +1498,11 @@ fn run_operation(
     let gate_asks = browser
         .as_ref()
         .and_then(crate::mono::browser::Runtime::attach_approver);
+    // A run is one agent turn: the gate starts its taint and intent tracking from the user's own
+    // request text, never from anything a page returns.
+    if let Some(runtime) = &browser {
+        runtime.begin_turn(&request.prompt);
+    }
     let mut command = Command::new(&request.binary);
     crate::scm::shell::apply_gui_env(&mut command);
     command.envs(&request.settings.environment);
@@ -2303,6 +2308,7 @@ mod tests {
                 },
                 reply,
                 abandoned: abandoned.clone(),
+                never: Default::default(),
             },
             can_answer,
         );
@@ -2351,6 +2357,44 @@ mod tests {
                 assert!(p.gate_asks.is_empty());
             }
         }
+    }
+    #[test]
+    fn the_recipe_suggestion_card_offers_never_for_this_site_through_the_session_answer() {
+        use crate::mono::browser::gate::{ApprovalRequest, Ask, Category, SUGGEST_ID_PREFIX};
+        let mut p = protocol(Kind::Claude);
+        let (reply, answer) = mpsc::channel();
+        let never = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let events = p.gate_ask(
+            Ask {
+                request: ApprovalRequest {
+                    category: Category::Suggestion,
+                    action: "Save it".into(),
+                    url: "https://shop.example".into(),
+                    details: String::new(),
+                    code: None,
+                    explanation: String::new(),
+                },
+                reply,
+                abandoned: Default::default(),
+                never: never.clone(),
+            },
+            true,
+        );
+        let Event::Approval(card) = &events[0] else {
+            panic!("card")
+        };
+        assert!(card.id.starts_with(SUGGEST_ID_PREFIX) && card.can_remember);
+        let mut sink = Vec::new();
+        p.respond(
+            Control {
+                id: card.id.clone(),
+                decision: Decision::Session,
+            },
+            &mut sink,
+        )
+        .unwrap();
+        assert!(answer.recv().unwrap());
+        assert!(never.load(Ordering::SeqCst));
     }
     #[test]
     fn browser_gate_cards_are_denied_when_nobody_can_answer_and_when_the_user_denies() {

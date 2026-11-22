@@ -1257,3 +1257,18 @@ fn an_unavailable_browser_is_logged_kept_for_the_ui_and_told_to_the_mono() {
     assert!(resolve_with(&ctx, &env, &servers).runtime().is_some());
     assert_eq!(servers.attach_error(&mono.id), None);
 }
+
+#[test]
+fn the_rules_tell_the_mono_about_fences_declared_intents_and_suggested_recipes() {
+    let mut browser = MonoBrowser {
+        trust: BrowserTrust::AskRisky,
+        ..MonoBrowser::default()
+    };
+    let rules = prompt_block(&browser);
+    assert!(rules.contains("<untrusted-content-"));
+    assert!(rules.contains("browser_declare_intent"));
+    assert!(rules.contains("Save as recipe?"));
+    browser.trust = BrowserTrust::ReadOnly;
+    let rules = prompt_block(&browser);
+    assert!(rules.contains("<untrusted-content-") && !rules.contains("browser_declare_intent"));
+}

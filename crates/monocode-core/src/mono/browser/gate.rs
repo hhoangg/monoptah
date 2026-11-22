@@ -27,16 +27,17 @@
 //! gate sends an [`Ask`] to the run that is attached ([`Gate::attach`]), the provider loop turns it
 //! into an `Event::Approval` and answers it from the user's decision.
 use super::recipe::{self, record::Trace, runner};
+use super::{defense, output, AuditEntry, BrowserTrust, MonoBrowserStore};
 use super::{
     is_scroll_key, ALWAYS_BLOCKED_TOOLS, CODE_TOOLS, KNOWN_TOOLS, READ_ONLY_TOOLS, SCROLL_KEYS,
 };
-use super::{output, AuditEntry, BrowserTrust, MonoBrowserStore};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
+mod guard;
 mod http;
 pub mod overlay;
 mod stdio;
@@ -45,6 +46,10 @@ pub use stdio::StdioUpstream;
 
 /// A stand-in route name for code that builds a [`Runtime`](super::Runtime) without a gate.
 pub const SHARED_ROUTE: &str = "shared";
+/// The prefix of the id of the card that offers to save a task as a recipe. Its three answers
+/// are Dismiss (deny), Save as recipe (allow once) and Never for this site (the session answer,
+/// desktop only).
+pub const SUGGEST_ID_PREFIX: &str = "browser-gate-suggest-";
 /// The tool the gate adds for the actions it can not detect itself.
 pub const APPROVAL_TOOL: &str = "browser_request_approval";
 /// How long the gate waits for the user. Codex is told to wait a minute longer.
@@ -73,6 +78,13 @@ pub enum Category {
     CardData,
     /// Saving a browser recipe the Mono recorded. Chosen by the gate.
     Recipe,
+    /// An action that follows untrusted page content and was not declared before it was read.
+    /// Chosen by the gate, asked at every trust level.
+    Untrusted,
+    /// A page held a prompt injection pattern: the user decides whether the Mono sees it.
+    Injection,
+    /// "Save as recipe?" for a task the app found repeatable. Chosen by the app.
+    Suggestion,
 }
 impl Category {
     /// The values `browser_request_approval` accepts.
@@ -97,6 +109,9 @@ impl Category {
             Self::FinancePage => "Change on a bank or payment page",
             Self::CardData => "Card number typed into a page",
             Self::Recipe => "Save a browser recipe",
+            Self::Untrusted => "Action after reading untrusted content",
+            Self::Injection => "Possible prompt injection in a page",
+            Self::Suggestion => "Save this task as a browser recipe",
         }
     }
 }
@@ -108,6 +123,13 @@ impl Category {
 /// categories (a finance page, a card number) always ask. A recipe that saves itself never asks
 /// through this function.
 pub fn approval_required(trust: BrowserTrust, category: Category) -> bool {
+    // Untrusted content and injection warnings ask at every level; a suggestion never blocks.
+    if matches!(category, Category::Untrusted | Category::Injection) {
+        return true;
+    }
+    if category == Category::Suggestion {
+        return false;
+    }
     match trust {
         BrowserTrust::ReadOnly => false,
         BrowserTrust::AskRisky => !matches!(category, Category::Recipe),
@@ -143,6 +165,9 @@ impl ApprovalRequest {
             Category::CardData => "Allow typing a card number into this page?",
             Category::Other => "Allow this risky browser action?",
             Category::Recipe => "Save this browser recipe?",
+            Category::Untrusted => "Allow this action? It follows untrusted web content",
+            Category::Injection => "This page looks like a prompt injection. Let the Mono read it?",
+            Category::Suggestion => "Save this task as a recipe?",
         }
         .to_owned()
     }
@@ -608,6 +633,9 @@ pub struct Ask {
     pub reply: mpsc::Sender<bool>,
     /// Set by the gate when it stopped waiting (timeout): the card should be withdrawn.
     pub abandoned: Arc<AtomicBool>,
+    /// Set by the run when the user chose "Never for this site" on a suggestion card (then the
+    /// reply is `true`, and the gate reads this first).
+    pub never: Arc<AtomicBool>,
 }
 
 /// A run's end of the approval channel. Dropping it detaches the run from the gate.
@@ -698,6 +726,10 @@ struct Inner {
     traces: Mutex<std::collections::HashMap<String, Trace>>,
     /// Failed recipe runs waiting for the Mono's repair patch (in memory, with an expiry).
     repairs: recipe::repair::Book,
+    /// What each route (app session) read and declared this turn (see [`defense`]).
+    turns: Mutex<std::collections::HashMap<String, defense::Turn>>,
+    /// This gate, for the suggestion card that waits on its own thread.
+    me: std::sync::Weak<Inner>,
     calls: AtomicU64,
     generation: AtomicU64,
     next_id: AtomicU64,
@@ -752,7 +784,9 @@ impl Gate {
         upstream_key: &str,
         timeout: Duration,
     ) -> Result<Arc<Self>, String> {
-        let inner = Arc::new(Inner {
+        let inner = Arc::new_cyclic(|me| Inner {
+            me: me.clone(),
+            turns: Mutex::new(Default::default()),
             state: Mutex::new(State {
                 policy,
                 upstream,
@@ -906,6 +940,18 @@ impl Gate {
         }
     }
 
+    /// A new agent turn starts on `route` with the user's own request text: what was read,
+    /// declared and suggested in the turn before is forgotten (see [`defense`]).
+    pub fn begin_turn(&self, route: &str, request: &str) {
+        self.inner.begin_turn(route, request);
+    }
+
+    /// Tests of other features: the route's turn is never judged by the taint rule.
+    #[cfg(test)]
+    pub fn exempt_from_taint(&self, route: &str) {
+        self.inner.exempt_from_taint(route);
+    }
+
     /// Answers one JSON-RPC message from the agent on `route` (what the HTTP server calls).
     pub fn handle(&self, route: &str, message: Value) -> Option<Value> {
         self.inner.respond(route, message)
@@ -1007,6 +1053,7 @@ impl Inner {
         }
         if policy.trust != BrowserTrust::ReadOnly {
             tools.push(approval_tool_definition());
+            tools.push(defense::declare_tool_definition());
         }
         if self.workspace().is_some() {
             tools.extend(recipe::tools::definitions(policy.trust));
@@ -1028,11 +1075,14 @@ impl Inner {
             let state = self.lock_state();
             (state.policy.clone(), state.page.clone())
         };
-        match policy.evaluate(name, args, &page_url) {
+        let verdict = policy.evaluate(name, args, &page_url);
+        let verdict = self.apply_taint(route, name, args, &page_url, verdict);
+        match verdict {
             Verdict::Deny(reason) => return Err(tool_text(reason, true)),
             Verdict::Ask(request) => {
                 self.ask(route, request)
                     .map_err(|reason| tool_text(reason, true))?;
+                self.allowed(route, name, args, &page_url);
                 // The wait can be long: the user may have lowered the level meanwhile.
                 let now = self.lock_state().policy.clone();
                 if let Verdict::Deny(reason) = now.evaluate(name, args, &page_url) {
@@ -1083,6 +1133,9 @@ impl Inner {
     }
 
     fn call_tool(&self, route: &str, name: &str, args: Value) -> Value {
+        if name == defense::DECLARE_TOOL {
+            return self.declare_intent(route, &args);
+        }
         if recipe::tools::is_recipe_tool(name) {
             return self.recipe_tool(route, name, &args);
         }
@@ -1124,8 +1177,11 @@ impl Inner {
         };
         if let Some(workspace) = &workspace {
             self.trace(route, workspace, name, &forwarded, &page_before, &result);
+            if result["isError"] != true {
+                self.maybe_suggest(route, workspace);
+            }
         }
-        result
+        self.defend(route, name, result)
     }
 
     /// [`Inner::forward`] with the action overlay around it: the call was authorized already. The
@@ -1211,7 +1267,7 @@ impl Inner {
                 }
                 result
             }
-            Err(error) => tool_text(format!("The browser is not available: {error}"), true),
+            Err(error) => tool_text(format!("{} {error}", guard::UNAVAILABLE_PREFIX), true),
         }
     }
 
@@ -1273,6 +1329,11 @@ impl Inner {
                 true,
             );
         }
+        if matches!(name, recipe::tools::RUN | recipe::tools::REPAIR) {
+            if let Err(reason) = self.check_recipe_params(route, name, args) {
+                return tool_text(reason, true);
+            }
+        }
         let uses_browser = matches!(
             name,
             recipe::tools::RUN | recipe::tools::RECORD | recipe::tools::REPAIR
@@ -1293,7 +1354,17 @@ impl Inner {
             route,
             workspace: &workspace,
         };
-        let ask = |request: ApprovalRequest| self.ask(route, request);
+        // The user accepted "Save as recipe?": the recorder keeps its checks and its dry run,
+        // but does not ask a second time. Never after untrusted content or an injection signal.
+        let accepted = name == recipe::tools::RECORD
+            && self.with_turn(route, |t| t.save_ok && !t.tainted && !t.flagged());
+        let ask = |request: ApprovalRequest| {
+            if accepted && request.category == Category::Recipe {
+                Ok(())
+            } else {
+                self.ask(route, request)
+            }
+        };
         let context = recipe::tools::Context {
             mono_id: &workspace.mono_id,
             store: &store,
@@ -1319,11 +1390,41 @@ impl Inner {
                 trace.clear();
             }
         }
+        if name == recipe::tools::RECORD && !reply.is_error {
+            self.with_turn(route, |t| t.save_ok = false);
+        }
+        // What a run or a repair returns is page content (extracted fields, an observation).
+        if reply.page {
+            return match self.after_read(route, name, &reply.text, true) {
+                Err(reason) => tool_text(
+                    format!("{reason} The result was withheld: it looked like a prompt injection."),
+                    true,
+                ),
+                Ok(hits) => {
+                    let mut out = tool_text(
+                        defense::fence(&reply.text, &defense::new_nonce()),
+                        reply.is_error,
+                    );
+                    if !hits.is_empty() {
+                        out["content"].as_array_mut().into_iter().for_each(|parts| {
+                            parts.push(json!({"type": "text", "text": guard::INJECTION_NOTE}))
+                        });
+                    }
+                    out
+                }
+            };
+        }
         tool_text(reply.text, reply.is_error)
     }
 
     /// Shows the card and waits. Everything but an explicit Allow is an error text for the agent.
     fn ask(&self, route: &str, request: ApprovalRequest) -> Result<(), String> {
+        self.ask_full(route, request).map(|_| ())
+    }
+
+    /// [`Inner::ask`] that also tells whether the user chose "Never for this site" (only a
+    /// suggestion card offers it).
+    fn ask_full(&self, route: &str, request: ApprovalRequest) -> Result<bool, String> {
         let sender = self
             .approvers
             .lock()
@@ -1331,20 +1432,22 @@ impl Inner {
             .get(route)
             .map(|a| a.sender.clone());
         let Some(sender) = sender else {
-            return Err("Denied: there is no way to ask the user right now.".into());
+            return Err(guard::NO_CHANNEL.into());
         };
         let (reply, answer) = mpsc::channel();
         let abandoned = Arc::new(AtomicBool::new(false));
+        let never = Arc::new(AtomicBool::new(false));
         let ask = Ask {
             request,
             reply,
             abandoned: abandoned.clone(),
+            never: never.clone(),
         };
         if sender.send(ask).is_err() {
-            return Err("Denied: there is no way to ask the user right now.".into());
+            return Err(guard::NO_CHANNEL.into());
         }
         match answer.recv_timeout(self.timeout) {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(never.load(Ordering::SeqCst)),
             Ok(false) => Err(
                 "Denied by the user. Do not do this action, and do not try another way to do it."
                     .into(),
@@ -1554,6 +1657,10 @@ impl runner::Host for GateHost<'_> {
             Ok(Authorized::Answer(reply)) => reply,
             Ok(Authorized::Forward) => self.inner.act(tool, &args, true),
         };
+        // A page a recipe step reads is scanned like one the agent reads, but it does not taint
+        // the turn until the run's output is read (the user approved the steps).
+        self.inner
+            .after_read(self.route, tool, &result_text(&result), false)?;
         Ok(runner::ToolOutput {
             text: result_text(&result),
             is_error: result["isError"] == true,

@@ -220,6 +220,12 @@ impl Trace {
         let forest = snapshot::parse(snapshot::snapshot_body(text));
         collect_refs(&forest, &[], &mut self.refs);
     }
+    /// The role and name the last snapshot showed for `reference` (an element the Mono acts on).
+    pub fn describe_ref(&self, reference: &str) -> Option<String> {
+        self.refs
+            .get(reference)
+            .map(|n| format!("{} {}", n.role, n.name).trim().to_owned())
+    }
     /// Notes one call. `args` are cut down to what a recipe may keep.
     pub fn note(
         &mut self,
