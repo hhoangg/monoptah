@@ -229,7 +229,7 @@ native app only).
 
 ### Releasing the native app
 
-Monoptah Native (GPUI) ships for macOS arm64 (ad-hoc signed, not notarized), Linux x86_64 and
+Monoptah Native (GPUI) ships for macOS arm64 (signed with a stable self-signed certificate, not notarized), Linux x86_64 and
 Windows x86_64 (unsigned installer). It releases separately from the Tauri app. No macOS job
 runs on GitHub Actions (hosted macOS runners are not being acquired): the macOS app is checked,
 built and packaged on the maintainer's Mac, everything else is on CI.
@@ -244,6 +244,11 @@ code or tests gated to macOS, also run the tests you touched on macOS. `npm run 
 (the full gate, including the GPUI tests on macOS) still runs locally in `native:release:mac`
 before every release. How often to run which check while developing is in "Developing the
 native app".
+
+The macOS app is signed with a stable self-signed certificate so the designated requirement
+(and macOS permission grants such as Full Disk Access) survive updates. One-time setup, backup
+and recovery: "Stable signing identity" in [`docs/native/release-flow.md`](docs/native/release-flow.md).
+The release needs `MONOPTAH_NATIVE_SIGNING_IDENTITY` (the certificate SHA-1) and fails early without it.
 
 How to release (timeline, notes rules, recovery and stuck runs: [`docs/native/release-flow.md`](docs/native/release-flow.md)):
 

@@ -201,3 +201,57 @@ test("release bundling marks the release directory as never indexed, dev bundlin
   assert.equal(f.run("native-dev").status, 0);
   await assert.rejects(access(join(f.target, "native-dev/.metadata_never_index")));
 });
+
+async function loggingCodesign(t) {
+  const f = await setup(t);
+  const log = join(f.directory, "codesign.log");
+  await writeFile(
+    join(f.directory, "bin/codesign"),
+    `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexit 0\n`,
+  );
+  await chmod(join(f.directory, "bin/codesign"), 0o755);
+  return { ...f, signLines: async () => (await readFile(log, "utf8").catch(() => "")).trim().split("\n").filter(Boolean) };
+}
+
+test("selfsigned mode signs with the identity, no timestamp, no runtime, no entitlements", { skip: process.platform === "win32" }, async (t) => {
+  const f = await loggingCodesign(t);
+  const result = f.run("release", {
+    MONOCODE_NATIVE_SIGNING_MODE: "selfsigned",
+    MONOCODE_NATIVE_SIGNING_IDENTITY: "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const [line] = await f.signLines();
+  assert.match(line, /^--force --sign ABCDEF0123456789ABCDEF0123456789ABCDEF01 --timestamp=none .*Monoptah Native\.app$/);
+  assert.ok(!/--options|--entitlements/.test(line));
+});
+
+test("selfsigned mode passes the keychain to codesign", { skip: process.platform === "win32" }, async (t) => {
+  const f = await loggingCodesign(t);
+  const result = f.run("release", {
+    MONOCODE_NATIVE_SIGNING_MODE: "selfsigned",
+    MONOCODE_NATIVE_SIGNING_IDENTITY: "Some CN",
+    MONOCODE_NATIVE_SIGNING_KEYCHAIN: "/tmp/k.keychain-db",
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const [line] = await f.signLines();
+  assert.match(line, /--sign Some CN --timestamp=none --keychain \/tmp\/k\.keychain-db /);
+});
+
+test("selfsigned mode without an identity fails and never signs ad-hoc", { skip: process.platform === "win32" }, async (t) => {
+  const f = await loggingCodesign(t);
+  for (const identity of [undefined, ""]) {
+    const result = f.run("release", { MONOCODE_NATIVE_SIGNING_MODE: "selfsigned", MONOCODE_NATIVE_SIGNING_IDENTITY: identity });
+    assert.notEqual(result.status, 0);
+    assert.ok(result.stderr.includes("needs MONOCODE_NATIVE_SIGNING_IDENTITY"));
+  }
+  assert.deepEqual(await f.signLines(), []);
+});
+
+test("without the mode, ad-hoc and Developer ID signing are unchanged", { skip: process.platform === "win32" }, async (t) => {
+  const f = await loggingCodesign(t);
+  assert.equal(f.run("release", { MONOCODE_NATIVE_SIGNING_IDENTITY: "" }).status, 0);
+  assert.equal(f.run("release", { MONOCODE_NATIVE_SIGNING_IDENTITY: "Developer ID Application: X" }).status, 0);
+  const [adhoc, dev] = await f.signLines();
+  assert.match(adhoc, /^--force --sign - .*Monoptah Native\.app$/);
+  assert.match(dev, /^--force --sign Developer ID Application: X --options runtime --timestamp --entitlements src-tauri\/Entitlements\.plist /);
+});

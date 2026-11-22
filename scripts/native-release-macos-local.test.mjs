@@ -353,6 +353,7 @@ test("an interrupt message names the step and how to continue", () => {
 });
 
 // A fake io that records every command, so the tests can check the order.
+const SIGNING_SHA = "836CA8AA6AB393A7E0356223551C62BED7D95E45";
 function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, failOn = null, cleanupFails = false, docs = docsNotes, ciRuns = [[run("completed", "success")]], early = {} } = {}) {
   // Options of the early workflow run: dispatchFails, findable, cancelFails, statusAfterRelease.
   // view(id, call) and jobs(id, call) override the status and the job count of a run.
@@ -379,13 +380,17 @@ function fakeIo({ files = true, headAfter = SHA, dirtyAfter = "", stamp = null, 
     "xcrun --sdk macosx --show-sdk-version": { status: 0, stdout: "26.2\n" },
     "xcrun metal --version": { status: 0 },
     "rustc -V": { status: 0, stdout: "rustc 1.90.0\n" },
+    "security find-identity -p codesigning": {
+      status: 0,
+      stdout: `  1) ${SIGNING_SHA} "Monoptah Native Release Signing" (CSSMERR_TP_NOT_TRUSTED)\n     1 identities found\n`,
+    },
   };
   const base = fakeRun();
   const names = assetNames(V);
   const io = {
     platform: "darwin",
     arch: "arm64",
-    env: { PATH: "/bin" },
+    env: { PATH: "/bin", MONOPTAH_NATIVE_SIGNING_IDENTITY: SIGNING_SHA },
     capture(command, args) {
       const key = [command, ...args].join(" ");
       events.push(`capture ${key}`);
@@ -547,6 +552,37 @@ test("runRelease: preconditions, toolchain, check, build, package, recheck, then
   assert.ok(events.includes("remove /tmp/out"));
   // Nothing before the check ran a publishing command.
   assert.ok(!visible(events).slice(0, -3).some((c) => /^(git tag|git push|gh )/.test(c)));
+});
+
+test("runRelease fails before dispatching anything when the signing identity is missing or not listed", async () => {
+  for (const [identity, message] of [
+    [undefined, /MONOPTAH_NATIVE_SIGNING_IDENTITY is not set.*setup-native-signing-identity\.sh/s],
+    ["1111111111111111111111111111111111111111", /not in the keychain search list/],
+  ]) {
+    for (const args of [[V], [V, "--dry-run"]]) {
+      const { io, events } = fakeIo();
+      if (identity === undefined) delete io.env.MONOPTAH_NATIVE_SIGNING_IDENTITY;
+      else io.env.MONOPTAH_NATIVE_SIGNING_IDENTITY = identity;
+      await assert.rejects(runRelease(args, io), message);
+      assert.ok(!events.some((e) => e.startsWith("capture gh workflow") || e.startsWith("visible ")), "nothing ran");
+    }
+  }
+});
+
+test("runRelease preflight rejects a common name that matches several identities", async () => {
+  const { io, events } = fakeIo();
+  io.env.MONOPTAH_NATIVE_SIGNING_IDENTITY = "Monoptah Native Release Signing";
+  const capture = io.capture;
+  io.capture = (command, args) =>
+    command === "security"
+      ? {
+          status: 0,
+          stdout: `  1) ${SIGNING_SHA} "Monoptah Native Release Signing" (X)\n  2) ${"2".repeat(40)} "Monoptah Native Release Signing" (X)\n`,
+          stderr: "",
+        }
+      : capture(command, args);
+  await assert.rejects(runRelease([V], io), /matches 2 identities/);
+  assert.ok(!events.some((e) => e.startsWith("visible ")));
 });
 
 test("runRelease --dry-run performs no publish command and leaves the files", async () => {

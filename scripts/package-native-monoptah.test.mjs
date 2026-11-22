@@ -18,6 +18,7 @@ import {
 } from "./package-native-monoptah.mjs";
 import { packageNative } from "./package-native.mjs";
 
+const SHA = "836CA8AA6AB393A7E0356223551C62BED7D95E45";
 const fakeTool = `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
@@ -32,7 +33,13 @@ if (name === 'tar') {
   fs.writeFileSync(args[1], fs.existsSync(plist) ? fs.readFileSync(plist) : 'archive bytes');
 }
 if (name === 'codesign' && args[0] === '-dv') {
-  process.stderr.write(process.env.FAKE_SIGNATURE || 'Signature=adhoc\\n');
+  process.stderr.write(process.env.FAKE_SIGNATURE || 'Identifier=com.monoptah.native\\n');
+}
+if (name === 'codesign' && args[0] === '-d' && args[1] === '-r-') {
+  process.stderr.write(process.env.FAKE_REQUIREMENT ?? ('designated => identifier "com.monoptah.native" and certificate leaf = H"' + '${SHA.toLowerCase()}' + '"\\n'));
+}
+if (name === 'security') {
+  process.stdout.write(process.env.FAKE_IDENTITIES ?? ('  1) ${SHA} "Monoptah Native Release Signing" (CSSMERR_TP_NOT_TRUSTED)\\n     1 identities found\\n'));
 }
 `;
 
@@ -49,7 +56,7 @@ async function setup(t, { binaryVersion = "0.34.0" } = {}) {
     `#!/bin/sh\nprintf 'Monoptah Native ${binaryVersion}\\n'\n`,
   );
   await chmod(binary, 0o755);
-  for (const name of ["uname", "lipo", "ditto", "tar", "codesign"]) {
+  for (const name of ["uname", "lipo", "ditto", "tar", "codesign", "security"]) {
     await writeFile(join(bin, name), fakeTool);
     await chmod(join(bin, name), 0o755);
   }
@@ -58,8 +65,12 @@ async function setup(t, { binaryVersion = "0.34.0" } = {}) {
   const saved = { ...process.env };
   process.env.PATH = `${bin}${delimiter}${process.env.PATH}`;
   process.env.FAKE_TOOL_LOG = log;
+  process.env.MONOPTAH_NATIVE_SIGNING_IDENTITY = SHA;
+  delete process.env.MONOPTAH_NATIVE_SIGNING_KEYCHAIN;
+  delete process.env.FAKE_IDENTITIES;
+  delete process.env.FAKE_REQUIREMENT;
   t.after(() => {
-    for (const key of ["PATH", "FAKE_TOOL_LOG", "FAKE_ARCH", "FAKE_SIGNATURE"]) {
+    for (const key of ["PATH", "FAKE_TOOL_LOG", "FAKE_ARCH", "FAKE_SIGNATURE", "FAKE_IDENTITIES", "FAKE_REQUIREMENT", "MONOPTAH_NATIVE_SIGNING_IDENTITY", "MONOPTAH_NATIVE_SIGNING_KEYCHAIN"]) {
       if (saved[key] === undefined) delete process.env[key];
       else process.env[key] = saved[key];
     }
@@ -70,7 +81,7 @@ const calls = async (log) =>
   (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 
 test(
-  "packaging signs ad-hoc and emits the updater archive, zip and checksum",
+  "packaging signs with the stable self-signed identity and emits the updater archive, zip and checksum",
   { skip: process.platform !== "darwin" },
   async (t) => {
     const { binary, out, log } = await setup(t);
@@ -91,8 +102,13 @@ test(
       ],
     );
     const made = await calls(log);
-    // Ad-hoc: the bundle script signs with "-" when no identity is given.
-    assert.ok(made.some(([n, ...a]) => n === "codesign" && a.join(" ").startsWith("--force --sign - ")));
+    // Self-signed: the identity, no timestamp, no hardened runtime, no entitlements.
+    const signed = made.find(([n, ...a]) => n === "codesign" && a[0] === "--force");
+    assert.ok(signed, "bundle was signed");
+    assert.deepEqual(signed.slice(1, 5), ["--force", "--sign", SHA, "--timestamp=none"]);
+    assert.ok(!signed.includes("--options") && !signed.includes("--entitlements"));
+    assert.ok(!signed.includes("--keychain"));
+    assert.ok(made.some(([n, ...a]) => n === "codesign" && a[0] === "-d" && a[1] === "-r-"));
     assert.ok(made.some(([n, ...a]) => n === "codesign" && a[0] === "--verify" && a.includes("--deep") && a.includes("--strict")));
     assert.ok(!made.some(([n]) => n === "xcrun" || n === "spctl"), "no notarization");
     const tar = made.find(([n]) => n === "tar");
@@ -110,7 +126,7 @@ test(
 );
 
 test(
-  "packaging refuses preview versions, a mismatched binary, other architectures and non-adhoc signatures",
+  "packaging refuses preview versions, a mismatched binary and other architectures",
   { skip: process.platform !== "darwin" },
   async (t) => {
     const { binary, out } = await setup(t);
@@ -127,12 +143,84 @@ test(
       packageMonoptahNative({ binary, out, version: "0.34.0" }),
       /Expected arm64/,
     );
-    process.env.FAKE_ARCH = "arm64";
-    process.env.FAKE_SIGNATURE = "Authority=Developer ID Application: Example\n";
+  },
+);
+
+test(
+  "packaging fails without a signing identity and never falls back to ad-hoc",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const { binary, out, log } = await setup(t);
+    delete process.env.MONOPTAH_NATIVE_SIGNING_IDENTITY;
     await assert.rejects(
       packageMonoptahNative({ binary, out, version: "0.34.0" }),
-      /not ad-hoc signed/,
+      /MONOPTAH_NATIVE_SIGNING_IDENTITY is not set.*setup-native-signing-identity\.sh/s,
     );
+    process.env.MONOPTAH_NATIVE_SIGNING_IDENTITY = SHA;
+    process.env.FAKE_IDENTITIES = "     0 identities found\n";
+    await assert.rejects(
+      packageMonoptahNative({ binary, out, version: "0.34.0" }),
+      /is not in the keychain search list.*setup-native-signing-identity\.sh/s,
+    );
+    const made = await calls(log);
+    assert.ok(!made.some(([n]) => n === "codesign"), "nothing was signed");
+    assert.ok(!existsSync(join(binary, "../Monoptah Native.app")));
+  },
+);
+
+test(
+  "packaging resolves the common name to its SHA-1 and passes a keychain to codesign",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const { binary, out, log } = await setup(t);
+    process.env.MONOPTAH_NATIVE_SIGNING_IDENTITY = "Monoptah Native Release Signing";
+    process.env.MONOPTAH_NATIVE_SIGNING_KEYCHAIN = "/tmp/test.keychain-db";
+    await packageMonoptahNative({ binary, out, version: "0.34.0" });
+    const made = await calls(log);
+    const signed = made.find(([n, ...a]) => n === "codesign" && a[0] === "--force");
+    assert.deepEqual(signed.slice(1), [
+      "--force", "--sign", SHA, "--timestamp=none",
+      "--keychain", "/tmp/test.keychain-db", signed.at(-1),
+    ]);
+    const find = made.find(([n]) => n === "security");
+    assert.deepEqual(find.slice(1), ["find-identity", "-p", "codesigning", "/tmp/test.keychain-db"]);
+  },
+);
+
+test(
+  "packaging fails when the common name matches more than one identity",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const { binary, out, log } = await setup(t);
+    process.env.MONOPTAH_NATIVE_SIGNING_IDENTITY = "Monoptah Native Release Signing";
+    process.env.FAKE_IDENTITIES =
+      `  1) ${SHA} "Monoptah Native Release Signing" (CSSMERR_TP_NOT_TRUSTED)\n  2) ${"2".repeat(40)} "Monoptah Native Release Signing" (CSSMERR_TP_NOT_TRUSTED)\n`;
+    await assert.rejects(packageMonoptahNative({ binary, out, version: "0.34.0" }), /matches 2 identities/);
+    assert.ok(!(await calls(log)).some(([n]) => n === "codesign"));
+  },
+);
+
+test(
+  "packaging fails when the result is ad-hoc or the requirement is not the stable certificate form",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const { binary, out } = await setup(t);
+    process.env.FAKE_SIGNATURE = "Signature=adhoc\n";
+    await assert.rejects(packageMonoptahNative({ binary, out, version: "0.34.0" }), /ad-hoc signed/);
+    assert.ok(!existsSync(join(binary, "../Monoptah Native.app")), "bundle removed after failure");
+    delete process.env.FAKE_SIGNATURE;
+    process.env.FAKE_REQUIREMENT = 'designated => cdhash H"8875c4604ec0c782ee2321079a2a9ea0af3c2a9a"\n';
+    await assert.rejects(
+      packageMonoptahNative({ binary, out, version: "0.34.0" }),
+      /not exactly the expected stable form.*designated => cdhash/,
+    );
+    const other = "1".repeat(40);
+    process.env.FAKE_REQUIREMENT = `designated => identifier "com.monoptah.native" and certificate leaf = H"${other}"\n`;
+    await assert.rejects(packageMonoptahNative({ binary, out, version: "0.34.0" }), /not exactly the expected stable form/);
+    process.env.FAKE_REQUIREMENT = `designated => identifier "com.monoptah.native" and certificate leaf = H"${SHA.toLowerCase()}" or cdhash H"${other}"\n`;
+    await assert.rejects(packageMonoptahNative({ binary, out, version: "0.34.0" }), /not exactly the expected stable form/);
+    process.env.FAKE_REQUIREMENT = 'designated => identifier "com.other" and certificate leaf = H"' + SHA.toLowerCase() + '"\n';
+    await assert.rejects(packageMonoptahNative({ binary, out, version: "0.34.0" }), /not exactly the expected stable form/);
     assert.ok(!existsSync(join(binary, "../Monoptah Native.app")), "bundle removed after failure");
   },
 );

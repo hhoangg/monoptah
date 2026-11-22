@@ -1,5 +1,5 @@
 // Fork-local (Monoptah). Packages a prebuilt macOS arm64 native executable as an
-// ad-hoc signed app. Upstream's package-native.mjs requires a Developer ID and
+// app signed with the stable self-signed identity (see native-signing.mjs). Upstream's package-native.mjs requires a Developer ID and
 // notarization for macOS; this fork has no Apple Developer account. Kept in its
 // own file so upstream merges do not conflict. Never builds or launches the app.
 //
@@ -19,6 +19,12 @@ import { lstatSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  SIGNING_IDENTITY_ENV,
+  SIGNING_KEYCHAIN_ENV,
+  signatureProblem,
+  resolveSigningIdentity,
+} from "./native-signing.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const APP_NAME = "Monoptah Native.app";
@@ -224,8 +230,14 @@ export async function packageMonoptahNative({ binary, out, version }) {
   let result;
   try {
     // bundle-native-macos.sh writes the app next to the binary's profile directory
-    // (<target>/release/Monoptah Native.app). An empty signing identity makes it
-    // sign ad-hoc (`codesign --sign -`).
+    // (<target>/release/Monoptah Native.app). It signs with the stable self-signed
+    // identity (selfsigned mode); there is no ad-hoc fallback.
+    const resolved = resolveSigningIdentity(process.env, (command, args) => {
+      const r = spawnSync(command, args, { encoding: "utf8" });
+      return { status: r.status ?? 1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+    });
+    if (resolved.problem) throw new Error(resolved.problem);
+    const keychain = (process.env[SIGNING_KEYCHAIN_ENV] ?? "").trim();
     run(
       "bash",
       [
@@ -235,13 +247,25 @@ export async function packageMonoptahNative({ binary, out, version }) {
         version,
         "monocode-data",
       ],
-      { env: { ...process.env, MONOCODE_NATIVE_SIGNING_IDENTITY: "" } },
+      {
+        env: {
+          ...process.env,
+          MONOCODE_NATIVE_SIGNING_MODE: "selfsigned",
+          // The resolved SHA-1 pins the exact certificate, whatever name was configured.
+          MONOCODE_NATIVE_SIGNING_IDENTITY: resolved.sha1,
+          MONOCODE_NATIVE_SIGNING_KEYCHAIN: keychain,
+        },
+      },
     );
     run("codesign", ["--verify", "--deep", "--strict", "--verbose=2", app]);
-    // codesign -dv writes to stderr.
+    // codesign -d writes to stderr.
+    const requirement = spawnSync("codesign", ["-d", "-r-", app], { encoding: "utf8" });
+    if (requirement.status !== 0) throw new Error(`codesign -d -r- failed (${requirement.status})`);
+    const requirementText = `${requirement.stdout ?? ""}${requirement.stderr ?? ""}`;
+    console.log(`Designated requirement:\n${requirementText.trim()}`);
     const details = spawnSync("codesign", ["-dv", app], { encoding: "utf8" });
-    if (!/^Signature=adhoc$/m.test(details.stderr ?? ""))
-      throw new Error("The packaged app is not ad-hoc signed");
+    const bad = signatureProblem(requirementText, details.stderr ?? "", resolved.sha1);
+    if (bad) throw new Error(bad);
 
     await mkdir(out, { recursive: true });
     const names = assetNames(version);

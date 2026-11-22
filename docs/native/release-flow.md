@@ -154,10 +154,85 @@ A run that GitHub leaves `queued` with no job for more than 10 minutes is stuck 
   `gh run cancel` and manual dispatch commands. After 2 replacements that are stuck too it
   stops and points at https://www.githubstatus.com.
 
+## Stable signing identity
+
+macOS releases are signed with a stable self-signed certificate (CN "Monoptah Native Release
+Signing"), not ad-hoc. An ad-hoc signature has a cdhash-based designated requirement (DR), so
+every update looked like a new app to macOS TCC and dropped grants such as Full Disk Access.
+With the certificate the DR is `identifier "com.monoptah.native" and certificate leaf = H"<sha1>"`
+and stays the same across rebuilds, so grants survive updates. The certificate is not trusted
+and does not need to be: `codesign` signs with it anyway (`security find-identity` shows it as
+`CSSMERR_TP_NOT_TRUSTED`). The app is still not notarized. Signing uses no hardened runtime, no
+entitlements and no timestamp, exactly like the ad-hoc signature did.
+
+### One-time setup (on the release Mac)
+
+```bash
+scripts/setup-native-signing-identity.sh
+```
+
+It creates a 20 year certificate with openssl, imports it into the login keychain with
+`-T /usr/bin/codesign`, asks for a backup passphrase (typed, never echoed, logged or put on a command line), writes
+the encrypted backup `~/monoptah-native-signing.p12` first (`--backup PATH` to change it; it refuses to
+overwrite an existing file, use `--import` instead), then imports the key and certificate from a private
+temp dir that is removed afterwards, sets the key partition list (asks for the keychain password, so
+codesign never shows "Always Allow") and prints the SHA-1. Running it
+again when the identity exists only prints the SHA-1. Then set, for example in your shell profile:
+
+```bash
+export MONOPTAH_NATIVE_SIGNING_IDENTITY=<SHA-1>   # the CN also works, the SHA-1 is preferred
+```
+
+Optional: `MONOPTAH_NATIVE_SIGNING_KEYCHAIN=/path/to/file.keychain-db` to sign from a specific
+keychain (used for tests).
+
+Store the `.p12` and its passphrase in a password manager. Never commit either (`*.p12` is
+git-ignored), never paste the passphrase into a command line or a chat.
+
+### Restoring on a new Mac
+
+```bash
+scripts/setup-native-signing-identity.sh --import /path/to/monoptah-native-signing.p12
+```
+
+Type the passphrase, then set `MONOPTAH_NATIVE_SIGNING_IDENTITY` to the printed SHA-1 (it is the
+same SHA-1 as before, so the DR does not change).
+
+### What the release does with it
+
+The login keychain must be unlocked while the release signs (it normally is in a logged-in session;
+an SSH or locked session makes codesign fail or prompt).
+
+`native:release:mac` checks in its preflight (before anything is dispatched, also with
+`--dry-run`, which signs too) that `MONOPTAH_NATIVE_SIGNING_IDENTITY` is set and listed by
+`security find-identity -p codesigning`. `package-native-monoptah.mjs` then signs with
+`MONOCODE_NATIVE_SIGNING_MODE=selfsigned`, runs `codesign --verify --deep --strict --verbose=2`,
+prints `codesign -d -r-` and fails unless the DR is exactly `identifier "com.monoptah.native" and certificate leaf = H"<sha1 of the configured identity>"`
+(no other hash, no extra clauses) and the signature is not ad-hoc. A common name that matches more than
+one certificate is refused: use the SHA-1. There is no silent fallback to ad-hoc signing.
+
+### First signed release: required highlight
+
+The first release signed this way changes the DR once, so macOS asks users to grant again.
+Pass this text as highlights with `--notes FILE` (first line `# Monoptah Native X.Y.Z`):
+
+> After updating to this version, open System Settings > Privacy & Security > Full Disk Access,
+> remove Monoptah Native and add it again one last time. Later updates keep the permission.
+
+(Do not rely on `docs/native/monoptah-release-notes.md` for this: it is only used when its first
+line names the exact version being released.)
+
+### If the key is lost
+
+Without the keychain item and the backup, a new certificate gets a new SHA-1, so the DR changes
+once more and users must re-grant Full Disk Access again. Releases keep working; only the
+permissions reset. Include the same highlight in that release.
+
 ## Dry run
 
 `--dry-run` is optional. A real run is safe on its own because every check, including the wait
 for native.yml, happens before the tag. The dry run exists to test changes to the script: it
-runs the checks, `native:check`, the build and the package step, prints the generated notes,
+runs the checks, `native:check`, the build and the package step (which signs, so it needs the
+signing identity), prints the generated notes,
 the files, the CI state (once) and the commands it would run. It never dispatches an early
 run, waits for CI, tags, pushes or publishes.
