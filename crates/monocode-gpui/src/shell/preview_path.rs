@@ -8,27 +8,56 @@ use crate::{
 use std::path::{Path, PathBuf};
 
 impl Shell {
-    /// The folder, absolute path and `:line:col` of a file link clicked in a chat. A Mono's link
-    /// is bound to its first project; the file may be in another one, or in the project the
-    /// window shows.
+    /// The folder, absolute path and `:line:col` of a file link clicked in a chat, and the
+    /// folders it was looked for in. A Mono's link is bound to its first project; the file may be
+    /// in another one, in a worktree, or in any project open in the app (see
+    /// `files::links::search_roots`, which fixes the order).
     pub(super) fn link_target(
         &self,
         raw: &str,
         cx: &App,
-    ) -> (String, String, Option<(usize, usize)>) {
+    ) -> (String, String, Option<(usize, usize)>, Vec<String>) {
         let cwd = self.git.read(cx).project().to_owned();
-        let roots = if self.mono_active(cx) {
+        let (mono_roots, session_worktree) = if self.mono_active(cx) {
             let projects = self
                 .monos
                 .as_ref()
                 .and_then(|m| m.read(cx).current().map(|m| m.projects.clone()))
                 .unwrap_or_default();
-            crate::file_links::candidate_roots(Some(&self.workspace.project), &projects)
+            (
+                crate::file_links::candidate_roots(Some(&self.workspace.project), &projects),
+                None,
+            )
         } else {
-            Vec::new()
+            let worktree = self
+                .workspace
+                .active
+                .and_then(|id| self.sessions.get(&id))
+                .map(|view| view.read(cx))
+                .map(|view| (view.execution_cwd().to_owned(), view.summary.cwd.clone()))
+                .filter(|(run, own)| run != own)
+                .map(|(run, _)| run);
+            (Vec::new(), worktree)
         };
+        let project = mono_roots.first().cloned().unwrap_or_else(|| cwd.clone());
+        let search = |worktrees: fn(&str) -> Vec<String>| {
+            monocode_core::files::links::search_roots(
+                &project,
+                session_worktree.as_deref(),
+                &mono_roots,
+                &self.workspace.projects,
+                worktrees,
+            )
+        };
+        // The git worktrees are listed only when the file is not found without them.
+        let cheap = search(|_| Vec::new());
+        let (path, location) = crate::file_links::resolve_link(raw, &cwd, &cheap);
+        if Path::new(&path).exists() || monocode_core::files::remote::is_remote(Path::new(&path)) {
+            return (cwd, path, location, cheap);
+        }
+        let roots = search(monocode_core::files::links::project_worktrees);
         let (path, location) = crate::file_links::resolve_link(raw, &cwd, &roots);
-        (cwd, path, location)
+        (cwd, path, location, roots)
     }
 
     /// Makes a session pane the active one for a file to open beside, when none is: a Mono tab
@@ -180,7 +209,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (cwd, path, location) = self.link_target(raw, cx);
+        let (cwd, path, location, searched) = self.link_target(raw, cx);
         // A file on another machine is not on this disk to look at: the editor reads it.
         if monocode_core::files::remote::is_remote(Path::new(&path)) {
             self.open_file_at(cwd, path, location, window, cx);
@@ -244,7 +273,10 @@ impl Shell {
                 self.show_cannot_preview(file, size, folder, window, cx)
             }
             Route::Missing => {
-                self.error = Some(format!("File not found: {path}"));
+                self.error = Some(format!(
+                    "File not found: {path} (looked in: {})",
+                    monocode_core::files::links::looked_in(&searched)
+                ));
                 cx.notify();
             }
             Route::Unreadable(reason) => {

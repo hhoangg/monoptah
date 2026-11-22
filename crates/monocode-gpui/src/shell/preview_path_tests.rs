@@ -247,9 +247,10 @@ fn a_missing_file_is_reported_not_ignored(cx: &mut TestAppContext) {
     preview(window, &mut visual, &text(&gone));
     window
         .update(&mut visual, |shell, _, _| {
-            assert_eq!(
-                shell.error.as_deref(),
-                Some(format!("File not found: {}", text(&gone)).as_str())
+            let error = shell.error.as_deref().unwrap_or_default();
+            assert!(
+                error.starts_with(&format!("File not found: {} (looked in: ", text(&gone))),
+                "{error}"
             );
             assert!(shell.document_lightbox.is_none() && shell.cannot_preview.is_none());
         })
@@ -381,4 +382,105 @@ fn a_forwarded_link_never_goes_to_the_active_cloud_session(cx: &mut TestAppConte
             assert!(shell.cloud_view.is_none());
         })
         .unwrap();
+}
+
+/// Clicks a bare file name and says which file the document lightbox ended up showing.
+fn preview_bare(
+    window: gpui::WindowHandle<Shell>,
+    visual: &mut VisualTestContext,
+    name: &str,
+) -> (Option<PathBuf>, Option<String>) {
+    preview(window, visual, name);
+    window
+        .update(visual, |shell, _, cx| {
+            (shell.document_preview_path(cx), shell.error.clone())
+        })
+        .unwrap()
+}
+
+#[gpui::test]
+fn a_bare_name_missing_from_the_project_opens_from_another_open_project(cx: &mut TestAppContext) {
+    let dir = Scratch::new("other-project");
+    let guide = dir.file("data/handoff/guide.md", b"# Guide\n");
+    let (window, mut visual) = start(cx);
+    let project = text(guide.parent().unwrap());
+    window
+        .update(&mut visual, |shell, _, _| {
+            shell.workspace.projects.push(project)
+        })
+        .unwrap();
+    let (shown, error) = preview_bare(window, &mut visual, "guide.md");
+    assert_eq!(shown, Some(guide), "{error:?}");
+}
+
+#[gpui::test]
+fn a_bare_name_opens_from_the_sessions_worktree_before_other_projects(cx: &mut TestAppContext) {
+    let dir = Scratch::new("worktree");
+    let in_tree = dir.file("tree/guide.md", b"# Tree\n");
+    dir.file("open/guide.md", b"# Open\n");
+    let (window, mut visual) = start(cx);
+    let tree = text(in_tree.parent().unwrap());
+    let open = text(dir.0.join("open").as_path());
+    window
+        .update(&mut visual, |shell, _, cx| {
+            shell.workspace.projects.push(open);
+            let id = shell.workspace.active.expect("a session is open");
+            shell.sessions[&id].update(cx, |view, _| view.settings.worktree_cwd = Some(tree));
+        })
+        .unwrap();
+    let (shown, error) = preview_bare(window, &mut visual, "guide.md");
+    assert_eq!(shown, Some(in_tree), "{error:?}");
+}
+
+#[gpui::test]
+fn a_bare_name_that_is_nowhere_names_where_it_looked(cx: &mut TestAppContext) {
+    let dir = Scratch::new("nowhere");
+    let (window, mut visual) = start(cx);
+    let project = text(&dir.0);
+    window
+        .update(&mut visual, |shell, _, _| {
+            shell.workspace.projects.push(project.clone())
+        })
+        .unwrap();
+    let (shown, error) = preview_bare(window, &mut visual, "nothing-here.md");
+    assert_eq!(shown, None);
+    let error = error.expect("an error is shown");
+    assert!(error.starts_with("File not found: "), "{error}");
+    assert!(
+        error.contains("(looked in: ") && error.contains(&project),
+        "{error}"
+    );
+}
+
+#[gpui::test]
+fn dot_dot_does_not_escape_a_project_to_find_a_file(cx: &mut TestAppContext) {
+    let dir = Scratch::new("dot-dot");
+    dir.file("secret.md", b"# Secret\n");
+    dir.file("project/readme.md", b"# Readme\n");
+    let (window, mut visual) = start(cx);
+    let project = text(dir.0.join("project").as_path());
+    window
+        .update(&mut visual, |shell, _, _| {
+            shell.workspace.projects.push(project)
+        })
+        .unwrap();
+    let (shown, error) = preview_bare(window, &mut visual, "../secret.md");
+    assert_eq!(shown, None);
+    assert!(error.is_some_and(|e| e.starts_with("File not found: ")));
+}
+
+#[gpui::test]
+fn an_absolute_path_opens_as_written_whatever_the_projects_hold(cx: &mut TestAppContext) {
+    let dir = Scratch::new("absolute");
+    let file = dir.file("docs/guide.md", b"# Guide\n");
+    dir.file("project/guide.md", b"# Other\n");
+    let (window, mut visual) = start(cx);
+    let project = text(dir.0.join("project").as_path());
+    window
+        .update(&mut visual, |shell, _, _| {
+            shell.workspace.projects.push(project)
+        })
+        .unwrap();
+    let (shown, error) = preview_bare(window, &mut visual, &text(&file));
+    assert_eq!(shown, Some(file), "{error:?}");
 }

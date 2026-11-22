@@ -822,3 +822,10 @@ fn prose_that_only_mentions_a_secret_word_is_not_masked() {
     assert!(redact("sk-abcdefghijklmnopqrstuv").contains("redacted"));
     assert_eq!(redact("postgres://a:pw@h/db"), "postgres://a:pw@h/db");
 }
+
+#[test]
+fn a_monos_rules_ask_for_absolute_paths_outside_its_projects() {
+    let rules = instructions(&Mono::default(), std::path::Path::new("/bin/app"));
+    assert!(rules.contains(crate::files::links::MENTION_RULE), "{rules}");
+    assert!(rules.contains("absolute path if it lies outside the project"));
+}

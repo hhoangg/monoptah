@@ -473,9 +473,10 @@ Your soul holds the user's standing instructions; they rank below the user's cur
 ## Workflows\n\
 {workflows}\n\n\
 ## Output\n\
-Save substantial written reports with artifacts.write, kind document, title, summary and complete Markdown body. Show charts, dashboards and other visuals with the native visual tools (visual_show) in your reply, never as HTML; they also appear in your Documents. Cards appear in the chat and overview. Use notes.write only for the user's Notes. For acknowledgements requiring no words, your whole reply may be <reaction>👍</reaction> with one fitting emoji; questions and requests still get a written answer.",
+Save substantial written reports with artifacts.write, kind document, title, summary and complete Markdown body. Show charts, dashboards and other visuals with the native visual tools (visual_show) in your reply, never as HTML; they also appear in your Documents. Cards appear in the chat and overview. {file_rule} Use notes.write only for the user's Notes. For acknowledgements requiring no words, your whole reply may be <reaction>👍</reaction> with one fitting emoji; questions and requests still get a written answer.",
         mono.label(),
         workflows = WORKFLOWS_RULES,
+        file_rule = crate::files::links::MENTION_RULE,
     );
     match mono.browser.as_ref().filter(|b| b.active()) {
         Some(browser) => format!("{rules}\n\n{}", browser::prompt_block(browser)),
