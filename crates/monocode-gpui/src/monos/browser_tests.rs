@@ -515,6 +515,26 @@ fn changing_the_level_reconfigures_the_gate_and_keeps_the_server(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn showing_agent_actions_defaults_on_and_the_switch_reaches_the_policy(cx: &mut TestAppContext) {
+    let mut page = open(cx);
+    page.enable();
+    assert!(page.on("mono-browser-show-actions"));
+    let setting = page.setting().unwrap();
+    assert!(setting.show_actions, "the overlay is on by default");
+    assert!(setting.policy().show_actions);
+    page.manager(|m, cx| m.browser_toggle_show_actions(cx));
+    let setting = page.setting().unwrap();
+    assert!(!setting.show_actions);
+    assert!(!setting.policy().show_actions);
+    // The switch is not part of the server's shape: flipping it never restarts the server.
+    let mut other = setting.clone();
+    other.show_actions = true;
+    assert_eq!(setting.server_key(), other.server_key());
+    page.manager(|m, cx| m.browser_toggle_show_actions(cx));
+    assert!(page.setting().unwrap().show_actions);
+}
+
+#[gpui::test]
 fn the_activity_log_lists_this_monos_browser_calls(cx: &mut TestAppContext) {
     let mut page = open(cx);
     page.enable();

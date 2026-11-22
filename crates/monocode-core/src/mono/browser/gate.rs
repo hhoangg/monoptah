@@ -38,6 +38,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 mod http;
+pub mod overlay;
 mod stdio;
 pub use http::HttpUpstream;
 pub use stdio::StdioUpstream;
@@ -184,13 +185,22 @@ pub struct Policy {
     pub trust: BrowserTrust,
     /// The Mono's blocked origins: a page change there needs approval, as on a finance page.
     pub blocked_origins: Vec<String>,
+    /// Draw a highlight and a cursor on the page before each targeted action (see [`overlay`]).
+    /// Off for a policy built with [`Policy::new`]: a gate draws only when the Mono's setting says
+    /// so, through [`Policy::with_show_actions`].
+    pub show_actions: bool,
 }
 impl Policy {
     pub fn new(trust: BrowserTrust, blocked_origins: Vec<String>) -> Self {
         Self {
             trust,
             blocked_origins,
+            show_actions: false,
         }
+    }
+    pub fn with_show_actions(mut self, show: bool) -> Self {
+        self.show_actions = show;
+        self
     }
 
     /// The decision for one `tools/call`. `page_url` is the last page the tools reported.
@@ -692,6 +702,12 @@ struct Inner {
     generation: AtomicU64,
     next_id: AtomicU64,
     timeout: Duration,
+    /// The attribute name of the action overlay: random per gate, made here, never from input.
+    overlay_token: String,
+    /// How long the overlay is held before the action, in milliseconds.
+    overlay_hold_ms: AtomicU64,
+    /// How long one overlay call may take before the gate goes on without it.
+    overlay_timeout_ms: AtomicU64,
 }
 
 /// What the gate needs to keep recipes and to confine the files Playwright writes. Without it
@@ -755,6 +771,9 @@ impl Gate {
             generation: AtomicU64::new(0),
             next_id: AtomicU64::new(100),
             timeout,
+            overlay_token: overlay::new_token(),
+            overlay_hold_ms: AtomicU64::new(overlay::DEFAULT_HOLD_MS),
+            overlay_timeout_ms: AtomicU64::new(overlay::CALL_TIMEOUT_MS),
         });
         let secret = format!("{:032x}", rand::random::<u128>());
         let server = http::HttpServer::start(inner.clone(), secret.clone())?;
@@ -835,6 +854,20 @@ impl Gate {
         if let Some(workspace) = self.inner.workspace() {
             output::clear(&workspace.output_dir);
         }
+    }
+
+    /// Sets how long the action overlay is held before the action (tests use a short one).
+    pub fn set_overlay_hold(&self, hold: Duration) {
+        self.inner
+            .overlay_hold_ms
+            .store(hold.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Sets how long one overlay call may take (tests use a short one).
+    pub fn set_overlay_timeout(&self, timeout: Duration) {
+        self.inner
+            .overlay_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Applies a new policy to the calls that follow, keeping the server.
@@ -1087,12 +1120,81 @@ impl Inner {
         let page_before = self.lock_state().page.clone();
         let result = {
             let _one_at_a_time = self.run.lock().unwrap_or_else(|e| e.into_inner());
-            self.forward(name, &forwarded)
+            self.act(name, &forwarded, false)
         };
         if let Some(workspace) = &workspace {
             self.trace(route, workspace, name, &forwarded, &page_before, &result);
         }
         result
+    }
+
+    /// [`Inner::forward`] with the action overlay around it: the call was authorized already. The
+    /// overlay is drawn only when the Mono's setting is on and the call has an element to show,
+    /// held for a moment, and removed whatever the action did. `trusted` is a recipe step (see
+    /// [`overlay::target_of`]). The drawing is a gate call to the server, not a tool call of the
+    /// agent: it is not audited, traced, approved or counted as an action, and a failure of it
+    /// is ignored.
+    fn act(&self, name: &str, forwarded: &Value, trusted: bool) -> Value {
+        let target = if self.lock_state().policy.show_actions {
+            overlay::target_of(name, forwarded, trusted)
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            return self.forward(name, forwarded);
+        };
+        let started = std::time::Instant::now();
+        let drawn = self.draw_overlay(&target);
+        if drawn {
+            // The draw call itself takes time (the server settles after an evaluate), and that
+            // time counts toward the hold: the user sees the box for about `hold` in all.
+            let hold = Duration::from_millis(self.overlay_hold_ms.load(Ordering::Relaxed));
+            if let Some(left) = hold.checked_sub(started.elapsed()) {
+                std::thread::sleep(left);
+            }
+        }
+        let result = self.forward(name, forwarded);
+        if drawn {
+            self.remove_overlay();
+        }
+        result
+    }
+
+    /// One `browser_evaluate` of the overlay, with its own short timeout (the caller holds the run
+    /// lock, and a stuck page must not hold it for the gate's whole approval timeout). `None`
+    /// is a failure or a timeout: the answer, if it comes later, is dropped.
+    fn overlay_call(&self, arguments: Value) -> Option<Value> {
+        let session = self.ensure_session().ok()?;
+        let upstream = self.lock_state().upstream.clone();
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id.fetch_add(1, Ordering::SeqCst),
+            "method": "tools/call",
+            "params": {"name": "browser_evaluate", "arguments": arguments},
+        });
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(upstream.post(&session.key, session.id.as_deref(), &message));
+        });
+        let wait = Duration::from_millis(self.overlay_timeout_ms.load(Ordering::Relaxed));
+        match rx.recv_timeout(wait) {
+            Ok(Ok((Some(reply), _))) if reply.get("error").is_none() => {
+                Some(reply["result"].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the overlay was drawn. Any failure is `false`: the action goes on without it.
+    fn draw_overlay(&self, target: &str) -> bool {
+        self.overlay_call(overlay::draw_args(&self.overlay_token, target))
+            .is_some_and(|result| result["isError"] != true && overlay::drew(&result_text(&result)))
+    }
+
+    /// Takes the drawing away with one page-level call. A drawing it can not reach (an iframe, a
+    /// page that changed) is removed by the timer the draw script set in the page.
+    fn remove_overlay(&self) {
+        let _ = self.overlay_call(overlay::remove_args(&self.overlay_token, None));
     }
 
     /// One call to the Playwright server, after the policy allowed it. Remembers the page.
@@ -1450,7 +1552,7 @@ impl runner::Host for GateHost<'_> {
         let result = match self.inner.authorize(self.route, tool, &args) {
             Err(reply) => return Err(result_text(&reply)),
             Ok(Authorized::Answer(reply)) => reply,
-            Ok(Authorized::Forward) => self.inner.forward(tool, &args),
+            Ok(Authorized::Forward) => self.inner.act(tool, &args, true),
         };
         Ok(runner::ToolOutput {
             text: result_text(&result),

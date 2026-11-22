@@ -235,6 +235,8 @@ impl Web {
                     None => reply("Clicked.".into(), false),
                 }
             }
+            // The gate's action overlay: the draw function answers `ok-1`.
+            "browser_evaluate" => reply("### Result\n\"ok-1\"\n### Ran Playwright code\n```js\nawait page.evaluate('ok-' + String(1));\n```".into(), false),
             _ => {
                 let (url, def) = self.page();
                 reply(
@@ -1194,6 +1196,46 @@ fn a_recipe_that_was_never_approved_or_was_edited_does_not_run() {
     let result = rig.call("recipe_run", json!({"id": recipe.id}));
     assert_eq!(result["isError"], true);
     assert!(text(&result).contains("not approved"));
+}
+
+#[test]
+fn recipe_steps_draw_the_overlay_before_the_click_when_the_setting_is_on() {
+    let rig = Rig::new(BrowserTrust::AskRisky);
+    rig.gate.set_overlay_hold(Duration::ZERO);
+    approved_recipe(&rig, &click_recipe());
+    let run = |rig: &Rig| {
+        let before = rig.web.names().len();
+        let (ok, result) = run_json(rig, "rcp_0a1b2c3d", json!({}));
+        assert!(ok, "{result}");
+        rig.web.tool_calls().split_off(before)
+    };
+    // Off (the default of a bare policy): the click is not framed.
+    let calls = run(&rig);
+    assert!(calls.iter().all(|c| c.0 != "browser_evaluate"), "{calls:?}");
+    // On: draw, click, remove, around the step. The drawing targets the locator the step clicks.
+    rig.gate
+        .set_policy(Policy::new(BrowserTrust::AskRisky, vec![]).with_show_actions(true));
+    let calls = run(&rig);
+    let at = calls.iter().position(|c| c.0 == "browser_click").unwrap();
+    assert_eq!(calls[at - 1].0, "browser_evaluate", "{calls:?}");
+    assert_eq!(calls[at - 1].1["target"], ARCHIVE_LINK);
+    assert!(calls[at - 1].1["function"]
+        .as_str()
+        .unwrap()
+        .contains("attachShadow"));
+    assert_eq!(calls[at + 1].0, "browser_evaluate", "{calls:?}");
+    assert!(calls[at + 1].1["function"]
+        .as_str()
+        .unwrap()
+        .contains("remove()"));
+    // Reads of the same run (open, snapshot probes, find) draw nothing.
+    let evaluates = calls.iter().filter(|c| c.0 == "browser_evaluate").count();
+    assert!(evaluates >= 2 && evaluates % 2 == 0, "{calls:?}");
+    assert_eq!(
+        calls.iter().filter(|c| c.0 == "browser_click").count() * 2,
+        evaluates,
+        "{calls:?}"
+    );
 }
 
 #[test]
