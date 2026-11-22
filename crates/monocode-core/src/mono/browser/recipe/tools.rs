@@ -172,6 +172,23 @@ impl Context<'_> {
             store.is_verified(self.mono_id, &recipe.id, &recipe.content_hash())
         })
     }
+    /// `draft`, `needs_dry_run` (approved, but from outside and not dry run in this Mono) or
+    /// `approved`.
+    fn status(&self, recipe: &Recipe) -> &'static str {
+        if !self.approved(recipe) {
+            "draft"
+        } else if self.needs_dry_run(recipe) {
+            "needs_dry_run"
+        } else {
+            "approved"
+        }
+    }
+    /// A recipe that came from a file or the shared library runs only after the user approved
+    /// it AND a dry run of exactly this content passed in this Mono (the Browser tab does it).
+    fn needs_dry_run(&self, recipe: &Recipe) -> bool {
+        self.approvals
+            .is_none_or(|store| store.needs_dry_run(self.mono_id, recipe))
+    }
     fn summary(&self, recipe: &Recipe) -> Value {
         let level = self.host.trust().level();
         json!({
@@ -184,7 +201,7 @@ impl Context<'_> {
             "risk": recipe.computed_risk().as_str(),
             "changes_things": recipe.changes_things(),
             "verified": self.verified(recipe),
-            "status": if self.approved(recipe) { "approved" } else { "draft" },
+            "status": self.status(recipe),
             "flaky": recipe.stats.flaky,
             "repaired": recipe.stats.repaired,
             "min_level": recipe.min_level(),
@@ -310,11 +327,7 @@ fn show_text(recipe: &Recipe, ctx: &Context) -> String {
         recipe.intent,
         recipe.version,
         recipe.origin,
-        if ctx.approved(recipe) {
-            "approved"
-        } else {
-            "draft"
-        },
+        ctx.status(recipe),
         recipe.description,
         record::plain_summary(recipe)
     )
@@ -364,6 +377,9 @@ fn run(recipe: &Recipe, args: &Value, ctx: &Context) -> Reply {
     }
     if !ctx.approved(recipe) {
         return err("This recipe is not approved (it is a draft, or its file changed after the user approved it), so it does not run. Do the task the normal way; recipe_record saves it again for the user to approve.");
+    }
+    if ctx.needs_dry_run(recipe) {
+        return err("This recipe came from a file or the shared library and has not passed a dry run in this Mono yet, so it does not run. Tell the user to run its dry run from the Browser tab. Do the task the normal way.");
     }
     let given = match args.get("params") {
         None | Some(Value::Null) => Map::new(),
@@ -815,6 +831,19 @@ fn repair(args: &Value, ctx: &Context) -> Reply {
     }
 }
 
+/// A recipe from outside keeps working after a repair or a new recording of it: the live run
+/// that just passed is its dry run for the new content. This is intentional and not a bypass:
+/// both paths replay the steps on the live page through this Mono's gate (trust level, blocked
+/// sites, cards) and only save after the user's own card or a same-class repair of the version
+/// they approved, and the outside marker stays, so nothing else gets the pass.
+fn keep_dry_run(ctx: &Context, recipe: &Recipe) {
+    if let Some(approvals) = ctx.approvals {
+        if approvals.outside_source(ctx.mono_id, &recipe.id).is_some() {
+            let _ = approvals.mark_dry_run(ctx.mono_id, &recipe.id, &recipe.content_hash());
+        }
+    }
+}
+
 /// The re-run passed every remaining step and assertion: save version + 1, keep the old one in
 /// the history. Same-class repairs keep the earlier approval; anything else was approved on the
 /// card a moment ago. Either way the approval is recorded for exactly this content.
@@ -838,13 +867,7 @@ fn accept(
     next.stats.clean_since_repair = 0;
     // Failed runs in a row since a repair are kept: a site that fails again and again, each time
     // repaired, still ends in a rollback and a flaky mark.
-    next.stats.runs += 1;
-    next.stats.ok += 1;
-    next.stats.last_ok_ms = crate::time::now_ms();
-    next.stats.window.push(true);
-    while next.stats.window.len() > repair::WINDOW {
-        next.stats.window.remove(0);
-    }
+    next.stats.note_repaired_pass();
     next.stats.revision = Some(Revision {
         parent: base.version,
         reason: "repair".into(),
@@ -863,6 +886,7 @@ fn accept(
         );
     }
     ctx.repairs.forget(&base.id);
+    keep_dry_run(ctx, &next);
     ctx.host.audit(
         "recipe_repair",
         &ctx.host.page_url(),
@@ -1024,6 +1048,7 @@ fn record(args: &Value, ctx: &Context) -> Reply {
     {
         return err(format!("The recipe was not saved: {reason}"));
     }
+    keep_dry_run(ctx, &recipe);
     ctx.host.audit(
         "recipe_record",
         &recipe.origin,

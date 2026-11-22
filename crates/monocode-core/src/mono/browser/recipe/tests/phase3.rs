@@ -5,8 +5,8 @@ use super::*;
 use crate::mono::browser::gate::approval_required;
 use crate::mono::browser::recipe::risk;
 
-const CHAT: &str = "https://news.example/chat";
-const CHAT_BODY: &str = r#"- main [ref=e20]:
+pub(super) const CHAT: &str = "https://news.example/chat";
+pub(super) const CHAT_BODY: &str = r#"- main [ref=e20]:
   - heading "Team chat" [level=1] [ref=e21]
   - textbox "Message" [ref=e30]
   - button "Save draft" [ref=e32]
@@ -15,15 +15,15 @@ const CHAT_BODY: &str = r#"- main [ref=e20]:
   - textbox "Password" [ref=e34]
   - combobox "Channel" [ref=e35]
 "#;
-const MSG_BOX: &str = "internal:role=textbox[name=\"Message\"s]";
+pub(super) const MSG_BOX: &str = "internal:role=textbox[name=\"Message\"s]";
 const SEND_BTN: &str = "internal:role=button[name=\"Send\"s]";
 const SAVE_BTN: &str = "internal:role=button[name=\"Save draft\"s]";
 const BUY_BTN: &str = "internal:role=button[name=\"Buy now\"s]";
 const PASS_BOX: &str = "internal:role=textbox[name=\"Password\"s]";
-const CHANNEL_BOX: &str = "internal:role=combobox[name=\"Channel\"s]";
-const TYPED: &str = "hello team";
+pub(super) const CHANNEL_BOX: &str = "internal:role=combobox[name=\"Channel\"s]";
+pub(super) const TYPED: &str = "hello team";
 
-fn chat_page() -> PageDef {
+pub(super) fn chat_page() -> PageDef {
     let mut page = PageDef {
         title: "Chat".into(),
         body: CHAT_BODY.into(),
@@ -45,29 +45,29 @@ fn chat_page() -> PageDef {
     }
     page
 }
-fn chat_web() -> Arc<Web> {
+pub(super) fn chat_web() -> Arc<Web> {
     let web = Web::new();
     web.pages.lock().unwrap().insert(CHAT.into(), chat_page());
     web
 }
-fn chat_rig(trust: BrowserTrust) -> Rig {
+pub(super) fn chat_rig(trust: BrowserTrust) -> Rig {
     Rig::with(trust, chat_web())
 }
-fn target(role: &str, name: &str) -> Target {
+pub(super) fn target(role: &str, name: &str) -> Target {
     Target {
         candidates: vec![locator(role, name)],
     }
 }
-fn extract_step() -> Step {
+pub(super) fn extract_step() -> Step {
     sample_recipe().steps[1].clone()
 }
-fn chat_open() -> Step {
+pub(super) fn chat_open() -> Step {
     Step::Open {
         url: CHAT.into(),
         expect: vec![Expect::UrlMatches("^https://news\\.example/chat".into())],
     }
 }
-fn typed(value: &str) -> Step {
+pub(super) fn typed(value: &str) -> Step {
     Step::Type {
         target: target("textbox", "Message"),
         value: value.into(),
@@ -77,17 +77,17 @@ fn typed(value: &str) -> Step {
         }],
     }
 }
-fn send_button() -> Step {
+pub(super) fn send_button() -> Step {
     Step::Send {
         target: target("button", "Send"),
         action: SendAction::Send,
         expect: vec![Expect::UrlMatches("^https://news\\.example/archive".into())],
     }
 }
-fn approve(kind: ApproveKind) -> Step {
+pub(super) fn approve(kind: ApproveKind) -> Step {
     Step::Approve { category: kind }
 }
-fn text_param() -> Param {
+pub(super) fn text_param() -> Param {
     Param {
         name: "text".into(),
         kind: ParamKind::String,
@@ -95,7 +95,7 @@ fn text_param() -> Param {
         default: None,
     }
 }
-fn n_declared() -> Param {
+pub(super) fn n_declared() -> Param {
     Param {
         name: "n".into(),
         kind: ParamKind::Integer,
@@ -104,7 +104,7 @@ fn n_declared() -> Param {
     }
 }
 /// Open the chat, type a message, send it, read the page that follows.
-fn chat_recipe() -> Recipe {
+pub(super) fn chat_recipe() -> Recipe {
     let mut recipe = sample_recipe();
     recipe.id = "rcp_0c0ffee1".into();
     recipe.intent = "chat.say".into();

@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS mono_browser_recipe_hashes(
   PRIMARY KEY(mono_id, recipe_id, hash));
 CREATE TABLE IF NOT EXISTS mono_browser_recipe_verified(
   mono_id TEXT NOT NULL, recipe_id TEXT NOT NULL, hash TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY(mono_id, recipe_id, hash));
+CREATE TABLE IF NOT EXISTS mono_browser_recipe_outside(
+  mono_id TEXT NOT NULL, recipe_id TEXT NOT NULL, source TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY(mono_id, recipe_id));
+CREATE TABLE IF NOT EXISTS mono_browser_recipe_dryrun(
+  mono_id TEXT NOT NULL, recipe_id TEXT NOT NULL, hash TEXT NOT NULL, at INTEGER NOT NULL,
   PRIMARY KEY(mono_id, recipe_id, hash));";
 /// Past versions kept per recipe.
 pub const KEEP_VERSIONS: usize = 20;
@@ -96,6 +102,74 @@ impl MonoBrowserStore {
         .flatten()
         .is_some()
     }
+    /// Remembers that this recipe came from outside this Mono (a file or the shared library), so
+    /// it needs a passing dry run before it runs. Kept here, not in the file: a file edit can
+    /// not clear it. Never rebuilt from files.
+    pub fn mark_outside(&self, mono_id: &str, recipe_id: &str, source: &str) -> Result<(), String> {
+        Self::valid_id(mono_id)?;
+        let conn = self.open()?.ok_or(UNAVAILABLE)?;
+        conn.execute_batch(RECIPE_TABLES).map_err(|_| UNAVAILABLE)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO mono_browser_recipe_outside(mono_id,recipe_id,source,at) VALUES(?1,?2,?3,?4)",
+            params![mono_id, recipe_id, source, crate::time::now_ms() as i64],
+        )
+        .map(|_| ())
+        .map_err(|_| UNAVAILABLE.into())
+    }
+    /// `import` or `shared` for a recipe that came from outside, else `None`. An unreadable
+    /// table counts as outside (the safe direction); a missing table means nothing was imported.
+    pub fn outside_source(&self, mono_id: &str, recipe_id: &str) -> Option<String> {
+        let conn = match self.open() {
+            Ok(Some(conn)) => conn,
+            Ok(None) => return None,
+            Err(_) => return Some("unknown".into()),
+        };
+        match conn
+            .query_row(
+                "SELECT source FROM mono_browser_recipe_outside WHERE mono_id=?1 AND recipe_id=?2",
+                params![mono_id, recipe_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        {
+            Ok(found) => found,
+            Err(e) if e.to_string().contains("no such table") => None,
+            Err(_) => Some("unknown".into()),
+        }
+    }
+    /// Records that a dry run of exactly this content passed in this Mono.
+    pub fn mark_dry_run(&self, mono_id: &str, recipe_id: &str, hash: &str) -> Result<(), String> {
+        Self::valid_id(mono_id)?;
+        let conn = self.open()?.ok_or(UNAVAILABLE)?;
+        conn.execute_batch(RECIPE_TABLES).map_err(|_| UNAVAILABLE)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO mono_browser_recipe_dryrun(mono_id,recipe_id,hash,at) VALUES(?1,?2,?3,?4)",
+            params![mono_id, recipe_id, hash, crate::time::now_ms() as i64],
+        )
+        .map(|_| ())
+        .map_err(|_| UNAVAILABLE.into())
+    }
+    /// Whether a dry run of exactly this content passed in this Mono.
+    pub fn dry_run_passed(&self, mono_id: &str, recipe_id: &str, hash: &str) -> bool {
+        let Ok(Some(conn)) = self.open() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT 1 FROM mono_browser_recipe_dryrun WHERE mono_id=?1 AND recipe_id=?2 AND hash=?3",
+            params![mono_id, recipe_id, hash],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
+    /// A recipe that came from outside runs only after a dry run of exactly its current content
+    /// passed in this Mono.
+    pub fn needs_dry_run(&self, mono_id: &str, recipe: &Recipe) -> bool {
+        self.outside_source(mono_id, &recipe.id).is_some()
+            && !self.dry_run_passed(mono_id, &recipe.id, &recipe.content_hash())
+    }
     /// The hash the user approved for a recipe, if any.
     pub fn approved_hash(&self, mono_id: &str, recipe_id: &str) -> Option<String> {
         let Ok(Some(conn)) = self.open() else {
@@ -124,6 +198,8 @@ impl MonoBrowserStore {
             "DELETE FROM mono_browser_recipe_approvals WHERE mono_id=?1 AND recipe_id=?2",
             "DELETE FROM mono_browser_recipe_hashes WHERE mono_id=?1 AND recipe_id=?2",
             "DELETE FROM mono_browser_recipe_verified WHERE mono_id=?1 AND recipe_id=?2",
+            "DELETE FROM mono_browser_recipe_outside WHERE mono_id=?1 AND recipe_id=?2",
+            "DELETE FROM mono_browser_recipe_dryrun WHERE mono_id=?1 AND recipe_id=?2",
         ] {
             match conn.execute(sql, params![mono_id, recipe_id]) {
                 Ok(_) => {}
@@ -149,7 +225,7 @@ fn origin_slug(origin: &str) -> String {
 }
 
 #[cfg(unix)]
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -158,13 +234,13 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 #[cfg(not(unix))]
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
 /// Writes `bytes` to `path` through a temporary file in the same folder (so a crash never leaves
 /// half a recipe), readable by the user only.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let parent = path.parent().unwrap_or(Path::new("."));
     let tmp = parent.join(format!(".tmp-{:08x}", rand::random::<u32>()));

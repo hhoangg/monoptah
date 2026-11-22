@@ -5,6 +5,7 @@ use super::workflows_ui::tests::click;
 use super::*;
 use crate::monos::tests::{Setup, setup};
 use gpui::{TestAppContext, VisualTestContext};
+use monocode_core::mono::browser::recipe::manage::DryRunReport;
 use monocode_core::mono::browser::{self, BrowserTrust, MonoBrowser, MonoBrowserStore, PrereqEnv};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -17,6 +18,9 @@ struct Fake {
     fda: StdMutex<u32>,
     probe: StdMutex<Option<Result<(), String>>>,
     probed: StdMutex<Vec<(Vec<String>, String)>>,
+    /// What the next recipe dry run answers, and which ones were asked for.
+    dry: StdMutex<Option<Result<DryRunReport, String>>>,
+    dry_asked: StdMutex<Vec<(String, String)>>,
 }
 impl BrowserOps for Fake {
     fn open_in_profile(&self, _: &PrereqEnv, profile: &str, url: &str) -> Result<(), String> {
@@ -35,6 +39,17 @@ impl BrowserOps for Fake {
             .unwrap()
             .push((runtime.spec.args.clone(), runtime.token().to_owned()));
         self.probe.lock().unwrap().clone().unwrap_or(Ok(()))
+    }
+    fn dry_run_recipe(&self, mono_id: &str, recipe_id: &str) -> Result<DryRunReport, String> {
+        self.dry_asked
+            .lock()
+            .unwrap()
+            .push((mono_id.into(), recipe_id.into()));
+        self.dry
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(Err("no gate".into()))
     }
 }
 
@@ -632,4 +647,387 @@ fn the_attach_note_goes_once_its_cause_is_fixed(cx: &mut TestAppContext) {
     page.save_token(TOKEN);
     assert!(!page.on("mono-browser-attach-error"));
     assert_eq!(browser::server::servers().attach_error(&id), None);
+}
+
+// ---- Recipes (Phase 4) ----
+
+mod recipes {
+    use super::*;
+    use crate::monos::recipes_ui::export_file_name;
+    use monocode_core::mono::browser::recipe::{
+        manage::{self, Status},
+        model::Recipe,
+        share::{self, Library},
+        store::RecipeStore,
+    };
+    use serde_json::json;
+
+    const ORIGIN: &str = "https://news.example";
+
+    fn recipe() -> Recipe {
+        let recipe: Recipe = serde_json::from_value(json!({
+            "schema": 1, "id": "rcp_0a1b2c3d", "origin": ORIGIN, "intent": "news.archive",
+            "description": "Read stories", "version": 1,
+            "params": [{"name": "n", "type": "integer", "description": "how many", "default": 2}],
+            "steps": [
+                {"op": "open", "url": "https://news.example/archive",
+                 "expect": [{"url_matches": "^https://news\\.example/archive"}]},
+                {"op": "extract", "scope": {"candidates": [{"role": "list", "name": "Stories"}]},
+                 "each": {"role": "listitem"}, "take_first": "{n}",
+                 "fields": {"title": {"role": "link", "from": "name"}},
+                 "max_chars_per_field": 100, "expect": [{"count_at_least": 1}]},
+            ],
+            "risk": "read", "playwright_mcp": "0.0.86",
+        }))
+        .unwrap();
+        recipe.validate().unwrap();
+        recipe
+    }
+    fn dry_ok() -> DryRunReport {
+        DryRunReport {
+            ok: true,
+            steps_run: 2,
+            stopped_before: None,
+            failure: None,
+        }
+    }
+
+    impl Page {
+        /// Scrolls the page until `selector` is well inside it, then clicks it: the recipes
+        /// sit below the safety rules, and a click only lands on what is visible.
+        fn tap(&mut self, selector: &'static str) {
+            use gpui::{ScrollDelta, ScrollWheelEvent, point, px};
+            for _ in 0..60 {
+                self.visual.refresh().unwrap();
+                let (Some(target), Some(page)) = (
+                    self.visual.debug_bounds(selector),
+                    self.visual.debug_bounds("mono-browser-page"),
+                ) else {
+                    break;
+                };
+                let y = target.center().y;
+                if y > page.top() + px(120.) && y < page.bottom() - px(60.) {
+                    break;
+                }
+                let dy = if y > page.center().y { -240. } else { 240. };
+                self.visual.simulate_event(ScrollWheelEvent {
+                    position: page.center(),
+                    delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                    ..Default::default()
+                });
+                self.visual.run_until_parked();
+            }
+            self.click(selector);
+        }
+        fn recipe_store(&self) -> RecipeStore {
+            RecipeStore::new(browser::recipes_dir(&self.s.root, &self.s.id))
+        }
+        fn library(&self) -> Library {
+            Library::new(browser::shared_recipes_dir(&self.s.root))
+        }
+        /// A recipe the user approved earlier, on a Mono that has the browser on.
+        fn with_recipe(&mut self, recipe: &Recipe) {
+            self.enable();
+            self.recipe_store().save(recipe).unwrap();
+            self.secrets()
+                .approve_recipe(&self.s.id, &recipe.id, &recipe.content_hash())
+                .unwrap();
+            self.manager(|m, cx| m.browser_refresh(cx));
+        }
+        fn rows(&self) -> Vec<manage::Row> {
+            self.ui(|u| u.recipes.rows.clone())
+        }
+        fn status(&self) -> Status {
+            self.rows()[0].status
+        }
+        fn notice(&self) -> Option<String> {
+            self.ui(|u| u.recipes.notice.clone())
+        }
+        fn problem(&self) -> Option<String> {
+            self.ui(|u| u.recipes.error.clone())
+        }
+        fn dry_run_answers(&self, answer: Result<DryRunReport, String>) {
+            *self.ops.dry.lock().unwrap() = Some(answer);
+        }
+        fn import(&mut self, text: &str) {
+            let text = text.to_owned();
+            self.manager(|m, cx| m.recipes_import_text(&text, cx));
+        }
+    }
+
+    fn exported_text() -> String {
+        share::export(&recipe()).unwrap()
+    }
+
+    #[gpui::test]
+    fn the_list_shows_title_origin_version_last_run_success_rate_and_the_flaky_flag(
+        cx: &mut TestAppContext,
+    ) {
+        let mut page = open(cx);
+        page.with_recipe(&recipe());
+        page.recipe_store().update_stats(&recipe(), |s| {
+            s.runs = 10;
+            s.ok = 8;
+            s.last_run_ms = monocode_core::time::now_ms() - 2 * 3_600_000;
+            s.flaky = true;
+        });
+        page.manager(|m, cx| m.browser_refresh(cx));
+        let row = page.rows().remove(0);
+        assert_eq!(
+            (row.intent.as_str(), row.origin.as_str(), row.version),
+            ("news.archive", ORIGIN, 1)
+        );
+        assert_eq!(row.success_percent(), Some(80));
+        assert!(row.flaky && row.status == Status::Approved);
+        for id in [
+            "mono-recipe-0",
+            "mono-recipe-title-0",
+            "mono-recipe-status-0",
+            "mono-recipe-meta-0",
+            "mono-recipe-flaky-0",
+            "mono-recipe-view-0",
+            "mono-recipe-dryrun-0",
+            "mono-recipe-share-0",
+            "mono-recipe-export-0",
+            "mono-recipe-delete-0",
+            "mono-recipes-import",
+        ] {
+            assert!(page.on(id), "{id}");
+        }
+        assert!(!page.on("mono-recipe-rollback-0"), "no earlier version");
+        assert!(!page.on("mono-recipes-empty"));
+    }
+
+    #[gpui::test]
+    fn an_empty_list_says_so_and_the_section_follows_the_browser_switch(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        assert!(!page.on("mono-recipes-import"), "off: no recipes section");
+        page.enable();
+        assert!(page.on("mono-recipes-empty") && page.on("mono-recipes-import"));
+        assert!(page.on("mono-recipes-shared-empty"));
+    }
+
+    #[gpui::test]
+    fn the_steps_are_shown_in_words_with_placeholders_and_no_value(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        page.with_recipe(&recipe());
+        assert!(!page.on("mono-recipe-steps-0"));
+        page.tap("mono-recipe-view-0");
+        assert!(page.on("mono-recipe-steps-0"));
+        let steps = page.ui(|u| u.recipes.open.clone()).unwrap().steps;
+        assert!(
+            steps.contains("{n}") && steps.contains("Risk: read"),
+            "{steps}"
+        );
+        assert!(!page.on("mono-recipe-approve-0"), "already approved");
+        page.tap("mono-recipe-view-0");
+        assert!(!page.on("mono-recipe-steps-0"));
+    }
+
+    #[gpui::test]
+    fn an_imported_recipe_is_a_draft_that_needs_the_users_approval_and_then_a_dry_run(
+        cx: &mut TestAppContext,
+    ) {
+        let mut page = open(cx);
+        page.enable();
+        page.import(&exported_text());
+        assert_eq!(page.status(), Status::Draft);
+        assert_eq!(page.rows()[0].outside.as_deref(), Some("import"));
+        // Its steps are open for review, with the approval button; no dry run until approved.
+        assert!(page.on("mono-recipe-steps-0") && page.on("mono-recipe-approve-0"));
+        assert!(!page.on("mono-recipe-dryrun-0"));
+        assert!(!page.on("mono-recipe-share-0"));
+        assert!(page.notice().unwrap().contains("approve"));
+        page.tap("mono-recipe-approve-0");
+        assert_eq!(page.status(), Status::NeedsDryRun);
+        assert!(page.notice().unwrap().contains("dry run"));
+        assert!(page.on("mono-recipe-dryrun-0"));
+        assert!(
+            !page.on("mono-recipe-share-0"),
+            "not shareable before it passed"
+        );
+        // A failing dry run keeps it locked and says why; an error from the gate too.
+        page.dry_run_answers(Ok(DryRunReport {
+            ok: false,
+            steps_run: 1,
+            stopped_before: None,
+            failure: Some("Step 2 (extract): No locator candidate matched.".into()),
+        }));
+        page.tap("mono-recipe-dryrun-0");
+        assert!(page.problem().unwrap().contains("No locator"));
+        assert_eq!(page.status(), Status::NeedsDryRun);
+        page.dry_run_answers(Err("This Mono's browser is not running yet.".into()));
+        page.tap("mono-recipe-dryrun-0");
+        assert!(page.problem().unwrap().contains("not running"));
+        assert_eq!(page.status(), Status::NeedsDryRun);
+        // The gate does the dry run; the page only shows its answer. Here the fake gate also
+        // records the pass the way the real one does.
+        let (id, mono) = (page.rows()[0].id.clone(), page.s.id.clone());
+        let hash = page.rows()[0].hash.clone();
+        page.dry_run_answers(Ok(dry_ok()));
+        page.tap("mono-recipe-dryrun-0");
+        assert_eq!(
+            page.ops.dry_asked.lock().unwrap().last().cloned(),
+            Some((mono.clone(), id.clone()))
+        );
+        assert!(page.notice().unwrap().contains("passed"));
+        // (The fake did not write the dry run row, so the real status is still locked.)
+        assert_eq!(page.status(), Status::NeedsDryRun);
+        page.secrets().mark_dry_run(&mono, &id, &hash).unwrap();
+        page.manager(|m, cx| m.browser_refresh(cx));
+        assert_eq!(page.status(), Status::Approved);
+        assert!(page.on("mono-recipe-share-0"));
+    }
+
+    #[gpui::test]
+    fn import_refuses_a_blocked_site_a_tampered_file_and_says_why(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        page.enable();
+        page.manager(|m, cx| m.browser_edit(cx, |b| b.blocked_origins.push(ORIGIN.into())));
+        page.import(&exported_text());
+        assert!(page.problem().unwrap().contains("blocked"));
+        assert!(page.on("mono-recipes-error"));
+        assert!(page.rows().is_empty());
+        page.manager(|m, cx| m.browser_edit(cx, |b| b.blocked_origins.clear()));
+        let tampered = exported_text().replace("/archive", "/evil");
+        page.import(&tampered);
+        assert!(page.problem().unwrap().contains("hash"));
+        assert!(page.rows().is_empty());
+        page.import("not a recipe");
+        assert!(page.problem().is_some() && page.rows().is_empty());
+        assert!(!page.recipe_store().dir().join("anything").exists());
+    }
+
+    #[gpui::test]
+    fn a_picked_file_is_imported_and_a_big_one_is_refused_unread(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        page.enable();
+        let file = std::env::temp_dir().join(format!("recipe-pick-{}.json", mono::new_id()));
+        std::fs::write(&file, exported_text()).unwrap();
+        page.tap("mono-recipes-import");
+        assert!(page.visual.did_prompt_for_paths());
+        let picked = file.clone();
+        page.visual
+            .simulate_path_prompt_response(move |_| Some(vec![picked.clone()]));
+        page.visual.run_until_parked();
+        page.visual.refresh().unwrap();
+        assert_eq!(page.status(), Status::Draft);
+        std::fs::write(&file, "x".repeat(share::MAX_FILE_BYTES + 1)).unwrap();
+        page.tap("mono-recipes-import");
+        let picked = file.clone();
+        page.visual
+            .simulate_path_prompt_response(move |_| Some(vec![picked.clone()]));
+        page.visual.run_until_parked();
+        assert!(page.problem().unwrap().contains("too big"));
+        assert_eq!(page.rows().len(), 1);
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[gpui::test]
+    fn approve_is_bound_to_the_steps_that_were_shown(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        page.enable();
+        page.import(&exported_text());
+        let id = page.rows()[0].id.clone();
+        // The file is replaced after its steps were shown and before the click.
+        let mut changed = page.recipe_store().get(&id).unwrap();
+        changed.description = "Something else entirely".into();
+        page.recipe_store().save(&changed).unwrap();
+        page.tap("mono-recipe-approve-0");
+        assert!(page.problem().unwrap().contains("changed"));
+        assert_eq!(page.status(), Status::Draft);
+        assert!(page.secrets().approved_hash(&page.s.id, &id).is_none());
+    }
+
+    #[gpui::test]
+    fn export_saves_the_recipe_file_where_the_user_picks(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        page.with_recipe(&recipe());
+        assert_eq!(
+            export_file_name("news.archive"),
+            "news.archive.monoptah-recipe.json"
+        );
+        page.tap("mono-recipe-export-0");
+        assert!(page.visual.did_prompt_for_new_path());
+        let target = std::env::temp_dir().join(format!("recipe-export-{}.json", mono::new_id()));
+        let file = target.clone();
+        page.visual.simulate_new_path_selection(move |_| Some(file));
+        page.visual.run_until_parked();
+        let text = std::fs::read_to_string(&target).unwrap();
+        assert!(text.contains("\"hash\": \"sha256:"));
+        assert!(share::parse(&text, &[]).is_ok());
+        assert!(page.notice().unwrap().contains("Exported"));
+        let _ = std::fs::remove_file(target);
+    }
+
+    #[gpui::test]
+    fn share_adopt_and_unshare_go_through_the_library_and_a_copy_starts_unapproved(
+        cx: &mut TestAppContext,
+    ) {
+        let mut page = open(cx);
+        page.with_recipe(&recipe());
+        page.tap("mono-recipe-share-0");
+        assert_eq!(page.library().list().len(), 1);
+        assert!(page.on("mono-recipe-shared-0") && page.on("mono-recipe-unshare-0"));
+        assert!(!page.on("mono-recipe-share-0"));
+        // This Mono has it already: no copy button. After deleting it there is one.
+        assert!(!page.on("mono-recipe-adopt-0"));
+        page.tap("mono-recipe-delete-0");
+        assert!(page.on("mono-recipe-delete-0"), "the first click only asks");
+        assert_eq!(page.rows().len(), 1);
+        page.tap("mono-recipe-delete-0");
+        assert!(page.rows().is_empty());
+        assert!(page.on("mono-recipe-adopt-0"));
+        page.tap("mono-recipe-adopt-0");
+        let row = page.rows().remove(0);
+        assert_eq!(row.status, Status::Draft);
+        assert_eq!(row.outside.as_deref(), Some("shared"));
+        assert!(
+            page.on("mono-recipe-approve-0"),
+            "its steps open for review"
+        );
+        // Unshare takes it out of the library and leaves the copy.
+        page.tap("mono-recipe-shared-remove-0");
+        assert!(page.library().list().is_empty());
+        assert_eq!(page.rows().len(), 1);
+        assert!(page.notice().unwrap().contains("Unshared"));
+    }
+
+    #[gpui::test]
+    fn a_blocked_site_stops_a_copy_from_the_library(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        page.with_recipe(&recipe());
+        page.tap("mono-recipe-share-0");
+        page.tap("mono-recipe-delete-0");
+        page.tap("mono-recipe-delete-0");
+        page.manager(|m, cx| m.browser_edit(cx, |b| b.blocked_origins.push(ORIGIN.into())));
+        page.tap("mono-recipe-adopt-0");
+        assert!(page.problem().unwrap().contains("blocked"));
+        assert!(page.rows().is_empty());
+    }
+
+    #[gpui::test]
+    fn rollback_goes_to_the_previous_version_and_delete_asks_twice(cx: &mut TestAppContext) {
+        let mut page = open(cx);
+        let v1 = recipe();
+        page.with_recipe(&v1);
+        let mut v2 = v1.clone();
+        v2.version = 2;
+        v2.description = "Read stories, second version".into();
+        page.recipe_store().save(&v2).unwrap();
+        page.manager(|m, cx| m.browser_refresh(cx));
+        assert_eq!(page.rows()[0].previous, Some(1));
+        assert_eq!(page.status(), Status::Draft, "v2 was never approved");
+        page.tap("mono-recipe-rollback-0");
+        assert_eq!(page.rows()[0].version, 1);
+        assert_eq!(page.status(), Status::Approved, "v1 was approved before");
+        assert!(page.notice().unwrap().contains("version 1"));
+        page.tap("mono-recipe-delete-0");
+        page.tap("mono-recipe-view-0");
+        page.tap("mono-recipe-delete-0");
+        assert_eq!(page.rows().len(), 1, "another click in between asks again");
+        page.tap("mono-recipe-delete-0");
+        assert!(page.rows().is_empty());
+        assert!(page.secrets().approved_hash(&page.s.id, &v1.id).is_none());
+    }
 }

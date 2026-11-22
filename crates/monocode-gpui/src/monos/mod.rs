@@ -30,6 +30,7 @@ mod notifications;
 mod overview;
 mod panel_stack;
 mod panels;
+mod recipes_ui;
 mod reset;
 mod scheduler;
 mod search;

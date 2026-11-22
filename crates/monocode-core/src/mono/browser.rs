@@ -780,6 +780,8 @@ impl MonoBrowserStore {
             "DELETE FROM mono_browser_recipe_approvals WHERE mono_id=?1",
             "DELETE FROM mono_browser_recipe_hashes WHERE mono_id=?1",
             "DELETE FROM mono_browser_recipe_verified WHERE mono_id=?1",
+            "DELETE FROM mono_browser_recipe_outside WHERE mono_id=?1",
+            "DELETE FROM mono_browser_recipe_dryrun WHERE mono_id=?1",
         ] {
             match conn.execute(sql, [mono_id]) {
                 Ok(_) => {}
@@ -1099,6 +1101,12 @@ pub fn output_dir(root: &Path, mono_id: &str) -> PathBuf {
 /// The folder for a Mono's recipes. Not inside [`output_dir`]: the files there are swept.
 pub fn recipes_dir(root: &Path, mono_id: &str) -> PathBuf {
     root.join(mono_id).join("recipes")
+}
+
+/// The folder of the shared recipe library: recipes a user promoted so other Monos can copy them.
+/// Next to the Mono folders; the underscore can not be in a Mono id, so it never collides.
+pub fn shared_recipes_dir(root: &Path) -> PathBuf {
+    root.join("_shared_recipes")
 }
 
 /// What a launch gets for a Mono's browser.
