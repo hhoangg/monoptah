@@ -48,7 +48,7 @@ export const DOWNLOADS_SECTION = `## Downloads and updates
 
 ## Known limits
 
-- macOS packages are ad-hoc signed and are not Apple-notarized. The Windows installer is unsigned, so SmartScreen warns on first install.
+- macOS packages are signed with a self-signed certificate and are not Apple-notarized. The Windows installer is unsigned, so SmartScreen warns on first install.
 - Linux and Windows desktop interaction still need broader runtime testing. The in-app HTML viewer is macOS only; on Linux and Windows the viewer offers to open HTML with the default app.
 `;
 

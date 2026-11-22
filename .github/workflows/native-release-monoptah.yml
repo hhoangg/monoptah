@@ -8,7 +8,7 @@
 #     its signature (what the in-app updater downloads):
 #       macOS arm64    MonoptahNative_X.Y.Z_aarch64.app.tar.gz (+ .sig), plus the
 #                      .zip and .zip.sha256 that the monoptah-native Homebrew
-#                      cask pins (ad-hoc signed, not notarized: no Apple account).
+#                      cask pins (self-signed, not notarized: no Apple account).
 #                      The three unsigned files are uploaded by the local script;
 #                      this workflow only adds the .sig.
 #       Linux x86_64   MonoptahNative_X.Y.Z_amd64.AppImage (+ .sig),

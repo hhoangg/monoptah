@@ -104,7 +104,24 @@ cat > "$native_bundle/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 native_identity="${MONOCODE_NATIVE_SIGNING_IDENTITY:--}"
-if [ "$native_identity" = - ]; then
+native_signing_mode="${MONOCODE_NATIVE_SIGNING_MODE:-}"
+if [ "$native_signing_mode" = selfsigned ]; then
+  # Stable self-signed release identity (see docs/native/release-flow.md). Signed
+  # like the ad-hoc path: no hardened runtime, no entitlements, no timestamp (a
+  # self-signed certificate has no timestamp authority). The only change from
+  # ad-hoc is the certificate, so the designated requirement becomes
+  # `identifier ... and certificate leaf = H"<sha1>"` and survives rebuilds.
+  # There is no fallback to ad-hoc: a missing identity must fail the release.
+  if [ "$native_identity" = - ]; then
+    echo 'MONOCODE_NATIVE_SIGNING_MODE=selfsigned needs MONOCODE_NATIVE_SIGNING_IDENTITY (SHA-1 or common name).' >&2
+    exit 1
+  fi
+  native_sign_args=(--force --sign "$native_identity" --timestamp=none)
+  if [ -n "${MONOCODE_NATIVE_SIGNING_KEYCHAIN:-}" ]; then
+    native_sign_args+=(--keychain "$MONOCODE_NATIVE_SIGNING_KEYCHAIN")
+  fi
+  codesign "${native_sign_args[@]}" "$native_bundle"
+elif [ "$native_identity" = - ]; then
   codesign --force --sign - "$native_bundle"
 else
   codesign --force --sign "$native_identity" --options runtime --timestamp \

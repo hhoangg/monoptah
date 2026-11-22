@@ -52,6 +52,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { CI_RUNS_JQ, REPOSITORY, ciRunsPath, ciVerdict, describeCi, readCiRuns } from "./native-release-monoptah.mjs";
 import { generateNotes } from "./native-release-notes.mjs";
 import { PLATFORMS, releaseVersion, removeBuiltAppBundle } from "./package-native-monoptah.mjs";
+import { signingIdentityProblem } from "./native-signing.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
@@ -687,7 +688,10 @@ export async function runRelease(argv, io) {
   io.log(notes.note);
   io.log("Release notes (" + notes.commits + " commits since " + notes.since + "):\n\n" + notes.text);
 
-  // Fail fast, before the long checks.
+  // Fail fast, before the long checks. The package step signs (also in --dry-run),
+  // so the stable signing identity must exist before anything is dispatched.
+  const signingIssue = signingIdentityProblem(io.env, io.capture);
+  if (signingIssue) throw new Error(signingIssue);
   const sdk = io.capture("xcrun", ["--sdk", "macosx", "--show-sdk-version"]);
   if (sdk.status !== 0)
     throw new Error("xcrun could not report the macOS SDK. Install Xcode 26 or newer. " + (sdk.stderr ?? "").trim());
