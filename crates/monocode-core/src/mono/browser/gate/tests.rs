@@ -369,9 +369,10 @@ fn a_typed_card_number_needs_approval() {
         let request = ask_of(p.evaluate("browser_type", &args, SHOP));
         assert_eq!(request.category, Category::CardData);
     }
-    // Digits that are not a card number do not ask: wrong checksum, or too short.
+    // Digits that are not a card number do not ask: wrong checksum, or too short. (Every stretch
+    // of 13 to 19 digits inside a longer run is checked, so only a short run is sure to pass.)
     for args in [
-        json!({"target": "e1", "text": "4111 1111 1111 1112"}),
+        json!({"target": "e1", "text": "1234567890123"}),
         json!({"target": "e1", "text": "2026-11-22"}),
         json!({"target": "e1", "text": "call me on 0912345678"}),
     ] {

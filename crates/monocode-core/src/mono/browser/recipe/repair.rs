@@ -15,11 +15,17 @@
 //! * only a same-class locator fix of a read step and a wait run under the earlier approval; a new
 //!   step or a changed assertion needs the user's card ([`Class::NeedsApproval`]);
 //! * the patched recipe must pass the full [`Recipe::validate`], so no `evaluate`, no origin
-//!   outside the recipe's, no click on a button.
+//!   outside the recipe's, no click on a button in a read step;
+//! * a step that changes things (Phase 3: `act`, `type`, `fill`, `select`, `press`, `send`) or
+//!   that sits next to an `approve` step never keeps the earlier approval: any patch of it shows
+//!   the user a card. A new locator of such a step must keep the role and exactly the same words
+//!   of the name, and the same class of action, so a repair can never point a send button at
+//!   another action, and the kind of the step and the risk of the recipe can not change.
 use super::model::{
     placeholders, substitute, Candidate, Encode, Expect, Recipe, Stats, Step, Target, MAX_WAIT_MS,
     NAVIGATION_ROLES,
 };
+use super::risk;
 use super::runner::Host;
 use super::store::RunEffect;
 use serde::Deserialize;
@@ -175,9 +181,9 @@ pub struct Applied {
     pub summary: String,
 }
 
-/// A step that may change something on the site: it is a write or a send, not a read. Phase 1
-/// has only link and tab clicks as acting steps; the file format can not hold another kind yet,
-/// but a click on anything else counts as one so a repair of it is never silent.
+/// A step that may change something on the site: it is a write, a send or a payment, or an
+/// `approve` step, not a read. A click on anything but a link or a tab counts as one too, so a
+/// repair of it is never silent.
 pub fn changes_things(step: &Step) -> bool {
     match step {
         Step::Click { target, .. } => target.candidates.iter().any(|c| {
@@ -185,12 +191,18 @@ pub fn changes_things(step: &Step) -> bool {
                 .as_deref()
                 .is_none_or(|r| !NAVIGATION_ROLES.contains(&r))
         }),
-        _ => false,
+        other => other.is_acting() || matches!(other, Step::Approve { .. }),
     }
 }
 
+/// Whether the step at `index` or one next to it is an `approve` step.
+fn near_approve(recipe: &Recipe, index: usize) -> bool {
+    let is_approve = |i: usize| matches!(recipe.steps.get(i), Some(Step::Approve { .. }));
+    is_approve(index) || is_approve(index + 1) || index.checked_sub(1).is_some_and(is_approve)
+}
+
 /// How a patch of step `index` is approved. A step that changes things, or that sits next to an
-/// `approve` step (Phase 3 adds them), never runs repaired under the earlier approval.
+/// `approve` step, never runs repaired under the earlier approval.
 pub fn classify(recipe: &Recipe, index: usize, patch: &Patch) -> Class {
     let step = &recipe.steps[index];
     match patch {
@@ -199,6 +211,8 @@ pub fn classify(recipe: &Recipe, index: usize, patch: &Patch) -> Class {
         Patch::ReplaceCandidates { .. } | Patch::AddWait { .. } => {
             if changes_things(step) {
                 Class::NeedsApproval("the step changes things on the site")
+            } else if near_approve(recipe, index) {
+                Class::NeedsApproval("the step sits next to an approval step")
             } else {
                 Class::SameClass
             }
@@ -215,8 +229,18 @@ pub fn apply(base: &Recipe, index: usize, patch: &Patch, level: u8) -> Result<Ap
     let (restart, target, summary) = match patch {
         Patch::GiveUp { .. } => return Err("give_up is not a change.".into()),
         Patch::ReplaceCandidates { candidates } => {
+            if matches!(step, Step::Fill { .. }) {
+                return Err(
+                    "A form with several fields is not repaired by a patch: do this step by hand."
+                        .into(),
+                );
+            }
             let old = match step {
-                Step::Click { target, .. } => &target.candidates,
+                Step::Click { target, .. }
+                | Step::Act { target, .. }
+                | Step::Send { target, .. }
+                | Step::Type { target, .. }
+                | Step::Select { target, .. } => &target.candidates,
                 Step::Extract {
                     scope: Some(target),
                     ..
@@ -226,6 +250,7 @@ pub fn apply(base: &Recipe, index: usize, patch: &Patch, level: u8) -> Result<Ap
             if candidates.is_empty() {
                 return Err("A locator needs at least one candidate.".into());
             }
+            let acting = step.is_acting();
             for new in candidates {
                 if new.looks_generated() {
                     return Err("A generated-looking name or id is not a stable locator.".into());
@@ -233,9 +258,18 @@ pub fn apply(base: &Recipe, index: usize, patch: &Patch, level: u8) -> Result<Ap
                 if !old.iter().any(|o| same_class(o, new)) {
                     return Err("The new locator must keep the role and the kind of name of the old one (for example a link named like the old link). A different role or a different name is not a repair.".into());
                 }
+                // A step that changes things keeps exactly its words and its class of action: a
+                // send button can not become another button, even one with fewer words.
+                if acting && !old.iter().any(|o| same_action(o, new)) {
+                    return Err("A step that changes things needs a new locator with the same role, the same words in the name and the same kind of action. Anything else is a different step: do this one by hand.".into());
+                }
             }
             match &mut recipe.steps[index] {
                 Step::Click { target, .. }
+                | Step::Act { target, .. }
+                | Step::Send { target, .. }
+                | Step::Type { target, .. }
+                | Step::Select { target, .. }
                 | Step::Extract {
                     scope: Some(target),
                     ..
@@ -315,7 +349,13 @@ pub fn apply(base: &Recipe, index: usize, patch: &Patch, level: u8) -> Result<Ap
             match &mut recipe.steps[index] {
                 Step::Open { expect: e, .. }
                 | Step::Click { expect: e, .. }
-                | Step::Extract { expect: e, .. } => *e = expect.clone(),
+                | Step::Extract { expect: e, .. }
+                | Step::Act { expect: e, .. }
+                | Step::Send { expect: e, .. }
+                | Step::Type { expect: e, .. }
+                | Step::Select { expect: e, .. }
+                | Step::Fill { expect: e, .. }
+                | Step::Press { expect: e, .. } => *e = expect.clone(),
                 _ => return Err("This step has no assertion.".into()),
             }
             (
@@ -325,12 +365,16 @@ pub fn apply(base: &Recipe, index: usize, patch: &Patch, level: u8) -> Result<Ap
             )
         }
     };
-    others_unchanged(
-        base,
-        &recipe,
-        index,
-        matches!(patch, Patch::AddWait { .. } | Patch::InsertStep { .. }),
-    )?;
+    let inserted = matches!(patch, Patch::AddWait { .. } | Patch::InsertStep { .. });
+    others_unchanged(base, &recipe, index, inserted)?;
+    // A repair never turns a read into a write, never lowers or raises what a step is, and never
+    // changes the risk of the recipe.
+    if !inserted && step.class() != recipe.steps[index].class() {
+        return Err("A repair can not change what kind of action a step is.".into());
+    }
+    if base.computed_risk() != recipe.computed_risk() {
+        return Err("A repair can not change what the recipe is able to do.".into());
+    }
     recipe.validate().map_err(|reason| {
         format!("The patched recipe is not valid, so it was not run: {reason}")
     })?;
@@ -424,6 +468,68 @@ pub fn same_class(old: &Candidate, new: &Candidate) -> bool {
         (Some(o), Some(n)) => name_class_ok(o, n),
         _ => false,
     }
+}
+
+fn show_candidate(c: &Candidate) -> String {
+    let part =
+        |label: &str, value: &Option<String>| value.as_ref().map(|v| format!("{label} \"{v}\""));
+    let mut bits = vec![
+        part("role", &c.role),
+        part("name", &c.name),
+        part("label", &c.label),
+        part("testid", &c.testid),
+        part("text", &c.text),
+    ];
+    if let Some(scope) = &c.scope {
+        bits.push(Some(format!("inside {} \"{}\"", scope.role, scope.name)));
+    }
+    bits.into_iter().flatten().collect::<Vec<_>>().join(", ")
+}
+
+fn locators(step: &Step) -> Vec<&Candidate> {
+    match step {
+        Step::Click { target, .. }
+        | Step::Act { target, .. }
+        | Step::Send { target, .. }
+        | Step::Type { target, .. }
+        | Step::Select { target, .. }
+        | Step::Extract {
+            scope: Some(target),
+            ..
+        } => target.candidates.iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The locators of a step before and after a patch, in words, for the user's card: the role,
+/// the name and the area of each candidate.
+pub fn locator_diff(old: &Step, new: &Step) -> String {
+    let list = |step: &Step| {
+        locators(step)
+            .into_iter()
+            .map(|c| format!("  - {}", show_candidate(c)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Locators now:\n{}\nLocators after the change:\n{}",
+        list(old),
+        list(new)
+    )
+}
+
+/// The stricter test for a step that changes things: [`same_class`], the same set of words in the
+/// name (none dropped, none added) and the same class of action by the words of the name.
+pub fn same_action(old: &Candidate, new: &Candidate) -> bool {
+    // The same area, and a name: a locator without a name (a role alone) or in another area
+    // can reach another element.
+    if !same_class(old, new) || old.scope != new.scope {
+        return false;
+    }
+    let (Some(o), Some(n)) = (needle(old), needle(new)) else {
+        return false;
+    };
+    words(o) == words(n) && risk::name_class(o) == risk::name_class(n)
 }
 
 fn name_class_ok(old: &str, new: &str) -> bool {
@@ -531,6 +637,8 @@ pub fn fence(text: &str) -> String {
 pub fn expected_name(step: &Step, values: &BTreeMap<String, String>) -> Option<String> {
     let fill = |t: &str| substitute(t, values, Encode::Raw);
     let from_target = |t: &Target| t.candidates.iter().find_map(needle).map(|n| fill(n));
+    // A step that types or sends is looked for by its target only: an assertion of such a step
+    // can hold what was typed, which must not go into a page search.
     let from_expect = |expect: &[Expect]| {
         expect.iter().find_map(|e| match e {
             Expect::TextVisible(t) => Some(fill(t)),
@@ -546,7 +654,12 @@ pub fn expected_name(step: &Step, values: &BTreeMap<String, String>) -> Option<S
             .or_else(|| from_expect(expect)),
         Step::Open { expect, .. } => from_expect(expect),
         Step::Wait { text, .. } => text.as_deref().map(fill),
-        Step::Scroll { .. } => None,
+        Step::Scroll { .. } | Step::Press { .. } | Step::Approve { .. } => None,
+        Step::Act { target, .. }
+        | Step::Send { target, .. }
+        | Step::Type { target, .. }
+        | Step::Select { target, .. } => from_target(target),
+        Step::Fill { fields, .. } => fields.first().and_then(|f| from_target(&f.target)),
     }
     .filter(|n| !n.is_empty())
 }
@@ -605,5 +718,13 @@ pub fn observe(
             }
         }
     }
-    parts.join("\n\n").chars().take(OBSERVATION_CAP).collect()
+    let secrets: Vec<String> = recipe
+        .typed_params()
+        .into_iter()
+        .filter_map(|name| values.get(name).cloned())
+        .collect();
+    risk::scrub(&parts.join("\n\n"), &secrets)
+        .chars()
+        .take(OBSERVATION_CAP)
+        .collect()
 }

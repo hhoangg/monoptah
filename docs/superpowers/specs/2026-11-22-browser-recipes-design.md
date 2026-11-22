@@ -353,6 +353,73 @@ On any step failure or failed assertion the runner stops and starts repair for t
 - Audit rows (`recipe_repair`, `recipe_rollback`, steps tagged `recipe:<id>@<v>+repair`) hold
   origin and path only, never a locator name, a parameter value or a query string.
 
+**Phase 3 as built.** Recipes can change things. New step ops: `act` (a click that changes
+something; `click` stays link and tab only), `type`, `fill`, `select`, `press` (Enter, Escape, Tab,
+Backspace, Delete, ArrowLeft, ArrowRight, Space; the scroll keys keep `scroll`), `send` (the
+explicit click that sends or posts) and `approve`. Uploads are not in this spec's step table and
+are refused when recording, with code, drag and drop, dialogs and coordinate clicks.
+
+- **Risk.** Every step has a class: `read`, `write`, `send` (send, post, comment, publish;
+  also Enter and Space presses), `money`, `code` (no step can be code; the class exists so the
+  rules have a name for it). The class comes from the step kind and the words of its locator
+  (`recipe/risk.rs`). `Recipe.risk` is the highest step and `validate` refuses a file whose
+  `risk` differs from the computed one. The stored class is only a floor: at run time the runner
+  classifies the element it found on the live page (role and accessible name) and takes the higher
+  class, so a button that now says "Send" or "Pay now" asks for that approval. A link or tab
+  whose live name says it sends, pays or removes also asks.
+- **Approvals.** One rule, `gate::approval_required(trust, category)`, shared with the Mono's
+  rules: Level 1 cannot act (the gate denies the tools; a recipe with a changing step is
+  `min_level` 2), Level 2 asks for money, send, post, other risky actions and code, Level 3 asks
+  for money and code. The runner raises the card through the gate's own `browser_request_approval`
+  path (same card, timeout and fail-closed rule), so a finance or blocked page and a card number
+  are still gated by `Policy::evaluate` on every call. The trust level is read again before
+  each step, so a level changed since the recording, or in the middle of a run, applies.
+- **`approve` steps** are part of the hash and follow `model::governing`: an `approve` of kind
+  `other` guards the run of plain writes after it (until a send or payment step, another
+  `approve` or a page change); any other kind guards exactly the next acting step. `validate`
+  refuses an acting step with no guard, a guard weaker than the step (a payment approval covers
+  any kind) and an `approve` that guards nothing. At run time a level that does not ask for a
+  kind drops that `approve` (a note in the result); a step whose live class needs a card that no
+  `approve` of this run covers (a repair re-run that starts after it, or a stronger live class)
+  gets its own card for that step alone. The card shows the step in words, the live target, the
+  page URL and the real parameter values; one that would not fit is refused, not cut. A recipe
+  that changes things asks once more on its first run (`stats.verified` false until a full run
+  passes) with every acting step and its values.
+- **Parameters.** A typed, filled or selected value is exactly one `{param}` (never a literal,
+  never text around it); a checkbox or radio holds `true` or `false`. A locator of an acting
+  step holds no `{param}` and is found by role, label or test id, so a value can not choose the
+  target. Passwords, one-time codes and card data are never stored, defaulted or replayed:
+  `validate` refuses a typing step whose locator names such a field, parameter names that look
+  like credentials, and defaults that are cards, keys, tokens or numeric codes; at run time
+  `bind_params` refuses a card, a private key, a JWT, a well-known token shape or a long token
+  as a value, and the runner refuses a live field that is a password, code or card field or not
+  the kind of field the step types into. This replaces the "sensitive parameter supplied at run
+  time" idea of the Security section: the requirement is that such values are never replayed.
+- **Recording.** The in-memory trace keeps typed values (memory only, hidden from `Debug`) to
+  match each with the parameter whose `example` is exactly that value; a value that matches none
+  refuses the recording. A name that holds an example refuses it for buttons and, for a field,
+  falls back to a role locator inside its named ancestor (strict single match at run time).
+  `approve` steps are inserted from the `governing` rule; an approval the Mono made in the trace
+  can only raise a step's approval to a payment. A task on a finance page is refused. The
+  record-time replay stops before the first step that changes things (the first `approve`): it
+  never types or sends, so a write recipe is saved `unverified`.
+- **Redaction.** Typed values are masked in audit rows ("values masked"), scrubbed from every
+  failure text and repair observation (the browser echoes what it typed), and absent from the
+  file, history, stats and the confirm card. A browser error of an acting step is reported
+  without its raw text.
+- **Failures after an action.** A step that already acted when it failed is never repairable (a
+  re-run would act twice), and the result lists `changed_things` and tells the Mono not to repeat
+  them (never send or post twice).
+- **Repair.** `replace_candidates`, `add_wait` and `change_assertion` on a step that changes
+  things, or on a step next to an `approve`, always show the user a card. A new locator of such a
+  step keeps the role, exactly the same words and the same class of action, so a send button
+  can not become another action. A repair can not change a step's class or the recipe's risk, a
+  form with several fields has no patch, and an inserted click that breaks an approval's cover
+  makes the patched recipe invalid.
+
+Not built: the per-step waiver of an `approve` on the confirm card (every acting step keeps its
+`approve`, the safe direction), and a recipe that carries a credential at all.
+
 This is the main difference from Stagehand and Skyvern as documented: repair is local to one step,
 verified by assertions, versioned and reversible, instead of "re-run the whole agent and overwrite
 the cache".
@@ -626,7 +693,7 @@ step latency. Replaces assumptions A and D. Exit: numbers in the doc.
 operators, rerun from the failing step, versions, history, rollback, flaky marking, drift
 fingerprint warnings, UI for history.
 
-**Phase 3 - write recipes (about 2 weeks)**: `type`, `fill`, `select`, `press`, parameters of
+**Phase 3 - write recipes (about 2 weeks; built, see "Phase 3 as built")**: `type`, `fill`, `select`, `press`, parameters of
 sensitive kind, `approve` steps with real values, Level 2 and 3 behavior, redaction tests, an
 adversarial review (high-risk per the repo rules: tokens and secrets, user data).
 

@@ -2,8 +2,13 @@
 //!
 //! A recipe is data the app runs on the user's logged-in browser, so it is treated as code: a
 //! closed vocabulary of steps, strict limits, and a hash that an approval is bound to. Phase 1
-//! has only read steps (`open`, `wait`, `scroll`, `click` on a link or tab, `extract`).
-use crate::mono::browser::gate::{contains_card_number, is_finance_url};
+//! has read steps (`open`, `wait`, `scroll`, `click` on a link or tab, `extract`); Phase 3 adds
+//! the steps that change things (`act`, `type`, `fill`, `select`, `press`, `send`) and the
+//! `approve` step that the user's card belongs to. Every acting step is guarded by an `approve`
+//! step (see [`governing`]), its typed values are always `{parameters}` (never literals), and
+//! the risk of a recipe is computed from its steps, never read from the file.
+use super::risk::{self, Class};
+use crate::mono::browser::gate::{contains_card_number, is_finance_url, Category};
 use crate::mono::browser::{is_scroll_key, normalize_origin};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -30,13 +35,139 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What a step or a recipe can do, from the least to the most. A recipe's risk is the highest of
+/// its steps and is computed, not trusted (see [`Recipe::computed_risk`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Risk {
-    /// Reads pages and follows navigation only. The only risk class of Phase 1.
+    /// Reads pages and follows navigation only.
     #[default]
     Read,
+    /// Types, selects or clicks something that changes a page (a draft, a setting).
+    Write,
+    /// Sends, posts, comments or publishes: it leaves the user's hands.
+    Send,
+    /// Pays, buys, subscribes or transfers.
+    Money,
+    /// Runs code. No recipe step does (the format has no such step); it is here so the
+    /// classification is complete and a Level 3 rule has a name for it.
+    Code,
 }
+impl Risk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Send => "send",
+            Self::Money => "money",
+            Self::Code => "code",
+        }
+    }
+}
+
+/// What the user is asked about on an `approve` step: the agent-chosen categories of the gate's
+/// `browser_request_approval`, with the same names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproveKind {
+    Payment,
+    SendMessage,
+    PostPublish,
+    Other,
+}
+impl ApproveKind {
+    pub fn category(self) -> Category {
+        match self {
+            Self::Payment => Category::Payment,
+            Self::SendMessage => Category::SendMessage,
+            Self::PostPublish => Category::PostPublish,
+            Self::Other => Category::Other,
+        }
+    }
+    pub fn from_category(category: Category) -> Self {
+        match category {
+            Category::Payment => Self::Payment,
+            Category::SendMessage => Self::SendMessage,
+            Category::PostPublish => Self::PostPublish,
+            _ => Self::Other,
+        }
+    }
+    /// The name `browser_request_approval` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Payment => "payment",
+            Self::SendMessage => "send_message",
+            Self::PostPublish => "post_publish",
+            Self::Other => "other",
+        }
+    }
+    /// Whether an approval of this kind satisfies one `needed`: the same kind, or a payment
+    /// approval (the strictest).
+    pub fn covers(self, needed: Category) -> bool {
+        self == Self::Payment || self.category() == needed
+    }
+}
+
+/// Which way a `send` step leaves the user's hands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendAction {
+    /// A message, an email, a direct message.
+    Send,
+    /// A post, a comment, a review, a publication.
+    Post,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldKind {
+    #[default]
+    Textbox,
+    Checkbox,
+    Radio,
+    Combobox,
+    Slider,
+}
+impl FieldKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Textbox => "textbox",
+            Self::Checkbox => "checkbox",
+            Self::Radio => "radio",
+            Self::Combobox => "combobox",
+            Self::Slider => "slider",
+        }
+    }
+    /// A checkbox or a radio button holds a fixed `true` or `false`; the others a `{parameter}`.
+    pub fn is_toggle(self) -> bool {
+        matches!(self, Self::Checkbox | Self::Radio)
+    }
+}
+
+/// One field of a `fill` step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormField {
+    pub target: Target,
+    #[serde(rename = "type", default)]
+    pub kind: FieldKind,
+    /// A single `{parameter}`, or `true` or `false` for a checkbox or a radio button.
+    pub value: String,
+}
+
+/// The keys a `press` step may send: the keys that scroll have their own `scroll` step.
+pub const PRESS_KEYS: [&str; 8] = [
+    "Enter",
+    "Escape",
+    "Tab",
+    "Backspace",
+    "Delete",
+    "ArrowLeft",
+    "ArrowRight",
+    "Space",
+];
+pub const MAX_FORM_FIELDS: usize = 10;
+pub const MAX_SELECT_VALUES: usize = 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +325,50 @@ pub enum Step {
     },
     /// `browser_press_key` with a scroll key, a bounded number of times.
     Scroll { key: String, times: u32 },
+    /// `browser_click` on any element that changes something (a button, a checkbox, a menu
+    /// item). The target never holds a `{parameter}`: a value must not choose what is clicked.
+    Act {
+        target: Target,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        expect: Vec<Expect>,
+    },
+    /// `browser_type` a `{parameter}` into a field. Never a literal, never Enter (`press`).
+    Type {
+        target: Target,
+        value: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        expect: Vec<Expect>,
+    },
+    /// `browser_fill_form`: several fields at once.
+    Fill {
+        fields: Vec<FormField>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        expect: Vec<Expect>,
+    },
+    /// `browser_select_option` with `{parameter}` values.
+    Select {
+        target: Target,
+        values: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        expect: Vec<Expect>,
+    },
+    /// `browser_press_key` with a key that does not scroll. Enter and Space count as sending.
+    Press {
+        key: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        expect: Vec<Expect>,
+    },
+    /// The click that sends or posts (`browser_click`): explicit, so the card and the rules can
+    /// name it. It always needs the user's approval at Level 2.
+    Send {
+        target: Target,
+        action: SendAction,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        expect: Vec<Expect>,
+    },
+    /// The user's approval (`browser_request_approval`) for the acting steps it guards: see
+    /// [`governing`]. At Level 3 an approval that Level 3 does not ask for is dropped at run time.
+    Approve { category: ApproveKind },
     /// Reads the declared fields of a scoped snapshot. Never returns a page dump.
     Extract {
         /// The area to read; none reads the whole page.
@@ -236,7 +411,9 @@ pub struct Stats {
     pub ok: u32,
     pub consecutive_ok: u32,
     pub last_ok_ms: u64,
-    /// A full run succeeded on the live page (the dry run at record time counts).
+    /// A full run succeeded on the live page (the dry run at record time counts). Bookkeeping in
+    /// the file: a recipe that changes things is trusted only by the store database
+    /// (`MonoBrowserStore::is_verified`), which a file edit can not touch.
     pub verified: bool,
     /// The result of the last runs, oldest first (at most `repair::WINDOW`): true is a pass.
     pub window: Vec<bool>,
@@ -388,6 +565,12 @@ pub fn bind_params(
                 param.name
             ));
         }
+        if let Some(what) = risk::secret_value(&text) {
+            return Err(format!(
+                "Parameter `{}` looks like {what}; recipes never carry credentials.",
+                param.name
+            ));
+        }
         out.insert(param.name.clone(), text);
     }
     Ok(out)
@@ -424,6 +607,15 @@ pub fn secret_name(text: &str) -> bool {
         "session",
         "credential",
         "card",
+        "passcode",
+        "passphrase",
+        "2fa",
+        "mfa",
+        "totp",
+        "verification",
+        "security_code",
+        "login_code",
+        "one_time",
     ]
     .iter()
     .any(|word| lower.contains(word))
@@ -446,6 +638,60 @@ fn regex_ok(pattern: &str) -> Result<(), String> {
         .build()
         .map(|_| ())
         .map_err(|_| format!("`{pattern}` is not a valid pattern."))
+}
+
+/// The locator of a step that changes things: found by role, label or test id (never by a bare
+/// text or a CSS selector), and never with a `{parameter}` in it. A value from the Mono or from
+/// a page must not be able to choose what gets clicked or typed into.
+fn acting_target(target: &Target) -> Result<(), String> {
+    target.validate(false)?;
+    for candidate in &target.candidates {
+        if candidate.text.is_some() && candidate.role.is_none() {
+            return Err(
+                "A step that changes things is found by role, label or test id, not by text alone."
+                    .into(),
+            );
+        }
+        let strings = [
+            &candidate.name,
+            &candidate.label,
+            &candidate.testid,
+            &candidate.text,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(candidate.scope.as_ref().map(|s| &s.name));
+        for text in strings {
+            if !placeholders(text).is_empty() {
+                return Err("The locator of a step that changes things holds no {parameter}: a value must not choose the target.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A field that takes typed text is not a password, code or card field.
+fn typed_target(target: &Target) -> Result<(), String> {
+    let secret = target
+        .candidates
+        .iter()
+        .flat_map(|c| [&c.name, &c.label, &c.testid, &c.text])
+        .flatten()
+        .any(|text| risk::secret_field(text));
+    if secret {
+        return Err("This field takes a password, a code or card data. A recipe never types those: do this step by hand.".into());
+    }
+    Ok(())
+}
+
+/// A typed value is exactly one `{parameter}`: never a literal, never text around it.
+fn single_param(value: &str) -> Result<(), String> {
+    let names = placeholders(value);
+    if names.len() == 1 && value == format!("{{{}}}", names[0]) {
+        Ok(())
+    } else {
+        Err("A typed or selected value is exactly one {parameter}, never a literal.".into())
+    }
 }
 
 impl Candidate {
@@ -532,6 +778,31 @@ impl Expect {
     }
 }
 
+impl Target {
+    /// The first candidate in words: `the link "Archive"`.
+    pub fn describe(&self) -> String {
+        self.candidates
+            .first()
+            .map(|c| {
+                let what = c
+                    .name
+                    .as_ref()
+                    .or(c.label.as_ref())
+                    .or(c.text.as_ref())
+                    .or(c.testid.as_ref())
+                    .or(c.css.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+                match &c.role {
+                    Some(role) if what.is_empty() => format!("the {role}"),
+                    Some(role) => format!("the {role} \"{what}\""),
+                    None => format!("\"{what}\""),
+                }
+            })
+            .unwrap_or_default()
+    }
+}
+
 impl Step {
     pub fn op(&self) -> &'static str {
         match self {
@@ -540,15 +811,101 @@ impl Step {
             Self::Wait { .. } => "wait",
             Self::Scroll { .. } => "scroll",
             Self::Extract { .. } => "extract",
+            Self::Act { .. } => "act",
+            Self::Type { .. } => "type",
+            Self::Fill { .. } => "fill",
+            Self::Select { .. } => "select",
+            Self::Press { .. } => "press",
+            Self::Send { .. } => "send",
+            Self::Approve { .. } => "approve",
         }
     }
     pub fn expects(&self) -> &[Expect] {
         match self {
             Self::Open { expect, .. }
             | Self::Click { expect, .. }
-            | Self::Extract { expect, .. } => expect,
+            | Self::Extract { expect, .. }
+            | Self::Act { expect, .. }
+            | Self::Type { expect, .. }
+            | Self::Fill { expect, .. }
+            | Self::Select { expect, .. }
+            | Self::Press { expect, .. }
+            | Self::Send { expect, .. } => expect,
             _ => &[],
         }
+    }
+    /// The locators of an acting step (not of `click`, which only follows a link or a tab).
+    pub fn acting_targets(&self) -> Vec<&Target> {
+        match self {
+            Self::Act { target, .. }
+            | Self::Type { target, .. }
+            | Self::Select { target, .. }
+            | Self::Send { target, .. } => vec![target],
+            Self::Fill { fields, .. } => fields.iter().map(|f| &f.target).collect(),
+            _ => Vec::new(),
+        }
+    }
+    /// The text a name-based class is read from: every name, label and text of the locators.
+    fn target_names(&self) -> Vec<&str> {
+        self.acting_targets()
+            .into_iter()
+            .flat_map(|t| &t.candidates)
+            .flat_map(|c| [&c.name, &c.label, &c.text, &c.testid])
+            .flatten()
+            .map(String::as_str)
+            .collect()
+    }
+    /// What this step can do, from what is stored: a floor, because the runner works it out again
+    /// from the element it finds on the live page and takes the higher of the two.
+    pub fn class(&self) -> Class {
+        let by_names = || {
+            self.target_names()
+                .into_iter()
+                .filter_map(risk::name_class)
+                .fold(Class::WRITE, Class::max)
+        };
+        match self {
+            Self::Act { .. } => by_names(),
+            Self::Send { action, .. } => {
+                let base = match action {
+                    SendAction::Send => Class::send(),
+                    SendAction::Post => Class::post(),
+                };
+                // A send button that is really a payment is a payment.
+                if by_names().risk == Risk::Money {
+                    Class::money()
+                } else {
+                    base
+                }
+            }
+            Self::Type { .. } => Class::WRITE,
+            Self::Select { .. } => by_names(),
+            // Only the toggles and menus of a form can be a payment or a send ("Pay by card");
+            // a text field is where text goes.
+            Self::Fill { fields, .. } => fields
+                .iter()
+                .filter(|f| f.kind != FieldKind::Textbox)
+                .flat_map(|f| &f.target.candidates)
+                .flat_map(|c| [&c.name, &c.label, &c.text, &c.testid])
+                .flatten()
+                .filter_map(|n| risk::name_class(n))
+                .fold(Class::WRITE, Class::max),
+            Self::Press { key, .. } => {
+                if matches!(key.as_str(), "Enter" | "Space") {
+                    Class::send()
+                } else {
+                    Class::WRITE
+                }
+            }
+            _ => Class::READ,
+        }
+    }
+    pub fn risk(&self) -> Risk {
+        self.class().risk
+    }
+    /// Whether the step changes something (everything but the read steps and `approve`).
+    pub fn is_acting(&self) -> bool {
+        self.risk() > Risk::Read
     }
     /// The strings of this step that may hold `{param}` placeholders.
     fn templates(&self) -> Vec<&str> {
@@ -574,7 +931,22 @@ impl Step {
             } => {
                 out.extend([text, text_gone].into_iter().flatten().map(String::as_str));
             }
-            Self::Scroll { .. } => {}
+            Self::Scroll { .. } | Self::Press { .. } | Self::Approve { .. } => {}
+            Self::Act { target, .. } | Self::Send { target, .. } => candidates(target, &mut out),
+            Self::Type { target, value, .. } => {
+                candidates(target, &mut out);
+                out.push(value);
+            }
+            Self::Select { target, values, .. } => {
+                candidates(target, &mut out);
+                out.extend(values.iter().map(String::as_str));
+            }
+            Self::Fill { fields, .. } => {
+                for field in fields {
+                    candidates(&field.target, &mut out);
+                    out.push(&field.value);
+                }
+            }
             Self::Extract {
                 scope,
                 take_last,
@@ -601,28 +973,13 @@ impl Step {
         }
         out
     }
+    /// The step in plain words with the run's values filled in, for an approval card.
+    pub fn describe_with(&self, values: &BTreeMap<String, String>) -> String {
+        substitute(&self.describe(), values, Encode::Raw)
+    }
     /// The step in plain words, for the confirm card and `recipe_show`.
     pub fn describe(&self) -> String {
-        let locator = |t: &Target| {
-            t.candidates
-                .first()
-                .map(|c| {
-                    let what = c
-                        .name
-                        .as_ref()
-                        .or(c.label.as_ref())
-                        .or(c.text.as_ref())
-                        .or(c.testid.as_ref())
-                        .or(c.css.as_ref())
-                        .cloned()
-                        .unwrap_or_default();
-                    match &c.role {
-                        Some(role) => format!("the {role} \"{what}\""),
-                        None => format!("\"{what}\""),
-                    }
-                })
-                .unwrap_or_default()
-        };
+        let locator = |t: &Target| t.describe();
         match self {
             Self::Open { url, .. } => format!("Open {url}"),
             Self::Click { target, .. } => format!("Click {}", locator(target)),
@@ -636,6 +993,47 @@ impl Step {
                 _ => format!("Wait {time_ms} ms"),
             },
             Self::Scroll { key, times } => format!("Press {key} {times} time(s) to scroll"),
+            Self::Act { target, .. } => format!("Click {} (changes something)", locator(target)),
+            Self::Send { target, action, .. } => format!(
+                "{} by clicking {}",
+                match action {
+                    SendAction::Send => "SEND",
+                    SendAction::Post => "POST",
+                },
+                locator(target)
+            ),
+            Self::Type { target, value, .. } => {
+                format!("Type \"{value}\" into {}", locator(target))
+            }
+            Self::Select { target, values, .. } => {
+                format!(
+                    "Select {} in {}",
+                    values
+                        .iter()
+                        .map(|v| format!("\"{v}\""))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    locator(target)
+                )
+            }
+            Self::Fill { fields, .. } => format!(
+                "Fill {}",
+                fields
+                    .iter()
+                    .map(|f| {
+                        if f.kind.is_toggle() {
+                            format!("set {} to {}", locator(&f.target), f.value)
+                        } else {
+                            format!("\"{}\" into {}", f.value, locator(&f.target))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            Self::Press { key, .. } => format!("Press {key}"),
+            Self::Approve { category } => {
+                format!("Ask the user first ({})", category.category().label())
+            }
             Self::Extract {
                 scope,
                 each,
@@ -664,13 +1062,31 @@ impl Step {
 }
 
 impl Recipe {
-    /// The lowest trust level that can run every step: a click is not available at Level 1.
+    /// The lowest trust level that can run every step: a click, or any step that changes
+    /// something, is not available at Level 1.
     pub fn min_level(&self) -> u8 {
-        if self.steps.iter().any(|s| matches!(s, Step::Click { .. })) {
+        if self
+            .steps
+            .iter()
+            .any(|s| matches!(s, Step::Click { .. }) || s.is_acting())
+        {
             2
         } else {
             1
         }
+    }
+    /// The risk of the recipe: the highest of its steps. Computed from the steps every time; the
+    /// `risk` field of a file is only checked against it, never believed.
+    pub fn computed_risk(&self) -> Risk {
+        self.steps
+            .iter()
+            .map(Step::risk)
+            .max()
+            .unwrap_or(Risk::Read)
+    }
+    /// Whether any step changes something.
+    pub fn changes_things(&self) -> bool {
+        self.computed_risk() > Risk::Read
     }
     /// Every origin a step may land on.
     pub fn origins(&self) -> Vec<String> {
@@ -759,7 +1175,91 @@ impl Recipe {
         if extracts == 0 {
             return Err("A recipe needs an extract step: it returns the data.".into());
         }
+        self.validate_writes()
+    }
+
+    /// The rules of the steps that change things: the risk field is the computed one, every
+    /// acting step is guarded by an `approve` step of a strong enough kind, and every `approve`
+    /// step guards something.
+    fn validate_writes(&self) -> Result<(), String> {
+        let computed = self.computed_risk();
+        if self.risk != computed {
+            return Err(format!(
+                "The recipe says its risk is {} but its steps are {}: the risk is computed from the steps.",
+                self.risk.as_str(),
+                computed.as_str()
+            ));
+        }
+        let guard = governing(&self.steps);
+        let mut guarding = BTreeSet::new();
+        for (index, step) in self.steps.iter().enumerate() {
+            if !step.is_acting() {
+                continue;
+            }
+            let fail = |reason: &str| format!("Step {} ({}): {reason}", index + 1, step.op());
+            let Some(approve) = guard[index] else {
+                return Err(fail(
+                    "it changes things and no approve step guards it (put an approve step right before it).",
+                ));
+            };
+            let Step::Approve { category } = &self.steps[approve] else {
+                return Err(fail("its guard is not an approve step."));
+            };
+            if !category.covers(step.class().category) {
+                return Err(fail(
+                    "its approve step asks about something weaker than this step does (a send or a payment needs its own approval).",
+                ));
+            }
+            guarding.insert(approve);
+        }
+        for (index, step) in self.steps.iter().enumerate() {
+            if matches!(step, Step::Approve { .. }) && !guarding.contains(&index) {
+                return Err(format!(
+                    "Step {} (approve): it guards no step that changes things.",
+                    index + 1
+                ));
+            }
+        }
+        // A default may not be a credential: not a card, a key or a token (checked by
+        // `bind_params`) and, for a value that gets typed, not a short numeric code.
+        let typed = self.typed_params();
+        for param in &self.params {
+            if typed.contains(param.name.as_str()) && param.default.is_some() {
+                return Err(format!(
+                    "`{}` is typed into a page, so it has no default: the caller gives every typed value.",
+                    param.name
+                ));
+            }
+            let default = param.default.as_ref().and_then(Value::as_str);
+            if typed.contains(param.name.as_str()) && default.is_some_and(risk::otp_like) {
+                return Err(format!(
+                    "The default of `{}` looks like a one-time code; recipes never carry one.",
+                    param.name
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The parameters whose value is typed or selected into a page.
+    pub fn typed_params(&self) -> BTreeSet<&str> {
+        let mut out = BTreeSet::new();
+        let mut take = |value: &'_ str| {
+            for name in placeholders(value) {
+                if let Some(param) = self.params.iter().find(|p| p.name == name) {
+                    out.insert(param.name.as_str());
+                }
+            }
+        };
+        for step in &self.steps {
+            match step {
+                Step::Type { value, .. } => take(value),
+                Step::Select { values, .. } => values.iter().for_each(|v| take(v)),
+                Step::Fill { fields, .. } => fields.iter().for_each(|f| take(&f.value)),
+                _ => {}
+            }
+        }
+        out
     }
 
     fn validate_step(&self, step: &Step, names: &BTreeSet<&str>) -> Result<(), String> {
@@ -822,6 +1322,70 @@ impl Recipe {
                     return Err("Phase 1 clicks only a link or a tab, found by role.".into());
                 }
             }
+            Step::Act { target, expect } | Step::Send { target, expect, .. } => {
+                acting_target(target)?;
+                if expect.is_empty() {
+                    return Err("A step that changes things needs an assertion.".into());
+                }
+            }
+            Step::Type {
+                target,
+                value,
+                expect,
+            } => {
+                acting_target(target)?;
+                typed_target(target)?;
+                single_param(value)?;
+                if expect.is_empty() {
+                    return Err("A step that changes things needs an assertion.".into());
+                }
+            }
+            Step::Select {
+                target,
+                values,
+                expect,
+            } => {
+                acting_target(target)?;
+                typed_target(target)?;
+                if values.is_empty() || values.len() > MAX_SELECT_VALUES {
+                    return Err(format!("Select 1 to {MAX_SELECT_VALUES} values."));
+                }
+                values.iter().try_for_each(|v| single_param(v))?;
+                if expect.is_empty() {
+                    return Err("A step that changes things needs an assertion.".into());
+                }
+            }
+            Step::Fill { fields, expect } => {
+                if fields.is_empty() || fields.len() > MAX_FORM_FIELDS {
+                    return Err(format!("A fill step has 1 to {MAX_FORM_FIELDS} fields."));
+                }
+                for field in fields {
+                    acting_target(&field.target)?;
+                    typed_target(&field.target)?;
+                    if field.kind.is_toggle() {
+                        if !matches!(field.value.as_str(), "true" | "false") {
+                            return Err("A checkbox or radio field is `true` or `false`.".into());
+                        }
+                    } else {
+                        single_param(&field.value)?;
+                    }
+                }
+                if expect.is_empty() {
+                    return Err("A step that changes things needs an assertion.".into());
+                }
+            }
+            Step::Press { key, expect } => {
+                if !PRESS_KEYS.contains(&key.as_str()) {
+                    return Err(format!(
+                        "A press step uses one of {} (the scroll keys have their own step).",
+                        PRESS_KEYS.join(", ")
+                    ));
+                }
+                if expect.is_empty() {
+                    return Err("A step that changes things needs an assertion.".into());
+                }
+            }
+            Step::Approve { .. } => {}
             Step::Wait {
                 text,
                 text_gone,
@@ -932,6 +1496,39 @@ impl Recipe {
     pub fn new_id() -> String {
         format!("rcp_{:08x}", rand::random::<u32>())
     }
+}
+
+/// For every step, the `approve` step that guards it (acting steps only).
+///
+/// * An `approve` of kind `other` guards the plain writes after it (types, fills, selects, clicks
+///   that only write) until something else comes: a step that sends or pays, another `approve`,
+///   or a page change (`open`, `click`), because the card showed those writes on one page.
+/// * An `approve` of any other kind guards exactly the next acting step, on the same page.
+///
+/// The recorder writes recipes to this rule, `validate` refuses a recipe that breaks it, and the
+/// runner follows it, so a removed or moved `approve` can not go unnoticed.
+pub fn governing(steps: &[Step]) -> Vec<Option<usize>> {
+    let mut out = vec![None; steps.len()];
+    let mut current: Option<(usize, ApproveKind)> = None;
+    for (index, step) in steps.iter().enumerate() {
+        match step {
+            Step::Approve { category } => current = Some((index, *category)),
+            // A page change: the card showed the steps for the page they were written for.
+            Step::Open { .. } | Step::Click { .. } => current = None,
+            step if step.is_acting() => match current {
+                Some((approve, ApproveKind::Other)) if step.risk() == Risk::Write => {
+                    out[index] = Some(approve);
+                }
+                Some((approve, kind)) if kind != ApproveKind::Other => {
+                    out[index] = Some(approve);
+                    current = None;
+                }
+                _ => current = None,
+            },
+            _ => {}
+        }
+    }
+    out
 }
 
 fn write_canonical(value: &Value, out: &mut String) {
