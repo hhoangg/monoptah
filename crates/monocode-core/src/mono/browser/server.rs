@@ -10,7 +10,7 @@
 //!
 //! Facts and the residual risk: `docs/superpowers/specs/2026-11-22-browser-all-tabs-research.md`.
 use super::gate::{self, Gate};
-use super::{ServerSpec, TOKEN_ENV};
+use super::{output, ServerSpec, TOKEN_ENV};
 use crate::git_credentials::Secret;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -269,16 +269,29 @@ impl BrowserServers {
 
     /// Stops this Mono's server (its browser was turned off or changed, or the Mono is gone).
     pub fn stop(&self, mono_id: &str) {
-        self.gates
+        let gate = self
+            .gates
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(mono_id);
+        if let Some(gate) = gate {
+            gate.clear_output();
+        }
         let entry = self.lock().remove(mono_id);
         stop_all(entry.map(|e| e.server));
     }
     /// Stops every server (the app quits).
     pub fn stop_everything(&self) {
-        self.gates.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let gates: Vec<Arc<Gate>> = self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, gate)| gate)
+            .collect();
+        for gate in gates {
+            gate.clear_output();
+        }
         let all: Vec<Entry> = self.lock().drain().map(|(_, e)| e).collect();
         stop_all(all.into_iter().map(|e| e.server));
     }
@@ -306,11 +319,21 @@ pub fn servers() -> &'static BrowserServers {
 pub struct NodeBackend;
 impl ServerBackend for NodeBackend {
     fn start(&self, launch: &ServerLaunch) -> Result<Box<dyn RunningServer>, String> {
+        // The server runs in its private output folder; without one it does not start (it would
+        // write page files into whatever directory the app has).
+        let output = launch
+            .spec
+            .output_dir()
+            .ok_or("The browser server has no output folder.")?;
+        output::prepare(&output).map_err(|_| "Could not prepare the browser output folder.")?;
         let mut command = std::process::Command::new(&launch.spec.command);
         command
             .args(&launch.spec.args)
             .env("PATH", launch.search_path)
             .env(TOKEN_ENV, launch.token.as_str())
+            // The server's working directory is its (private) output folder: a relative file name
+            // it is given lands there, never in the app's own working directory.
+            .current_dir(&output)
             // The server exits when its stdin closes: if the app dies, so does the server.
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

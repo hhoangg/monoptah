@@ -30,6 +30,7 @@ fn level_1_allows_only_the_read_tools_and_denies_writes_and_code() {
         let args = match tool {
             "browser_tabs" => json!({"action": "list"}),
             "browser_navigate" => json!({"url": "https://news.example"}),
+            "browser_press_key" => json!({"key": "PageDown"}),
             _ => json!({}),
         };
         assert_eq!(p.evaluate(tool, &args, SHOP), Verdict::Allow, "{tool}");
@@ -48,10 +49,30 @@ fn level_1_allows_only_the_read_tools_and_denies_writes_and_code() {
             "{tool} must not run at Level 1: {verdict:?}"
         );
     }
-    // press_key can submit with Enter: not available, so the wheel scrolls.
-    assert!(
-        denied(&p.evaluate("browser_press_key", &json!({"key": "End"}), SHOP)).contains("Level 1")
-    );
+    // press_key scrolls at Level 1, but only with the scroll keys: Enter, Space, Tab, a letter or
+    // a chord could press a button, submit a form or type.
+    for key in SCROLL_KEYS {
+        assert_eq!(
+            p.evaluate("browser_press_key", &json!({"key": key}), SHOP),
+            Verdict::Allow,
+            "{key}"
+        );
+    }
+    for args in [
+        json!({"key": "Enter"}),
+        json!({"key": " "}),
+        json!({"key": "Space"}),
+        json!({"key": "Tab"}),
+        json!({"key": "a"}),
+        json!({"key": "Control+End"}),
+        json!({"key": "pagedown"}),
+        json!({"key": ""}),
+        json!({}),
+        json!({"key": ["End"]}),
+    ] {
+        let verdict = p.evaluate("browser_press_key", &args, SHOP);
+        assert!(denied(&verdict).contains("Level 1"), "{args}");
+    }
     // Tabs: list, open and switch are reads; closing one is not.
     for action in ["list", "new", "select"] {
         assert_eq!(

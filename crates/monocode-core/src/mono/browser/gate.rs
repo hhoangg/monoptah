@@ -26,9 +26,13 @@
 //! An approval is shown through the app's existing approval card (desktop, web app, phone): the
 //! gate sends an [`Ask`] to the run that is attached ([`Gate::attach`]), the provider loop turns it
 //! into an `Event::Approval` and answers it from the user's decision.
-use super::BrowserTrust;
-use super::{ALWAYS_BLOCKED_TOOLS, CODE_TOOLS, KNOWN_TOOLS, READ_ONLY_TOOLS};
+use super::recipe::{self, record::Trace, runner};
+use super::{
+    is_scroll_key, ALWAYS_BLOCKED_TOOLS, CODE_TOOLS, KNOWN_TOOLS, READ_ONLY_TOOLS, SCROLL_KEYS,
+};
+use super::{output, AuditEntry, BrowserTrust, MonoBrowserStore};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -66,6 +70,8 @@ pub enum Category {
     FinancePage,
     /// A card number typed into a page. Chosen by the gate.
     CardData,
+    /// Saving a browser recipe the Mono recorded. Chosen by the gate.
+    Recipe,
 }
 impl Category {
     /// The values `browser_request_approval` accepts.
@@ -89,6 +95,7 @@ impl Category {
             Self::Code => "Running code",
             Self::FinancePage => "Change on a bank or payment page",
             Self::CardData => "Card number typed into a page",
+            Self::Recipe => "Save a browser recipe",
         }
     }
 }
@@ -117,6 +124,7 @@ impl ApprovalRequest {
             Category::FinancePage => "Allow a change on this bank or payment page?",
             Category::CardData => "Allow typing a card number into this page?",
             Category::Other => "Allow this risky browser action?",
+            Category::Recipe => "Save this browser recipe?",
         }
         .to_owned()
     }
@@ -187,6 +195,17 @@ impl Policy {
             // Closing a tab ends something the user may still need.
             let allowed = READ_ONLY_TOOLS.contains(&tool)
                 && (tool != "browser_tabs" || matches!(action, "list" | "new" | "select"));
+            // `browser_press_key` is the Level 1 way to scroll, for the scroll keys only: Enter or
+            // Space could submit a form or press a focused button.
+            if allowed
+                && tool == "browser_press_key"
+                && !args["key"].as_str().is_some_and(is_scroll_key)
+            {
+                return Verdict::Deny(format!(
+                    "browser_press_key at Level 1 (read only) only accepts the scrolling keys {}. Other keys can press a button or submit a form; tell the user what to do, or that the browser level must be raised.",
+                    SCROLL_KEYS.join(", ")
+                ));
+            }
             return if allowed {
                 Verdict::Allow
             } else {
@@ -198,7 +217,9 @@ impl Policy {
         if CODE_TOOLS.contains(&tool) {
             return self.code(tool, args, page_url);
         }
-        if READ_ONLY_TOOLS.contains(&tool) {
+        // `browser_press_key` is in the read set only for Level 1's scroll keys; at Levels 2 and 3
+        // it can type into a page, so it takes the checks below.
+        if READ_ONLY_TOOLS.contains(&tool) && tool != "browser_press_key" {
             return Verdict::Allow;
         }
         // A tool that changes a page, at Level 2 or 3.
@@ -561,9 +582,31 @@ struct Inner {
     state: Mutex<State>,
     init: Mutex<()>,
     approvers: Mutex<std::collections::HashMap<String, Approver>>,
+    /// Held by a recipe run for all of it, and by an agent call while it is forwarded, so a run is
+    /// never interleaved with agent clicks in the same tab.
+    run: Mutex<()>,
+    /// Where this Mono keeps its recipes and browser files; none until the app sets it.
+    workspace: Mutex<Option<Workspace>>,
+    /// The browser calls of each route (app session) since its last saved recipe, in memory only.
+    traces: Mutex<std::collections::HashMap<String, Trace>>,
+    calls: AtomicU64,
     generation: AtomicU64,
     next_id: AtomicU64,
     timeout: Duration,
+}
+
+/// What the gate needs to keep recipes and to confine the files Playwright writes. Without it
+/// (tests, the connection test) the gate offers no recipe tools and leaves `filename` alone.
+#[derive(Clone, Debug)]
+pub struct Workspace {
+    pub mono_id: String,
+    /// Playwright's output folder: private, swept, the only place `filename` may point to.
+    pub output_dir: PathBuf,
+    /// Recipe files. Outside the output folder, so a sweep never touches them.
+    pub recipes_dir: PathBuf,
+    /// The store database (approved hashes, audit log).
+    pub database: PathBuf,
+    pub recipe_options: runner::Options,
 }
 
 /// One Mono's gate: its loopback server and its policy.
@@ -605,6 +648,10 @@ impl Gate {
             }),
             init: Mutex::new(()),
             approvers: Mutex::new(Default::default()),
+            run: Mutex::new(()),
+            workspace: Mutex::new(None),
+            traces: Mutex::new(Default::default()),
+            calls: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             next_id: AtomicU64::new(100),
             timeout,
@@ -638,6 +685,25 @@ impl Gate {
     /// The URL of the route used by callers that have no session.
     pub fn url(&self) -> String {
         self.url_for(&self.route_for(None))
+    }
+
+    /// Tells the gate where this Mono keeps its recipes and browser files. Turns the recipe tools
+    /// on and confines `filename` arguments to the output folder.
+    pub fn set_workspace(&self, workspace: Workspace) {
+        let _ = output::prepare(&workspace.output_dir);
+        output::sweep(&workspace.output_dir);
+        *self
+            .inner
+            .workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(workspace);
+    }
+
+    /// Removes the browser files of this Mono (its server stopped): they are page content.
+    pub fn clear_output(&self) {
+        if let Some(workspace) = self.inner.workspace() {
+            output::clear(&workspace.output_dir);
+        }
     }
 
     /// Applies a new policy to the calls that follow, keeping the server.
@@ -778,30 +844,87 @@ impl Inner {
         if policy.trust != BrowserTrust::ReadOnly {
             tools.push(approval_tool_definition());
         }
+        if self.workspace().is_some() {
+            tools.extend(recipe::tools::definitions(policy.trust));
+        }
         Ok(tools)
     }
 
-    fn call_tool(&self, route: &str, name: &str, args: Value) -> Value {
+    fn workspace(&self) -> Option<Workspace> {
+        self.workspace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The policy's decision for one call, asking the user when it says so. `Err` is the reply
+    /// to give the caller instead of running the call.
+    fn authorize(&self, route: &str, name: &str, args: &Value) -> Result<Authorized, Value> {
         let (policy, page_url) = {
             let state = self.lock_state();
             (state.policy.clone(), state.page.clone())
         };
-        match policy.evaluate(name, &args, &page_url) {
-            Verdict::Deny(reason) => return tool_text(reason, true),
+        match policy.evaluate(name, args, &page_url) {
+            Verdict::Deny(reason) => return Err(tool_text(reason, true)),
             Verdict::Ask(request) => {
-                if let Err(reason) = self.ask(route, request) {
-                    return tool_text(reason, true);
-                }
+                self.ask(route, request)
+                    .map_err(|reason| tool_text(reason, true))?;
                 // The wait can be long: the user may have lowered the level meanwhile.
                 let now = self.lock_state().policy.clone();
-                if let Verdict::Deny(reason) = now.evaluate(name, &args, &page_url) {
-                    return tool_text(reason, true);
+                if let Verdict::Deny(reason) = now.evaluate(name, args, &page_url) {
+                    return Err(tool_text(reason, true));
                 }
                 if name == APPROVAL_TOOL {
-                    return tool_text("Approved by the user. You may do this action now.", false);
+                    return Ok(Authorized::Answer(tool_text(
+                        "Approved by the user. You may do this action now.",
+                        false,
+                    )));
                 }
             }
             Verdict::Allow => {}
+        }
+        if name == "browser_press_key" && policy.trust == BrowserTrust::ReadOnly {
+            self.focus_guard()
+                .map_err(|reason| tool_text(reason, true))?;
+        }
+        Ok(Authorized::Forward)
+    }
+
+    /// Level 1 scrolls with keys, and a key moves the value of a focused select, slider, radio,
+    /// listbox or menu. So before the key goes out, the page is probed for the focused element
+    /// (`[active]` in Playwright's snapshot): a form control or widget refuses the key, and so
+    /// does a page whose focus can not be read. A page with nothing focused is fine to scroll.
+    fn focus_guard(&self) -> Result<(), String> {
+        const UNKNOWN: &str = "browser_press_key is refused at Level 1: the focused element of the page could not be read, and a key could change a control. Use browser_mouse_wheel if it is listed, or tell the user.";
+        let probe = self.forward("browser_snapshot", &json!({}));
+        if probe["isError"] == true {
+            return Err(UNKNOWN.into());
+        }
+        let text = result_text(&probe);
+        if !text.contains("```yaml") {
+            return Err(UNKNOWN.into());
+        }
+        let forest = recipe::snapshot::parse(recipe::snapshot::snapshot_body(&text));
+        let focused = recipe::snapshot::all(&forest).into_iter().find(|node| {
+            node.attrs.iter().any(|a| a == "active") && FOCUS_WIDGETS.contains(&node.role.as_str())
+        });
+        match focused {
+            Some(node) => Err(format!(
+                "browser_press_key is refused at Level 1: a {} (\"{}\") has the focus, and a key could change its value or press it. Tell the user, or raise the browser level.",
+                node.role,
+                node.name.chars().take(40).collect::<String>()
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn call_tool(&self, route: &str, name: &str, args: Value) -> Value {
+        if recipe::tools::is_recipe_tool(name) {
+            return self.recipe_tool(route, name, &args);
+        }
+        match self.authorize(route, name, &args) {
+            Err(reply) | Ok(Authorized::Answer(reply)) => return reply,
+            Ok(Authorized::Forward) => {}
         }
         let mut forwarded = args;
         if CODE_TOOLS.contains(&name) {
@@ -809,9 +932,34 @@ impl Inner {
                 map.remove("explanation");
             }
         }
+        let workspace = self.workspace();
+        if let Some(workspace) = &workspace {
+            // A file the Mono names goes into the private output folder, never elsewhere.
+            if let Err(reason) =
+                output::confine_filename(name, &mut forwarded, &workspace.output_dir)
+            {
+                return tool_text(reason, true);
+            }
+            if self.calls.fetch_add(1, Ordering::Relaxed) % 25 == 24 {
+                output::sweep(&workspace.output_dir);
+            }
+        }
+        let page_before = self.lock_state().page.clone();
+        let result = {
+            let _one_at_a_time = self.run.lock().unwrap_or_else(|e| e.into_inner());
+            self.forward(name, &forwarded)
+        };
+        if let Some(workspace) = &workspace {
+            self.trace(route, workspace, name, &forwarded, &page_before, &result);
+        }
+        result
+    }
+
+    /// One call to the Playwright server, after the policy allowed it. Remembers the page.
+    fn forward(&self, name: &str, forwarded: &Value) -> Value {
         // Opening a page makes it this session's page at once, so the next write is checked
         // against it even when the result does not repeat the address.
-        if let Some(target) = opened_address(name, &forwarded) {
+        if let Some(target) = opened_address(name, forwarded) {
             self.lock_state().page = target;
         }
         match self.upstream_rpc("tools/call", json!({"name": name, "arguments": forwarded})) {
@@ -823,6 +971,109 @@ impl Inner {
             }
             Err(error) => tool_text(format!("The browser is not available: {error}"), true),
         }
+    }
+
+    /// Adds an agent call to its route's trace (in memory; see `recipe::record`).
+    fn trace(
+        &self,
+        route: &str,
+        workspace: &Workspace,
+        name: &str,
+        args: &Value,
+        page_before: &str,
+        result: &Value,
+    ) {
+        let text = result_text(result);
+        let ok = result["isError"] != true;
+        let page_after = self.lock_state().page.clone();
+        let mut traces = self.traces.lock().unwrap_or_else(|e| e.into_inner());
+        let trace = traces.entry(route.to_owned()).or_default();
+        if ok {
+            // A saved snapshot (`- [Snapshot](page-1.yml)`) is read from the private output folder.
+            let saved = output::linked_file(&text, &workspace.output_dir)
+                .filter(|path| path.metadata().is_ok_and(|m| m.len() < 4_000_000))
+                .and_then(|path| std::fs::read_to_string(path).ok());
+            trace.learn(saved.as_deref().unwrap_or(&text));
+        }
+        trace.note(name, args, page_before, &page_after, ok);
+    }
+
+    fn audit(&self, route: &str, workspace: &Workspace, tool: &str, url: &str, summary: &str) {
+        let session_id = self
+            .lock_state()
+            .routes
+            .iter()
+            .find(|(_, r)| r.as_str() == route)
+            .and_then(|(session, _)| *session)
+            .unwrap_or(0);
+        let entry = AuditEntry {
+            ts_ms: crate::time::now_ms(),
+            session_id,
+            tool: tool.to_owned(),
+            url: audit_url(url),
+            summary: summary.chars().take(200).collect(),
+        };
+        let _ = MonoBrowserStore::at(workspace.database.clone()).record(&workspace.mono_id, &entry);
+    }
+
+    /// A `recipe_*` tool call. The browser-using ones (`run`, `record`) hold the run lock.
+    fn recipe_tool(&self, route: &str, name: &str, args: &Value) -> Value {
+        let Some(workspace) = self.workspace() else {
+            return tool_text("Recipes are not available here.", true);
+        };
+        let trust = self.lock_state().policy.trust;
+        if !recipe::tools::offered(name, trust) {
+            return tool_text(
+                format!(
+                    "{name} is not available at this browser level (Level {}).",
+                    trust.level()
+                ),
+                true,
+            );
+        }
+        let uses_browser = matches!(name, recipe::tools::RUN | recipe::tools::RECORD);
+        let _one_at_a_time =
+            uses_browser.then(|| self.run.lock().unwrap_or_else(|e| e.into_inner()));
+        let store = recipe::store::RecipeStore::new(workspace.recipes_dir.clone());
+        let approvals = MonoBrowserStore::at(workspace.database.clone());
+        let trace = self
+            .traces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route)
+            .cloned()
+            .unwrap_or_default();
+        let host = GateHost {
+            inner: self,
+            route,
+            workspace: &workspace,
+        };
+        let ask = |request: ApprovalRequest| self.ask(route, request);
+        let context = recipe::tools::Context {
+            mono_id: &workspace.mono_id,
+            store: &store,
+            approvals: Some(&approvals),
+            host: &host,
+            ask: &ask,
+            trace: &trace,
+            options: workspace.recipe_options.clone(),
+        };
+        let reply = recipe::tools::call(name, args, &context);
+        if uses_browser {
+            // A run reads many snapshots: sweep at the end of each one.
+            output::sweep(&workspace.output_dir);
+        }
+        if name == recipe::tools::RECORD && !reply.is_error {
+            if let Some(trace) = self
+                .traces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(route)
+            {
+                trace.clear();
+            }
+        }
+        tool_text(reply.text, reply.is_error)
     }
 
     /// Shows the card and waits. Everything but an explicit Allow is an error text for the agent.
@@ -986,6 +1237,100 @@ fn approval_tool_definition() -> Value {
             "required": ["category", "action"],
         },
     })
+}
+
+/// What the audit log keeps of a page address: origin and path, never the query or fragment
+/// (they can carry tokens). An address that does not parse is not logged.
+fn audit_url(url: &str) -> String {
+    url::Url::parse(url)
+        .map(|u| format!("{}{}", u.origin().ascii_serialization(), u.path()))
+        .unwrap_or_default()
+        .chars()
+        .take(300)
+        .collect()
+}
+
+/// Roles that react to the scroll keys (or to a press) when they have the focus.
+const FOCUS_WIDGETS: [&str; 22] = [
+    "textbox",
+    "searchbox",
+    "combobox",
+    "listbox",
+    "option",
+    "slider",
+    "spinbutton",
+    "radio",
+    "radiogroup",
+    "checkbox",
+    "switch",
+    "menu",
+    "menubar",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "tab",
+    "tablist",
+    "button",
+    "tree",
+    "treeitem",
+    "grid",
+];
+
+enum Authorized {
+    /// Run the call.
+    Forward,
+    /// The answer is already known (an approved `browser_request_approval`).
+    Answer(Value),
+}
+
+/// The text parts of a tool result, joined.
+fn result_text(result: &Value) -> String {
+    result["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A recipe run's way to the browser: every step passes the same policy as an agent call, and
+/// asks the user where the policy says so.
+struct GateHost<'a> {
+    inner: &'a Inner,
+    route: &'a str,
+    workspace: &'a Workspace,
+}
+impl runner::Host for GateHost<'_> {
+    fn call(&self, tool: &str, args: Value) -> Result<runner::ToolOutput, String> {
+        let result = match self.inner.authorize(self.route, tool, &args) {
+            Err(reply) => return Err(result_text(&reply)),
+            Ok(Authorized::Answer(reply)) => reply,
+            Ok(Authorized::Forward) => self.inner.forward(tool, &args),
+        };
+        Ok(runner::ToolOutput {
+            text: result_text(&result),
+            is_error: result["isError"] == true,
+        })
+    }
+    fn page_url(&self) -> String {
+        self.inner.lock_state().page.clone()
+    }
+    fn trust(&self) -> BrowserTrust {
+        self.inner.lock_state().policy.trust
+    }
+    fn blocked_origins(&self) -> Vec<String> {
+        self.inner.lock_state().policy.blocked_origins.clone()
+    }
+    fn pause(&self, duration: Duration) {
+        if !duration.is_zero() {
+            std::thread::sleep(duration);
+        }
+    }
+    fn audit(&self, tool: &str, url: &str, summary: &str) {
+        self.inner
+            .audit(self.route, self.workspace, tool, url, summary);
+    }
 }
 
 #[cfg(test)]
