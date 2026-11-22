@@ -278,11 +278,10 @@ fn no_allowed_flag_without_allowed_origins_and_npx_is_resolved_when_known() {
     assert!(spec.args.iter().any(|a| a == "--blocked-origins"));
 }
 
-const WRITE_TOOLS: [&str; 17] = [
+const WRITE_TOOLS: [&str; 16] = [
     "browser_click",
     "browser_type",
     "browser_fill_form",
-    "browser_press_key",
     "browser_select_option",
     "browser_drag",
     "browser_drop",
@@ -334,9 +333,10 @@ fn level_1_disables_every_tool_but_the_read_ones_for_both_harnesses() {
     {
         assert!(disabled.contains(&(*tool).to_owned()), "{tool} must be off");
     }
-    // Scrolling goes through the wheel; press_key can submit with Enter, so it is off.
+    // Scrolling goes through press_key (the gate accepts only the scroll keys at Level 1) and the
+    // wheel when the server has it.
     assert!(!disabled.contains(&"browser_mouse_wheel".to_owned()));
-    assert!(disabled.contains(&"browser_press_key".to_owned()));
+    assert!(!disabled.contains(&"browser_press_key".to_owned()));
     assert_eq!(disabled.len(), KNOWN_TOOLS.len() - READ_ONLY_TOOLS.len());
     // Codex gets the same list.
     let codex = r
@@ -496,12 +496,13 @@ fn the_prompt_block_carries_the_safety_rules_only_when_the_browser_is_active() {
     }
     assert!(!rules.contains("Stay inside these origins"));
     assert!(!rules.contains("Level 1") && !rules.contains("Level 3"));
-    // Level 1 is read only: no click, no key press, scrolls by wheel, asks for nothing.
+    // Level 1 is read only: no click, only scroll keys, asks for nothing.
     let level_1 = prompt_block(&at(BrowserTrust::ReadOnly));
     assert!(level_1.contains("Level 1, read only"));
-    assert!(level_1.contains("cannot click, type, fill forms, press keys or run code"));
+    assert!(level_1.contains("cannot click, type, fill forms, press other keys or run code"));
+    assert!(level_1.contains("`browser_press_key` (the only keys it accepts at this level"));
     assert!(level_1.contains("`browser_mouse_wheel`"));
-    assert!(!level_1.contains("PageDown") && !level_1.contains("browser_request_approval"));
+    assert!(!level_1.contains("browser_request_approval"));
     assert!(level_1.contains("Never resize the viewport"));
     // Level 3 may send and post, and asks only for money and risky code.
     let level_3 = prompt_block(&at(BrowserTrust::Autonomous));
