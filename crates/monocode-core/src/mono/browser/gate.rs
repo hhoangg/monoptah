@@ -100,6 +100,23 @@ impl Category {
     }
 }
 
+/// Whether an action of `category` needs the user's approval at `trust`. This is the one rule
+/// behind the Mono's rules text (see `prompt_block`) and behind recipes: Level 1 can not act at
+/// all (the policy denies the tool, so there is nothing to approve), Level 2 asks for money,
+/// sending, posting, other risky actions and code, Level 3 only for money and code. Gate-chosen
+/// categories (a finance page, a card number) always ask. A recipe that saves itself never asks
+/// through this function.
+pub fn approval_required(trust: BrowserTrust, category: Category) -> bool {
+    match trust {
+        BrowserTrust::ReadOnly => false,
+        BrowserTrust::AskRisky => !matches!(category, Category::Recipe),
+        BrowserTrust::Autonomous => matches!(
+            category,
+            Category::Payment | Category::Code | Category::FinancePage | Category::CardData
+        ),
+    }
+}
+
 /// One approval the user is asked for. Everything the user needs to decide is in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalRequest {
@@ -454,20 +471,46 @@ pub fn contains_card_number(args: &Value) -> bool {
     }
     let mut texts = Vec::new();
     strings(args, &mut texts);
-    texts.into_iter().any(|text| {
-        let mut run = String::new();
-        let mut found = false;
-        for c in text.chars().chain(std::iter::once('\n')) {
-            if c.is_ascii_digit() {
-                run.push(c);
-            } else if matches!(c, ' ' | '-') && !run.is_empty() {
-                // Separators inside a number do not end the run.
-            } else {
-                found |= (13..=19).contains(&run.len()) && luhn(&run);
-                run.clear();
-            }
+    texts.into_iter().any(digits_hold_card)
+}
+
+/// The value of a decimal digit written in ASCII, full width or another common script.
+fn digit_value(c: char) -> Option<char> {
+    let base = match c as u32 {
+        0x30..=0x39 => 0x30,
+        0xFF10..=0xFF19 => 0xFF10,
+        0x0660..=0x0669 => 0x0660,
+        0x06F0..=0x06F9 => 0x06F0,
+        0x0966..=0x096F => 0x0966,
+        _ => return None,
+    };
+    char::from_digit(c as u32 - base, 10)
+}
+
+/// Whether a text has a run of 13 to 19 digits that passes Luhn. Digits are normalized (full
+/// width and other scripts count), and any character that is not a letter or a digit (spaces of
+/// every kind, dots, slashes, dashes) is a separator inside a number.
+pub fn digits_hold_card(text: &str) -> bool {
+    let mut run = String::new();
+    let mut found = false;
+    for c in text.chars() {
+        if let Some(digit) = digit_value(c) {
+            run.push(digit);
+        } else if !c.is_alphanumeric() && !run.is_empty() {
+            // A separator inside a number does not end the run.
+        } else {
+            found |= window_is_card(&run);
+            run.clear();
         }
-        found
+    }
+    found | window_is_card(&run)
+}
+
+/// Whether any stretch of 13 to 19 digits inside a run passes Luhn: a card number can sit inside
+/// a longer run of digits (an order number glued to it).
+fn window_is_card(run: &str) -> bool {
+    (13..=19).any(|len| {
+        run.len() >= len && (0..=run.len() - len).any(|start| luhn(&run[start..start + len]))
     })
 }
 fn luhn(digits: &str) -> bool {
@@ -926,7 +969,16 @@ impl Inner {
             return self.recipe_tool(route, name, &args);
         }
         match self.authorize(route, name, &args) {
-            Err(reply) | Ok(Authorized::Answer(reply)) => return reply,
+            Err(reply) => return reply,
+            Ok(Authorized::Answer(reply)) => {
+                // An approval the Mono asked for is part of the task it did: a recording keeps
+                // its category (never its text) to make the step it guards ask at least as much.
+                if let Some(workspace) = self.workspace() {
+                    let page = self.lock_state().page.clone();
+                    self.trace(route, &workspace, name, &args, &page, &reply);
+                }
+                return reply;
+            }
             Ok(Authorized::Forward) => {}
         }
         let mut forwarded = args;

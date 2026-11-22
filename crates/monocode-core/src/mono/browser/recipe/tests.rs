@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod phase3;
+
 const SITE: &str = "https://news.example";
 const HOME: &str = "https://news.example/";
 const ARCHIVE: &str = "https://news.example/archive";
@@ -546,8 +548,10 @@ fn a_recipe_round_trips_and_its_hash_ignores_stats_but_not_content() {
     edited.description = "Read other stories".into();
     assert_ne!(edited.content_hash(), recipe.content_hash());
     assert!(recipe.content_hash().starts_with("sha256:"));
-    // Only the "read" risk exists, so a file can not claim another.
-    assert!(serde_json::from_str::<Recipe>(&text.replace("\"read\"", "\"write\"")).is_err());
+    // A file can claim another risk, but the risk is computed from the steps: it does not validate.
+    let claimed = serde_json::from_str::<Recipe>(&text.replace("\"read\"", "\"write\"")).unwrap();
+    assert!(claimed.validate().is_err());
+    assert!(serde_json::from_str::<Recipe>(&text.replace("\"read\"", "\"safe\"")).is_err());
 }
 
 #[test]
@@ -1086,6 +1090,12 @@ fn trust_levels_and_blocked_origins_decide_what_a_recipe_may_do() {
 // ---- The gate runs recipes ----
 
 fn approved_recipe(rig: &Rig, recipe: &Recipe) {
+    if recipe.stats.verified {
+        // A full run on this exact content is remembered in the database, not in the file.
+        rig.approvals()
+            .mark_verified(MONO, &recipe.id, &recipe.content_hash())
+            .unwrap();
+    }
     rig.store().save(recipe).unwrap();
     rig.approvals()
         .approve_recipe(MONO, &recipe.id, &recipe.content_hash())
@@ -1446,7 +1456,7 @@ fn the_confirm_card_shows_the_steps_and_a_no_saves_nothing() {
 }
 
 #[test]
-fn a_task_that_typed_or_clicked_a_button_or_ran_code_is_not_recorded() {
+fn a_task_that_typed_a_literal_ran_code_or_uploaded_is_not_recorded() {
     for (tool, args) in [
         (
             "browser_type",
@@ -1457,14 +1467,10 @@ fn a_task_that_typed_or_clicked_a_button_or_ran_code_is_not_recorded() {
             json!({"fields": [{"name": "q", "type": "textbox", "value": "typed-by-the-mono"}]}),
         ),
         (
-            "browser_click",
-            json!({"target": "e6", "element": "Subscribe"}),
-        ),
-        ("browser_press_key", json!({"key": "Enter"})),
-        (
             "browser_evaluate",
             json!({"function": "() => 1", "explanation": "x"}),
         ),
+        ("browser_file_upload", json!({"paths": ["/tmp/x"]})),
     ] {
         let rig = Rig::new(BrowserTrust::AskRisky);
         assert_eq!(

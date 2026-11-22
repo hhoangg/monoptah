@@ -8,11 +8,13 @@
 //! * [`runner`]: replays a recipe through the gate's policy, locates elements with scoped probes
 //!   and returns a compact result.
 //! * [`repair`]: self-healing of one failed step with a validated patch, versions and rollback.
+//! * [`risk`]: what a step can do (read, write, send, money), and the credentials a recipe never types.
 //! * [`record`]: keeps a trace of the Mono's browser calls and compiles a recipe from it.
 //! * [`tools`]: the `recipe_*` tools the gate offers.
 pub mod model;
 pub mod record;
 pub mod repair;
+pub mod risk;
 pub mod runner;
 pub mod snapshot;
 pub mod store;

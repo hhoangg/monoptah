@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS mono_browser_recipe_approvals(
   PRIMARY KEY(mono_id, recipe_id));
 CREATE TABLE IF NOT EXISTS mono_browser_recipe_hashes(
   mono_id TEXT NOT NULL, recipe_id TEXT NOT NULL, hash TEXT NOT NULL, approved_at INTEGER NOT NULL,
+  PRIMARY KEY(mono_id, recipe_id, hash));
+CREATE TABLE IF NOT EXISTS mono_browser_recipe_verified(
+  mono_id TEXT NOT NULL, recipe_id TEXT NOT NULL, hash TEXT NOT NULL, at INTEGER NOT NULL,
   PRIMARY KEY(mono_id, recipe_id, hash));";
 /// Past versions kept per recipe.
 pub const KEEP_VERSIONS: usize = 20;
@@ -64,6 +67,35 @@ impl MonoBrowserStore {
         .flatten()
         .is_some()
     }
+    /// Records that a full run of exactly this content passed on the live page. Kept here, not in
+    /// the recipe file: a recipe that changes things asks the user on its first run, and a file
+    /// edit (or its stats) must not be able to skip that. Never rebuilt from files.
+    pub fn mark_verified(&self, mono_id: &str, recipe_id: &str, hash: &str) -> Result<(), String> {
+        Self::valid_id(mono_id)?;
+        let conn = self.open()?.ok_or(UNAVAILABLE)?;
+        conn.execute_batch(RECIPE_TABLES).map_err(|_| UNAVAILABLE)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO mono_browser_recipe_verified(mono_id,recipe_id,hash,at) VALUES(?1,?2,?3,?4)",
+            params![mono_id, recipe_id, hash, crate::time::now_ms() as i64],
+        )
+        .map(|_| ())
+        .map_err(|_| UNAVAILABLE.into())
+    }
+    /// Whether a full run of exactly this content passed.
+    pub fn is_verified(&self, mono_id: &str, recipe_id: &str, hash: &str) -> bool {
+        let Ok(Some(conn)) = self.open() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT 1 FROM mono_browser_recipe_verified WHERE mono_id=?1 AND recipe_id=?2 AND hash=?3",
+            params![mono_id, recipe_id, hash],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    }
     /// The hash the user approved for a recipe, if any.
     pub fn approved_hash(&self, mono_id: &str, recipe_id: &str) -> Option<String> {
         let Ok(Some(conn)) = self.open() else {
@@ -91,6 +123,7 @@ impl MonoBrowserStore {
         for sql in [
             "DELETE FROM mono_browser_recipe_approvals WHERE mono_id=?1 AND recipe_id=?2",
             "DELETE FROM mono_browser_recipe_hashes WHERE mono_id=?1 AND recipe_id=?2",
+            "DELETE FROM mono_browser_recipe_verified WHERE mono_id=?1 AND recipe_id=?2",
         ] {
             match conn.execute(sql, params![mono_id, recipe_id]) {
                 Ok(_) => {}

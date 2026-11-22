@@ -105,7 +105,7 @@ pub fn definitions(trust: BrowserTrust) -> Vec<Value> {
         out.push(json!({
             "name": RECORD,
             "title": "Save the task you just did as a recipe",
-            "description": "After you finished a READ-ONLY browsing task the user is likely to repeat (open pages, follow links, read data), call this to save it. Monoptah builds the steps from what you did in this browser (addresses, links, tabs), replays them to check them, then asks the user to confirm. You provide the intent, the parameters and what to extract. A task that typed, clicked a button or ran code can not be recorded. Never include secrets.",
+            "description": "After you finished a browsing task the user is likely to repeat (open pages, follow links, read data, and also type, fill a form, click a button or send), call this to save it. Monoptah builds the steps from what you did in this browser, replays the reading part to check it (it never types or sends during the check), then asks the user to confirm. You provide the intent, the parameters and what to extract. Every value you typed, filled or chose must be given as a parameter with the exact value as its `example` (the whole value, nothing around it): a typed literal is never stored. Passwords, one-time codes, card data and tokens can never be recorded, nor can code, uploads or drag and drop. Never include secrets.",
             "inputSchema": {"type": "object", "properties": {
                 "intent": {"type": "string", "description": "A short slug such as news.top_stories."},
                 "description": {"type": "string", "description": "One line: what the recipe does."},
@@ -113,7 +113,7 @@ pub fn definitions(trust: BrowserTrust) -> Vec<Value> {
                     "name": {"type": "string"},
                     "type": {"type": "string", "enum": ["string", "integer"]},
                     "description": {"type": "string"},
-                    "example": {"type": "string", "description": "The literal you used in this task; it becomes {name}."},
+                    "example": {"type": "string", "description": "The literal you used in this task (a channel name, a message you typed); it becomes {name}. Never a secret."},
                     "default": {},
                 }, "required": ["name"]}},
                 "extract": {"type": "object", "description": "What to read from the final page: optional scope (candidates of role/name locators), each (role of the repeated items), take_last or take_first (an integer or {param}), fields (name to {role, from: name|text|url, nth, regex}), max_chars_per_field, min_items.", "properties": {
@@ -162,6 +162,16 @@ impl Context<'_> {
         self.approvals
             .is_some_and(|store| store.recipe_approved(self.mono_id, recipe))
     }
+    /// Whether this exact content ran fully before. A recipe that only reads needs no such proof;
+    /// one that changes things has it only in the store database, keyed by its hash.
+    fn verified(&self, recipe: &Recipe) -> bool {
+        if !recipe.changes_things() {
+            return recipe.stats.verified;
+        }
+        self.approvals.is_some_and(|store| {
+            store.is_verified(self.mono_id, &recipe.id, &recipe.content_hash())
+        })
+    }
     fn summary(&self, recipe: &Recipe) -> Value {
         let level = self.host.trust().level();
         json!({
@@ -171,7 +181,9 @@ impl Context<'_> {
             "description": recipe.description,
             "version": recipe.version,
             "params": recipe.params.iter().map(param_json).collect::<Vec<_>>(),
-            "risk": "read",
+            "risk": recipe.computed_risk().as_str(),
+            "changes_things": recipe.changes_things(),
+            "verified": self.verified(recipe),
             "status": if self.approved(recipe) { "approved" } else { "draft" },
             "flaky": recipe.stats.flaky,
             "repaired": recipe.stats.repaired,
@@ -363,6 +375,13 @@ fn run(recipe: &Recipe, args: &Value, ctx: &Context) -> Reply {
         options.max_chars = (max as usize).clamp(200, 20_000);
     }
     let max_chars = options.max_chars;
+    // A recipe that changes things asks once more, with the real values, on its first run: it
+    // was never replayed on the live page (the record-time check stops before the first write).
+    if recipe.changes_things() && !ctx.verified(recipe) {
+        if let Err(reason) = ask_first_run(recipe, &given, ctx) {
+            return err(reason);
+        }
+    }
     let outcome = runner::run(ctx.host, recipe, &given, options);
     // A refusal before the first step is not a run of the recipe; do not count it. A sign-in
     // page says nothing about a repair, so it does not count against one.
@@ -370,6 +389,11 @@ fn run(recipe: &Recipe, args: &Value, ctx: &Context) -> Reply {
     if outcome.failure.as_ref().is_none_or(|f| f.step > 0) {
         let blame = outcome.failure.as_ref().is_none_or(|f| !f.needs_login);
         effect = ctx.store.record_run_with(recipe, outcome.ok(), blame);
+    }
+    if outcome.ok() && recipe.changes_things() {
+        if let Some(approvals) = ctx.approvals {
+            let _ = approvals.mark_verified(ctx.mono_id, &recipe.id, &recipe.content_hash());
+        }
     }
     let verdict = if outcome.ok() { "ok" } else { "failed" };
     ctx.host.audit(
@@ -412,6 +436,35 @@ fn run(recipe: &Recipe, args: &Value, ctx: &Context) -> Reply {
         text,
         is_error: !outcome.ok(),
     }
+}
+
+/// The card for the first run of a recipe that changes things: every step that acts, with the
+/// values it will type or send.
+fn ask_first_run(recipe: &Recipe, given: &Map<String, Value>, ctx: &Context) -> Result<(), String> {
+    let values = bind_params(&recipe.params, given)?;
+    let steps: Vec<String> = recipe
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.is_acting())
+        .map(|(i, step)| format!("Step {}: {}", i + 1, step.describe_with(&values)))
+        .collect();
+    let request = ApprovalRequest {
+        category: Category::Other,
+        action: format!(
+            "Run the browser recipe `{}` (v{}) for the first time: it changes things on the site",
+            recipe.intent, recipe.version
+        ),
+        url: recipe.origin.clone(),
+        details: format!(
+            "It has never run on a live page. It will do this ({} risk):\n{}",
+            recipe.computed_risk().as_str(),
+            steps.join("\n")
+        ),
+        code: None,
+        explanation: String::new(),
+    };
+    (ctx.ask)(request).map_err(|reason| format!("The recipe was not run. {reason}"))
 }
 
 /// Two failed runs after a repair: back to the version it came from, and flaky.
@@ -680,8 +733,16 @@ fn repair(args: &Value, ctx: &Context) -> Reply {
             ),
             url: base.origin.clone(),
             details: format!(
-                "The recipe failed and the Mono proposes: {}.\nIt needs your approval because {why}.\nThe recipe would become:\n{}",
+                "The recipe failed and the Mono proposes: {}.\nIt needs your approval because {why}.\n{}\nThe recipe would become:\n{}",
                 applied.summary,
+                if matches!(patch, Patch::ReplaceCandidates { .. }) {
+                    repair::locator_diff(
+                        &pending.working.steps[pending.step],
+                        &applied.recipe.steps[applied.restart],
+                    )
+                } else {
+                    String::new()
+                },
                 record::plain_summary(&applied.recipe)
             ),
             code: None,
@@ -903,6 +964,9 @@ fn record(args: &Value, ctx: &Context) -> Reply {
     }
     let mut options = ctx.options.clone();
     options.verify_candidates = true;
+    // The replay never types, clicks a button or sends: it stops before the first step that
+    // changes something.
+    options.stop_before_acting = recipe.changes_things();
     let outcome = runner::run(ctx.host, &recipe, &given, options);
     if let Some(failure) = &outcome.failure {
         return err(format!(
@@ -910,12 +974,13 @@ fn record(args: &Value, ctx: &Context) -> Reply {
             failure.step, failure.op, failure.reason, failure.expected
         ));
     }
-    if let Err(reason) =
-        record::prune(&mut recipe, &outcome.unique).and_then(|()| recipe.validate())
+    let checked_until = outcome.stopped_before.map_or(usize::MAX, |n| n - 1);
+    if let Err(reason) = record::prune_until(&mut recipe, &outcome.unique, checked_until)
+        .and_then(|()| recipe.validate())
     {
         return err(format!("This task can not be saved as a recipe: {reason}"));
     }
-    recipe.stats.verified = true;
+    recipe.stats.verified = outcome.stopped_before.is_none();
     let request = ApprovalRequest {
         category: Category::Recipe,
         action: format!(
@@ -924,15 +989,24 @@ fn record(args: &Value, ctx: &Context) -> Reply {
         ),
         url: recipe.origin.clone(),
         details: format!(
-            "{}\nParameters: {}\nSteps:\n{}\nThe replay just read {} item(s). It only reads: it opens pages, follows links and reads the fields above, never types or sends. Later runs go through the same level and site rules as the Mono's own browsing.",
+            "{}\nRisk: {}\nParameters: {}\nSteps:\n{}\n{}",
             recipe.description,
+            recipe.computed_risk().as_str(),
             if recipe.params.is_empty() {
                 "none".to_owned()
             } else {
                 recipe.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(", ")
             },
             record::plain_summary(&recipe),
-            outcome.items
+            match outcome.stopped_before {
+                None => format!(
+                    "The replay just read {} item(s). It only reads: it opens pages, follows links and reads the fields above, never types or sends. Later runs go through the same level and site rules as the Mono's own browsing.",
+                    outcome.items
+                ),
+                Some(step) => format!(
+                    "THIS RECIPE CHANGES THINGS on the site (types, clicks buttons, sends). The replay did not do that: it stopped before step {step}, so those steps are not checked yet and the first real run asks you again with the real values. What is typed is always a parameter, never stored here. Every later run asks before each step that changes something at Level 2, and always before a payment; at Level 3 only a payment asks. Approving this saves these steps, as shown."
+                ),
+            }
         ),
         code: None,
         explanation: String::new(),

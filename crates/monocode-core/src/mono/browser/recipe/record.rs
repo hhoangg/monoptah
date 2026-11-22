@@ -1,11 +1,25 @@
 //! Learning: a per-session, in-memory trace of the Mono's browser calls, and the compile pass that
 //! turns a successful read-only trace into a recipe draft.
 //!
-//! Nothing here is stored. The trace keeps no typed value (a `browser_type`, `browser_fill_form`
-//! or `browser_select_option` call is only noted as "changed something") and it is dropped when a
-//! recipe is saved or the gate goes away. The compile pass is deterministic Rust, not a model call:
-//! the Mono (which is the model) names the intent, the parameters and the data to extract, and
-//! this code derives the navigation steps and the locators from what the browser really showed.
+//! Nothing here is stored. The trace is in memory and dropped when a recipe is saved or the gate
+//! goes away. It keeps the text of a typed, filled or selected value in memory only (to find the
+//! parameter that value is an example of), never in `args`, and its `Debug` output hides it. The
+//! compile pass is deterministic Rust, not a model call: the Mono (which is the model) names the
+//! intent, the parameters and the data to extract, and this code derives the navigation steps and
+//! the locators from what the browser really showed.
+//!
+//! Phase 3 records tasks that change things, under rules that refuse rather than guess:
+//!
+//! * every typed, filled or selected value must equal the example of a parameter (the whole
+//!   value, not a part of it), and becomes exactly `{name}`: a literal is never stored;
+//! * a field that takes a password, a code or card data, and a value that looks like a card, a
+//!   key or a token, are never recorded, whatever parameter they match;
+//! * a click on a button (or anything but a link or tab) becomes an `act` step, or a `send` step
+//!   when its name says it sends or posts; its locator holds no parameter value;
+//! * an `approve` step is inserted before every step that changes things, following
+//!   `model::governing`; an approval the Mono made in the trace can only make a step ask more
+//!   (a payment), never less;
+//! * code, uploads, drag and drop, dialogs and coordinate clicks refuse the recording.
 //!
 //! * A link that was only used to navigate becomes an `open` step with its address (measured: 0.45 s
 //!   against 1.4 to 6.3 s for a click through the extension relay).
@@ -16,10 +30,13 @@
 //! * Anything else that changed something (typing, a button, a menu item, code) refuses the
 //!   recording: Phase 1 records read-only work.
 use super::model::{
-    generated_looking, percent_encode, Candidate, Each, Expect, Field, Param, ParamKind, Recipe,
-    Risk, Scope, Stats, Step, Target, NAVIGATION_ROLES, SCHEMA,
+    generated_looking, percent_encode, ApproveKind, Candidate, Each, Expect, Field, FieldKind,
+    FormField, Param, ParamKind, Recipe, Risk, Scope, SendAction, Stats, Step, Target,
+    NAVIGATION_ROLES, PRESS_KEYS, SCHEMA,
 };
+use super::risk;
 use super::snapshot::{self, Node};
+use crate::mono::browser::gate::{is_finance_url, Category};
 use crate::mono::browser::{is_scroll_key, PLAYWRIGHT_MCP_VERSION};
 use regex::Regex;
 use serde::Deserialize;
@@ -30,23 +47,43 @@ use std::collections::{BTreeMap, HashMap};
 pub const MAX_ENTRIES: usize = 120;
 const MAX_REFS: usize = 6000;
 
-/// Tools whose successful call means the page or the user's data was changed or code ran.
-const CHANGING_TOOLS: [&str; 14] = [
-    "browser_type",
-    "browser_fill_form",
-    "browser_select_option",
-    "browser_file_upload",
-    "browser_drag",
-    "browser_drop",
-    "browser_handle_dialog",
-    "browser_evaluate",
-    "browser_run_code_unsafe",
-    "browser_mouse_click_xy",
-    "browser_mouse_drag_xy",
-    "browser_mouse_down",
-    "browser_mouse_up",
-    "browser_request_approval",
+/// Tools that type, fill or select: recorded (Phase 3) when every value is a parameter.
+const WRITING_TOOLS: [&str; 3] = ["browser_type", "browser_fill_form", "browser_select_option"];
+
+/// Tools a recipe can never replay, with what they do (for the refusal). A failed call to one of
+/// them blocks the recording too: it may still have changed something.
+const REFUSED_TOOLS: [(&str, &str); 11] = [
+    (
+        "browser_file_upload",
+        "uploads a file from the user's computer, which a recipe never does",
+    ),
+    ("browser_drag", "drags an element"),
+    ("browser_drop", "drops something on the page"),
+    ("browser_handle_dialog", "answers a dialog"),
+    ("browser_evaluate", "runs code"),
+    ("browser_run_code_unsafe", "runs code"),
+    ("browser_mouse_click_xy", "clicks at a screen position"),
+    ("browser_mouse_drag_xy", "drags at a screen position"),
+    (
+        "browser_mouse_down",
+        "presses the mouse at a screen position",
+    ),
+    (
+        "browser_mouse_up",
+        "releases the mouse at a screen position",
+    ),
+    (
+        "browser_mouse_move_xy",
+        "moves the mouse to a screen position",
+    ),
 ];
+
+fn refused_reason(tool: &str) -> Option<&'static str> {
+    REFUSED_TOOLS
+        .iter()
+        .find(|(name, _)| *name == tool)
+        .map(|(_, why)| *why)
+}
 
 /// What the browser showed for an element the Mono may later click.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +95,37 @@ pub struct NodeInfo {
     pub ancestors: Vec<Scope>,
 }
 
+/// One field of a recorded `browser_fill_form`. Its value is memory only; `Debug` hides it.
+#[derive(Clone)]
+pub struct TypedField {
+    pub node: Option<NodeInfo>,
+    pub kind: String,
+    pub value: String,
+}
+impl std::fmt::Debug for TypedField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TypedField({}, value hidden)", self.kind)
+    }
+}
+
+/// The values a call typed, filled or selected, and the category of an approval the Mono asked
+/// for. Kept in memory so the compile pass can match each value with the parameter it is an
+/// example of; never written anywhere, and never printed by `Debug`.
+#[derive(Clone, Default)]
+pub struct Typed {
+    pub text: Option<String>,
+    /// `browser_type` with `submit`: the text was followed by Enter.
+    pub submit: bool,
+    pub values: Vec<String>,
+    pub fields: Vec<TypedField>,
+    pub category: Option<String>,
+}
+impl std::fmt::Debug for Typed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Typed(values hidden)")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Entry {
     pub tool: String,
@@ -67,6 +135,7 @@ pub struct Entry {
     pub page_after: String,
     pub ok: bool,
     pub node: Option<NodeInfo>,
+    pub typed: Typed,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,14 +229,53 @@ impl Trace {
         page_after: &str,
         ok: bool,
     ) {
-        let node = (tool == "browser_click")
-            .then(|| {
-                args["target"]
-                    .as_str()
-                    .and_then(|t| self.refs.get(t))
-                    .cloned()
-            })
-            .flatten();
+        let lookup = |reference: &Value| reference.as_str().and_then(|t| self.refs.get(t)).cloned();
+        let node = matches!(
+            tool,
+            "browser_click" | "browser_type" | "browser_select_option"
+        )
+        .then(|| lookup(&args["target"]))
+        .flatten();
+        let text_of = |value: &Value| match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Bool(flag) => Some(flag.to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        };
+        let typed = match tool {
+            "browser_type" => Typed {
+                text: text_of(&args["text"]),
+                submit: args["submit"] == true,
+                ..Typed::default()
+            },
+            "browser_select_option" => Typed {
+                values: args["values"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(text_of)
+                    .collect(),
+                ..Typed::default()
+            },
+            "browser_fill_form" => Typed {
+                fields: args["fields"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|field| TypedField {
+                        node: lookup(&field["target"]).or_else(|| lookup(&field["ref"])),
+                        kind: field["type"].as_str().unwrap_or("").to_owned(),
+                        value: text_of(&field["value"]).unwrap_or_default(),
+                    })
+                    .collect(),
+                ..Typed::default()
+            },
+            "browser_request_approval" => Typed {
+                category: args["category"].as_str().map(str::to_owned),
+                ..Typed::default()
+            },
+            _ => Typed::default(),
+        };
         self.entries.push(Entry {
             tool: tool.to_owned(),
             args: keep_args(tool, args),
@@ -175,6 +283,7 @@ impl Trace {
             page_after: page_after.to_owned(),
             ok,
             node,
+            typed,
         });
         if self.entries.len() > MAX_ENTRIES {
             self.entries.remove(0);
@@ -348,6 +457,17 @@ impl Params<'_> {
                     .map(|example| (spec, example))
             })
     }
+    /// The parameter whose example is exactly this value (a typed value is all of an example,
+    /// never a part of one).
+    fn exact(&self, text: &str) -> Option<&ParamSpec> {
+        self.specs
+            .iter()
+            .find(|spec| spec.example.as_deref() == Some(text) && !text.is_empty())
+    }
+    /// Whether a plain text holds the example of a parameter (so the text is not a stable name).
+    fn mentions(&self, text: &str) -> bool {
+        self.found().any(|(_, example)| text.contains(example))
+    }
     /// Writes `{name}` where an example appears, in a plain string.
     fn plain(&self, text: &str) -> String {
         let mut out = text.to_owned();
@@ -439,6 +559,23 @@ pub fn compile(
                     spec.name
                 ));
             }
+            if let Some(what) = risk::secret_value(example) {
+                return Err(format!(
+                    "The example of `{}` looks like {what}; recipes never carry credentials.",
+                    spec.name
+                ));
+            }
+        }
+        if let Some(what) = spec
+            .default
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(risk::secret_value)
+        {
+            return Err(format!(
+                "The default of `{}` looks like {what}; recipes never carry credentials.",
+                spec.name
+            ));
         }
     }
     let params = Params {
@@ -464,6 +601,9 @@ pub fn compile(
         return Err("The task is longer than the trace kept ({MAX_ENTRIES} calls), so its start is lost. Record a shorter task.".replace("{MAX_ENTRIES}", &MAX_ENTRIES.to_string()));
     }
     let examples: Vec<&str> = params.found().map(|(_, example)| example).collect();
+    // The approval the Mono asked for, waiting for the next step that changes something.
+    let mut declared: Option<ApproveKind> = None;
+    let mut upgrades: BTreeMap<usize, ApproveKind> = BTreeMap::new();
     for entry in &trace.entries {
         let tool = entry.tool.as_str();
         let pressed_other =
@@ -473,8 +613,17 @@ pub fn compile(
                 .node
                 .as_ref()
                 .is_none_or(|n| !NAVIGATION_ROLES.contains(&n.role.as_str()));
+        let changes = WRITING_TOOLS.contains(&tool)
+            || refused_reason(tool).is_some()
+            || pressed_other
+            || clicked_other;
         // A call that failed may still have changed something: it blocks the recording too.
-        if !entry.ok && !(CHANGING_TOOLS.contains(&tool) || pressed_other || clicked_other) {
+        if !entry.ok && changes {
+            return Err(format!(
+                "The task used {tool} and the call failed. A failed call may still have changed something, so this task can not be recorded."
+            ));
+        }
+        if !entry.ok {
             continue;
         }
         if matches!(tool, "browser_navigate_back")
@@ -484,28 +633,182 @@ pub fn compile(
                 "The task used {tool}, which moves between pages or tabs in a way a recipe can not replay. Record a task that only opens addresses and follows links."
             ));
         }
-        if CHANGING_TOOLS.contains(&tool) {
+        if let Some(why) = refused_reason(tool) {
             return Err(format!(
-                "The task used {tool}, which changes something or runs code. Phase 1 records read-only tasks only (opening pages, following links, reading)."
+                "The task used {tool}, which {why}. A recipe never does that."
             ));
         }
+        if changes
+            && (is_finance_url(&entry.page_before, &[]) || is_finance_url(&entry.page_after, &[]))
+        {
+            return Err("The task changed something on a bank, wallet or payment page. Recipes are not recorded there.".into());
+        }
+        // A step that changes something takes the approval the Mono asked for (as a floor).
+        let mut push_acting = |step: Step, steps: &mut Vec<Step>| {
+            // The approval belongs to the click or key that does the thing, not to the typing
+            // before it.
+            if matches!(
+                step,
+                Step::Act { .. } | Step::Send { .. } | Step::Press { .. }
+            ) {
+                if let Some(kind) = declared.take() {
+                    upgrades.insert(steps.len(), kind);
+                }
+            }
+            steps.push(step);
+        };
         match tool {
+            "browser_request_approval" => {
+                declared = entry
+                    .typed
+                    .category
+                    .as_deref()
+                    .and_then(Category::parse)
+                    .map(ApproveKind::from_category);
+            }
+            "browser_type" => {
+                let node = entry.node.as_ref().ok_or(
+                    "A field the task typed into could not be matched to an element of a snapshot, so it can not be recorded.",
+                )?;
+                let text = entry.typed.text.as_deref().unwrap_or("");
+                let spec = typed_param(&params, text, node)?;
+                check_typed(
+                    node,
+                    text,
+                    &["textbox", "searchbox", "combobox", "spinbutton"],
+                )?;
+                let step = Step::Type {
+                    target: acting_target(node, &params, true)?,
+                    value: format!("{{{}}}", spec.name),
+                    expect: field_expect(node, &params),
+                };
+                push_acting(step, &mut steps);
+                if entry.typed.submit {
+                    let origin = origin
+                        .clone()
+                        .ok_or("The task typed before it opened a page.")?;
+                    let step = Step::Press {
+                        key: "Enter".into(),
+                        expect: vec![Expect::UrlMatches(format!("^{}", regex::escape(&origin)))],
+                    };
+                    push_acting(step, &mut steps);
+                }
+            }
+            "browser_select_option" => {
+                let node = entry.node.as_ref().ok_or(
+                    "A menu the task chose from could not be matched to an element of a snapshot, so it can not be recorded.",
+                )?;
+                if entry.typed.values.is_empty() {
+                    return Err("A selection in the trace has no values.".into());
+                }
+                let mut values = Vec::new();
+                for value in &entry.typed.values {
+                    let spec = typed_param(&params, value, node)?;
+                    check_typed(node, value, &["combobox", "listbox"])?;
+                    values.push(format!("{{{}}}", spec.name));
+                }
+                let step = Step::Select {
+                    target: acting_target(node, &params, true)?,
+                    values,
+                    expect: field_expect(node, &params),
+                };
+                push_acting(step, &mut steps);
+            }
+            "browser_fill_form" => {
+                if entry.typed.fields.is_empty() {
+                    return Err("A form fill in the trace has no fields.".into());
+                }
+                let mut fields = Vec::new();
+                let mut first: Option<&NodeInfo> = None;
+                for field in &entry.typed.fields {
+                    let node = field.node.as_ref().ok_or(
+                        "A form field the task filled could not be matched to an element of a snapshot, so it can not be recorded.",
+                    )?;
+                    first.get_or_insert(node);
+                    let kind = match field.kind.as_str() {
+                        "textbox" => FieldKind::Textbox,
+                        "checkbox" => FieldKind::Checkbox,
+                        "radio" => FieldKind::Radio,
+                        "combobox" => FieldKind::Combobox,
+                        "slider" => FieldKind::Slider,
+                        other => {
+                            return Err(format!(
+                                "A form field of type {other:?} can not be recorded."
+                            ))
+                        }
+                    };
+                    let value = if kind.is_toggle() {
+                        if !matches!(field.value.as_str(), "true" | "false") {
+                            return Err(
+                                "A checkbox or radio field in the trace is neither true nor false."
+                                    .into(),
+                            );
+                        }
+                        field.value.clone()
+                    } else {
+                        let spec = typed_param(&params, &field.value, node)?;
+                        let roles: &[&str] = match kind {
+                            FieldKind::Combobox => &["combobox", "listbox"],
+                            FieldKind::Slider => &["slider"],
+                            _ => &["textbox", "searchbox", "spinbutton"],
+                        };
+                        check_typed(node, &field.value, roles)?;
+                        format!("{{{}}}", spec.name)
+                    };
+                    fields.push(FormField {
+                        target: acting_target(node, &params, true)?,
+                        kind,
+                        value,
+                    });
+                }
+                let step = Step::Fill {
+                    fields,
+                    expect: first.map(|n| field_expect(n, &params)).unwrap_or_default(),
+                };
+                push_acting(step, &mut steps);
+            }
             "browser_navigate" => {
                 let url = clean_url_with(entry.args["url"].as_str().unwrap_or(""), &examples)?;
                 set_origin(&url, &mut origin)?;
                 saw_navigate = true;
+                declared = None;
                 steps.push(open_step(&url, &params));
             }
             "browser_click" => {
                 let node = entry.node.as_ref().ok_or(
                     "A click in the trace could not be matched to an element of a snapshot, so it can not be recorded.",
                 )?;
+                let after = url::Url::parse(&entry.page_after)
+                    .ok()
+                    .filter(|_| entry.page_after != entry.page_before && origin.is_some());
+                let expect = match &after {
+                    Some(after) => vec![Expect::UrlMatches(same_origin_pattern(after, &params))],
+                    None => vec![Expect::RolePresent {
+                        role: node.role.clone(),
+                        name: Some(node.name.clone())
+                            .filter(|n| !params.mentions(n) && !n.is_empty()),
+                    }],
+                };
                 if !NAVIGATION_ROLES.contains(&node.role.as_str()) {
-                    return Err(format!(
-                        "The task clicked a {} (\"{}\"). Phase 1 only records links and tabs, because a click on anything else can change something.",
-                        node.role,
-                        node.name.chars().take(60).collect::<String>()
-                    ));
+                    // A button, a checkbox, a menu item: it changes something. A name that says
+                    // it sends or posts makes it a `send` step.
+                    let class = risk::label_class(&node.role, &node.name);
+                    let target = acting_target(node, &params, false)?;
+                    let step = if class.risk == Risk::Send {
+                        Step::Send {
+                            target,
+                            action: if class.category == Category::PostPublish {
+                                SendAction::Post
+                            } else {
+                                SendAction::Send
+                            },
+                            expect,
+                        }
+                    } else {
+                        Step::Act { target, expect }
+                    };
+                    push_acting(step, &mut steps);
+                    continue;
                 }
                 let link = node
                     .url
@@ -557,19 +860,30 @@ pub fn compile(
             }
             "browser_press_key" => {
                 let key = entry.args["key"].as_str().unwrap_or("");
-                if !is_scroll_key(key) {
-                    return Err(format!(
-                        "The task pressed {key:?}. Only the scroll keys can be recorded."
-                    ));
-                }
-                match steps.last_mut() {
-                    Some(Step::Scroll { key: last, times }) if last == key && *times < 20 => {
-                        *times += 1
+                if is_scroll_key(key) {
+                    match steps.last_mut() {
+                        Some(Step::Scroll { key: last, times }) if last == key && *times < 20 => {
+                            *times += 1
+                        }
+                        _ => steps.push(Step::Scroll {
+                            key: key.to_owned(),
+                            times: 1,
+                        }),
                     }
-                    _ => steps.push(Step::Scroll {
+                } else if PRESS_KEYS.contains(&key) {
+                    let origin = origin
+                        .clone()
+                        .ok_or("The task pressed a key before it opened a page.")?;
+                    let step = Step::Press {
                         key: key.to_owned(),
-                        times: 1,
-                    }),
+                        expect: vec![Expect::UrlMatches(format!("^{}", regex::escape(&origin)))],
+                    };
+                    push_acting(step, &mut steps);
+                } else {
+                    return Err(format!(
+                        "The task pressed {key:?}. Only the scroll keys and {} can be recorded.",
+                        PRESS_KEYS.join(", ")
+                    ));
                 }
             }
             _ => {}
@@ -578,6 +892,7 @@ pub fn compile(
     if !saw_navigate {
         return Err("The trace has no page that was opened, so there is nothing to start a recipe from. Open the page, read it, then record.".into());
     }
+    let steps = insert_approvals(steps, &upgrades);
     // An address followed at once by another address is only a stop on the way.
     let mut collapsed: Vec<Step> = Vec::new();
     for step in steps {
@@ -602,6 +917,7 @@ pub fn compile(
         max_chars_per_field: extract.max_chars_per_field,
         expect,
     });
+    let risk = collapsed.iter().map(Step::risk).max().unwrap_or(Risk::Read);
     let recipe = Recipe {
         schema: SCHEMA,
         id: Recipe::new_id(),
@@ -621,7 +937,7 @@ pub fn compile(
             })
             .collect(),
         steps: collapsed,
-        risk: Risk::Read,
+        risk,
         playwright_mcp: PLAYWRIGHT_MCP_VERSION.to_owned(),
         stats: Stats::default(),
     };
@@ -639,6 +955,144 @@ pub fn compile(
     Ok(recipe)
 }
 
+// ---- Steps that change things ----
+
+/// The parameter a typed value is the example of. A value that is not (a literal, or only a part
+/// of an example) refuses the recording: a recipe never stores a typed literal.
+fn typed_param<'a>(
+    params: &'a Params,
+    value: &str,
+    node: &NodeInfo,
+) -> Result<&'a ParamSpec, String> {
+    params.exact(value).ok_or_else(|| {
+        format!(
+            "A value the task typed or chose in the {} \"{}\" is not a parameter. A recipe never stores a typed literal: give the whole value as the `example` of a parameter (and nothing around it), or do not record this task.",
+            node.role,
+            node.name.chars().take(60).collect::<String>()
+        )
+    })
+}
+
+/// A typed value goes only into the kind of field the call says, never into a place for a
+/// credential, and is never a credential.
+fn check_typed(node: &NodeInfo, value: &str, roles: &[&str]) -> Result<(), String> {
+    if !roles.contains(&node.role.as_str()) {
+        return Err(format!(
+            "The task typed into a {} (\"{}\"), which is not a text field of the kind the recipe types into.",
+            node.role,
+            node.name.chars().take(60).collect::<String>()
+        ));
+    }
+    if risk::secret_field(&node.name) {
+        return Err(format!(
+            "The task typed into \"{}\", a field for a password, a code or card data. A recipe never types those.",
+            node.name.chars().take(60).collect::<String>()
+        ));
+    }
+    if let Some(what) = risk::secret_value(value) {
+        return Err(format!(
+            "The task typed {what}. A recipe never types a credential."
+        ));
+    }
+    Ok(())
+}
+
+/// The locator of a step that changes things: role and name, the same scoped by its nearest
+/// named ancestor. It never holds a parameter value. A field (`nameless_ok`) whose name has a
+/// parameter value in it (a box named after the channel) is found by role inside its ancestor
+/// instead, and a locator that matches several elements fails at run time rather than guess.
+fn acting_target(node: &NodeInfo, params: &Params, nameless_ok: bool) -> Result<Target, String> {
+    let name = node.name.trim();
+    let scope = node
+        .ancestors
+        .first()
+        .filter(|s| !params.mentions(&s.name) && !params.mentions(&s.role));
+    let stable = !name.is_empty() && !generated_looking(name);
+    let literal = stable && !params.mentions(name);
+    let mut candidates = Vec::new();
+    if literal {
+        candidates.push(Candidate {
+            role: Some(node.role.clone()),
+            name: Some(name.to_owned()),
+            ..Candidate::default()
+        });
+        if let Some(scope) = scope {
+            candidates.push(Candidate {
+                role: Some(node.role.clone()),
+                name: Some(name.to_owned()),
+                scope: Some(scope.clone()),
+                ..Candidate::default()
+            });
+        }
+    } else if nameless_ok && stable {
+        let Some(scope) = scope else {
+            return Err(format!(
+                "The {} \"{}\" has a parameter value in its name and no named area around it, so a locator for it can not be built safely.",
+                node.role,
+                name.chars().take(60).collect::<String>()
+            ));
+        };
+        candidates.push(Candidate {
+            role: Some(node.role.clone()),
+            scope: Some(scope.clone()),
+            ..Candidate::default()
+        });
+    } else if stable {
+        return Err(format!(
+            "The {} \"{}\" has a parameter value in its name. A value must not choose what gets clicked, so this task can not be recorded.",
+            node.role,
+            name.chars().take(60).collect::<String>()
+        ));
+    } else {
+        return Err(format!(
+            "The {} that was changed has no stable name, so a locator can not be built for it.",
+            node.role
+        ));
+    }
+    Ok(Target { candidates })
+}
+
+/// What must hold after a typed, filled or selected step: the field is still on the page.
+fn field_expect(node: &NodeInfo, params: &Params) -> Vec<Expect> {
+    vec![Expect::RolePresent {
+        role: node.role.clone(),
+        name: Some(node.name.trim().to_owned())
+            .filter(|n| !n.is_empty() && !params.mentions(n) && !generated_looking(n)),
+    }]
+}
+
+/// Writes the `approve` steps (see `model::governing`): one for a run of plain writes, one for each
+/// step that sends, posts or pays. An approval the Mono asked for can make a step ask for a
+/// payment approval, never for less.
+fn insert_approvals(steps: Vec<Step>, upgrades: &BTreeMap<usize, ApproveKind>) -> Vec<Step> {
+    let mut out = Vec::with_capacity(steps.len() + 4);
+    let mut block_open = false;
+    for (index, step) in steps.into_iter().enumerate() {
+        if matches!(step, Step::Open { .. } | Step::Click { .. }) {
+            block_open = false;
+        }
+        if step.is_acting() {
+            let mut kind = ApproveKind::from_category(step.class().category);
+            if upgrades.get(&index) == Some(&ApproveKind::Payment) {
+                kind = ApproveKind::Payment;
+            }
+            if kind == ApproveKind::Other && step.risk() == Risk::Write {
+                if !block_open {
+                    out.push(Step::Approve {
+                        category: ApproveKind::Other,
+                    });
+                    block_open = true;
+                }
+            } else {
+                out.push(Step::Approve { category: kind });
+                block_open = false;
+            }
+        }
+        out.push(step);
+    }
+    out
+}
+
 fn open_step(url: &url::Url, params: &Params) -> Step {
     Step::Open {
         url: params.url(url.as_str()),
@@ -648,7 +1102,20 @@ fn open_step(url: &url::Url, params: &Params) -> Step {
 
 /// Keeps only the candidates the dry run found unique. A step with none left cannot be recorded.
 pub fn prune(recipe: &mut Recipe, unique: &BTreeMap<usize, Vec<usize>>) -> Result<(), String> {
+    prune_until(recipe, unique, usize::MAX)
+}
+
+/// Like [`prune`], for a replay that stopped early: only the steps before index `until` were
+/// probed, the others keep their candidates (the run time check is strict single match anyway).
+pub fn prune_until(
+    recipe: &mut Recipe,
+    unique: &BTreeMap<usize, Vec<usize>>,
+    until: usize,
+) -> Result<(), String> {
     for (index, step) in recipe.steps.iter_mut().enumerate() {
+        if index >= until {
+            break;
+        }
         let target = match step {
             Step::Click { target, .. } => Some(target),
             Step::Extract {
