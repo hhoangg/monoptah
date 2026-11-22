@@ -86,7 +86,7 @@ sees ordinary calls:
 | `select` | `browser_select_option` | |
 | `press` | `browser_press_key` | |
 | `wait` | `browser_wait_for` | text appears or disappears, or time |
-| `scroll` | `browser_mouse_wheel` (only form allowed at Level 1); `browser_press_key` PageDown/End at Level 2 and 3 | bounded count |
+| `scroll` | `browser_press_key` PageDown/End (Level 2 and 3 only; Level 1 has no scroll until a wheel tool exists, see Measured surprise 2) | bounded count |
 | `extract` | scoped `browser_snapshot` or `browser_find`, parsed locally | see Extractors |
 | `approve` | gate approval step (`browser_request_approval`) | required before every step that is not read-only, below full trust (see Execution engine) |
 
@@ -208,9 +208,9 @@ of category send, post or payment). It is computed from the steps, never trusted
   `Verdict::Deny` fails the run with that sentence; a `Verdict::Ask` raises the usual approval
   card. Recipes add no new way to act.
 - Trust levels still decide what a recipe may do:
-  - Level 1 (read only): only recipes with `risk: read` and only `open`, `wait`, `scroll` and
-    `extract` steps run. `scroll` uses `browser_mouse_wheel` only: the gate denies `browser_click`
-    and `browser_press_key` at Level 1 (`READ_ONLY_TOOLS`; Level 1 offers neither), so a recipe
+  - Level 1 (read only): only recipes with `risk: read` and only `open`, `wait` and `extract`
+    steps run. `scroll` is not available at Level 1 (Playwright MCP 0.0.86 has no
+    `browser_mouse_wheel`): the gate denies `browser_click` and `browser_press_key` at Level 1 (`READ_ONLY_TOOLS`; Level 1 offers neither), so a recipe
     with a click or key step is listed as unavailable at Level 1 (see open question 4).
   - Level 2: `write` steps run; every `approve` step stops the run and asks the user with the real
     values (the typed text, the recipient, the amount).
@@ -287,9 +287,10 @@ Recipes come from work the Mono already did successfully, so there is no separat
 On any step failure or failed assertion the runner stops and starts repair for that step only.
 
 1. **Collect a partial observation**: the current URL, the failing step and its expectation, and a
-   scoped accessibility snapshot of the nearest landmark around where the target should be (the
-   fingerprint scope; if that scope is gone, its parent landmark, then the page's main region),
-   capped (default 6,000 chars). Never the whole page unless nothing narrower exists. A screenshot
+   targeted observation: a `browser_find` around the expected name, or a `browser_snapshot` with
+   `target` on the nearest named ancestor (measured 140-450 tokens), capped (default 6,000 chars).
+   Never the nearest landmark or the whole page unless nothing narrower exists (a landmark was
+   up to 21,200 tokens, see Measured). A screenshot
    is added only if the scoped snapshot is empty.
 2. **Ask the model for one patch** with a tight schema (`ContractSkill` style minimal operators):
    `replace_candidates` (new locator list), `add_wait`, `insert_step` (for example dismiss a new
@@ -456,7 +457,7 @@ Assumptions (typical authenticated web app, 12 steps, one list extraction):
 |---|---|---|---|---|
 | First run (explore) | 15-20 | 60,000-150,000 input (cumulative, with the snapshots re-read), 3,000-5,000 output | 60-180 s | Plus the compile pass: 1 call, 5,000-15,000 input |
 | Cached run (recipe) | 2 (find, then run; or 1 with injected title list) | 3,000-5,500 total: recipe rule and title list (about 300-650), `recipe_*` tool descriptions (about 600-1,500), args about 100, compact result 300-1,200 | 5-15 s | Engine time: 12 steps x (0.3-1 s MCP + scoped snapshot) plus page loads. No per-step model call |
-| Repair (one step) | +1 small call | 3,000-8,000 input (6,000 char scoped observation is about 1,500 tokens, plus prompt), 200-500 output | +10-30 s on top of a cached run | Rerun from the failing step; save a new version |
+| Repair (one step) | +1 small call | 3,000-8,000 input (6,000 char scoped observation is about 1,500 tokens, plus prompt; measured: 140-450 tokens, see Measured), 200-500 output | +10-30 s on top of a cached run | Rerun from the failing step; save a new version |
 | Failed repair, fall back to normal browsing | as first run | as first run | as first run | The cost of a recipe that cannot be repaired is the first-run cost plus a small wasted attempt |
 
 A cached run also pays for the injected context: the recipe rule in the Browser block (about
@@ -465,7 +466,9 @@ A cached run also pays for the injected context: the recipe rule in the Browser 
 in the context on every turn of a Mono with recipes, whether or not a recipe runs). With those
 included the cached-run row is about 3,000-5,500 tokens, not 1,500-3,000. The estimated saving on
 a cached run is therefore roughly 90 to 97 percent of tokens and 80 to 95 percent of time against
-exploration; vendors report speedups from "as high as ~80%" (Stagehand blog) to
+exploration (measured in Phase 0: 64 percent (T1) and 94 percent (T2) of model input including
+the tool-list base, and the time saving comes only from the skipped LLM turns because the browser
+time is the same; see Measured); vendors report speedups from "as high as ~80%" (Stagehand blog) to
 "10-100x" (Stagehand doc, illustrative) and "3-5x faster, up to 70% cheaper" (Skyvern, vendor
 claim), so our estimate of tokens is at the optimistic end because Monoptah's repeat run asks the
 model only to choose and call a recipe, and our assumption that most of the first-run cost is
@@ -486,17 +489,17 @@ profile with a working extension token had no signed-in session for the chosen a
 - **T2** GitHub: latest 3 releases of `microsoft/playwright-mcp` (tag, date, commit).
   1 open + 1 navigation click + 1 extract.
 
-Raw sizes and latencies (median of 3 explore runs and 5 recipe runs):
+Raw sizes and latencies (ranges over 3 explore and 5 recipe runs; the cumulative figures below use explore run 1):
 
 | Observation | Bytes | Tokens | Latency |
 |---|---|---|---|
-| Full `browser_snapshot`, HN front page | 47,312 | 12,200 | 40 ms |
+| Full `browser_snapshot`, HN front page | 47,312 | 12,200-13,400 | 40-47 ms |
 | Full `browser_snapshot`, GitHub repo page | 86,000 | 20,700-22,400 | 120 ms |
 | Full `browser_snapshot`, GitHub releases page | 131,600 | 28,800-31,900 | 100-180 ms |
 | `browser_find` result (6 matches with context) | 1,457 | 450 | 90-100 ms |
 | `browser_snapshot` with `target` (one element, locator probe) | 84-440 | 20-140 | 4-25 ms |
-| `browser_navigate` (response only, no inline snapshot) | 240-380 | 80-130 | 300-800 ms HN, 450-2,350 ms GitHub |
-| `browser_click` on a navigating link | ~300 | 95 | 1.4-1.6 s, bimodal to 6.3 s in 4 of 8 runs |
+| `browser_navigate` (response only, no inline snapshot) | 237-379 | 78-133 | 310-680 ms HN, 450-1,600 ms GitHub |
+| `browser_click` on a navigating link | ~300 | 95 | 1.4-2.1 s, 6.3 s in 2 of 8 runs (and 1 of 3 fallback runs) |
 | Playwright MCP `tools/list` (26 tools) | - | 4,484 | - |
 
 Explore vs recipe vs repair. "Model input" counts only what the browser adds to the context,
@@ -508,10 +511,10 @@ LLM turn time is not measured here (assumption D, 3-10 s per turn, still applies
 |---|---|---|---|---|---|---|
 | Explore | T1 | 3 | 2 | 12,400 | 12,200 snapshot | 0.36-0.75 s |
 | Explore | T2 | 6 | 5 | 116,500 | 20,700 + 31,900 snapshots | 2.2-2.7 s |
-| Recipe | T1 | 2 | 3 (runner) | 390 | 388 compact JSON | 0.42-0.76 s |
+| Recipe | T1 | 2 | 3 (runner) | 390 | 388 compact JSON | 0.41-0.76 s |
 | Recipe | T2 | 2 | 6-8 (runner) | 95 | 95 compact JSON | 2.1-2.4 s, 7.0 s when the click is slow |
-| Recipe, first candidate broken, fallback resolves | T2 | 2 | 8-10 | 95 | 95 | 2.3-6.9 s (+0.1 s for the fallback probe, plus the probe wait) |
-| Repair observation, all candidates broken | T2 | +1 | 1-2 | 140-450 | `browser_find` regex 447, named heading scope 142 | +5.2 s to detect (wait timeout) + 0.1 s |
+| Recipe, first candidate broken, fallback resolves | T2 | 2 | 8-10 | 95 | 95 | 2.1-7.0 s, 3 of 3 ok (1.5 s probe wait on the broken candidate; slow click in 1 run) |
+| Repair observation, all candidates broken | T2 | +1 | 1-2 | 140-450 | `browser_find` regex 447, named heading scope 142 | +5.2 s step (5 s wait timeout), 5.6 s run |
 
 With a 4,484-token base per turn: T1 explore about 25,800 input vs recipe about 9,400 (64 percent
 less); T2 explore about 143,000 vs recipe about 9,100 (94 percent less). Excluding the base, the
@@ -520,13 +523,13 @@ four (T2) dominate wall time; the browser time of explore and recipe is about th
 the recipe runs the same navigations.
 
 Runner-internal (never sent to the model): the extract scope snapshot was 11,500 tokens (HN,
-no landmarks, CSS scope `#bigbox`) and about 29,900 tokens (GitHub `region "Releases results"`,
+no landmarks, CSS scope `#bigbox`) and about 27,600-29,900 tokens (GitHub `region "Releases results"`,
 which contains the full release notes); parsing and field extraction took 110-200 ms per step.
 
 Assumption A was low: full snapshots are 12,000-32,000 tokens, not 3,000-10,000, and a landmark
 "scoped" snapshot is not small: GitHub `main` is 21,200 tokens (95 percent of the page),
 `main` at `depth: 8` 9,100, at `depth: 4` 430 but without the target. Assumption D holds for
-navigation (0.3-2.4 s) but MCP snapshot calls are faster (5-180 ms) and navigating clicks are
+navigation (0.3-1.6 s) but MCP snapshot calls are faster (5-180 ms) and navigating clicks are
 slower (1.4-6.3 s).
 
 Surprises that change the design:
@@ -580,8 +583,8 @@ step latency. Replaces assumptions A and D. Exit: numbers in the doc.
   step, scoped snapshot and locator resolution, assertions, extractors, compact results.
 - `recipe_find`, `recipe_list`, `recipe_show`, `recipe_run`, `recipe_history`, injected context.
 - Recording: trace capture in the gate, compile pass, confirm card, hash approval. Read steps only
-  (`open`, `wait`, `scroll` via `browser_mouse_wheel`, `extract`, and navigation clicks); Level 1
-  can run recipes with the first four step kinds only, since it offers no `browser_click` or
+  (`open`, `wait`, `extract`, and navigation clicks; `scroll` via `browser_press_key` at Level 2
+  and 3); Level 1 can run recipes with `open`, `wait` and `extract` only, since it offers no `browser_click` or
   `browser_press_key`. Recipes with click steps run at Levels 2 and 3.
 - Audit tag, basic metrics, a Browser tab list with approve, delete, show.
 - No repair yet: on failure return the compact failure and the Mono explores as today.
@@ -655,6 +658,9 @@ portable, a fake `Upstream` for the runner (the gate tests already do this), no 
    principle; the compile pass is harness independent.
 9. How to rank multiple recipes for one intent on one origin (different parameters, different
    workspaces)? Proposed: by explicit intent slug and param match, not by the user's sentence.
+10. The fingerprint scope ("nearest named landmark subtree", see Locators) is unbounded in
+    practice: Phase 0 measured GitHub `main` at 21,200 tokens and found no landmarks on HN. Use the
+    nearest named ancestor of the target instead, or a depth-limited skeleton? Decide in Phase 2.
 
 ## Effort estimate
 
