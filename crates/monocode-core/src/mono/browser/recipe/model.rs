@@ -214,6 +214,21 @@ pub enum Step {
     },
 }
 
+/// Where a version came from. Bookkeeping like [`Stats`]: not part of the hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Revision {
+    /// The version this one was made from.
+    pub parent: u32,
+    /// `record`, `repair` or `rollback`.
+    pub reason: String,
+    /// What changed, in words (never a parameter value).
+    pub summary: String,
+    pub at_ms: u64,
+}
+
+/// Bookkeeping that changes after the user approved a recipe, so it is NOT part of the hash (see
+/// [`Recipe::canonical`]). It decides nothing about what a recipe does.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Stats {
@@ -223,6 +238,20 @@ pub struct Stats {
     pub last_ok_ms: u64,
     /// A full run succeeded on the live page (the dry run at record time counts).
     pub verified: bool,
+    /// The result of the last runs, oldest first (at most `repair::WINDOW`): true is a pass.
+    pub window: Vec<bool>,
+    /// Failed too often lately (or was rolled back after a bad repair): ranked last, verify it.
+    pub flaky: bool,
+    /// The current version came from a repair and has not had enough clean runs yet.
+    pub repaired: bool,
+    pub clean_since_repair: u32,
+    /// Failed runs in a row since the repair.
+    pub failed_since_repair: u32,
+    /// Days since the epoch of the repair counter below.
+    pub repair_day: u64,
+    /// Repair attempts today: the per-day cap that stops a flapping site from burning tokens.
+    pub repairs_today: u32,
+    pub revision: Option<Revision>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

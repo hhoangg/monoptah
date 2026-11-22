@@ -778,6 +778,7 @@ impl MonoBrowserStore {
             "DELETE FROM mono_secrets WHERE mono_id=?1",
             "DELETE FROM mono_browser_audit WHERE mono_id=?1",
             "DELETE FROM mono_browser_recipe_approvals WHERE mono_id=?1",
+            "DELETE FROM mono_browser_recipe_hashes WHERE mono_id=?1",
         ] {
             match conn.execute(sql, [mono_id]) {
                 Ok(_) => {}
@@ -878,7 +879,8 @@ pub fn audit_entry(tool_name: &str, input: &str, session_id: i64) -> Option<Audi
         ts_ms: crate::time::now_ms(),
         session_id,
         tool: short.to_owned(),
-        url: text("url").chars().take(500).collect(),
+        // Origin and path only: the query and fragment can carry a token.
+        url: gate::audit_url(&text("url")),
         summary: summary.chars().take(200).collect(),
     })
 }
@@ -1315,7 +1317,10 @@ pub fn prompt_block(browser: &MonoBrowser) -> String {
             browser.allowed_origins.join(", ")
         ));
     }
-    lines.push("- Recipes: before you browse for a task, call `recipe_find` with the site and the task. If a recipe matches, call `recipe_run` with its id and params instead of clicking through the page yourself: it is faster and uses far fewer tokens, and it respects the same browser level and site rules. Trust its result unless it fails; then do the task the normal way.".into());
+    lines.push("- Recipes: before you browse for a task, call `recipe_find` with the site and the task. If a recipe matches, call `recipe_run` with its id and params instead of clicking through the page yourself: it is faster and uses far fewer tokens, and it respects the same browser level and site rules. Trust its result unless it fails or says the recipe is flaky; then verify with a normal snapshot or do the task the normal way.".into());
+    if browser.trust != BrowserTrust::ReadOnly {
+        lines.push("- When `recipe_run` fails it may return a `repair` token and a small observation of the page. Call `recipe_repair` with ONE patch for that step only (a new locator with the same role and kind of name, a wait, or give_up). If it still fails or a limit is reached, do the task the normal way.".into());
+    }
     if browser.trust != BrowserTrust::ReadOnly {
         lines.push("- After you finish a read-only browsing task the user is likely to repeat (opening pages, following links, reading data), call `recipe_record`; the user is asked to confirm. A task that typed, clicked a button or ran code can not be recorded.".into());
     }

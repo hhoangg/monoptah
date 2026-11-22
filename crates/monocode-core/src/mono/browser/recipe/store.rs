@@ -10,7 +10,7 @@
 //! runner recomputes the hash of the file it loads and runs it only when it equals the approved
 //! hash. The table is never rebuilt from the files (a rebuilt hash would approve whatever a file
 //! says); losing it makes every recipe a draft again, which is the safe direction.
-use super::model::Recipe;
+use super::model::{Recipe, Revision, Stats};
 use crate::mono::browser::MonoBrowserStore;
 use rusqlite::{params, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,10 @@ const UNAVAILABLE: &str = "Browser storage is unavailable.";
 pub const RECIPE_TABLES: &str = "
 CREATE TABLE IF NOT EXISTS mono_browser_recipe_approvals(
   mono_id TEXT NOT NULL, recipe_id TEXT NOT NULL, hash TEXT NOT NULL, approved_at INTEGER NOT NULL,
-  PRIMARY KEY(mono_id, recipe_id));";
+  PRIMARY KEY(mono_id, recipe_id));
+CREATE TABLE IF NOT EXISTS mono_browser_recipe_hashes(
+  mono_id TEXT NOT NULL, recipe_id TEXT NOT NULL, hash TEXT NOT NULL, approved_at INTEGER NOT NULL,
+  PRIMARY KEY(mono_id, recipe_id, hash));";
 /// Past versions kept per recipe.
 pub const KEEP_VERSIONS: usize = 20;
 
@@ -29,13 +32,37 @@ impl MonoBrowserStore {
         Self::valid_id(mono_id)?;
         let conn = self.open()?.ok_or(UNAVAILABLE)?;
         conn.execute_batch(RECIPE_TABLES).map_err(|_| UNAVAILABLE)?;
+        let now = crate::time::now_ms() as i64;
         conn.execute(
             "INSERT INTO mono_browser_recipe_approvals(mono_id,recipe_id,hash,approved_at) VALUES(?1,?2,?3,?4)
              ON CONFLICT(mono_id,recipe_id) DO UPDATE SET hash=excluded.hash, approved_at=excluded.approved_at",
-            params![mono_id, recipe_id, hash, crate::time::now_ms() as i64],
+            params![mono_id, recipe_id, hash, now],
+        )
+        .map_err(|_| UNAVAILABLE)?;
+        // Every content the user approved is remembered, so a rollback to it needs no new card.
+        conn.execute(
+            "INSERT INTO mono_browser_recipe_hashes(mono_id,recipe_id,hash,approved_at) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(mono_id,recipe_id,hash) DO UPDATE SET approved_at=excluded.approved_at",
+            params![mono_id, recipe_id, hash, now],
         )
         .map(|_| ())
         .map_err(|_| UNAVAILABLE.into())
+    }
+    /// Whether the user once approved exactly this content (the current approval or an earlier
+    /// one). Never rebuilt from files, like the approvals themselves.
+    pub fn hash_was_approved(&self, mono_id: &str, recipe_id: &str, hash: &str) -> bool {
+        let Ok(Some(conn)) = self.open() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT 1 FROM mono_browser_recipe_hashes WHERE mono_id=?1 AND recipe_id=?2 AND hash=?3",
+            params![mono_id, recipe_id, hash],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
     }
     /// The hash the user approved for a recipe, if any.
     pub fn approved_hash(&self, mono_id: &str, recipe_id: &str) -> Option<String> {
@@ -61,14 +88,17 @@ impl MonoBrowserStore {
         let Some(conn) = self.open()? else {
             return Ok(());
         };
-        match conn.execute(
+        for sql in [
             "DELETE FROM mono_browser_recipe_approvals WHERE mono_id=?1 AND recipe_id=?2",
-            params![mono_id, recipe_id],
-        ) {
-            Ok(_) => Ok(()),
-            Err(e) if e.to_string().contains("no such table") => Ok(()),
-            Err(_) => Err(UNAVAILABLE.into()),
+            "DELETE FROM mono_browser_recipe_hashes WHERE mono_id=?1 AND recipe_id=?2",
+        ] {
+            match conn.execute(sql, params![mono_id, recipe_id]) {
+                Ok(_) => {}
+                Err(e) if e.to_string().contains("no such table") => {}
+                Err(_) => return Err(UNAVAILABLE.into()),
+            }
         }
+        Ok(())
     }
 }
 
@@ -228,34 +258,95 @@ impl RecipeStore {
             .into_iter()
             .filter_map(|v| read(&dir.join(format!("v{v}.json"))))
             .collect();
-        out.extend(self.find_intent(origin, intent));
+        // After a rollback the current version is also in the archive: list it once.
+        if let Some(current) = self.find_intent(origin, intent) {
+            out.retain(|r| r.version != current.version);
+            out.push(current);
+        }
         out.sort_by_key(|r| std::cmp::Reverse(r.version));
         out
+    }
+    /// The number a new version of this recipe gets: above every version kept, so a repair after
+    /// a rollback never overwrites the version that was rolled back from.
+    pub fn next_version(&self, recipe: &Recipe) -> u32 {
+        self.history(&recipe.origin, &recipe.intent)
+            .iter()
+            .map(|r| r.version)
+            .chain([recipe.version])
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+    /// Makes an archived version the current one. The version it replaces moves to the history.
+    /// The caller decides whether the restored content is still approved (see
+    /// `MonoBrowserStore::hash_was_approved`).
+    pub fn rollback(
+        &self,
+        current: &Recipe,
+        version: u32,
+        summary: &str,
+        mark_flaky: bool,
+    ) -> Result<Recipe, String> {
+        let on_disk = self
+            .find_intent(&current.origin, &current.intent)
+            .filter(|r| r.id == current.id)
+            .ok_or("The recipe is no longer saved.")?;
+        if version == on_disk.version {
+            return Err(format!("Version {version} is already the current one."));
+        }
+        let dir = self.history_dir(&current.origin, &current.intent);
+        let mut restored = read(&dir.join(format!("v{version}.json")))
+            .filter(|r| r.id == current.id && r.version == version && r.validate().is_ok())
+            .ok_or_else(|| format!("Version {version} is not in the history."))?;
+        restored.stats = on_disk.stats.clone();
+        restored.stats.repaired = false;
+        restored.stats.clean_since_repair = 0;
+        restored.stats.failed_since_repair = 0;
+        restored.stats.consecutive_ok = 0;
+        restored.stats.flaky |= mark_flaky;
+        restored.stats.revision = Some(Revision {
+            parent: on_disk.version,
+            reason: "rollback".into(),
+            summary: summary.chars().take(200).collect(),
+            at_ms: crate::time::now_ms(),
+        });
+        self.save(&restored)?;
+        Ok(restored)
+    }
+    /// Changes the stats in the current file of this recipe (not part of the hash).
+    pub fn update_stats<R>(
+        &self,
+        recipe: &Recipe,
+        change: impl FnOnce(&mut Stats) -> R,
+    ) -> Option<R> {
+        let path = self.path_of(recipe);
+        let mut current = read(&path).filter(|r| r.id == recipe.id)?;
+        let result = change(&mut current.stats);
+        let text = serde_json::to_vec_pretty(&current).ok()?;
+        write_private(&path, &text).ok()?;
+        Some(result)
     }
     pub fn delete(&self, recipe: &Recipe) -> Result<(), String> {
         let _ = std::fs::remove_file(self.path_of(recipe));
         let _ = std::fs::remove_dir_all(self.history_dir(&recipe.origin, &recipe.intent));
         Ok(())
     }
-    /// Counts one run in the recipe's stats (not part of the hash).
-    pub fn record_run(&self, recipe: &Recipe, ok: bool) {
-        let path = self.path_of(recipe);
-        let Some(mut current) = read(&path).filter(|r| r.id == recipe.id) else {
-            return;
-        };
-        current.stats.runs += 1;
-        if ok {
-            current.stats.ok += 1;
-            current.stats.consecutive_ok += 1;
-            current.stats.last_ok_ms = crate::time::now_ms();
-            current.stats.verified = true;
-        } else {
-            current.stats.consecutive_ok = 0;
-        }
-        if let Ok(text) = serde_json::to_vec_pretty(&current) {
-            let _ = write_private(&path, &text);
-        }
+    /// Counts one run in the recipe's stats (not part of the hash). `blame_repair` is false for a
+    /// failure that says nothing about the recipe (a sign-in page).
+    pub fn record_run(&self, recipe: &Recipe, ok: bool) -> RunEffect {
+        self.record_run_with(recipe, ok, true)
     }
+    pub fn record_run_with(&self, recipe: &Recipe, ok: bool, blame_repair: bool) -> RunEffect {
+        self.update_stats(recipe, |stats| stats.note_run(ok, blame_repair))
+            .unwrap_or_default()
+    }
+}
+
+/// What a counted run changed beyond the counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RunEffect {
+    /// The repaired version failed twice in a row: go back to the version before it.
+    pub rollback_due: bool,
 }
 
 fn read(path: &Path) -> Option<Recipe> {
