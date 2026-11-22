@@ -352,10 +352,7 @@ impl Monos {
         if before.server_key() != setting.server_key() {
             stop_server(&id);
         }
-        browser::server::servers().update_policy(
-            &id,
-            browser::gate::Policy::new(setting.trust, setting.blocked_origins.clone()),
-        );
+        browser::server::servers().update_policy(&id, setting.policy());
         self.save(cx);
         self.configure_chat_with(&id, false, cx);
         self.browser_ui.error = None;
@@ -365,6 +362,34 @@ impl Monos {
     /// A level row was chosen.
     pub(super) fn browser_set_trust(&mut self, trust: BrowserTrust, cx: &mut Context<Self>) {
         self.browser_edit(cx, |b| b.trust = trust);
+    }
+
+    /// The "Show agent actions on the page" switch was flipped.
+    pub(super) fn browser_toggle_show_actions(&mut self, cx: &mut Context<Self>) {
+        self.browser_edit(cx, |b| b.show_actions = !b.show_actions);
+    }
+
+    fn browser_show_actions_card(
+        &mut self,
+        setting_: &MonoBrowser,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let toggle = switch_track(
+            "mono-browser-show-actions",
+            "Show agent actions on the page",
+            setting_.show_actions,
+        )
+        .debug_selector(|| "mono-browser-show-actions".into())
+        .cursor_pointer()
+        .on_click(cx.listener(|this, _, _, cx| this.browser_toggle_show_actions(cx)));
+        card()
+            .child(switch_setting(
+                "Show agent actions on the page",
+                "Before a click or a typed value, a box and a cursor show where the Mono is about to act, for about half a second. Off: no overlay and no delay.",
+                false,
+                toggle.into_any_element(),
+            ))
+            .into_any_element()
     }
 
     fn browser_toggle(&mut self, cx: &mut Context<Self>) {
@@ -774,6 +799,7 @@ impl Monos {
             sections.push(self.browser_profile_card(mono, &setting, cx));
             sections.push(self.browser_token_card(&setting, cx));
             sections.push(self.browser_safety_card(&setting, window, cx));
+            sections.push(self.browser_show_actions_card(&setting, cx));
             sections.push(self.recipes_card(cx));
             sections.push(self.browser_audit_card());
         }

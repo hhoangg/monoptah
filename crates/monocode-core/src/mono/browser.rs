@@ -251,6 +251,10 @@ pub struct MonoBrowser {
     /// How far the Mono may act on its own. Replaces the old "ask before send/post/delete"
     /// switch: a roster saved with that key (`confirmActions`) still loads and reads as Level 2.
     pub trust: BrowserTrust,
+    /// Show the Mono's actions on the page: a highlight and a cursor appear on the target for
+    /// about half a second before a click, a typed value and the like. Default on. Not part of
+    /// the server's shape: the gate reads it live (see [`MonoBrowser::policy`]).
+    pub show_actions: bool,
     /// The Browser page's last check found Chrome, node, a profile and a saved token. Shown in
     /// the UI only: a launch never reads it (a stale value used to drop the server silently), it
     /// checks the live conditions instead, see [`resolve`].
@@ -268,11 +272,17 @@ impl Default for MonoBrowser {
                 .collect(),
             allowed_origins: Vec::new(),
             trust: BrowserTrust::default(),
+            show_actions: true,
             ready: false,
         }
     }
 }
 impl MonoBrowser {
+    /// The gate's rules for this setting: the one place the setting becomes a [`gate::Policy`].
+    pub fn policy(&self) -> gate::Policy {
+        gate::Policy::new(self.trust, self.blocked_origins.clone())
+            .with_show_actions(self.show_actions)
+    }
     /// The browser is switched on and has a saved profile: a launch tries to add the server and
     /// the prompt mentions it. Whether it can be attached right now is decided by [`resolve`].
     pub fn active(&self) -> bool {
@@ -1198,7 +1208,7 @@ fn attach(
         }
     };
     // The agent never talks to the Playwright server itself: it talks to the Mono's gate.
-    let policy = gate::Policy::new(browser.trust, browser.blocked_origins.clone());
+    let policy = browser.policy();
     let gate = match servers.gate_for(&ctx.mono.id, &url, policy) {
         Ok(gate) => gate,
         Err(error) => {
