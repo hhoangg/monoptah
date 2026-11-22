@@ -183,6 +183,14 @@ impl BrowserServers {
         gates.insert(mono_id.to_owned(), gate.clone());
         Ok(gate)
     }
+    /// The Mono's gate, if its browser has been started in this app session.
+    pub fn gate(&self, mono_id: &str) -> Option<Arc<Gate>> {
+        self.gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(mono_id)
+            .cloned()
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }

@@ -13,6 +13,7 @@ use crate::{
     popover::{Choice, ChoiceEvent, Choices, Popover},
 };
 use gpui::{Div, Stateful};
+use monocode_core::mono::browser::recipe::manage::DryRunReport;
 use monocode_core::mono::browser::{
     self, AuditEntry, BrowserTrust, Check, ChromeProfile, MonoBrowser, MonoBrowserStore, PrereqEnv,
     Prerequisites,
@@ -100,6 +101,9 @@ pub(super) trait BrowserOps: Send + Sync {
     fn open_in_profile(&self, env: &PrereqEnv, profile_dir: &str, url: &str) -> Result<(), String>;
     fn open_full_disk_access(&self);
     fn probe(&self, runtime: &browser::Runtime, env: &PrereqEnv) -> Result<(), String>;
+    /// A recipe's dry run through the Mono's running gate (see `Gate::dry_run_recipe`). It
+    /// blocks until a run in progress ends, so it is called off the UI thread.
+    fn dry_run_recipe(&self, mono_id: &str, recipe_id: &str) -> Result<DryRunReport, String>;
 }
 struct RealOps;
 impl BrowserOps for RealOps {
@@ -115,6 +119,14 @@ impl BrowserOps for RealOps {
     fn probe(&self, runtime: &browser::Runtime, env: &PrereqEnv) -> Result<(), String> {
         let mut transport = browser::ProcessTransport::spawn(runtime, env)?;
         browser::probe(&mut transport)
+    }
+    fn dry_run_recipe(&self, mono_id: &str, recipe_id: &str) -> Result<DryRunReport, String> {
+        browser::server::servers()
+            .gate(mono_id)
+            .ok_or_else(|| {
+                "This Mono's browser is not running yet. Send the Mono a message that uses the browser, then try the dry run again.".to_owned()
+            })?
+            .dry_run_recipe(recipe_id)
     }
 }
 
@@ -141,6 +153,7 @@ pub(super) struct BrowserUi {
     pub(super) replacing: bool,
     pub(super) test: TestState,
     pub(super) audit: Vec<AuditEntry>,
+    pub(super) recipes: super::recipes_ui::RecipesUi,
     pub(super) select: Option<Choices<String>>,
     pub(super) profile_anchor: AnchorSlot,
     pub(super) watching: bool,
@@ -165,6 +178,7 @@ impl BrowserUi {
             replacing: false,
             test: TestState::Idle,
             audit: Vec::new(),
+            recipes: Default::default(),
             select: None,
             profile_anchor: AnchorSlot::default(),
             watching: false,
@@ -193,14 +207,18 @@ impl BrowserUi {
     }
 }
 
-fn action(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
+pub(super) fn action(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
     crate::modal::ghost_button(id, label)
         .debug_selector(move || id.into())
         .border_1()
         .border_color(content(0.1))
         .cursor_pointer()
 }
-fn note(id: impl Into<SharedString>, text: impl Into<SharedString>, alpha: f32) -> Stateful<Div> {
+pub(super) fn note(
+    id: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+    alpha: f32,
+) -> Stateful<Div> {
     let id = id.into();
     div()
         .id(id.clone())
@@ -210,7 +228,7 @@ fn note(id: impl Into<SharedString>, text: impl Into<SharedString>, alpha: f32) 
         .text_color(content(alpha))
         .child(text.into())
 }
-fn ago(ts_ms: u64) -> String {
+pub(super) fn ago(ts_ms: u64) -> String {
     let seconds = monocode_core::time::now_ms().saturating_sub(ts_ms) / 1000;
     match seconds {
         0..=59 => "now".into(),
@@ -221,7 +239,7 @@ fn ago(ts_ms: u64) -> String {
 }
 
 impl Monos {
-    fn browser_store(&self) -> Result<MonoBrowserStore, String> {
+    pub(super) fn browser_store(&self) -> Result<MonoBrowserStore, String> {
         let store = locked(&self.store)?;
         MonoBrowserStore::for_store(&store)
     }
@@ -284,6 +302,7 @@ impl Monos {
             .as_ref()
             .map(|s| s.recent(&id, AUDIT_ROWS))
             .unwrap_or_default();
+        self.recipes_refresh();
         self.browser_sync(cx);
     }
 
@@ -353,7 +372,7 @@ impl Monos {
         self.browser_refresh(cx);
     }
 
-    fn browser_setting(&self) -> MonoBrowser {
+    pub(super) fn browser_setting(&self) -> MonoBrowser {
         self.current()
             .and_then(|m| m.browser.clone())
             .unwrap_or_default()
@@ -755,6 +774,7 @@ impl Monos {
             sections.push(self.browser_profile_card(mono, &setting, cx));
             sections.push(self.browser_token_card(&setting, cx));
             sections.push(self.browser_safety_card(&setting, window, cx));
+            sections.push(self.recipes_card(cx));
             sections.push(self.browser_audit_card());
         }
         div()

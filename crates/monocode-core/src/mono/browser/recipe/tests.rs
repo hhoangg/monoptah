@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod phase3;
+mod phase4;
 
 const SITE: &str = "https://news.example";
 const HOME: &str = "https://news.example/";

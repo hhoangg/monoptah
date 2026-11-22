@@ -420,6 +420,74 @@ are refused when recording, with code, drag and drop, dialogs and coordinate cli
 Not built: the per-step waiver of an `approve` on the confirm card (every acting step keeps its
 `approve`, the safe direction), and a recipe that carries a credential at all.
 
+**Phase 4 as built.** Sharing and polish (`recipe/share.rs`, `recipe/manage.rs`,
+`monos/recipes_ui.rs`):
+
+- **Export file.** One JSON file: `format: "monoptah-recipe"`, `format_version` (1; a newer file is
+  refused), `origin`, `version`, `hash` (`sha256:` of the recipe's canonical content), `exported_at_ms`
+  and the `recipe` (steps, parameters as `{placeholders}`, never a value). No stats, no history. A
+  recipe that holds anything secret-looking (card, key, token shape, long token) in its description,
+  parameters or steps is refused at export.
+- **Import is untrusted input.** Size limit (256 KB), known format and schema, every field and step
+  kind known (an unknown step kind or field is refused, not skipped), the same `Recipe::validate` as
+  a recorded recipe, the hash must match (a file edited after the export is refused; the hash catches
+  edits, it is not a signature, so it never replaces the approval), no secrets, and no origin on this
+  Mono's blocked list or a bank or payment site. The result is a DRAFT: a new id, version 1, stats
+  reset, no approval, saved as `revision.reason = import`. A recipe with the same site and intent is
+  never replaced. There is no `recipe_import` tool for the Mono: page content must not be able to
+  bring recipes in, so import and export are the user's actions in the Browser tab.
+- **Outside recipes need a dry run.** Import and adopting a shared recipe record the recipe in the
+  store database (`mono_browser_recipe_outside`, never rebuilt from files). After the user approves
+  the shown steps, `recipe_run` still refuses until a dry run of exactly that content passed in this
+  Mono (`mono_browser_recipe_dryrun`, keyed by hash). A dry run runs through the Mono's gate
+  (`Gate::dry_run_recipe`, so trust level, blocked and finance sites, and the policy apply), on a route
+  nobody is attached to (a step that would ask is denied), replays the recipe with `stop_before_acting`
+  (it never types, clicks a button or sends) and uses each parameter's default; a parameter only a
+  typing step uses gets a placeholder, any other without a default is an error. It needs the approval
+  first. A live repair or a new recording of an outside recipe counts as the dry run of its new
+  content. `recipe_list` and `recipe_find` report `status`: `draft`, `needs_dry_run` or `approved`.
+- **Approval is bound to what was shown.** The Browser tab reads the file when it opens the steps and
+  approves only if the content hash is still the one shown (`manage::approve`), so a file replaced
+  between the card and the click approves nothing.
+- **Shared library.** `<root>/_shared_recipes/<origin>/<intent>.json`: the export format plus
+  `shared_by`. Only an approved recipe that passed its dry run can be promoted; another Mono's entry
+  with the same site and intent is not replaced; unshare removes the entry and leaves copies. Using a
+  shared recipe in another Mono is `Library::adopt`: a copy that goes through `import` like a file, so
+  it is a draft in that Mono, with that Mono's blocked list checked at once and its trust level and
+  blocked list read again at every run (the runner already does this). Sharing widens nothing. A
+  library file edited by hand fails the hash and is skipped. A live link was not built (Open question
+  6): copy on adopt, so repairs do not surprise other Monos.
+- **Browser tab.** A Recipes section (when the browser is on): per recipe the title (intent), origin,
+  version, last run, success rate, a Flaky flag and the status; steps in words (redacted by
+  construction), Approve (only inside the steps view), Dry run, Roll back to the previous version,
+  Share or Unshare, Export, Delete (asks twice), Import a file, and the Shared recipes list with Add
+  to this Mono. The dry run needs the Mono's browser to have started in this app session (it uses the
+  running gate); otherwise the page says so. `Stats` gained `last_run_ms`.
+- **Phase 2 polish.** A passing re-run of a repair is counted like any pass: `consecutive_ok` goes up
+  and the flaky mark is recomputed (`Stats::note_repaired_pass`).
+- **Phase 3 polish.** Money words: `reorder` and `ordering` join `order` (alone, `Order #12`, `Place
+  order`; "Sort order" and "Order by" stay non-money). Card detection keeps Luhn and 13 to 19 digits
+  and now also needs the length and leading digits of a real brand (`card_shape`: Visa, Mastercard,
+  Maestro, Amex, Discover, Diners, JCB, UnionPay, Mir, RuPay, Napas, Troy, Humo, UATP and anything
+  that starts with 6). A stretch inside a longer run is still checked, so a card glued to digits is
+  still found. Measured on random digit runs: a 13-digit run is a false card 10 percent of the time
+  before and 2 percent now, 16 digits 65 percent and 22 percent, 22 digits 99 percent and about 80
+  percent. Long runs stay noisy on purpose (the glued-card checks pin it); a false alarm costs one card.
+- **Review fixes.** Parameter `default` values (an address, a name) never leave a Mono: export and
+  promote drop them, import drops any a hand made file carries, and the dry run uses a placeholder of
+  the parameter's kind. Library folders are the readable origin plus a short hash of the exact origin
+  (`my-site.com` and `my.site.com` no longer collide), and adopt and unshare check the file's origin
+  and intent. Visa-prefixed numbers count at 13 to 19 digits, and JCB 15-digit 2131 and 1800 count.
+- **Tool parameter shapes** (checked against `playwright-core` 1.66.0-alpha, the engine of
+  `@playwright/mcp` 0.0.86): `browser_type` `{target, element?, text, submit?, slowly?}` and
+  `browser_select_option` `{target, element?, values: string[]}` matched. `browser_fill_form` took
+  `value: string` for every field, and the runner sent a JSON boolean for checkboxes and radio
+  buttons; it now sends `"true"` or `"false"`.
+
+Not built: a `recipe_export` or `recipe_import` tool for the Mono (see above), periodic validation,
+a metrics dashboard, the "pick locator" helper, and a way to run a dry run without the Mono's
+browser having started once in this app session.
+
 This is the main difference from Stagehand and Skyvern as documented: repair is local to one step,
 verified by assertions, versioned and reversible, instead of "re-run the whole agent and overwrite
 the cache".
@@ -697,7 +765,7 @@ fingerprint warnings, UI for history.
 sensitive kind, `approve` steps with real values, Level 2 and 3 behavior, redaction tests, an
 adversarial review (high-risk per the repo rules: tokens and secrets, user data).
 
-**Phase 4 - sharing and polish (about 1.5 weeks)**: export and import, promote to shared library,
+**Phase 4 - sharing and polish (about 1.5 weeks; built, see "Phase 4 as built")**: export and import, promote to shared library,
 periodic validation, retention, metrics dashboard, optional codegen-style "pick locator" helper.
 
 Total about 8 to 9 weeks of one engineer for everything, about 3 weeks for a useful MVP. Tests

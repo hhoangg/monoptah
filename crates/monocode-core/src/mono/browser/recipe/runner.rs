@@ -993,8 +993,13 @@ impl Runner<'_> {
                 FieldKind::Slider => &["slider"],
             };
             self.check_field(number, "fill", &resolved, roles)?;
+            // `browser_fill_form` takes every value as a string (a checkbox as "true" or "false").
             let value = if field.kind.is_toggle() {
-                json!(field.value == "true")
+                json!(if field.value == "true" {
+                    "true"
+                } else {
+                    "false"
+                })
             } else {
                 json!(self.typed_value(number, "fill", &field.value)?)
             };

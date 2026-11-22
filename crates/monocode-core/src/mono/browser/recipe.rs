@@ -10,12 +10,16 @@
 //! * [`repair`]: self-healing of one failed step with a validated patch, versions and rollback.
 //! * [`risk`]: what a step can do (read, write, send, money), and the credentials a recipe never types.
 //! * [`record`]: keeps a trace of the Mono's browser calls and compiles a recipe from it.
+//! * [`share`]: the export file, importing it, and the shared library (Phase 4).
+//! * [`manage`]: what the Browser tab does: list, approve, dry run, rollback, delete, promote.
 //! * [`tools`]: the `recipe_*` tools the gate offers.
+pub mod manage;
 pub mod model;
 pub mod record;
 pub mod repair;
 pub mod risk;
 pub mod runner;
+pub mod share;
 pub mod snapshot;
 pub mod store;
 pub mod tools;

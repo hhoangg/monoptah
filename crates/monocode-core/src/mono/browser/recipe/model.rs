@@ -411,6 +411,8 @@ pub struct Stats {
     pub ok: u32,
     pub consecutive_ok: u32,
     pub last_ok_ms: u64,
+    /// When the last run ended, passed or failed (the Browser tab shows it).
+    pub last_run_ms: u64,
     /// A full run succeeded on the live page (the dry run at record time counts). Bookkeeping in
     /// the file: a recipe that changes things is trusted only by the store database
     /// (`MonoBrowserStore::is_verified`), which a file edit can not touch.

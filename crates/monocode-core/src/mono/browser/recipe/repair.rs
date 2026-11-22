@@ -62,6 +62,7 @@ impl Stats {
     /// (the browser was on a sign-in page).
     pub fn note_run(&mut self, ok: bool, blame_repair: bool) -> RunEffect {
         self.runs += 1;
+        self.last_run_ms = crate::time::now_ms();
         self.window.push(ok);
         while self.window.len() > WINDOW {
             self.window.remove(0);
@@ -69,7 +70,7 @@ impl Stats {
         if ok {
             self.ok += 1;
             self.consecutive_ok += 1;
-            self.last_ok_ms = crate::time::now_ms();
+            self.last_ok_ms = self.last_run_ms;
             self.verified = true;
             self.failed_since_repair = 0;
             if self.repaired {
@@ -85,14 +86,33 @@ impl Stats {
                 self.failed_since_repair += 1;
             }
         }
+        self.refresh_flaky(ok);
+        RunEffect {
+            rollback_due: self.repaired && self.failed_since_repair >= ROLLBACK_AFTER,
+        }
+    }
+    /// The flaky mark follows the last runs: set when too many failed, cleared by a clean streak.
+    fn refresh_flaky(&mut self, ok: bool) {
         if self.fail_rate_high() {
             self.flaky = true;
         } else if ok && self.consecutive_ok >= CLEAN_RUNS {
             self.flaky = false;
         }
-        RunEffect {
-            rollback_due: self.repaired && self.failed_since_repair >= ROLLBACK_AFTER,
+    }
+    /// Counts the passing re-run of a repair as a run: the streak and the flaky mark follow it
+    /// like any other pass (the repair does not touch `failed_since_repair`, so a site that
+    /// fails again and again still ends in a rollback).
+    pub fn note_repaired_pass(&mut self) {
+        self.runs += 1;
+        self.ok += 1;
+        self.consecutive_ok += 1;
+        self.last_run_ms = crate::time::now_ms();
+        self.last_ok_ms = self.last_run_ms;
+        self.window.push(true);
+        while self.window.len() > WINDOW {
+            self.window.remove(0);
         }
+        self.refresh_flaky(true);
     }
     /// More than [`FLAKY_PERCENT`] of the last runs failed.
     pub fn fail_rate_high(&self) -> bool {

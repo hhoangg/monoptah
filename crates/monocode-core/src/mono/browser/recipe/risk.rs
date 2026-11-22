@@ -70,7 +70,7 @@ fn words(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-const MONEY: [&str; 29] = [
+const MONEY: [&str; 31] = [
     "pay",
     "paying",
     "payment",
@@ -100,6 +100,8 @@ const MONEY: [&str; 29] = [
     "redeem",
     "wire",
     "fund",
+    "reorder",
+    "ordering",
 ];
 const MONEY_PHRASES: [&str; 4] = [
     "place order",

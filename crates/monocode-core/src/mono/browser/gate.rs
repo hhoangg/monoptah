@@ -506,12 +506,66 @@ pub fn digits_hold_card(text: &str) -> bool {
     found | window_is_card(&run)
 }
 
-/// Whether any stretch of 13 to 19 digits inside a run passes Luhn: a card number can sit inside
-/// a longer run of digits (an order number glued to it).
+/// Whether any stretch of 13 to 19 digits inside a run is a card number: it passes Luhn and has
+/// the length and the leading digits of a real card brand. A card number can sit inside a longer
+/// run of digits (an order number glued to it), so every stretch is looked at; the brand check
+/// keeps the order and tracking numbers that pass Luhn by chance (about one in ten) from looking
+/// like cards.
 fn window_is_card(run: &str) -> bool {
     (13..=19).any(|len| {
-        run.len() >= len && (0..=run.len() - len).any(|start| luhn(&run[start..start + len]))
+        run.len() >= len
+            && (0..=run.len() - len).any(|start| {
+                let digits = &run[start..start + len];
+                luhn(digits) && card_shape(digits)
+            })
     })
+}
+
+/// Whether 13 to 19 digits have the length and the leading digits (issuer range) of a payment
+/// card brand: Visa, Mastercard (51-55 and 2221-2720), Maestro, American Express, Discover,
+/// Diners Club, JCB, UnionPay, Mir, RuPay, Verve, Troy, UATP, Napas, and the local brands that
+/// start with 5, 6, 8 or 9. Digits that no brand issues (a leading 0 or 7, a Visa of 14 digits,
+/// an American Express of 16) are not a card. The ranges are deliberately generous where brands
+/// overlap (every number that starts with 6 and is 13 to 19 digits long counts), because missing
+/// a real card is worse than a false alarm.
+fn card_shape(digits: &str) -> bool {
+    let len = digits.len();
+    let prefix = |n: usize| digits[..n].parse::<u32>().unwrap_or(0);
+    match digits.as_bytes()[0] {
+        // Visa (13 to 19 digits: 13, 16 and 19 are issued, the rest are Visa-based local brands).
+        b'4' => true,
+        // Mastercard 51-55 (16), Maestro 50 and 56-59 (12-19), Dankort 5019, Verve 5061.
+        b'5' => len == 16 || (matches!(prefix(2), 50 | 56..=59) && len >= 12),
+        // Every brand that starts with 6 (Discover, UnionPay, Maestro, RuPay, Elo, Hipercard,
+        // Troy 65): 13 to 19 digits.
+        b'6' => true,
+        // American Express 34 and 37 (15); Diners Club 30, 36, 38, 39 (14, 16-19); JCB 3528-3589
+        // (16-19); JCB 15-digit (3088, 3096, 3112, 3158, 3337); InstaPayment 637-639 is a 6.
+        b'3' => match prefix(2) {
+            34 | 37 => len == 15,
+            30 | 36 | 38 | 39 => len == 14 || len >= 16,
+            35 => len >= 16,
+            31 | 33 => len == 15 || len >= 16,
+            _ => false,
+        },
+        // Mastercard 2221-2720 and Mir 2200-2204 (16-19).
+        b'2' => {
+            // JCB 2131 (15 digits) too.
+            ((2221..=2720).contains(&prefix(4)) && len == 16)
+                || (prefix(4) == 2131 && len == 15)
+                || ((2200..=2204).contains(&prefix(4)) && len >= 16)
+        }
+        // UATP (15) and the old JCB 1800 (15).
+        b'1' => len == 15,
+        // RuPay 81 and 82, Uzcard 8600 (16).
+        b'8' => matches!(prefix(2), 81 | 82 | 86) && len == 16,
+        // Napas 9704 (16-19), Troy 9792, Humo 9860, BC Card 94 (16).
+        b'9' => {
+            (prefix(4) == 9704 && len >= 16)
+                || (matches!(prefix(4), 9792 | 9860) || prefix(2) == 94) && len == 16
+        }
+        _ => false,
+    }
 }
 fn luhn(digits: &str) -> bool {
     let sum: u32 = digits
@@ -743,6 +797,37 @@ impl Gate {
             .workspace
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(workspace);
+    }
+
+    /// The Browser tab's dry run of a recipe (see `recipe::manage::dry_run`), through this gate:
+    /// the Mono's trust level, blocked sites and approval rules apply to every step. It uses a
+    /// route of its own that no run is attached to, so a step that would need a card is denied
+    /// instead of asking in some chat. It waits for a running recipe to finish, so call it off
+    /// the UI thread.
+    pub fn dry_run_recipe(&self, recipe_id: &str) -> Result<recipe::manage::DryRunReport, String> {
+        let workspace = self
+            .inner
+            .workspace()
+            .ok_or("The Mono's browser is not ready.")?;
+        let _one_at_a_time = self.inner.run.lock().unwrap_or_else(|e| e.into_inner());
+        let route = "dry-run";
+        let host = GateHost {
+            inner: &self.inner,
+            route,
+            workspace: &workspace,
+        };
+        let store = recipe::store::RecipeStore::new(workspace.recipes_dir.clone());
+        let approvals = MonoBrowserStore::at(workspace.database.clone());
+        let result = recipe::manage::dry_run(
+            &host,
+            &store,
+            &approvals,
+            &workspace.mono_id,
+            recipe_id,
+            workspace.recipe_options.clone(),
+        );
+        output::sweep(&workspace.output_dir);
+        result
     }
 
     /// Removes the browser files of this Mono (its server stopped): they are page content.
