@@ -24,6 +24,7 @@ pub const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long "nothing found" is trusted before [`resolve`] looks again.
 const MISS_TTL: Duration = Duration::from_secs(60);
 /// The fixed command the login shell runs. Nothing from the user is put into it.
+#[cfg(unix)]
 const LOGIN_SHELL_COMMAND: &str = "command -v npx";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
