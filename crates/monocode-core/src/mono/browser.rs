@@ -1402,6 +1402,7 @@ pub fn prompt_block(browser: &MonoBrowser) -> String {
         lines.push("- When a task you finish looks repeatable (three or more steps, or one you did before), tell the user in your final answer that it can be saved as a recipe. The app may show a \"Save as recipe?\" card; if the user accepts it, call `recipe_record` when the task is done and do not ask again.".into());
     }
     lines.push("- A full snapshot is large. Save it to a file with the snapshot tool's filename (a plain file name; the tool reports where it went), then search or filter that file instead of reading the whole snapshot.".into());
+    lines.push("- Tabs: ALWAYS call `browser_tabs` with action `list` first, before you open or navigate to any site, and reuse a tab that is already open for the same site (switch to it with action `select`) instead of opening another. The same Teams, Slack or mail tab serves every task. Open a new tab only for a site that is not open yet, or when the user asks for a second one (then pass `allow_duplicate_tab: true`). The browser keeps at most 8 tabs and closes the one you used least when you go over.".into());
     lines.push("- Do not close tabs you did not open.".into());
     lines.join("\n")
 }
