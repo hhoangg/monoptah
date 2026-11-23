@@ -105,7 +105,7 @@ Route ownership (every route of architecture.md 3.1 has exactly one owner; the r
 | `/` (index redirect) | `index.tsx` | WS-L (calls the last-place resolver of W-06) |
 | `/login`, `/register`, `/recover`, `/install` | `login`, `register`, `recover`, `install` | WS-S |
 | `/pair/:code` | `pair/**` | WS-S |
-| `/desktops`, `/desktops/:id`, `/desktops/:id/verify` | `desktops/**` | WS-M (the verify screen is a slice shared with WS-L) |
+| `/settings/desktops`, `/settings/desktops/:id` (old `/desktops`, `/desktops/:id` redirect), `/desktops/:id/verify` | `desktops/**` | WS-M (the verify screen is a slice shared with WS-L) |
 | `/d/:desktopId` layout (`LinkProvider`) | `d/$desktopId/route.tsx` | WS-L |
 | `/d/:desktopId` (catalog home) | `d/$desktopId/index.tsx` | WS-T |
 | `/d/:desktopId/p/:projectId`, `.../new` | `d/$desktopId/p/$projectId/{index,new}.tsx`, plus `route.tsx` (shared project layout, only if needed) | WS-T |
@@ -113,8 +113,8 @@ Route ownership (every route of architecture.md 3.1 has exactly one owner; the r
 | `/d/:desktopId/s/:sessionId` | `d/$desktopId/s/**` | WS-T |
 | `/d/:desktopId/monos/:monoId` and `.../profile` with its children | `d/$desktopId/monos/**` | WS-P |
 | `/d/:desktopId/cloud` | `d/$desktopId/cloud/**` | WS-C |
-| `/d/:desktopId/settings` | `d/$desktopId/settings/**` | WS-S |
-| `/settings`, `/admin`, `/admin/users`, `/admin/invites` | `settings/**`, `admin/**` | WS-S |
+| `/d/:desktopId/settings` (redirects to `/settings/desktops/:id`) | `d/$desktopId/settings/**` | WS-S |
+| `/settings/*`, `/admin`, `/admin/users`, `/admin/invites` | `settings/**`, `admin/**` | WS-S |
 
 ### 3.2 Shared files: one owner, others hook in
 

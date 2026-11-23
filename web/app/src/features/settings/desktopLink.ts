@@ -55,9 +55,13 @@ export function dropDesktopLink(desktopId: string): void {
 
 const NO_UNSUBSCRIBE = (): void => undefined;
 
-/** The link of a desktop and its live status. `link` is null when none is provided. */
-export function useDesktopLink(desktopId: string): { link: DesktopLink | null; status: DesktopLinkStatus | null } {
-  const link = useMemo(() => getDesktopLink(desktopId), [desktopId]);
+/**
+ * The link of a desktop and its live status. `link` is null when none is provided. With `enabled: false` it is null and
+ * nothing is built or subscribed, so a caller can decide first whether this browser should touch the desktop at all.
+ */
+export function useDesktopLink(desktopId: string, options?: { enabled?: boolean }): { link: DesktopLink | null; status: DesktopLinkStatus | null } {
+  const enabled = options?.enabled ?? true;
+  const link = useMemo(() => (enabled ? getDesktopLink(desktopId) : null), [desktopId, enabled]);
   const subscribe = useCallback((listener: () => void) => (link ? link.subscribe(listener) : NO_UNSUBSCRIBE), [link]);
   const status = useSyncExternalStore(subscribe, () => link?.status ?? null);
   return { link, status };

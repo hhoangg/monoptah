@@ -51,8 +51,13 @@ function mount(url: string) {
   return { queryClient, router };
 }
 
+/** The header of the page itself (its h1), so the nav's own badge under "This browser" cannot satisfy a badge assertion. */
+function pageHeader(): HTMLElement {
+  return screen.getByRole("heading", { level: 1 }).closest("header") as HTMLElement;
+}
+
 function section(title: string): HTMLElement {
-  const heading = screen.getByRole("heading", { level: 3, name: title });
+  const heading = screen.getByRole("heading", { level: 2, name: title });
   return heading.closest("section") as HTMLElement;
 }
 
@@ -73,46 +78,74 @@ afterEach(() => {
   window.history.replaceState(null, "", "/");
 });
 
-describe("/settings", () => {
-  it("renders one h1 and the account groups, and hosts the settings-sections slot", async () => {
-    registerSlot("settings-sections", () => <p>Slot content</p>);
+describe("settings pages", () => {
+  it("Profile renders one h1, the account rows, the Sign out container and who is signed in", async () => {
     install();
-    mount("/settings");
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    mount("/settings/profile");
+    await screen.findByRole("heading", { level: 1, name: "Profile" });
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    for (const title of ["Account", "Passkeys", "Recovery codes", "Signed-in browsers", "Invites", "Appearance"]) {
-      // Card titles are h3 under the h2 of their area.
-      expect(screen.getByRole("heading", { level: 3, name: title })).toBeInTheDocument();
-    }
-    expect(screen.getByText("Slot content")).toBeInTheDocument();
+    expect(screen.getByText("Signed in as @dev-user")).toBeInTheDocument();
+    expect(within(pageHeader()).queryByText("Only on this browser")).toBeNull();
+    expect(screen.getByRole("heading", { level: 2, name: "Account" })).toBeInTheDocument();
     expect(screen.getByText("@dev-user")).toBeInTheDocument();
+    const signOut = document.getElementById("sign-out") as HTMLElement;
+    expect(within(signOut).getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+    // Passkeys and the rest moved to Security.
+    expect(screen.queryByRole("heading", { name: "Passkeys" })).toBeNull();
   });
 
-  it("groups the cards under headed areas and offers a section index with an anchor per area", async () => {
+  it("Security shows Passkeys, Recovery codes and Signed-in browsers", async () => {
     install();
-    mount("/settings");
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
-    const areas = ["Account and security", "Alerts", "Look and feel", "App and admin"];
-    for (const title of areas) expect(screen.getByRole("heading", { level: 2, name: title })).toBeInTheDocument();
-    for (const nav of screen.getAllByRole("navigation", { name: "Settings sections" })) {
-      for (const title of areas) expect(within(nav).getByRole("link", { name: title })).toHaveAttribute("href", expect.stringMatching(/^#settings-/));
+    mount("/settings/security");
+    await screen.findByRole("heading", { level: 1, name: "Security" });
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    for (const title of ["Passkeys", "Recovery codes", "Signed-in browsers"]) {
+      expect(screen.getByRole("heading", { level: 2, name: title })).toBeInTheDocument();
     }
-    const account = screen.getByRole("heading", { level: 2, name: "Account and security" }).parentElement as HTMLElement;
-    expect(within(account).getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+    expect(within(pageHeader()).queryByText("Only on this browser")).toBeNull();
+  });
+
+  it("Invites shows the invites card", async () => {
+    install();
+    mount("/settings/invites");
+    await screen.findByRole("heading", { level: 1, name: "Invites" });
+    expect(screen.getByRole("heading", { level: 2, name: "Invites" })).toBeInTheDocument();
+    expect(within(pageHeader()).queryByText("Only on this browser")).toBeNull();
+  });
+
+  it("Appearance is marked as stored on this browser and hosts the settings-sections slot", async () => {
+    registerSlot("settings-sections", () => <p>Slot content</p>);
+    install();
+    mount("/settings/appearance");
+    await screen.findByRole("heading", { level: 1, name: "Appearance" });
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    // The badge sits under the title (the nav has one too, under its "This browser" heading).
+    expect(within(pageHeader()).getByText("Only on this browser")).toBeInTheDocument();
+    expect(screen.getByRole("radiogroup", { name: "Colour scheme" })).toBeInTheDocument();
+    expect(screen.getByText("Slot content")).toBeInTheDocument();
+  });
+
+  it("every sub page has a back link to the settings list that only shows below 1024px", async () => {
+    install();
+    mount("/settings/security");
+    const back = await screen.findByRole("link", { name: "Settings" });
+    expect(back).toHaveAttribute("href", "/settings");
+    expect(back.className).toContain("lg:hidden");
   });
 
   it("keeps the forced regenerate screen while the codes are unconfirmed", async () => {
     install({ recoveryAckAt: null });
-    mount("/settings");
+    mount("/settings/profile");
     await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
     expect(screen.queryByRole("heading", { name: "Passkeys" })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Settings" })).toBeNull();
   });
 });
 
 describe("passkeys", () => {
   it("disables remove for the last passkey and explains why", async () => {
     install({ passkeyCount: 1 });
-    mount("/settings");
+    mount("/settings/security");
     const passkeys = await waitFor(() => {
       const el = section("Passkeys");
       expect(within(el).getAllByRole("button", { name: /^Remove passkey/ })).toHaveLength(1);
@@ -125,7 +158,7 @@ describe("passkeys", () => {
   it("enables remove with two passkeys and removes one after a fresh retry", async () => {
     install({ passkeyCount: 2 });
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/security");
     const passkeys = await waitFor(() => {
       const el = section("Passkeys");
       expect(within(el).getAllByRole("button", { name: /^Remove passkey/ })).toHaveLength(2);
@@ -143,7 +176,7 @@ describe("passkeys", () => {
   it("renames after a fresh re-auth retry", async () => {
     install({ passkeyCount: 2 });
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/security");
     const rename = await screen.findAllByRole("button", { name: /^Rename passkey/ });
     await user.click(rename[0]!);
     const field = await screen.findByLabelText("Passkey name");
@@ -162,7 +195,7 @@ describe("passkeys", () => {
     install({ passkeyCount: 2 });
     lib.startAuthentication.mockRejectedValue(Object.assign(new Error("closed"), { name: "NotAllowedError" }));
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/security");
     const rename = await screen.findAllByRole("button", { name: /^Rename passkey/ });
     const original = rename[0]!.getAttribute("aria-label")!.replace("Rename passkey ", "");
     await user.click(rename[0]!);
@@ -182,7 +215,7 @@ describe("recovery codes", () => {
   it("regenerates after confirmation, shows the codes once and keeps them out of caches and storage", async () => {
     install();
     const user = userEvent.setup();
-    const { queryClient } = mount("/settings");
+    const { queryClient } = mount("/settings/security");
     await user.click(await screen.findByRole("button", { name: "Generate new codes" }));
     await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Generate new codes" }));
     const list = await screen.findByRole("list", { name: "Recovery codes" });
@@ -207,7 +240,7 @@ describe("recovery codes and a me refetch", () => {
   it("keeps the new codes on screen when me is refetched with a cleared ack, until the user confirms", async () => {
     install();
     const user = userEvent.setup();
-    const { queryClient } = mount("/settings");
+    const { queryClient } = mount("/settings/security");
     await user.click(await screen.findByRole("button", { name: "Generate new codes" }));
     await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Generate new codes" }));
     await screen.findByRole("list", { name: "Recovery codes" });
@@ -229,7 +262,7 @@ describe("recovery codes replaced in another tab", () => {
   it("an ack 409 shows its own message and drops the dead codes", async () => {
     const state = install();
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/security");
     await user.click(await screen.findByRole("button", { name: "Generate new codes" }));
     await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Generate new codes" }));
     await screen.findByRole("list", { name: "Recovery codes" });
@@ -245,7 +278,7 @@ describe("recovery codes replaced in another tab", () => {
 describe("signed-in browsers", () => {
   it("marks the current browser and gives it no sign-out button", async () => {
     install();
-    mount("/settings");
+    mount("/settings/security");
     const sessions = await waitFor(() => {
       const el = section("Signed-in browsers");
       expect(within(el).getAllByRole("listitem").length).toBeGreaterThan(1);
@@ -258,7 +291,7 @@ describe("signed-in browsers", () => {
   it("signs out one browser through DELETE /api/sessions/:id", async () => {
     install();
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/security");
     const buttons = await screen.findAllByRole("button", { name: /Fake Phone Browser|Unknown browser/ });
     await user.click(buttons[0]!);
     await waitFor(() => expect(calls.filter((c) => c.method === "DELETE" && c.url.startsWith("/api/sessions/"))).toHaveLength(1));
@@ -268,8 +301,9 @@ describe("signed-in browsers", () => {
   it("signs out everywhere else by revoking every other session and never the current one", async () => {
     install();
     const user = userEvent.setup();
-    mount("/settings");
-    await screen.findAllByText("This browser");
+    mount("/settings/security");
+    // The nav has a "This browser" heading too: wait for the card.
+    await waitFor(() => expect(within(section("Signed-in browsers")).getAllByText("This browser")).toHaveLength(1));
     await user.click(screen.getByRole("button", { name: "Sign out everywhere else" }));
     await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Sign out everywhere else" }));
     await waitFor(() => expect(screen.getByText("This is the only browser signed in.")).toBeInTheDocument());
@@ -281,7 +315,7 @@ describe("signed-in browsers", () => {
   it("signs out through POST /api/auth/logout and goes to /login", async () => {
     install();
     const user = userEvent.setup();
-    const { router } = mount("/settings");
+    const { router } = mount("/settings/profile");
     await user.click(await screen.findByRole("button", { name: "Sign out" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
     expect(calls.some((c) => c.method === "POST" && c.url === "/api/auth/logout")).toBe(true);
@@ -293,7 +327,7 @@ describe("invites", () => {
     install();
     const user = userEvent.setup();
     const write = vi.spyOn(navigator.clipboard, "writeText");
-    const { queryClient } = mount("/settings");
+    const { queryClient } = mount("/settings/invites");
     await screen.findByText("3 of 3 available");
     await user.click(screen.getByRole("button", { name: "Create invite" }));
     const box = await screen.findByTestId("new-invite");
@@ -318,7 +352,7 @@ describe("invites", () => {
   it("revokes an unused invite and restores the quota", async () => {
     install();
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/invites");
     await screen.findByText("3 of 3 available");
     await user.click(screen.getByRole("button", { name: "Create invite" }));
     await screen.findByText("2 of 3 available");
@@ -331,7 +365,7 @@ describe("invites", () => {
   it("explains a revoke conflict as used or revoked, and keeps other conflicts generic", async () => {
     const state = install();
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/invites");
     await screen.findByText("3 of 3 available");
     await user.click(screen.getByRole("button", { name: "Create invite" }));
     await screen.findByText("2 of 3 available");
@@ -345,7 +379,7 @@ describe("invites", () => {
   it("disables create when no invites are left", async () => {
     install();
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/invites");
     await screen.findByText("3 of 3 available");
     for (let i = 0; i < 3; i += 1) {
       await user.click(screen.getByRole("button", { name: "Create invite" }));
@@ -357,7 +391,7 @@ describe("invites", () => {
   it("shows the paused state when the server answers invites_paused", async () => {
     install({ invitesPaused: true });
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/invites");
     await screen.findByText("3 of 3 available");
     await user.click(screen.getByRole("button", { name: "Create invite" }));
     expect(await screen.findByText("Invites are paused")).toBeInTheDocument();
@@ -374,7 +408,7 @@ describe("appearance", () => {
   it("switches the scheme and persists it under the monoptah. key", async () => {
     install();
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/appearance");
     const group = await screen.findByRole("radiogroup", { name: "Colour scheme" });
     expect(within(group).getByRole("radio", { name: "System" })).toBeChecked();
     await user.click(within(group).getByRole("radio", { name: "Dark" }));
@@ -449,6 +483,25 @@ describe("/install", () => {
     } finally {
       Reflect.deleteProperty(navigator, "standalone");
     }
+  });
+
+  it("is also a page of the settings shell, with the badge and no way-back row", async () => {
+    install({ signedIn: true });
+    stubMedia(false);
+    mount("/settings/install");
+    await screen.findByRole("heading", { level: 1, name: "Install app" });
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    expect(document.getElementById("install")).not.toBeNull();
+    expect(screen.getByText(/Add to Home Screen/)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /Back to Monoptah/ })).toBeNull();
+    expect(within(pageHeader()).getByText("Only on this browser")).toBeInTheDocument();
+  });
+
+  it("Notifications is marked as stored on this browser", async () => {
+    install({ signedIn: true });
+    mount("/settings/notifications");
+    await screen.findByRole("heading", { level: 1, name: "Notifications" });
+    expect(within(pageHeader()).getByText("Only on this browser")).toBeInTheDocument();
   });
 
   it("offers no notification button here (P-05)", async () => {

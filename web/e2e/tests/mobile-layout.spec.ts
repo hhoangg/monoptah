@@ -178,7 +178,7 @@ test.describe("mobile chat layout", () => {
     desktopId = String(online["desktopId"]);
     await page.evaluate((id) => window.localStorage.setItem(`monoptah.pickerSeen.${id}`, "1"), desktopId);
 
-    await page.goto("/desktops");
+    await page.goto("/settings/desktops");
     await page.getByRole("link", { name: `Open ${MACHINE}` }).click();
     await expect(page).toHaveURL(new RegExp(`/d/${desktopId}$`));
     const pendingScreen = page.getByRole("alertdialog", { name: "Confirm this device on your desktop" });

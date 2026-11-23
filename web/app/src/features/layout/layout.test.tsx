@@ -115,7 +115,7 @@ afterEach(() => {
   stubViewport(1280);
 });
 
-function mount(width: number, path = "/settings", options: MockLinkOptions = {}) {
+function mount(width: number, path = "/cloud", options: MockLinkOptions = {}) {
   stubViewport(width);
   connectMockDesktop({ ...options, seed: seedWorkspace });
   const queryClient = createQueryClient();
@@ -159,7 +159,7 @@ describe("sidebar", () => {
     const sidebar = await screen.findByTestId("app-sidebar");
     // The rail is the first column of the shell, right before the sidebar.
     expect(rail.nextElementSibling).toBe(sidebar);
-    expect(within(rail).getByRole("link", { name: "Desktop settings" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/settings`);
+    expect(within(rail).getByRole("link", { name: "Desktop settings" })).toHaveAttribute("href", `/settings/desktops/${DESKTOP_ID}`);
     expect(within(rail).getByRole("button", { name: "Account" })).toBeInTheDocument();
     expect(await within(rail).findByRole("link", { name: /current desktop/ })).toBeInTheDocument();
     // No duplicates in the sidebar.
@@ -330,7 +330,7 @@ describe("classic layout: session list sidebar and chat pane (>= 1024)", () => {
   });
 
   it("has no session list on screens without a project, at tablet width and on a phone", async () => {
-    mount(1280, "/settings");
+    mount(1280, "/cloud");
     await screen.findByTestId("app-sidebar");
     expect(screen.queryByTestId("session-list-pane")).toBeNull();
     resizeViewport(768);
@@ -770,6 +770,21 @@ describe("shortcuts and palette", () => {
     await waitFor(() => expect(screen.queryByRole("combobox")).toBeNull());
   });
 
+  it("shows a Settings group only once something is typed, and Enter opens the page and scrolls to the item", async () => {
+    const user = userEvent.setup();
+    const { router } = mount(1280);
+    await screen.findByTestId("app-sidebar");
+    await user.keyboard("{Control>}k{/Control}");
+    const box = await screen.findByRole("combobox");
+    await waitFor(() => expect(screen.getAllByRole("option").length).toBeGreaterThan(2));
+    expect(screen.queryByRole("group", { name: "Settings" })).toBeNull();
+    await user.type(box, "reconnect");
+    const group = await screen.findByRole("group", { name: "Settings" });
+    await user.click(within(group).getByRole("option", { name: /Reconnect/ }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/settings/desktops/${DESKTOP_ID}`));
+    expect(router.state.location.hash).toBe("desktop-troubleshoot");
+  });
+
   it("arrow keys move the selection and Enter opens a Mono", async () => {
     const user = userEvent.setup();
     const { router } = mount(1280);
@@ -813,7 +828,7 @@ describe("shortcuts and palette", () => {
 
   it("does not offer New Mono to a read-only device, or when the desktop has no Mono tools", async () => {
     const user = userEvent.setup();
-    mount(1280, "/settings", { permission: "read" });
+    mount(1280, "/cloud", { permission: "read" });
     await screen.findByTestId("app-sidebar");
     await user.keyboard("{Control>}k{/Control}");
     await user.type(await screen.findByRole("combobox"), "mono");
@@ -997,13 +1012,13 @@ describe("project tools (project bar and palette)", () => {
   });
 
   it("is absent below 640px on a screen without a project", async () => {
-    mount(390, "/settings");
+    mount(390, "/cloud");
     await screen.findByTestId("app-shell");
     expect(screen.queryByRole("toolbar", { name: "Project tools" })).toBeNull();
   });
 
   it("is absent on a screen without a project", async () => {
-    mount(1280, "/settings");
+    mount(1280, "/cloud");
     await screen.findByTestId("app-shell");
     expect(screen.queryByRole("toolbar", { name: "Project tools" })).toBeNull();
   });

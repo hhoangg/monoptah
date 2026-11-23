@@ -192,7 +192,7 @@ describe("notificationclick", () => {
 });
 
 describe("notificationclick targets", () => {
-  it.each(["/d/x/s/y", "/d/x/monos/m", "/settings"])("opens a new window at %s when none is open", async (url) => {
+  it.each(["/d/x/s/y", "/d/x/monos/m", "/settings", "/settings/notifications"])("opens a new window at %s when none is open", async (url) => {
     const { handlers, opened } = setup();
     const click = clickEvent({ url });
     handlers.notificationclick(click.event);
@@ -200,7 +200,7 @@ describe("notificationclick targets", () => {
     expect(opened).toEqual([url]);
   });
 
-  it.each(["/d/x/s/y", "/d/x/monos/m", "/settings"])("focuses an open window and navigates it to %s", async (url) => {
+  it.each(["/d/x/s/y", "/d/x/monos/m", "/settings", "/settings/notifications"])("focuses an open window and navigates it to %s", async (url) => {
     const existing = client(`${ORIGIN}/`);
     const { handlers, opened } = setup([existing]);
     const click = clickEvent({ url });

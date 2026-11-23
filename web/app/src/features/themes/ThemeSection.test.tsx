@@ -56,6 +56,11 @@ describe("ThemeSection", () => {
     expect(useAppearance.getState().theme).toBe("mono");
   });
 
+  it("is the Theme anchor of the settings quick-find", () => {
+    render(<ThemeSection />);
+    expect(document.getElementById("theme")).toBe(screen.getByRole("radiogroup", { name: "Theme" }).closest("section"));
+  });
+
   it("is rendered by the settings-sections registration", async () => {
     clearSlots();
     await import("./register");

@@ -9,7 +9,7 @@ import { useMediaQuery } from "./useMediaQuery";
 const TABLET_QUERY = "(min-width: 640px)";
 
 /**
- * The app-level controls of a top bar: the avatar menu (Account settings, All desktops, Install app), plus the
+ * The app-level controls of a top bar: the avatar menu (Settings, Desktops and Install app), plus the
  * phone-only Search button on the /d routes. One component, two homes: the top header of the pages outside a desktop,
  * and the right end of the phone's desktop switcher row (from 640px the /d routes use the activity rail instead).
  */

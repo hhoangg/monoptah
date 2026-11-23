@@ -1,8 +1,9 @@
 import { useMemo } from "react";
+import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "@/ui/Icon";
 import { PageHeader } from "@/ui/PageHeader";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SETTINGS_DIVIDER_PLAIN, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { PushOnboarding } from "./PushOnboarding";
 import { SettingsLayout } from "./SettingsLayout";
 import { detectPlatform, useStandalone, type InstallPlatform } from "./standalone";
@@ -66,7 +67,7 @@ function GuideCard({ guide, current }: { guide: Guide; current: boolean }) {
     >
       <ol className="m-0 flex list-none flex-col p-0">
         {guide.steps.map((step, index) => (
-          <li key={step.text} className="relative flex min-h-13 items-center gap-3 px-1.5 py-2 text-row text-content before:absolute before:top-0 before:right-0 before:left-4 before:h-px before:bg-stroke first:before:hidden">
+          <li key={step.text} className={cn("relative flex min-h-13 items-center gap-3 px-1.5 py-2 text-row text-content", SETTINGS_DIVIDER_PLAIN, "before:left-[62px]")}>
             <span className="inline-flex size-11 shrink-0 items-center justify-center rounded-row bg-fill text-content">
               <Icon name={step.icon} size={22} />
             </span>
@@ -81,14 +82,16 @@ function GuideCard({ guide, current }: { guide: Guide; current: boolean }) {
   );
 }
 
-/** /install (N-13): per-platform guide, with the guide for this device first and an Installed state. */
-export function InstallGuide() {
+/**
+ * The guide itself (N-13): per-platform steps with the guide for this device first, and an Installed state. Shared by
+ * the public /install page and the Install app page of the settings shell (`id` is the quick-find anchor).
+ */
+export function InstallGuideContent({ id }: { id?: string }) {
   const standalone = useStandalone();
   const detected = useMemo(() => detectPlatform(), []);
   const guides = useMemo(() => [...GUIDES].sort((a, b) => Number(b.platform === detected) - Number(a.platform === detected)), [detected]);
   return (
-    <SettingsLayout>
-      <PageHeader title="Install Monoptah" description="Open Monoptah like any other app, full screen and one tap away." />
+    <div id={id} className={cn("flex flex-col gap-6", SETTINGS_ANCHOR)}>
       {standalone ? (
         <Notice variant="info" title="Installed">
           You are using Monoptah as an installed app. You can turn on notifications below.
@@ -101,6 +104,16 @@ export function InstallGuide() {
           <PushOnboarding />
         </SettingsCard>
       ) : null}
+    </div>
+  );
+}
+
+/** /install (public): the guide under its own header. */
+export function InstallGuide() {
+  return (
+    <SettingsLayout>
+      <PageHeader title="Install Monoptah" description="Open Monoptah like any other app, full screen and one tap away." />
+      <InstallGuideContent />
       {/* An installed app has no browser Back button: always offer a way into the app. */}
       <SettingsCard>
         <SettingsRow icon="computer" title="Back to Monoptah" to="/" />

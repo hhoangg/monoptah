@@ -1,7 +1,8 @@
-// Route of /desktops. Owner: WS-M (workstreams.md 3.1). Desktop list, pairing help and this account's devices.
-import { createFileRoute } from "@tanstack/react-router";
-import { DesktopsScreen } from "@/features/desktops/DesktopsScreen";
+// Route of /desktops (old URL, kept for bookmarks and links): the desktop list now lives in the settings shell.
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/desktops/")({
-  component: DesktopsScreen,
+  beforeLoad: () => {
+    throw redirect({ to: "/settings/desktops", replace: true });
+  },
 });

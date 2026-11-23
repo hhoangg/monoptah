@@ -21,7 +21,10 @@ export const AVATAR_EMOJIS: readonly string[] = [
   "\u{1F916}", "\u{1F47E}", "\u{1F3AE}", "\u{1F3A7}", "☕", "\u{1F34E}", "\u{1F3E0}", "\u{1F3E2}",
 ];
 
-export function DesktopAvatarSection({ desktop }: { desktop: DesktopDirectory }) {
+const AVATAR_FOOTNOTE = "Shown in the desktop list on the left and the desktop switcher, on every device of your account. Without one, the initials are used.";
+
+/** `embedded` renders just the content and the footnote (as in-card muted text), for a card that already has a title. */
+export function DesktopAvatarSection({ desktop, embedded = false }: { desktop: DesktopDirectory; embedded?: boolean }) {
   const queryClient = useQueryClient();
   const action = useAction(desktopErrorMessage);
   const [pickError, setPickError] = useState<string | null>(null);
@@ -42,8 +45,8 @@ export function DesktopAvatarSection({ desktop }: { desktop: DesktopDirectory })
     await action.run(() => setDesktopAvatar(queryClient, desktop.id, { kind: "image", mime: prepared.mime, data: prepared.data }));
   }
 
-  return (
-    <SettingsCard title="Avatar" footnote="Shown in the desktop list on the left and the desktop switcher, on every device of your account. Without one, the initials are used.">
+  const content = (
+    <>
       <div className="flex flex-col gap-3 px-1.5 py-2">
         <div className="flex items-center gap-3">
           <span
@@ -103,6 +106,13 @@ export function DesktopAvatarSection({ desktop }: { desktop: DesktopDirectory })
         {pickError ? <Notice variant="error">{pickError}</Notice> : null}
         {action.error ? <Notice variant="error">{action.error}</Notice> : null}
       </div>
+      {embedded ? <p className="px-1.5 pb-2 text-meta text-muted-text">{AVATAR_FOOTNOTE}</p> : null}
+    </>
+  );
+  if (embedded) return content;
+  return (
+    <SettingsCard title="Avatar" footnote={AVATAR_FOOTNOTE}>
+      {content}
     </SettingsCard>
   );
 }

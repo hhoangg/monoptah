@@ -99,7 +99,7 @@ afterEach(() => {
 });
 
 describe("push onboarding (P-05)", () => {
-  it.each(["/settings", "/install", "/d/desktop-dev-1/settings"])("never asks for permission on load or render of %s", async (url) => {
+  it.each(["/settings/notifications", "/settings/install", "/install", "/settings/desktops/desktop-dev-1"])("never asks for permission on load or render of %s", async (url) => {
     stubEnvironment({ standalone: true, permission: "default" });
     mount(url);
     await screen.findByRole("heading", { level: 1 });
@@ -108,29 +108,38 @@ describe("push onboarding (P-05)", () => {
     expect(push.subscribeToPush).not.toHaveBeenCalled();
   });
 
-  it("hides the button when the app is not installed and points to /install", async () => {
+  it("hides the button when the app is not installed and points to the install page of the settings shell", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
-    mount("/settings");
+    mount("/settings/notifications");
     expect(await screen.findByText("Install Monoptah to get notifications")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Enable notifications" })).toBeNull();
-    expect(screen.getByRole("link", { name: /Install Monoptah to get notifications/ })).toHaveAttribute("href", "/install");
+    // Inside the settings shell the link stays in the shell, not the public /install page.
+    expect(screen.getByRole("link", { name: /Install Monoptah to get notifications/ })).toHaveAttribute("href", "/settings/install");
   });
 
   it("hides the button without PushManager", async () => {
     stubEnvironment({ standalone: true, permission: "default", pushManager: false });
-    mount("/settings");
+    mount("/settings/notifications");
     expect(await screen.findByText("Notifications are not available here")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Enable notifications" })).toBeNull();
   });
 
   it("requests permission from the click, then subscribes with the device id", async () => {
     stubEnvironment({ standalone: true, permission: "default" });
-    mount("/settings");
+    mount("/settings/notifications");
     await userEvent.click(await screen.findByRole("button", { name: "Enable notifications" }));
     await screen.findByText("Notifications on");
     expect(requestPermission).toHaveBeenCalledTimes(1);
     expect(push.subscribeToPush).toHaveBeenCalledWith("dev_9", SEED_USER_ID);
     expect(screen.getByRole("button", { name: "Turn off" })).toBeInTheDocument();
+  });
+
+  it("shows the Enable button on /settings/install in standalone mode, inside the settings shell", async () => {
+    stubEnvironment({ standalone: true, permission: "default" });
+    mount("/settings/install");
+    await userEvent.click(await screen.findByRole("button", { name: "Enable notifications" }));
+    await screen.findByText("Notifications on");
+    expect(requestPermission).toHaveBeenCalledTimes(1);
   });
 
   it("shows the Enable button on /install in standalone mode", async () => {
@@ -143,12 +152,12 @@ describe("push onboarding (P-05)", () => {
 
   it("shows help when the permission is denied, before and after the click", async () => {
     stubEnvironment({ standalone: true, permission: "denied" });
-    mount("/settings");
+    mount("/settings/notifications");
     expect(await screen.findByText("Notifications are blocked")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Enable notifications" })).toBeNull();
     cleanup();
     stubEnvironment({ standalone: true, permission: "default", result: "denied" });
-    mount("/settings");
+    mount("/settings/notifications");
     await userEvent.click(await screen.findByRole("button", { name: "Enable notifications" }));
     expect(await screen.findByText("Notifications are blocked")).toBeInTheDocument();
     expect(push.subscribeToPush).not.toHaveBeenCalled();
@@ -163,7 +172,7 @@ describe("push onboarding (P-05)", () => {
   it("turn off unsubscribes", async () => {
     stubEnvironment({ standalone: true, permission: "granted" });
     push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: SEED_USER_ID });
-    mount("/settings");
+    mount("/settings/notifications");
     await userEvent.click(await screen.findByRole("button", { name: "Turn off" }));
     await waitFor(() => expect(push.unsubscribeFromPush).toHaveBeenCalledTimes(1));
     expect(await screen.findByRole("button", { name: "Enable notifications" })).toBeInTheDocument();
@@ -192,7 +201,7 @@ describe("push onboarding (P-05)", () => {
   it("Pause all with every desktop already off changes nothing and says so", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
     for (const id of desktopIds) mockState.prefs.set(id, { enabled: false, categories: CATS });
-    mount("/settings");
+    mount("/settings/notifications");
     await userEvent.click(await screen.findByRole("button", { name: "Pause all" }));
     await screen.findByText(/Nothing to pause/);
     expect(requests.filter((r) => r.method === "PUT")).toEqual([]);
@@ -200,7 +209,7 @@ describe("push onboarding (P-05)", () => {
 
   it("Pause all reads every desktop, turns off the ones that are on (defaults count) and keeps their categories; Resume all restores exactly those", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
-    mount("/settings");
+    mount("/settings/notifications");
     expect(desktopIds.length).toBeGreaterThan(1);
     const [a, b] = desktopIds as [string, string];
     // `a` has no stored row (the Worker's defaults, all on); `b` was turned off by the user.
@@ -223,7 +232,7 @@ describe("push onboarding (P-05)", () => {
 
   it("Resume all is disabled when Pause all turned nothing off, so it never turns a desktop on by itself", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
-    mount("/settings");
+    mount("/settings/notifications");
     expect(await screen.findByRole("button", { name: "Resume all" })).toBeDisabled();
     expect(requests.filter((r) => r.method === "PUT")).toEqual([]);
   });
@@ -231,7 +240,7 @@ describe("push onboarding (P-05)", () => {
   it("a Resume all after a reload still restores what Pause all recorded", async () => {
     stubEnvironment({ standalone: false, permission: "default" });
     window.localStorage.setItem("monoptah.pushPaused", JSON.stringify({ [desktopIds[0] as string]: CATS }));
-    mount("/settings");
+    mount("/settings/notifications");
     await userEvent.click(await screen.findByRole("button", { name: "Resume all" }));
     await screen.findByText(/Notifications are back on for 1 desktop\./);
     expect(requests.filter((r) => r.method === "PUT").map((p) => p.body)).toEqual([{ enabled: true, categories: CATS }]);
@@ -240,7 +249,7 @@ describe("push onboarding (P-05)", () => {
   it("does not subscribe again on load for a subscription of another account", async () => {
     stubEnvironment({ standalone: true, permission: "granted" });
     push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: "someone-else" });
-    mount("/settings");
+    mount("/settings/notifications");
     expect(await screen.findByRole("button", { name: "Enable notifications" })).toBeInTheDocument();
     expect(push.subscribeToPush).not.toHaveBeenCalled();
   });
@@ -249,7 +258,7 @@ describe("push onboarding (P-05)", () => {
     stubEnvironment({ standalone: true, permission: "granted" });
     push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: SEED_USER_ID });
     push.hasBrowserSubscription.mockResolvedValue(false);
-    mount("/settings");
+    mount("/settings/notifications");
     expect(await screen.findByRole("button", { name: "Enable notifications" })).toBeInTheDocument();
     expect(await screen.findByText(LOST_SUBSCRIPTION_NOTICE)).toBeInTheDocument();
     expect(screen.queryByText("Notifications on")).toBeNull();
@@ -260,7 +269,7 @@ describe("push onboarding (P-05)", () => {
     stubEnvironment({ standalone: true, permission: "granted" });
     push.getSavedPushSubscription.mockResolvedValue({ deviceId: "dev_9", subscriptionId: "sub_1", userId: SEED_USER_ID });
     push.hasBrowserSubscription.mockResolvedValue(true);
-    mount("/settings");
+    mount("/settings/notifications");
     await waitFor(() => expect(push.subscribeToPush).toHaveBeenCalledWith("dev_9", SEED_USER_ID));
   });
 
@@ -274,9 +283,45 @@ describe("push onboarding (P-05)", () => {
     expect(requestPermission).not.toHaveBeenCalled();
   });
 
+  it("shows the switches of every desktop inline, and Pause all and Resume all move them", async () => {
+    stubEnvironment({ standalone: false, permission: "default" });
+    mount("/settings/notifications");
+    const names = mockState.desktops.map((desktop) => desktop.name);
+    expect(names.length).toBeGreaterThan(1);
+    // No more links to each desktop's settings: the switches are on this page.
+    const first = await screen.findByRole("switch", { name: `Notifications from this desktop (${names[0]})` });
+    expect(screen.getByRole("switch", { name: `Notifications from this desktop (${names[1]})` })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: `Agent finished (${names[0]})` })).toBeInTheDocument();
+    await waitFor(() => expect(first).toBeEnabled());
+    expect(first).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Pause all" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: `Notifications from this desktop (${names[0]})` })).not.toBeChecked());
+    expect(screen.getByRole("switch", { name: `Notifications from this desktop (${names[1]})` })).not.toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Resume all" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: `Notifications from this desktop (${names[0]})` })).toBeChecked());
+  });
+
+  it("Resume all and the result notice follow the inline switches that replace what Pause all recorded", async () => {
+    stubEnvironment({ standalone: false, permission: "default" });
+    const [a, ...others] = desktopIds as [string, ...string[]];
+    // Only `a` is on, so Pause all records exactly one desktop.
+    for (const id of others) mockState.prefs.set(id, { enabled: false, categories: CATS });
+    mount("/settings/notifications");
+    await userEvent.click(await screen.findByRole("button", { name: "Pause all" }));
+    await screen.findByText(/Notifications are paused for 1 desktop\./);
+    expect(screen.getByRole("button", { name: "Resume all" })).toBeEnabled();
+    const name = mockState.desktops.find((desktop) => desktop.id === a)?.name;
+    const inline = screen.getByRole("switch", { name: `Notifications from this desktop (${name})` });
+    await waitFor(() => expect(inline).not.toBeChecked());
+    await userEvent.click(inline);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Resume all" })).toBeDisabled());
+    expect(screen.queryByText(/Notifications are paused for 1 desktop\./)).toBeNull();
+    expect(window.localStorage.getItem("monoptah.pushPaused")).toBeNull();
+  });
+
   it("the per-desktop categories save with PUT at once", async () => {
     stubEnvironment({ standalone: true, permission: "default" });
-    mount("/d/desktop-dev-1/settings");
+    mount("/settings/desktops/desktop-dev-1");
     const toggle = await screen.findByRole("switch", { name: "Agent finished" });
     await waitFor(() => expect(toggle).toBeEnabled());
     await userEvent.click(toggle);

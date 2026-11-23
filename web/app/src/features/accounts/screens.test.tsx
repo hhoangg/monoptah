@@ -211,7 +211,7 @@ describe("login", () => {
     expect(screen.getByRole("link", { name: /Lost your passkey/ })).toHaveAttribute("href", "/recover");
     expect(screen.getByRole("link", { name: /Install the app/ })).toHaveAttribute("href", "/install");
     await user.click(screen.getByRole("button", { name: /Sign in with passkey/ }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/settings/desktops"));
   });
 });
 
@@ -284,7 +284,7 @@ describe("recover", () => {
     state.recoveryOnly = false;
     await user.click(screen.getByRole("button", { name: /Sign in with passkey/ }));
     await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
-    expect(router.state.location.pathname).toBe("/settings");
+    expect(router.state.location.pathname).toBe("/settings/profile");
     expect(screen.queryByRole("button", { name: /skip|not now/i })).toBeNull();
     await user.click(screen.getByRole("button", { name: /Generate recovery codes/ }));
     await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
@@ -293,14 +293,14 @@ describe("recover", () => {
     expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
     await user.click(screen.getByLabelText("I saved these codes"));
     await user.click(screen.getByRole("button", { name: "Continue" }));
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    await screen.findByRole("heading", { level: 1, name: "Profile" });
     expect(sessionStorage.getItem("monoptah.lowCodes")).toBeNull();
   });
 
   it("an ack 409 (codes replaced in another tab) shows its own message and brings Generate back", async () => {
     const state = install({ signedIn: true, recoveryAckAt: null });
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/profile");
     await user.click(await screen.findByRole("button", { name: /Generate recovery codes/ }));
     await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
     // Another tab issued newer codes meanwhile.
@@ -315,14 +315,14 @@ describe("recover", () => {
     await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
     await user.click(screen.getByLabelText("I saved these codes"));
     await user.click(screen.getByRole("button", { name: "Continue" }));
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    await screen.findByRole("heading", { level: 1, name: "Profile" });
   });
 
   it("ignores and clears a low-codes flag that belongs to another account", async () => {
     install({ signedIn: true });
     sessionStorage.setItem("monoptah.lowCodes", "someone-else");
-    mount("/settings");
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    mount("/settings/profile");
+    await screen.findByRole("heading", { level: 1, name: "Profile" });
     expect(sessionStorage.getItem("monoptah.lowCodes")).toBeNull();
   });
 
@@ -368,14 +368,14 @@ describe("forced regenerate", () => {
   it("replaces the settings stub while recoveryAckAt is null and keeps the codes until Continue", async () => {
     install({ signedIn: true, recoveryAckAt: null });
     const user = userEvent.setup();
-    mount("/settings");
+    mount("/settings/profile");
     await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
     await user.click(screen.getByRole("button", { name: /Generate recovery codes/ }));
     await screen.findByRole("heading", { level: 1, name: "Save your new recovery codes" });
     expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
     await user.click(screen.getByLabelText("I saved these codes"));
     await user.click(screen.getByRole("button", { name: "Continue" }));
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    await screen.findByRole("heading", { level: 1, name: "Profile" });
   });
 });
 

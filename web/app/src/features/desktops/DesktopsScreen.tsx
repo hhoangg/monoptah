@@ -1,17 +1,17 @@
-// `/desktops`: the desktop list, the "Pair a desktop" help with the optional paste field (F-02) and
-// this account's devices (U-01, N-09, N-12). Owner: WS-M. Names and OS strings come from other
+// `/settings/desktops` ("All desktops"): the desktop list, the "Pair a desktop" help with the optional paste field (F-02) and
+// the browsers with desktop access (U-01, N-09, N-12). Owner: WS-M. Names and OS strings come from other
 // machines: they are rendered as text only.
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { useState, type FormEvent } from "react";
+import { useState } from "react";
 import { safeName, lastSeenLabel, versionLabel } from "./format";
 import { Icon } from "@/ui/Icon";
 import { forgetDevice, useDesktops, useDevices, type DesktopSummary, type DeviceSummary } from "./api";
 import { desktopErrorMessage, ColorDot, Fingerprint, PresenceBadge } from "./parts";
-import { parsePairingInput } from "./pairingLink";
+import { PairSection, PairStepsList } from "./PairDesktop";
 import { RenameDesktopForm } from "./RenameDesktopForm";
 import { useThisDevice } from "./thisDevice";
-import { SettingsLayout } from "@/features/settings/SettingsLayout";
+import { SettingsPage } from "@/features/settings/SettingsPage";
 import { QueryBoundary } from "@/features/settings/QueryBoundary";
 import { formatRelative } from "@/features/settings/format";
 import { useAction } from "@/features/settings/useAction";
@@ -19,33 +19,24 @@ import { Badge } from "@/ui/badge";
 import { Button, buttonVariants } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/ui/dialog";
-import { Field } from "@/ui/Field";
-import { PageHeader } from "@/ui/PageHeader";
-import { SettingsCard } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SETTINGS_DIVIDER_BASE, SETTINGS_DIVIDER_PLAIN, SETTINGS_HIDE_DIVIDER_SELF_WRAPPED, SettingsCard } from "@/ui/SettingsCard";
 import { cn } from "@/lib/utils";
 import { displayFingerprint } from "@/link/fingerprint";
 
 export function DesktopsScreen() {
   const desktops = useDesktops();
   return (
-    <SettingsLayout>
-      <PageHeader title="Desktops" description="Open a desktop to work with its sessions, or manage who can reach it." />
-      <SettingsCard title="Your desktops">
+    <SettingsPage title="All desktops" description="Open a desktop to work with its sessions, or manage who can reach it.">
+      <SettingsCard id="your-desktops" className={SETTINGS_ANCHOR} title="Your desktops">
         <QueryBoundary query={desktops} label="desktops">
           {(data) => (data.desktops.length === 0 ? <EmptyDesktops /> : <DesktopList desktops={data.desktops} />)}
         </QueryBoundary>
       </SettingsCard>
       <PairSection empty={desktops.data?.desktops.length === 0} />
       <DevicesSection />
-    </SettingsLayout>
+    </SettingsPage>
   );
 }
-
-const PAIR_STEPS = [
-  "On the desktop, open Settings > Web app > Pair. It shows a link and a QR code.",
-  "Scan the QR code with this device, or paste the link or its 8 character code below.",
-  "Confirm the match on the desktop. It then shows up here.",
-] as const;
 
 function EmptyDesktops() {
   return (
@@ -53,11 +44,7 @@ function EmptyDesktops() {
       <Icon name="computer" size={40} className="text-faint" />
       <h2 className="text-headline font-semibold text-content">Pair your first desktop</h2>
       <p className="max-w-prose text-small text-muted-text">A desktop must be paired before you can reach its sessions from this device.</p>
-      <ol className="m-0 flex max-w-prose list-decimal flex-col gap-1.5 pl-5 text-left text-small text-content">
-        {PAIR_STEPS.map((step) => (
-          <li key={step}>{step}</li>
-        ))}
-      </ol>
+      <PairStepsList />
     </div>
   );
 }
@@ -77,10 +64,11 @@ function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
   const name = safeName(desktop.name, "Unnamed desktop");
   const version = versionLabel(desktop.os, desktop.appVersion);
   return (
-    <li className="relative flex flex-wrap items-center gap-x-2 gap-y-1 rounded-row px-1.5 py-1 before:absolute before:top-0 before:right-0 before:left-4 before:h-px before:bg-stroke first:before:hidden">
+    <li className={cn("relative flex flex-wrap items-center gap-x-2 gap-y-1 rounded-row py-0 pr-1.5 pl-0", desktop.color === null ? SETTINGS_DIVIDER_PLAIN : `${SETTINGS_DIVIDER_BASE} before:left-[30px]`, SETTINGS_HIDE_DIVIDER_SELF_WRAPPED)}>
       <Link
         to="/d/$desktopId"
         params={{ desktopId: desktop.id }}
+        data-row-highlight=""
         className="flex min-h-13 min-w-0 flex-[1_1_12rem] items-center gap-3 rounded-row py-2 pl-1.5 text-left hover:bg-selection active:opacity-60"
       >
         {desktop.color === null ? null : <ColorDot color={desktop.color} />}
@@ -95,7 +83,7 @@ function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
         <Icon name="chevronRight" size={18} className="mr-1 shrink-0 text-faint" />
       </Link>
       <Link
-        to="/desktops/$id"
+        to="/settings/desktops/$id"
         params={{ id: desktop.id }}
         aria-label={`Manage ${name}`}
         className={cn(buttonVariants({ variant: "ghost", size: "sm" }), "shrink-0 text-muted-text")}
@@ -118,61 +106,17 @@ function DesktopRow({ desktop }: { desktop: DesktopSummary }) {
   );
 }
 
-// --- Pair a desktop (F-02) ---
-
-function PairSection({ empty }: { empty: boolean }) {
-  const navigate = useNavigate();
-  const [value, setValue] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    const target = parsePairingInput(value);
-    if (!target) {
-      setError("That is not a pairing link or code of this app. Paste the link shown on the desktop, or its 8 character code.");
-      return;
-    }
-    setError(null);
-    await navigate({ to: "/pair/$code", params: { code: target.code }, hash: target.fp ? `fp=${encodeURIComponent(target.fp)}` : undefined });
-  }
-
-  return (
-    <SettingsCard
-      title="Pair a desktop"
-      footnote={empty ? undefined : "On the desktop, open Settings > Web app > Pair. It shows a link and a QR code. Scan the code with this device, or paste the link here."}
-    >
-      <form onSubmit={(event) => void submit(event)} className="flex flex-col gap-3 px-1.5 py-2" noValidate>
-        <Field
-          label="Paste a pairing link"
-          placeholder="Pairing link or code"
-          value={value}
-          onChange={(event) => {
-            setValue(event.target.value);
-            setError(null);
-          }}
-          autoComplete="off"
-          autoCapitalize="none"
-          spellCheck={false}
-          error={error}
-          hint="Paste the link or the 8 character code shown on the desktop."
-        />
-        <Button type="submit" className="w-full sm:w-auto sm:self-start" disabled={value.trim() === ""}>
-          Continue
-        </Button>
-      </form>
-    </SettingsCard>
-  );
-}
-
-// --- This account's devices ---
+// --- Browsers with desktop access ---
 
 function DevicesSection() {
   const devices = useDevices();
   const thisDevice = useThisDevice();
   return (
     <SettingsCard
-      title="This account's devices"
-      footnote="Browsers that have asked to reach a desktop. Forgetting a device removes its access on every desktop and deletes its notifications."
+      id="browser-access"
+      className={SETTINGS_ANCHOR}
+      title="Browsers with desktop access"
+      footnote="Browsers of this account that have asked to reach a desktop. Forgetting a browser removes its access on every desktop and deletes its notifications."
     >
       <QueryBoundary query={devices} label="devices">
         {(data) =>
@@ -206,10 +150,7 @@ function DeviceList({ devices, thisDeviceId }: { devices: DeviceSummary[]; thisD
           const name = safeName(device.name, "Unnamed device");
           const isThis = device.id === thisDeviceId;
           return (
-            <li
-              key={device.id}
-              className="relative flex flex-wrap items-center gap-x-3 gap-y-1 rounded-row px-1.5 py-2 before:absolute before:top-0 before:right-0 before:left-4 before:h-px before:bg-stroke first:before:hidden"
-            >
+            <li key={device.id} className={cn("relative flex flex-wrap items-center gap-x-3 gap-y-1 rounded-row px-1.5 py-2", SETTINGS_DIVIDER_PLAIN)}>
               <span className="min-w-0 flex-[1_1_12rem] wrap-anywhere">
                 <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-row text-content">
                   <span className="min-w-0 wrap-anywhere">{name}</span>

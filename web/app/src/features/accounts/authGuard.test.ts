@@ -33,7 +33,7 @@ describe("authGuard", () => {
   });
 
   it("lets a signed-in user through", async () => {
-    expect(await run("/desktops", { signedIn: true })).toBeNull();
+    expect(await run("/settings/desktops", { signedIn: true })).toBeNull();
   });
 
   it("redirects a 401 to /login with the wanted path", async () => {
@@ -52,10 +52,10 @@ describe("authGuard", () => {
     expect(await run("/recover", { signedIn: true, recoveryOnly: true })).toBeNull();
   });
 
-  it("sends a signed-in user to /settings while the low-codes flag is set, and lets /settings through", async () => {
+  it("sends a signed-in user to /settings/profile while the low-codes flag is set, and lets /settings/profile through", async () => {
     sessionStorage.setItem("monoptah.lowCodes", "dev-user");
-    expect(await run("/desktops", { signedIn: true })).toMatchObject({ to: "/settings" });
-    expect(await run("/settings", { signedIn: true })).toBeNull();
+    expect(await run("/settings/desktops", { signedIn: true })).toMatchObject({ to: "/settings/profile" });
+    expect(await run("/settings/profile", { signedIn: true })).toBeNull();
     // A recovery-only session is still confined to /recover first.
     expect(await run("/settings", { signedIn: true, recoveryOnly: true })).toMatchObject({ to: "/recover" });
   });
@@ -73,9 +73,10 @@ describe("authGuard", () => {
   });
 
   it("forces the regenerate screen while recoveryAckAt is null", async () => {
-    expect(await run("/desktops", { signedIn: true, recoveryAckAt: null })).toMatchObject({ to: "/settings" });
-    expect(await run("/d/dk1", { signedIn: true, recoveryAckAt: null })).toMatchObject({ to: "/settings" });
-    expect(await run("/settings", { signedIn: true, recoveryAckAt: null })).toBeNull();
+    expect(await run("/settings/desktops", { signedIn: true, recoveryAckAt: null })).toMatchObject({ to: "/settings/profile" });
+    expect(await run("/d/dk1", { signedIn: true, recoveryAckAt: null })).toMatchObject({ to: "/settings/profile" });
+    expect(await run("/settings", { signedIn: true, recoveryAckAt: null })).toMatchObject({ to: "/settings/profile" });
+    expect(await run("/settings/profile", { signedIn: true, recoveryAckAt: null })).toBeNull();
   });
 
   it("does not turn a server failure into a login redirect", async () => {

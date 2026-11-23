@@ -42,13 +42,13 @@ Reuse rule: code taken from the old Tauri React app (`src/`) is copied into `web
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `/` | session | Restores the last place (last used desktop, project, session) and redirects there, else `/desktops` |
+| `/` | session | Restores the last place (last used desktop, project, session) and redirects there, else `/settings/desktops` |
 | `/login` | public | Passkey sign-in (discoverable credential, hybrid QR offered by the browser), link to `/recover` |
 | `/register#invite=CODE` | public | Invite code (read from the URL fragment, so it stays out of logs and history), immutable handle, display name, create passkey, one-time recovery codes screen with "I saved these", then a prompt to add a second passkey |
 | `/recover` | public | Handle + recovery code, then forced "add a new passkey" |
 | `/pair/:code` | session (login redirect keeps the code) | Approve a desktop: machine name, fingerprint, confirmation code (section 6.4); if the account already has desktops, an option "This replaces <desktop>" (fresh re-auth). The `#fp` fragment is saved to `sessionStorage` before any redirect to `/login?redirect=` and restored after sign-in; without a `#fp` the page shows a warning that the desktop key cannot be checked |
-| `/desktops` | session | List: online status, rename, color, pending confirmations badge |
-| `/desktops/:id` | session | Manage one desktop: rename, color, devices and grants, per-device permission (lower now, request raise), revoke device, "add another device" link, revoke desktop |
+| `/settings/desktops` | session | All desktops: online status, pending confirmations badge, pair a desktop, browsers with desktop access. Old URL `/desktops` redirects here |
+| `/settings/desktops/:id` | session | One desktop on one page: status, rename, color, avatar, default model, notification categories, visible projects, desktop app update, devices and grants (per-device permission, revoke device, "add another device" link), Reconnect, forget in this browser, revoke desktop. It attaches to the desktop link only when this browser asked for access before. Old URLs `/desktops/:id` and `/d/:desktopId/settings` redirect here |
 | `/desktops/:id/verify#fp=<full hex>` | session | Re-pin after "Desktop key changed": compares the directory key of `GET /api/desktops/:id` with `#fp` (the link or QR shown in desktop Settings > Web app > "Verify on another device"); on match it replaces the pin, on mismatch it blocks. There is no "trust new key" button |
 | `/d/:desktopId` | session + link | Home for one desktop: projects and recent sessions (catalog) |
 | `/d/:desktopId/p/:projectId` | session + link | Project: sessions list (`sessions.list` paging) |
@@ -60,8 +60,7 @@ Reuse rule: code taken from the old Tauri React app (`src/`) is copied into `web
 | `/d/:desktopId/monos/:monoId` | session + link | Mono chat |
 | `/d/:desktopId/monos/:monoId/profile` | session + link | Mono profile; children: `/edit`, `/habit/:id`, `/documents`, `/file/:name` |
 | `/d/:desktopId/cloud` | session + link | Cloud instance list: state, sessions per instance, Stop and Resume (U-17) |
-| `/d/:desktopId/settings` | session + link | Per-desktop: model defaults, project selection view, notification categories, Reconnect row |
-| `/settings` | session | Account: passkeys, recovery codes, active sessions, notifications, theme, install |
+| `/settings/*` | session | One settings shell with a left nav (list page below 1024px): `/settings/profile`, `/settings/security`, `/settings/invites`, `/settings/appearance`, `/settings/notifications`, `/settings/install`, plus the desktop pages above. Old URL `/settings` redirects to `/settings/profile` |
 | `/admin`, `/admin/users`, `/admin/invites` | session, role admin, fresh | Minimal admin (security.md section 4) |
 | `/install` | public | Add to Home Screen guide, push enable button |
 

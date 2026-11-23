@@ -44,8 +44,8 @@ const SIGNED_OUT: Screen[] = [
 ];
 
 const SIGNED_IN: Screen[] = [
-  { name: "desktops", path: "/desktops", key: (p) => p.getByRole("heading", { name: "Desktops" }) },
-  { name: "settings", path: "/settings", key: (p) => p.getByRole("button", { name: "Sign out" }) },
+  { name: "desktops", path: "/settings/desktops", key: (p) => p.getByRole("heading", { name: "All desktops" }) },
+  { name: "settings", path: "/settings/profile", key: (p) => p.getByRole("button", { name: "Sign out" }) },
   { name: "admin", path: "/admin", key: (p) => p.getByRole("switch", { name: "Pause invites" }) },
 ];
 
@@ -95,9 +95,9 @@ test.describe.serial("W-14 screens: visual, axe and keyboard", () => {
 
     await test.step("keyboard: settings and the pair page, Escape closes the confirm dialog", async () => {
       const page = actor.page;
-      await tabThrough(page, "/settings", /sign out/i);
+      await tabThrough(page, "/settings/profile", /sign out/i);
 
-      await page.goto("/settings");
+      await page.goto("/settings/security");
       await page.getByRole("button", { name: "Generate new codes" }).focus();
       await page.keyboard.press("Enter");
       const dialog = page.getByRole("dialog", { name: "Replace your recovery codes?" });

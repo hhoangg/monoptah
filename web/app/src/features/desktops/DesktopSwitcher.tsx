@@ -8,7 +8,7 @@
 // design-system.md 11). Desktops are sorted by last use; choosing one opens `/d/:id`. "Request
 // access" posts the grant of that one desktop on tap (never for all). The bar is hidden while a
 // blocking link-state layer shows (any of them, including "Requesting access..."): the row then keeps only the nav icons, so the
-// way out to /desktops stays. The last-used order is updated when the page mounts.
+// way out to /settings/desktops stays. The last-used order is updated when the page mounts.
 import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
@@ -130,7 +130,7 @@ function SwitcherSheet({ currentId, onClose }: { currentId: string; onClose: () 
       title="Switch desktop"
       description="Your most recently used desktops come first."
       footer={
-        <Link to="/desktops" onClick={onClose} className={buttonVariants({ variant: "outline" })}>
+        <Link to="/settings/desktops" onClick={onClose} className={buttonVariants({ variant: "outline" })}>
           Manage desktops
         </Link>
       }

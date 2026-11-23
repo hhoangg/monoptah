@@ -6,7 +6,7 @@ import { createInvite, invitesQuery, revokeInvite } from "@/features/accounts/qu
 import { Button } from "@/ui/button";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { settingsErrorMessage } from "./copy";
 import { formatDate } from "./format";
 import { QueryBoundary } from "./QueryBoundary";
@@ -37,7 +37,7 @@ function revokeErrorMessage(error: unknown): string | null {
 export function InvitesSection() {
   const query = useQuery(invitesQuery);
   return (
-    <SettingsCard title="Invites" footnote="Each invite works once and expires after 7 days. Only people you invite can create an account.">
+    <SettingsCard id="invites" className={SETTINGS_ANCHOR} title="Invites" footnote="Each invite works once and expires after 7 days. Only people you invite can create an account.">
       <QueryBoundary query={query} label="invites">
         {(data) => <InviteList data={data} />}
       </QueryBoundary>
@@ -118,7 +118,7 @@ function InviteList({ data }: { data: ReturnType<typeof InvitesResponse.parse> }
         </div>
       ) : null}
       {created ? (
-        <div className="m-1.5 flex flex-col gap-3 rounded-row bg-fill p-3.5" data-testid="new-invite">
+        <div className="flex flex-col gap-3 rounded-row bg-fill p-3.5" data-testid="new-invite">
           <p className="text-body font-semibold text-content">Your new invite</p>
           <p className="text-small text-muted-text">Copy this link now and send it to the person you invite. Monoptah cannot show it again.</p>
           <p className="rounded-row border border-stroke bg-background p-3 font-mono text-small break-all text-content select-all">{inviteLink(created.code)}</p>

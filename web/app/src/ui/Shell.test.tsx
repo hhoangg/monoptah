@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import { setApiTransport } from "@/features/accounts/api";
+import { createMockServer } from "@/features/accounts/mock/transport";
 import { getLinkStore } from "@/link/store";
 import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { mountApp } from "@/features/desktops/testMount";
@@ -42,8 +44,8 @@ describe("app shell landmarks", () => {
 });
 
 describe("app shell frame and navigation", () => {
-  it("shows only the Account avatar in the header nav, with All desktops and Install app inside its menu", async () => {
-    mountApp("/desktops");
+  it("shows only the Account avatar in the header nav, with Settings, Desktops and Install app inside its menu", async () => {
+    mountApp("/admin");
     const nav = await screen.findByRole("navigation", { name: "Main" });
     // No Desktops (monitor) or Install (download) icon beside the avatar.
     expect(within(nav).queryAllByRole("link")).toEqual([]);
@@ -53,9 +55,62 @@ describe("app shell frame and navigation", () => {
     const user = userEvent.setup();
     await user.click(within(nav).getByRole("button", { name: "Account" }));
     const menu = await screen.findByRole("menu");
-    expect(within(menu).getByRole("menuitem", { name: "Account settings" })).toHaveAttribute("href", "/settings");
-    expect(within(menu).getByRole("menuitem", { name: "All desktops" })).toHaveAttribute("href", "/desktops");
-    expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/install");
+    expect(within(menu).getByRole("menuitem", { name: "Settings" })).toHaveAttribute("href", "/settings/profile");
+    expect(within(menu).getByRole("menuitem", { name: "Desktops" })).toHaveAttribute("href", "/settings/desktops");
+    expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/settings/install");
+  });
+
+  it.each(["/settings/profile", "/settings/desktops/desktop-dev-1", "/settings/security"])("draws no app header on %s", async (url) => {
+    mountApp(url);
+    await screen.findByRole("navigation", { name: "Settings" });
+    expect(screen.queryByTestId("app-header")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Monoptah" })).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+  });
+
+  it("draws no app header on the settings list page, and keeps the skip link and the banner", async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+    try {
+      mountApp("/settings");
+      await screen.findByRole("heading", { level: 1, name: "Settings" });
+      expect(screen.queryByTestId("app-header")).toBeNull();
+      expect(screen.getByRole("link", { name: "Skip to content" })).toHaveAttribute("href", `#${screen.getByRole("main").id}`);
+      // The notch inset moves from the header to main; the banner sticks to the top edge instead of under a header.
+      expect(screen.getByRole("main")).toHaveClass("pt-[env(safe-area-inset-top)]");
+      expect(screen.getByTestId("connection-banner").className).toContain("sticky top-[env(safe-area-inset-top)]");
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
+  it("gives the forced regenerate screen on /settings the notch inset too, without a header", async () => {
+    const original = setApiTransport(createMockServer({ signedIn: true, recoveryAckAt: null }).transport);
+    try {
+      mountApp("/settings/profile");
+      await screen.findByRole("heading", { level: 1, name: "Get new recovery codes" });
+      expect(screen.queryByTestId("app-header")).toBeNull();
+      expect(screen.getByRole("main")).toHaveClass("pt-[env(safe-area-inset-top)]");
+    } finally {
+      original();
+    }
+  });
+
+  it.each(["/install", "/pair/c0de", "/desktops/dk1/verify", "/admin", "/login"])("keeps the app header on %s", async (url) => {
+    mountApp(url);
+    expect(await screen.findByTestId("app-header")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Monoptah" })).toBeInTheDocument();
+    expect(screen.getByRole("main")).not.toHaveClass("pt-[env(safe-area-inset-top)]");
+    expect(screen.getByTestId("connection-banner").className).toContain("top-[calc(env(safe-area-inset-top)+2.75rem)]");
   });
 
   it("marks the Account avatar as current on /admin", async () => {
@@ -68,10 +123,11 @@ describe("app shell frame and navigation", () => {
     clearSlots();
     registerSlot("desktop-switcher", DesktopSwitcher);
     try {
-      mountApp("/d/dk-frame/settings");
+      mountApp("/d/dk-frame");
       const switcher = await screen.findByRole("button", { name: /Switch desktop/ });
       const nav = screen.getByRole("navigation", { name: "Main" });
-      expect(screen.queryByRole("banner")).toBeNull();
+      // The app header (brand link and nav) is not drawn; a page of the desktop may have its own <header>.
+      expect(screen.queryByTestId("app-header")).toBeNull();
       expect(screen.queryByRole("link", { name: "Monoptah" })).toBeNull();
       // One row: the switcher and the nav share the same parent, nav last.
       const row = nav.parentElement as HTMLElement;
@@ -90,7 +146,7 @@ describe("app shell frame and navigation", () => {
     registerSlot("desktop-switcher", DesktopSwitcher);
     vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
     try {
-      mountApp("/d/dk-frame/settings");
+      mountApp("/d/dk-frame");
       const banner = await screen.findByTestId("connection-banner");
       await within(banner).findByText("You are offline");
       const nav = screen.getByRole("navigation", { name: "Main" });
@@ -103,7 +159,7 @@ describe("app shell frame and navigation", () => {
     }
   });
 
-  it("keeps only Search and the Account avatar on a phone, with All desktops and Install app in the avatar menu", async () => {
+  it("keeps only Search and the Account avatar on a phone, with Settings, Desktops and Install app in the avatar menu", async () => {
     const original = window.matchMedia;
     window.matchMedia = ((query: string) => ({
       matches: query === "(max-width: 39.9375rem)",
@@ -119,7 +175,7 @@ describe("app shell frame and navigation", () => {
     registerSlot("desktop-switcher", DesktopSwitcher);
     try {
       const user = userEvent.setup();
-      mountApp("/d/dk-frame/settings");
+      mountApp("/d/dk-frame");
       const nav = await screen.findByRole("navigation", { name: "Main" });
       expect(within(nav).getByRole("button", { name: "Search" })).toBeInTheDocument();
       expect(within(nav).queryAllByRole("link")).toEqual([]);
@@ -128,8 +184,8 @@ describe("app shell frame and navigation", () => {
       for (const control of within(nav).getAllByRole("button")) expect(control.className).toContain("size-11");
       await user.click(within(nav).getByRole("button", { name: "Account" }));
       const menu = await screen.findByRole("menu");
-      expect(within(menu).getByRole("menuitem", { name: "All desktops" })).toHaveAttribute("href", "/desktops");
-      expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/install");
+      expect(within(menu).getByRole("menuitem", { name: "Desktops" })).toHaveAttribute("href", "/settings/desktops");
+      expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/settings/install");
     } finally {
       window.matchMedia = original;
       clearSlots();
@@ -137,7 +193,7 @@ describe("app shell frame and navigation", () => {
   });
 
   it("is a fixed-height column on /d routes and a normal page elsewhere", async () => {
-    mountApp("/d/dk-frame/settings");
+    mountApp("/d/dk-frame");
     await screen.findByRole("main");
     expect(screen.getByRole("main").parentElement).toHaveClass("h-dvh", "overflow-hidden");
     expect(screen.getByRole("main")).toHaveClass("min-h-0", "flex-1");
@@ -150,8 +206,8 @@ describe("app shell frame and navigation", () => {
     act(() => getLinkStore("dk-removed").setState({ blocked: "revoked", status: "closed" }));
     expect(await screen.findByRole("heading", { level: 1, name: "This desktop is no longer in your account" })).toBeInTheDocument();
     expect(screen.getByText("It was revoked or removed. Pair it again to use it from the web.")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Go to Desktops" })).toHaveAttribute("href", "/desktops");
-    expect(screen.getByRole("link", { name: "Pair a desktop" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to Desktops" })).toHaveAttribute("href", "/settings/desktops");
+    expect(screen.getByRole("link", { name: "Pair a desktop" })).toHaveAttribute("href", "/settings/desktops");
     expect(screen.queryByTestId("route-stub")).toBeNull();
   });
 

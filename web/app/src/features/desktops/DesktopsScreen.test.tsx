@@ -40,7 +40,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("/desktops list", () => {
+describe("/settings/desktops list", () => {
   it("shows online and offline desktops with last seen, version, pending badge and both links", async () => {
     install({
       desktops: [
@@ -48,14 +48,22 @@ describe("/desktops list", () => {
         desktop({ id: "d2", name: "Linux box", color: null, online: false, os: "Linux", appVersion: "1.3.0", lastSeenAt: NOW - 3 * 3600 }),
       ],
     });
-    mountApp("/desktops");
-    await screen.findByRole("heading", { level: 1, name: "Desktops" });
+    mountApp("/settings/desktops");
+    await screen.findByRole("heading", { level: 1, name: "All desktops" });
     const studio = (await screen.findByRole("link", { name: /^Open Studio Mac/ })).closest("li") as HTMLElement;
     expect(within(studio).getByText("Online")).toBeInTheDocument();
     expect(within(studio).getByText("2 to confirm")).toBeInTheDocument();
     expect(within(studio).getByText(/macOS, v1\.4\.0/)).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /^Open Studio Mac/ })).toHaveAttribute("href", "/d/d1");
-    expect(screen.getByRole("link", { name: "Manage Studio Mac" })).toHaveAttribute("href", "/desktops/d1");
+    expect(screen.getByRole("link", { name: /^Open Studio Mac/ })).toHaveAttribute("data-row-highlight");
+    expect(screen.getByRole("link", { name: "Manage Studio Mac" })).not.toHaveAttribute("data-row-highlight");
+    expect(screen.getByRole("button", { name: "Rename Studio Mac" })).not.toHaveAttribute("data-row-highlight");
+    expect(document.getElementById("your-desktops")).not.toBeNull();
+    expect(document.getElementById("pair-desktop")).not.toBeNull();
+    expect(document.getElementById("browser-access")).not.toBeNull();
+    expect(screen.getByRole("heading", { level: 2, name: "Your desktops" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 2, name: "Pair a desktop" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Manage Studio Mac" })).toHaveAttribute("href", "/settings/desktops/d1");
 
     const linux = screen.getByRole("link", { name: /^Open Linux box/ }).closest("li") as HTMLElement;
     expect(within(linux).getByText("Offline")).toBeInTheDocument();
@@ -65,7 +73,7 @@ describe("/desktops list", () => {
 
   it("renames a desktop from its row in a dialog", async () => {
     install({ desktops: [desktop({ id: "d1", name: "Studio Mac" })] });
-    mountApp("/desktops");
+    mountApp("/settings/desktops");
     await userEvent.click(await screen.findByRole("button", { name: "Rename Studio Mac" }));
     const dialog = await screen.findByRole("dialog");
     const field = within(dialog).getByLabelText("Desktop name");
@@ -80,7 +88,7 @@ describe("/desktops list", () => {
 
   it("explains how to pair when there is no desktop", async () => {
     install();
-    mountApp("/desktops");
+    mountApp("/settings/desktops");
     expect(await screen.findByRole("heading", { name: "Pair your first desktop" })).toBeInTheDocument();
     expect(screen.getByText(/Settings > Web app > Pair/)).toBeInTheDocument();
     expect(screen.getByLabelText("Paste a pairing link")).toBeInTheDocument();
@@ -90,7 +98,7 @@ describe("/desktops list", () => {
 
   it("renders desktop names as text only", async () => {
     install({ desktops: [desktop({ name: "<img src=x onerror=alert(1)>‮evil" })] });
-    mountApp("/desktops");
+    mountApp("/settings/desktops");
     const link = await screen.findByRole("link", { name: /^Open / });
     expect(link.textContent).toContain("<img src=x onerror=alert(1)>evil");
     expect(document.querySelector("img")).toBeNull();
@@ -100,7 +108,7 @@ describe("/desktops list", () => {
 describe("paste a pairing link", () => {
   it("opens /pair/:code and keeps #fp for a same-origin link", async () => {
     install();
-    const { router } = mountApp("/desktops");
+    const { router } = mountApp("/settings/desktops");
     const field = await screen.findByLabelText("Paste a pairing link");
     await userEvent.type(field, `${window.location.origin}/pair/ABCD2345#fp=${FP_A}`);
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
@@ -110,7 +118,7 @@ describe("paste a pairing link", () => {
 
   it("accepts a bare code", async () => {
     install();
-    const { router } = mountApp("/desktops");
+    const { router } = mountApp("/settings/desktops");
     await userEvent.type(await screen.findByLabelText("Paste a pairing link"), "abcd2345");
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
     await waitFor(() => expect(router.state.location.pathname).toBe("/pair/ABCD2345"));
@@ -118,20 +126,20 @@ describe("paste a pairing link", () => {
 
   it("rejects a link of another origin and stays on the page", async () => {
     install();
-    const { router } = mountApp("/desktops");
+    const { router } = mountApp("/settings/desktops");
     await userEvent.type(await screen.findByLabelText("Paste a pairing link"), `https://evil.example/pair/ABCD2345#fp=${FP_A}`);
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/not a pairing link or code of this app/);
-    expect(router.state.location.pathname).toBe("/desktops");
+    expect(router.state.location.pathname).toBe("/settings/desktops");
   });
 });
 
-describe("This account's devices", () => {
+describe("Browsers with desktop access", () => {
   it("lists name, fingerprint in display form, last seen and marks this device", async () => {
     keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "dev1", publicKey: new Uint8Array(32) });
     install({ devices: [device({ id: "dev2", name: "Firefox on Linux", fingerprint: FP_B, lastSeenAt: null }), device({ id: "dev1", name: "Chrome on macOS", lastSeenAt: NOW - 120 })] });
-    mountApp("/desktops");
-    const heading = await screen.findByRole("heading", { level: 2, name: "This account's devices" });
+    mountApp("/settings/desktops");
+    const heading = await screen.findByRole("heading", { level: 2, name: "Browsers with desktop access" });
     const section = heading.closest("section") as HTMLElement;
     const items = await within(section).findAllByRole("listitem");
     expect(within(items[0]!).getByText("Chrome on macOS")).toBeInTheDocument();
@@ -145,7 +153,7 @@ describe("This account's devices", () => {
   it("forgets another device only after the confirm dialog, without touching the local key", async () => {
     keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "me", publicKey: new Uint8Array(32) });
     install({ devices: [device({ id: "dev2", name: "Firefox on Linux" })] });
-    mountApp("/desktops");
+    mountApp("/settings/desktops");
     await userEvent.click(await screen.findByRole("button", { name: "Forget device Firefox on Linux" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/every desktop/)).toBeInTheDocument();
@@ -164,7 +172,7 @@ describe("This account's devices", () => {
   it("forgetting this device also clears the local key and pins", async () => {
     keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "dev1", publicKey: new Uint8Array(32) });
     install({ devices: [device({ id: "dev1", name: "Chrome on macOS" })] });
-    mountApp("/desktops");
+    mountApp("/settings/desktops");
     await waitFor(() => expect(screen.getByText("This device")).toBeInTheDocument());
     await userEvent.click(screen.getByRole("button", { name: "Forget device Chrome on macOS" }));
     const dialog = await screen.findByRole("dialog");
@@ -178,7 +186,7 @@ describe("This account's devices", () => {
 
   it("renders device names as text only", async () => {
     install({ devices: [device({ name: "<script>alert(1)</script>" })] });
-    mountApp("/desktops");
+    mountApp("/settings/desktops");
     expect(await screen.findByText("<script>alert(1)</script>")).toBeInTheDocument();
     expect(document.querySelector("script")).toBeNull();
   });

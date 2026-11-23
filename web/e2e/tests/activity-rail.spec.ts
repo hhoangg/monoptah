@@ -1,6 +1,6 @@
 // The navigation redesign of the /d routes: from 640 px an activity rail at the far left (the paired desktops as
 // avatars on top; Cloud, Desktop settings and the account avatar at the bottom) replaces the top bar; below 640 px the
-// top bar stays with the desktop switcher, Search and the account avatar. The avatar menu holds All desktops and
+// top bar stays with the desktop switcher, Search and the account avatar. The avatar menu holds Settings, Desktops and
 // Install app, so the monitor and download icons are gone from every top nav. Two real headless desktops are paired and
 // confirmed for one account (serial).
 //
@@ -191,7 +191,7 @@ test.describe("activity rail", () => {
         await expect(page).toHaveURL(new RegExp(`/d/${ids[ALPHA]}$`));
       });
 
-      test("the avatar menu holds All desktops and Install app; the rail has no monitor or download icon", async () => {
+      test("the avatar menu holds Settings, Desktops and Install app; the rail has no monitor or download icon", async () => {
         await open(ALPHA, layout);
         const rail = page.getByTestId("activity-rail");
         await expect(rail.locator('[data-icon="computer"], [data-icon="download"]')).toHaveCount(0);
@@ -199,10 +199,10 @@ test.describe("activity rail", () => {
         await expect(page.getByRole("button", { name: /Switch desktop/ })).toHaveCount(0);
         await rail.getByRole("button", { name: "Account" }).click();
         const menu = page.getByRole("menu");
-        await expect(menu.getByRole("menuitem", { name: "Account settings" })).toBeVisible();
-        await expect(menu.getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/install");
-        await menu.getByRole("menuitem", { name: "All desktops" }).click();
-        await expect(page).toHaveURL(/\/desktops$/);
+        await expect(menu.getByRole("menuitem", { name: "Settings" })).toBeVisible();
+        await expect(menu.getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/settings/install");
+        await menu.getByRole("menuitem", { name: "Desktops" }).click();
+        await expect(page).toHaveURL(/\/settings\/desktops$/);
       });
 
       test("Desktop settings, then the avatar, sit at the bottom of the rail, and the sidebar has no duplicates", async () => {
@@ -216,7 +216,7 @@ test.describe("activity rail", () => {
         for (const name of ["All desktops", "Desktop settings", "Cloud"]) await expect(sidebar.getByRole("link", { name })).toHaveCount(0);
         await expect(sidebar.getByRole("button", { name: "Search" })).toBeVisible();
         await rail.getByRole("link", { name: "Desktop settings" }).click();
-        await expect(page).toHaveURL(new RegExp(`/d/${ids[ALPHA]}/settings$`));
+        await expect(page).toHaveURL(new RegExp(`/settings/desktops/${ids[ALPHA]}$`));
       });
     });
   }
@@ -232,8 +232,8 @@ test.describe("activity rail", () => {
     await expect(nav.locator('[data-icon="computer"], [data-icon="download"]')).toHaveCount(0);
     await nav.getByRole("button", { name: "Account" }).click();
     const menu = page.getByRole("menu");
-    await expect(menu.getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/install");
-    await menu.getByRole("menuitem", { name: "All desktops" }).click();
-    await expect(page).toHaveURL(/\/desktops$/);
+    await expect(menu.getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/settings/install");
+    await menu.getByRole("menuitem", { name: "Desktops" }).click();
+    await expect(page).toHaveURL(/\/settings\/desktops$/);
   });
 });

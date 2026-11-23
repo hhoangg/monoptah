@@ -65,25 +65,87 @@ function useShowDelay(active: boolean, delay: number): boolean {
   return active && elapsed;
 }
 
+/** Pinned banners that currently show; the document attribute stays while at least one does (several banners, StrictMode double effects). */
+let markOwners = 0;
+
+/** Marks the document for the settings anchors; returns the release function. The attribute goes only with the last owner. */
+function claimConnectionBannerMark(): () => void {
+  const root = document.documentElement;
+  markOwners += 1;
+  root.setAttribute("data-connection-banner", "shown");
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    markOwners -= 1;
+    if (markOwners === 0) root.removeAttribute("data-connection-banner");
+  };
+}
+
+/** Publishes the pill's height as `--connection-banner-height` while it shows; the variable goes with the last owner. */
+let heightOwners = 0;
+
+/** Publishes the measured height of `element`; returns the release function. A no-op measure where ResizeObserver is missing. */
+function claimConnectionBannerHeight(element: HTMLElement): () => void {
+  const root = document.documentElement;
+  heightOwners += 1;
+  const publish = () => root.style.setProperty("--connection-banner-height", `${element.getBoundingClientRect().height}px`);
+  publish();
+  const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(publish);
+  observer?.observe(element);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    observer?.disconnect();
+    heightOwners -= 1;
+    if (heightOwners === 0) root.style.removeProperty("--connection-banner-height");
+  };
+}
+
 /**
  * The connection status as an overlay toast. The live region is a zero-height box in the flow (right under the top
  * bar, which already clears the notch), so showing or hiding it never moves the content; the pill floats over the
  * content from there. Only the pill takes pointer events. It is the single live region for the connection state
  * (the pill also says the saved data is shown).
  */
-export function OfflineBanner({ pinnedBelowHeader = false }: { /** The page scrolls (not a /d frame): stay in view just under the sticky header. */ pinnedBelowHeader?: boolean }) {
+export function OfflineBanner({
+  pinnedBelowHeader = false,
+  pinned = pinnedBelowHeader ? "below-header" : undefined,
+}: {
+  /** Same as `pinned="below-header"`. Only tests pass it; new callers use `pinned`. */
+  pinnedBelowHeader?: boolean;
+  /**
+   * The page scrolls (not a /d frame): stay in view. `below-header` sits just under the sticky 44px app header; `top` is
+   * for a page without that header (settings), where only the notch inset is above the banner.
+   */
+  pinned?: "below-header" | "top";
+}) {
   const desktopId = useRouterState({ select: (state) => desktopIdFromPath(state.location.pathname) });
   const connectivity = useDesktopConnectivity(desktopId);
   const reduceMotion = useReducedMotion();
   const showing = useShowDelay(connectivity.kind !== "online", SHOW_DELAY_MS);
   const canRetry = desktopId !== null && ((connectivity.kind === "desktop_offline" || (connectivity.kind === "reconnecting" && connectivity.connecting !== true)));
   const offset = reduceMotion ? 0 : -8;
+  // Only a pinned pill floats over a scrolling page: tell the settings anchors (`--settings-anchor-offset`) to clear it.
+  const covering = pinned === "top" && showing;
+  useEffect(() => {
+    if (!covering) return;
+    return claimConnectionBannerMark();
+  }, [covering]);
+  const [pill, setPill] = useState<HTMLElement | null>(null);
+  const measured = covering ? pill : null;
+  useEffect(() => {
+    if (measured === null) return;
+    return claimConnectionBannerHeight(measured);
+  }, [measured]);
   return (
-    <div role="status" aria-live="polite" data-testid="connection-banner" className={cn("pointer-events-none z-20 h-0 shrink-0", pinnedBelowHeader ? "sticky top-[calc(env(safe-area-inset-top)+2.75rem)]" : "relative")}>
+    <div role="status" aria-live="polite" data-testid="connection-banner" className={cn("pointer-events-none z-20 h-0 shrink-0", pinned === "below-header" ? "sticky top-[calc(env(safe-area-inset-top)+2.75rem)]" : pinned === "top" ? "sticky top-[env(safe-area-inset-top)]" : "relative")}>
       <AnimatePresence>
         {showing ? (
           <div key="toast" className="absolute inset-x-0 top-2 flex justify-center pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.5rem,env(safe-area-inset-left))]">
             <Glass
+              ref={setPill}
               data-kind={connectivity.kind}
               initial={{ opacity: 0, y: offset }}
               animate={{ opacity: 1, y: 0 }}

@@ -81,7 +81,7 @@ test.describe("W-14 flows through the UI", () => {
       expect(eventOf(started.process, "paired")).toMatchObject({ account: HANDLE, fingerprint });
 
       await page.getByRole("link", { name: "Go to my desktops" }).click();
-      await expect(page).toHaveURL(/\/desktops$/);
+      await expect(page).toHaveURL(/\/settings\/desktops$/);
       await expect(openDesktop).toBeVisible();
       return started;
     });
@@ -103,7 +103,7 @@ test.describe("W-14 flows through the UI", () => {
     });
 
     await test.step("confirm: opening the desktop registers this device and shows the pending screen until the desktop approves", async () => {
-      await page.goto("/desktops");
+      await page.goto("/settings/desktops");
       await openDesktop.click();
       await expect(page).toHaveURL(new RegExp(`/d/${desktopId}$`));
       const pendingScreen = page.getByRole("alertdialog", { name: "Confirm this device on your desktop" });
@@ -205,7 +205,7 @@ test.describe("W-14 flows through the UI", () => {
     await test.step("visual and axe: the desktop detail screen, with this device confirmed", async () => {
       await checkScreen(page, {
         name: "desktop-detail",
-        path: `/desktops/${desktopId}`,
+        path: `/settings/desktops/${desktopId}`,
         key: (p) => p.getByRole("heading", { level: 1, name: MACHINE }),
         ready: (p) => p.getByRole("button", { name: `Revoke access for ${deviceName}` }),
       });
@@ -215,7 +215,7 @@ test.describe("W-14 flows through the UI", () => {
     });
 
     await test.step("revoke (a): Revoke access for this device, the desktop prints revoked, the link shows the revoked screen", async () => {
-      await page.goto(`/desktops/${desktopId}`);
+      await page.goto(`/settings/desktops/${desktopId}`);
       await page.getByRole("button", { name: `Revoke access for ${deviceName}` }).click();
       const dialog = page.getByRole("dialog", { name: `Revoke access for ${deviceName}?` });
       await expect(dialog).toBeVisible();
@@ -236,12 +236,12 @@ test.describe("W-14 flows through the UI", () => {
     });
 
     await test.step("revoke (b): Revoke desktop removes it from the account and the desktop prints revoked", async () => {
-      await page.goto(`/desktops/${desktopId}`);
-      await page.getByRole("button", { name: "Revoke desktop" }).click();
+      await page.goto(`/settings/desktops/${desktopId}`);
+      await page.getByRole("button", { name: "Revoke from account" }).click();
       const dialog = page.getByRole("dialog", { name: `Revoke ${MACHINE}?` });
       await expect(dialog).toBeVisible();
       await dialog.getByRole("button", { name: "Revoke desktop" }).click();
-      await expect(page).toHaveURL(/\/desktops$/, { timeout: 20_000 });
+      await expect(page).toHaveURL(/\/settings\/desktops$/, { timeout: 20_000 });
       await expect(openDesktop).toHaveCount(0);
       await desktop.waitFor("revoked", { scope: "desktop" }, 60_000);
       const listed = await actor.call("GET", "/api/desktops");

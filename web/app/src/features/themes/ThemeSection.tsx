@@ -4,7 +4,7 @@ import { useAppearance } from "@/lib/appearance";
 import { cn } from "@/lib/utils";
 import { ACCENTS, THEME_LABELS, THEMES, type Accent, type Scheme, type Theme } from "@/styles/themes";
 import { Icon } from "@/ui/Icon";
-import { SettingsCard } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard } from "@/ui/SettingsCard";
 import { ACCENT_LABELS, accentSwatch, themeSwatch } from "./swatches";
 
 interface Choice<T extends string> {
@@ -125,7 +125,7 @@ export function ThemeSection() {
   }));
 
   return (
-    <SettingsCard title="Theme" footnote="Theme tints the surfaces. An accent replaces the theme's own accent color. Saved on this device only.">
+    <SettingsCard id="theme" className={SETTINGS_ANCHOR} title="Theme" footnote="Theme tints the surfaces. An accent replaces the theme's own accent color. Saved on this device only.">
       <SwatchGroup label="Theme" choices={themeChoices} value={theme} onChange={setTheme} />
       <div role="separator" className="mx-1.5 h-px bg-stroke" />
       <SwatchGroup label="Accent" choices={accentChoices} value={accent} onChange={setAccent} />

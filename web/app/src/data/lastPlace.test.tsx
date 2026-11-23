@@ -52,13 +52,13 @@ describe("last place registry", () => {
 });
 
 describe("/ redirect", () => {
-  it("drops a last used desktop that is no longer in the account and goes to /desktops (N-12)", async () => {
+  it("drops a last used desktop that is no longer in the account and goes to /settings/desktops (N-12)", async () => {
     localStorage.setItem(LAST_DESKTOP_KEY, "gone");
     localStorage.setItem(lastPlaceKey("gone"), "/d/gone/s/s9");
     registerLastPlaceResolver(() => "/d/gone/s/s9");
     const router = renderAt("/");
-    await screen.findByRole("heading", { level: 1, name: "Desktops" });
-    expect(router.state.location.pathname).toBe("/desktops");
+    await screen.findByRole("heading", { level: 1, name: "All desktops" });
+    expect(router.state.location.pathname).toBe("/settings/desktops");
     expect(localStorage.getItem(LAST_DESKTOP_KEY)).toBeNull();
     expect(localStorage.getItem(lastPlaceKey("gone"))).toBeNull();
   });
@@ -73,10 +73,10 @@ describe("/ redirect", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/d/dk1/s/s9"));
   });
 
-  it("goes to /desktops when there is no last place", async () => {
+  it("goes to /settings/desktops when there is no last place", async () => {
     const router = renderAt("/");
-    await screen.findByRole("heading", { level: 1, name: "Desktops" });
-    expect(router.state.location.pathname).toBe("/desktops");
+    await screen.findByRole("heading", { level: 1, name: "All desktops" });
+    expect(router.state.location.pathname).toBe("/settings/desktops");
   });
 
   it("goes to the last place of the last used desktop when a resolver is registered", async () => {

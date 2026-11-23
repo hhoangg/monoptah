@@ -1,12 +1,9 @@
-// Per-desktop settings /d/:desktopId/settings (W-11, F-86). Owner: WS-S (workstreams.md 3.1).
-import { createFileRoute } from "@tanstack/react-router";
-import { DesktopSettingsScreen } from "@/features/settings/DesktopSettingsScreen";
+// /d/:desktopId/settings (old URL, kept for links and notifications): the desktop's settings now live in the settings
+// shell at /settings/desktops/:desktopId.
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/d/$desktopId/settings/")({
-  component: Page,
+  beforeLoad: ({ params }) => {
+    throw redirect({ to: "/settings/desktops/$id", params: { id: params.desktopId }, replace: true });
+  },
 });
-
-function Page() {
-  const { desktopId } = Route.useParams();
-  return <DesktopSettingsScreen desktopId={desktopId} />;
-}

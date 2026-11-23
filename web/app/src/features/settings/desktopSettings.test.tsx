@@ -14,6 +14,7 @@ import { createAppRouter } from "@/router";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { DesktopLinkError, forgetDesktopLocally, onForgetDesktop, provideDesktopLink, resetDesktopLinks } from "./desktopLink";
 import { UPDATE_POLL_MS } from "./DesktopUpdateSection";
+import { markGrantRequested, wasGrantRequested } from "@/features/desktops/storage";
 import { FirstRunPicker, pickerSeenKey } from "./FirstRunPicker";
 import { createMockDesktopLink, type MockDesktopLink } from "./mockDesktopLink";
 
@@ -25,13 +26,15 @@ vi.mock("@/link/keys", async (importOriginal) => ({ ...(await importOriginal<typ
 const ASSERTION = { status: "ok", response: { id: "cred", rawId: "cred", type: "public-key", response: {}, clientExtensionResults: {} } };
 
 const DESKTOP = "desktop-dev-1";
-const SETTINGS = `/d/${DESKTOP}/settings`;
+const SETTINGS = `/settings/desktops/${DESKTOP}`;
+const THIS_DEVICE = "dev-this";
 
 let restore: (() => void) | undefined;
 let requests: Array<{ method: string; url: string; body: unknown }> = [];
 let links: MockDesktopLink[] = [];
 
 let mockState: ReturnType<typeof createMockState>;
+
 /** Tickets the fake selection-ticket route handed out, and the answer it gives next (default: a ticket once fresh). */
 let tickets: string[] = [];
 let ticketAnswer: { status: number; code: string } | null = null;
@@ -64,6 +67,8 @@ function installApi() {
 function provideMockLink(options: { online?: boolean; permission?: "read" | "control" } = {}): MockDesktopLink {
   const link = createMockDesktopLink(options);
   links.push(link);
+  // The page attaches to the link only for a desktop this browser asked access to before (see DesktopSettingsPage).
+  markGrantRequested(DESKTOP, THIS_DEVICE);
   provideDesktopLink(() => link);
   return link;
 }
@@ -93,7 +98,7 @@ function setCalls(link: MockDesktopLink) {
 }
 
 async function openPicker(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(await screen.findByRole("button", { name: /Projects on this device/ }));
+  await user.click(await screen.findByRole("button", { name: /Choose projects/ }));
   return screen.findByRole("dialog", { name: "Projects on this device" });
 }
 
@@ -101,7 +106,8 @@ beforeEach(() => {
   requests = [];
   window.localStorage.clear();
   webauthn.getPasskey.mockResolvedValue(ASSERTION);
-  keys.getDeviceKeyInfo.mockResolvedValue({ deviceId: "dev-this", publicKey: new Uint8Array(32) });
+  keys.getDeviceKeyInfo.mockClear();
+  keys.getDeviceKeyInfo.mockResolvedValue({ deviceId: THIS_DEVICE, publicKey: new Uint8Array(32) });
   installApi();
   getLinkStore(DESKTOP).setState({ permission: "control", desktopVersion: "1.4.0" });
 });
@@ -115,32 +121,91 @@ afterEach(() => {
   window.history.replaceState(null, "", "/");
 });
 
-describe("/d/:desktopId/settings", () => {
+describe("/settings/desktops/:id", () => {
   it("renders one h1, the groups and the desktop-settings-sections slot with the desktop id", async () => {
     // The router imports features/sessions/register, which registers the default-model row (U-07): replace it.
     clearSlots();
     registerSlot("desktop-settings-sections", ({ desktopId }) => <p>Slot for {desktopId}</p>);
     const link = provideMockLink();
     mount(SETTINGS);
-    await screen.findByRole("heading", { level: 1, name: "Desktop settings" });
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
-    for (const title of ["Status", "Notifications", "Projects", "Connection", "Remove"]) {
+    for (const title of ["General", "Notifications", "Projects visible in this browser", "Desktop app update", "Access", "Troubleshoot", "Remove"]) {
       expect(screen.getByRole("heading", { level: 2, name: title })).toBeInTheDocument();
     }
-    expect(screen.getByText("Fake Studio Mac", { selector: "span" })).toBeInTheDocument();
-    expect(screen.getByText(`Slot for ${DESKTOP}`)).toBeInTheDocument();
+    for (const title of ["Status", "About", "Name", "Color", "Avatar"]) {
+      expect(screen.getByRole("heading", { level: 3, name: title })).toBeInTheDocument();
+    }
+    // The settings nav lists the desktop too: look at the status card of the page.
+    expect(within(document.getElementById("desktop-status") as HTMLElement).getByText("Fake Studio Mac", { selector: "span" })).toBeInTheDocument();
+    expect(await screen.findByText(`Slot for ${DESKTOP}`)).toBeInTheDocument();
     await connected(link);
     expect(await screen.findByText("Connected")).toBeInTheDocument();
     expect(await screen.findByText("2 projects, 1 Mono")).toBeInTheDocument();
   });
 
-  it("shows a clear not-connected state without a link provider", async () => {
+  it("does not connect a desktop this browser never asked access to, and shows a Models placeholder", async () => {
+    const link = createMockDesktopLink();
+    links.push(link);
+    const factory = vi.fn(() => link);
+    provideDesktopLink(factory);
+    const subscribe = vi.spyOn(link, "subscribe");
+    clearSlots();
+    registerSlot("desktop-settings-sections", () => <p>Models slot</p>);
     mount(SETTINGS);
-    await screen.findByRole("heading", { level: 1, name: "Desktop settings" });
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
+    // The device is known by now; with no grant marker the page still stays off the link.
+    await waitFor(() => expect(keys.getDeviceKeyInfo).toHaveBeenCalled());
+    expect(wasGrantRequested(DESKTOP, THIS_DEVICE)).toBe(false);
+    expect(factory).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
+    expect(screen.queryByText("Models slot")).toBeNull();
+    const models = document.getElementById("desktop-models") as HTMLElement;
+    expect(within(models).getByRole("heading", { name: "Models" })).toBeInTheDocument();
+    expect(within(models).getByText("Needs a connection to the desktop")).toBeInTheDocument();
     expect(screen.getAllByText("Not connected").length).toBeGreaterThan(0);
-    expect(screen.queryByRole("button", { name: /Projects on this device/ })).toBeNull();
+  });
+
+  it("shows neither the not-connected notice nor the placeholders while this browser's device is still loading", async () => {
+    let resolveDevice: (value: { deviceId: string; publicKey: Uint8Array }) => void = () => undefined;
+    keys.getDeviceKeyInfo.mockReturnValue(new Promise((resolve) => (resolveDevice = resolve)));
+    const link = createMockDesktopLink();
+    links.push(link);
+    provideDesktopLink(() => link);
+    mount(SETTINGS);
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
+    await waitFor(() => expect(keys.getDeviceKeyInfo).toHaveBeenCalled());
+    expect(screen.queryByText("Not connected")).toBeNull();
+    expect(screen.queryByText("Needs a connection to the desktop")).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Models" })).toBeNull();
+    expect(within(document.getElementById("desktop-update") as HTMLElement).getAllByText("Checking...").length).toBeGreaterThan(0);
+    // The device is known and this browser never used the desktop: now the notice and the placeholders are right.
+    resolveDevice({ deviceId: THIS_DEVICE, publicKey: new Uint8Array(32) });
+    expect((await screen.findAllByText("Not connected")).length).toBeGreaterThan(0);
+    expect(within(document.getElementById("desktop-models") as HTMLElement).getByRole("heading", { name: "Models" })).toBeInTheDocument();
+    expect(within(document.getElementById("desktop-projects") as HTMLElement).getByText("Needs a connection to the desktop")).toBeInTheDocument();
+  });
+
+  it("connects and mounts the Models slot once this browser asked access before", async () => {
+    clearSlots();
+    registerSlot("desktop-settings-sections", () => <p>Models slot</p>);
+    const link = provideMockLink();
+    mount(SETTINGS);
+    expect(await screen.findByText("Models slot")).toBeInTheDocument();
+    await connected(link);
+    expect(await screen.findByText("Connected")).toBeInTheDocument();
+  });
+
+  it("shows a clear not-connected state without a link provider", async () => {
+    // A browser that used this desktop before, so the page would attach: only the missing provider leaves it unlinked.
+    markGrantRequested(DESKTOP, THIS_DEVICE);
+    mount(SETTINGS);
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
+    // The page shows "Checking..." until this browser's device is read; wait for that, then the state is final.
+    expect((await screen.findAllByText("Not connected")).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /Choose projects/ })).toBeNull();
     expect(screen.queryByRole("button", { name: /Reconnect/ })).toBeNull();
-    expect(screen.getByRole("button", { name: /Remove this desktop from this device/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Forget in this browser/ })).toBeInTheDocument();
   });
 
   it("Reconnect runs the handshake again and refreshes workspace.list", async () => {
@@ -447,15 +512,20 @@ describe("projects picker", () => {
 });
 
 describe("first run", () => {
-  function mountFirstRun() {
+  // The first-run picker slot is rendered by the /d/:desktopId layout only, so these tests mount a /d route. The probe
+  // slot proves the layout rendered, so "no dialog" is not true just because nothing mounted yet.
+  async function mountFirstRun() {
     registerSlot("first-run-picker", FirstRunPicker);
-    return mount(SETTINGS);
+    registerSlot("desktop-switcher", () => <p>Layout probe</p>);
+    const mounted = mount(`/d/${DESKTOP}`);
+    await screen.findByText("Layout probe");
+    return mounted;
   }
 
   it("Choose later makes no set call, keeps the selection and sets the flag; the picker shows once", async () => {
     const user = userEvent.setup();
     const link = provideMockLink();
-    const first = mountFirstRun();
+    const first = await mountFirstRun();
     await connected(link);
     const dialog = await screen.findByRole("dialog", { name: "Projects on this device" });
     expect(within(dialog).queryByRole("button", { name: "Cancel" })).toBeNull();
@@ -468,34 +538,32 @@ describe("first run", () => {
     first.queryClient.clear();
     cleanup();
     clearSlots();
-    mountFirstRun();
-    await screen.findByRole("heading", { level: 1, name: "Desktop settings" });
+    await mountFirstRun();
     await connected(link);
     expect(screen.queryByRole("dialog", { name: "Projects on this device" })).toBeNull();
   });
 
   it("does not show without a link provider and leaves the flag unset", async () => {
-    mountFirstRun();
-    await screen.findByRole("heading", { level: 1, name: "Desktop settings" });
+    await mountFirstRun();
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(window.localStorage.getItem(pickerSeenKey(DESKTOP))).toBeNull();
   });
 });
 
 describe("remove this desktop", () => {
-  it("confirms, calls device.leave, runs the forget hook and goes to /desktops", async () => {
+  it("confirms, calls device.leave, runs the forget hook and goes to /settings/desktops", async () => {
     const user = userEvent.setup();
     const link = provideMockLink();
     const forgotten = vi.fn();
     onForgetDesktop(forgotten);
     const { router } = mount(SETTINGS);
     await connected(link);
-    await user.click(await screen.findByRole("button", { name: /Remove this desktop from this device/ }));
+    await user.click(await screen.findByRole("button", { name: /Forget in this browser/ }));
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("Remove this desktop from this device?");
     expect(link.calls.some((call) => call.method === "device.leave")).toBe(false);
     await user.click(within(dialog).getByRole("button", { name: "Remove" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/settings/desktops"));
     expect(link.calls.some((call) => call.method === "device.leave")).toBe(true);
     expect(forgotten).toHaveBeenCalledWith(DESKTOP);
     expect(link.desktop.devices.size).toBe(0);
@@ -509,11 +577,11 @@ describe("remove this desktop", () => {
     onForgetDesktop(forgotten);
     const { router } = mount(SETTINGS);
     await connected(link);
-    await user.click(await screen.findByRole("button", { name: /Remove this desktop from this device/ }));
+    await user.click(await screen.findByRole("button", { name: /Forget in this browser/ }));
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent("revoke this device's access on your account, use Desktops");
     await user.click(within(dialog).getByRole("button", { name: "Remove" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/settings/desktops"));
     expect(link.calls.some((call) => call.method === "device.leave")).toBe(false);
     expect(forgotten).toHaveBeenCalledWith(DESKTOP);
   });
@@ -526,7 +594,7 @@ describe("remove this desktop", () => {
     window.localStorage.setItem(pickerSeenKey(DESKTOP), "1");
     vi.spyOn(link, "call").mockRejectedValue(new DesktopLinkError("closed", "closed"));
     const { router } = mount(SETTINGS);
-    await user.click(await screen.findByRole("button", { name: /Remove this desktop from this device/ }));
+    await user.click(await screen.findByRole("button", { name: /Forget in this browser/ }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).queryByRole("button", { name: "Remove from this device anyway" })).toBeNull();
     await user.click(within(dialog).getByRole("button", { name: "Remove" }));
@@ -536,7 +604,7 @@ describe("remove this desktop", () => {
 
     // Never trapped: the local forget works without the desktop and clears the picker flag (M11).
     await user.click(within(dialog).getByRole("button", { name: "Remove from this device anyway" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/settings/desktops"));
     expect(forgotten).toHaveBeenCalledWith(DESKTOP);
     expect(window.localStorage.getItem(pickerSeenKey(DESKTOP))).toBeNull();
   });
@@ -585,7 +653,7 @@ describe("Desktop app update", () => {
     const link = provideMockLink();
     link.desktop.world.latestVersion = "1.5.0";
     mount(SETTINGS);
-    expect(await screen.findByRole("heading", { level: 2, name: "Desktop app" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 2, name: "Desktop app update" })).toBeInTheDocument();
     expect(await screen.findByText("1.5.0")).toBeInTheDocument();
     expect(screen.getByText("1.4.0")).toBeInTheDocument();
 
@@ -719,8 +787,103 @@ describe("Desktop app update", () => {
 
   it("without a connection the card says it needs one", async () => {
     mount(SETTINGS);
-    expect(await screen.findByRole("heading", { level: 2, name: "Desktop app" })).toBeInTheDocument();
-    expect(screen.getAllByText("Needs a connection to the desktop")).toHaveLength(2);
+    expect(await screen.findByRole("heading", { level: 2, name: "Desktop app update" })).toBeInTheDocument();
+    // The Models placeholder says it too, so each card is checked on its own. The cards say "Checking..." until the device is read.
+    await waitFor(() => expect(within(document.getElementById("desktop-update")!).getByText("Needs a connection to the desktop")).toBeInTheDocument());
+    expect(within(document.getElementById("desktop-update")!).getByText("Needs a connection to the desktop")).toBeInTheDocument();
+    expect(within(document.getElementById("desktop-projects")!).getByText("Needs a connection to the desktop")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Update and restart" })).toBeNull();
+  });
+});
+
+describe("page structure", () => {
+  const ANCHORS = [
+    "desktop-general",
+    "desktop-status",
+    "desktop-about",
+    "desktop-name",
+    "desktop-color",
+    "desktop-avatar",
+    "desktop-models",
+    "desktop-notifications",
+    "desktop-projects",
+    "desktop-update",
+    "desktop-access",
+    "desktop-troubleshoot",
+    "desktop-remove",
+  ];
+
+  it("renders the cards in the requested order, each with its settings anchor", async () => {
+    provideMockLink();
+    mount(SETTINGS);
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
+    const nodes = ANCHORS.map((anchor) => document.getElementById(anchor));
+    nodes.forEach((node, index) => expect(node, ANCHORS[index]).not.toBeNull());
+    for (let index = 1; index < nodes.length; index += 1) {
+      const before = nodes[index - 1] as HTMLElement;
+      const after = nodes[index] as HTMLElement;
+      expect(before.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING, `${ANCHORS[index - 1]} before ${ANCHORS[index]}`).toBeTruthy();
+    }
+  });
+
+  it("groups status, about, name, color and avatar as blocks of the General card, in that order", async () => {
+    provideMockLink();
+    mount(SETTINGS);
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
+    const general = document.getElementById("desktop-general") as HTMLElement;
+    expect(within(general).getByRole("heading", { level: 2, name: "General" })).toBeInTheDocument();
+    const blocks = ["desktop-status", "desktop-about", "desktop-name", "desktop-color", "desktop-avatar"].map((id) => document.getElementById(id) as HTMLElement);
+    blocks.forEach((block) => expect(general.contains(block)).toBe(true));
+    expect(blocks.map((block) => block.querySelector("h3")?.textContent)).toEqual(["Status", "About", "Name", "Color", "Avatar"]);
+    expect(blocks.every((block) => block.className.includes("scroll-mt-"))).toBe(true);
+    // The avatar block keeps its footnote as in-card text, and no block is a card of its own.
+    expect(within(blocks[4] as HTMLElement).getByText(/Shown in the desktop list on the left/)).toBeInTheDocument();
+    expect(general.querySelectorAll('[data-slot="settings-card"]')).toHaveLength(1);
+  });
+
+  it("offers Open desktop and a way back to all desktops", async () => {
+    mount(SETTINGS);
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
+    expect(screen.getByRole("link", { name: "Open desktop" })).toHaveAttribute("href", `/d/${DESKTOP}`);
+    // The nav repeats "All desktops": the back link is the one in the page header.
+    const header = screen.getByRole("heading", { level: 1 }).closest("header") as HTMLElement;
+    expect(within(header).getByRole("link", { name: "All desktops" })).toHaveAttribute("href", "/settings/desktops");
+  });
+
+  it("shows the not-found state for a desktop that is not on the account", async () => {
+    mount("/settings/desktops/nope");
+    expect(await screen.findByRole("heading", { level: 1, name: "Desktop not found" })).toBeInTheDocument();
+    expect(screen.getByText("It may have been revoked, or it belongs to another account.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Back to desktops" })).toHaveAttribute("href", "/settings/desktops");
+  });
+
+  it("the Remove card has two clearly scoped actions, each with its own unchanged dialog", async () => {
+    const user = userEvent.setup();
+    provideMockLink();
+    mount(SETTINGS);
+    const card = (await screen.findByRole("heading", { level: 2, name: "Remove" })).closest("section") as HTMLElement;
+    expect(within(card).getByText("This browser stops using this desktop. It stays on your account.")).toBeInTheDocument();
+    expect(within(card).getByText("Removes this desktop and every device's access from your account, in every browser. Needs your passkey.")).toBeInTheDocument();
+
+    await user.click(within(card).getByRole("button", { name: /Forget in this browser/ }));
+    let dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("heading", { name: "Remove this desktop from this device?" })).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Remove" })).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    await user.click(within(card).getByRole("button", { name: /Revoke from account/ }));
+    dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("heading", { name: "Revoke Fake Studio Mac?" })).toBeInTheDocument();
+    expect(dialog).toHaveTextContent("Fake Studio Mac and every device's access to it are removed from your account. You will be asked to confirm with your passkey.");
+    expect(within(dialog).getByRole("button", { name: "Revoke desktop" })).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(requests.some((request) => request.method === "DELETE")).toBe(false);
+  });
+
+  it.each([`/d/${DESKTOP}/settings`, `/desktops/${DESKTOP}`])("%s lands on this page", async (url) => {
+    const { router } = mount(url);
+    await screen.findByRole("heading", { level: 1, name: "Fake Studio Mac" });
+    expect(router.state.location.pathname).toBe(SETTINGS);
   });
 });

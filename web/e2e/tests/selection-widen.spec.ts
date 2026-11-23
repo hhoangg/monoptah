@@ -63,8 +63,8 @@ test.describe("selection widening from the web", () => {
     await expect(page.getByText(E2E_CATALOG.projectName).first()).toBeVisible({ timeout: 60_000 });
 
     const openPicker = async () => {
-      await page.goto(`/d/${desktopId}/settings`);
-      await page.getByRole("button", { name: /Projects on this device/ }).click();
+      await page.goto(`/settings/desktops/${desktopId}`);
+      await page.getByRole("button", { name: /Choose projects/ }).click();
       const dialog = page.getByRole("dialog", { name: "Projects on this device" });
       await expect(dialog).toBeVisible();
       return dialog;

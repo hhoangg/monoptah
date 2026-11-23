@@ -2,7 +2,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Button } from "@/ui/button";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard, SettingsCardsUnderHeading, SettingsRow } from "@/ui/SettingsCard";
+import { NotificationsSection } from "./NotificationsSection";
 import { PushOnboarding } from "./PushOnboarding";
 import { PushTest } from "./PushTest";
 import { useDesktops } from "@/features/desktops/api";
@@ -10,6 +11,7 @@ import { safeName } from "@/features/desktops/format";
 import { loadPauseRecord } from "@/features/push/pauseRecord";
 import { pauseAll, resumeAll, type BulkResult } from "./pushPrefs";
 import { useAction } from "./useAction";
+import { DelayedSpinner } from "@/ui/DelayedSpinner";
 
 function plural(count: number): string {
   return `${count} ${count === 1 ? "desktop" : "desktops"}`;
@@ -25,21 +27,23 @@ function bulkMessage(enabled: boolean, { changed, skipped }: BulkResult): string
   return !enabled && skipped > 0 ? `${done} ${plural(skipped)} left as they are, because they were already off or their settings could not be read.` : done;
 }
 
-/** Account level notifications (P-05): enable in this browser, what the three categories mean, Pause all. */
-export function NotificationsCard() {
+/**
+ * Account level notifications (P-05): enable in this browser, send a test, Pause all and Resume all. `pausedCount` is the
+ * number of desktops that Pause all turned off and Resume all can turn back on; the page owns it (see `NotificationsPage`)
+ * because the per-desktop switches on the same page change it too.
+ */
+export function NotificationsCard({ pausedCount, onPausedChange }: { pausedCount: number; onPausedChange: () => void }) {
   const queryClient = useQueryClient();
   const bulk = useAction();
-  const desktops = useDesktops();
-  const [last, setLast] = useState<{ enabled: boolean; result: BulkResult } | null>(null);
-
-  // Desktops that Pause all turned off and Resume all can turn back on (read again after every action).
-  const [pausedCount, setPausedCount] = useState(() => Object.keys(loadPauseRecord()).length);
+  // `paused` is the paused count right after the action: when the per-desktop switches change it later, the result is stale.
+  const [shown, setLast] = useState<{ enabled: boolean; result: BulkResult; paused: number } | null>(null);
+  const last = shown && shown.paused === pausedCount ? shown : null;
 
   async function apply(enabled: boolean) {
     await bulk.run(async () => {
       const result = enabled ? await resumeAll(queryClient) : await pauseAll(queryClient);
-      setLast({ enabled, result });
-      setPausedCount(Object.keys(loadPauseRecord()).length);
+      setLast({ enabled, result, paused: Object.keys(loadPauseRecord()).length });
+      onPausedChange();
     });
   }
 
@@ -50,28 +54,11 @@ export function NotificationsCard() {
       aria-label="Notifications"
       footnote="Pause all turns off the desktops that are on. Resume all turns back on only the ones it paused."
     >
-      <PushOnboarding />
-      <PushTest />
-      <p className="px-1.5 py-1.5 text-small text-muted-text">
-        Each desktop sends approvals and questions, finished agents and messages from Monos. Choose which ones in that desktop's settings.
-      </p>
-      {desktops.data && desktops.data.desktops.length > 0 ? (
-        <ul className="m-0 flex list-none flex-col p-0" aria-label="Notification settings per desktop">
-          {desktops.data.desktops.map((desktop, index) => (
-            <li key={desktop.id}>
-              <SettingsRow
-                icon="computer"
-                title={safeName(desktop.name, "Unnamed desktop")}
-                description="Choose notification categories"
-                to="/d/$desktopId/settings"
-                params={{ desktopId: desktop.id }}
-                className={index > 0 ? "before:block!" : undefined}
-              />
-            </li>
-          ))}
-        </ul>
-      ) : null}
+      <PushOnboarding id="notification-permission" installTo="/settings/install" />
+      <PushTest id="test-notification" />
       <SettingsRow
+        id="pause-notifications"
+        className={SETTINGS_ANCHOR}
         icon="notifications"
         title="Pause notifications"
         description="Turn notifications off for every desktop that has them on, and back on later with the same choices."
@@ -102,5 +89,31 @@ export function NotificationsCard() {
         </Notice>
       ) : null}
     </SettingsCard>
+  );
+}
+
+/**
+ * "Notifications per desktop": the three category switches of every desktop, inline (they used to be links to each
+ * desktop's settings). Pause all and Resume all write the same query cache entries, so these switches follow them.
+ */
+export function NotificationsPerDesktop({ onSaved }: { onSaved?: () => void } = {}) {
+  const desktops = useDesktops();
+  const list = desktops.data?.desktops ?? [];
+  return (
+    <section id="notifications-per-desktop" aria-labelledby="notifications-per-desktop-title" className={`flex ${SETTINGS_ANCHOR} flex-col gap-6`}>
+      <div className="flex flex-col gap-1 border-b border-stroke px-1 pb-2">
+        <h2 id="notifications-per-desktop-title" className="text-h font-semibold text-content">
+          Notifications per desktop
+        </h2>
+        <p className="text-small text-muted-text">Each desktop sends approvals and questions, finished agents and messages from Monos. Choose which ones for each desktop.</p>
+      </div>
+      {desktops.isPending ? <DelayedSpinner label="Loading desktops" className="px-1.5 py-2" /> : null}
+      {desktops.data && list.length === 0 ? <p className="px-1 text-small text-muted-text">No desktops yet. Pair a desktop to choose its notifications.</p> : null}
+      <SettingsCardsUnderHeading>
+        {list.map((desktop) => (
+          <NotificationsSection key={desktop.id} desktopId={desktop.id} title={safeName(desktop.name, "Unnamed desktop")} onSaved={onSaved} />
+        ))}
+      </SettingsCardsUnderHeading>
+    </section>
   );
 }

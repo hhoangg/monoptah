@@ -31,7 +31,11 @@ let restore: (() => void) | undefined;
 
 function install(options: Parameters<typeof createFakeServer>[0] = {}) {
   server = createFakeServer({ desktops: [desktop()], grants: { d1: [grant()] }, ...options });
-  restore = setApiTransport(server.transport);
+  // The page also holds the notification switches of the desktop; the fake server does not know the push routes.
+  const prefs = { enabled: true, categories: { agentFinished: true, agentInput: true, monoMessages: true }, stored: false };
+  restore = setApiTransport((url, init) =>
+    url.startsWith("/api/push/prefs/") ? Promise.resolve(new Response(JSON.stringify(prefs), { status: 200, headers: { "Content-Type": "application/json" } })) : server.transport(url, init),
+  );
 }
 
 function row(name: string): HTMLElement {
@@ -52,19 +56,19 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("/desktops/:id", () => {
+describe("/settings/desktops/:id", () => {
   it("shows the header, status, version and the open link", async () => {
     install({ desktops: [desktop({ lastSeenAt: null })] });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     expect(await screen.findByRole("heading", { level: 1, name: "Studio Mac" })).toBeInTheDocument();
     expect(screen.getByText("macOS, v1.4.0")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Open desktop" })).toHaveAttribute("href", "/d/d1");
-    expect(screen.getByRole("link", { name: "Open the install guide" })).toHaveAttribute("href", "/install");
+    expect(screen.getByRole("link", { name: "Open the install guide" })).toHaveAttribute("href", "/settings/install");
   });
 
   it("never shows the server's fingerprint claim: it computes one from the key and says it is not verified yet", async () => {
     install({ publicKeys: { d1: base64UrlEncode(KEY) }, fingerprintClaims: { d1: FP_B } });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     expect(await screen.findByText("Reported by the server, not yet verified on this device")).toBeInTheDocument();
     expect(await screen.findByText(displayFingerprint(fingerprint(KEY)))).toBeInTheDocument();
     expect(screen.queryByText(displayFingerprint(FP_B))).toBeNull();
@@ -74,7 +78,7 @@ describe("/desktops/:id", () => {
   it("shows the pinned fingerprint of this device when the directory key matches it", async () => {
     await checkPin("d1", KEY);
     install({ publicKeys: { d1: base64UrlEncode(KEY) }, fingerprintClaims: { d1: FP_B } });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     expect(await screen.findByText("Pinned on this device")).toBeInTheDocument();
     expect(screen.getByText(displayFingerprint(fingerprint(KEY)))).toBeInTheDocument();
     expect(screen.queryByText("Key changed since this device pinned it")).toBeNull();
@@ -84,7 +88,7 @@ describe("/desktops/:id", () => {
   it("warns when the directory key differs from the pin, with the verify guidance", async () => {
     await checkPin("d1", OTHER_KEY);
     install({ publicKeys: { d1: base64UrlEncode(KEY) }, fingerprintClaims: { d1: fingerprint(OTHER_KEY) } });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Key changed since this device pinned it");
     expect(alert).toHaveTextContent(/Verify on another device/);
@@ -98,20 +102,20 @@ describe("/desktops/:id", () => {
 
   it("says so when the key cannot be read", async () => {
     install();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     expect(await screen.findByText("The key of this desktop could not be read.")).toBeInTheDocument();
   });
 
   it("shows loading then a not-found state for an unknown desktop", async () => {
     install();
-    mountApp("/desktops/nope");
+    mountApp("/settings/desktops/nope");
     expect(await screen.findByRole("heading", { level: 1, name: "Desktop not found" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Back to desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Back to desktops" })).toHaveAttribute("href", "/settings/desktops");
   });
 
   it("renames with the trimmed name and blocks an empty one", async () => {
     install();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     const field = await screen.findByLabelText("Desktop name");
     await userEvent.clear(field);
     expect(await screen.findByText("Enter a name.")).toBeInTheDocument();
@@ -124,7 +128,7 @@ describe("/desktops/:id", () => {
 
   it("sets the color from the palette", async () => {
     install();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     const group = await screen.findByRole("radiogroup", { name: "Desktop color" });
     expect(within(group).getByRole("radio", { name: "Blue" })).toBeChecked();
     await userEvent.click(within(group).getByRole("radio", { name: "Green" }));
@@ -144,7 +148,7 @@ describe("/desktops/:id", () => {
         ],
       },
     });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     await screen.findByText("Control device");
     const control = row("Control device");
     expect(within(control).getByText("Confirmed")).toBeInTheDocument();
@@ -173,7 +177,7 @@ describe("/desktops/:id", () => {
 
   it("lowering sends requestedPermission read, raising sends control", async () => {
     install({ grants: { d1: [grant({ deviceId: "a", deviceName: "Control device", permission: "control" }), grant({ deviceId: "b", deviceName: "Read device", permission: "read" })] } });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     await userEvent.click(await screen.findByRole("button", { name: "Lower Control device to read only" }));
     await waitFor(() => expect(server.calls.some((call) => call.method === "PUT" && call.path.endsWith("/grants/a") && JSON.stringify(call.body) === JSON.stringify({ requestedPermission: "read" }))).toBe(true));
     await userEvent.click(screen.getByRole("button", { name: "Request control for Read device" }));
@@ -184,13 +188,13 @@ describe("/desktops/:id", () => {
   it("marks this device", async () => {
     keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "dev1", publicKey: new Uint8Array(32) });
     install({ grants: { d1: [grant({ deviceId: "dev1", fingerprint: FP_A })] } });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     await waitFor(() => expect(within(row("Chrome on macOS")).getByText("This device")).toBeInTheDocument());
   });
 
   it("revokes access only after a confirm dialog that names the device, and re-authenticates when asked", async () => {
     install();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     await userEvent.click(await screen.findByRole("button", { name: "Revoke access for Chrome on macOS" }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("heading", { name: "Revoke access for Chrome on macOS?" })).toBeInTheDocument();
@@ -210,22 +214,22 @@ describe("/desktops/:id", () => {
   it("keeps the grant and shows the soft notice when the passkey prompt is closed", async () => {
     webauthn.getPasskey.mockResolvedValue({ status: "cancelled" });
     install();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     await userEvent.click(await screen.findByRole("button", { name: "Revoke access for Chrome on macOS" }));
     await userEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Revoke access" }));
     expect(await screen.findByText(/passkey prompt was closed/)).toBeInTheDocument();
     expect(server.grants.d1?.[0]?.state).toBe("confirmed");
   });
 
-  it("revokes the desktop behind a confirm dialog naming it, then returns to /desktops", async () => {
+  it("revokes the desktop behind a confirm dialog naming it, then returns to /settings/desktops", async () => {
     install();
-    const { router } = mountApp("/desktops/d1");
-    await userEvent.click(await screen.findByRole("button", { name: "Revoke desktop" }));
+    const { router } = mountApp("/settings/desktops/d1");
+    await userEvent.click(await screen.findByRole("button", { name: /Revoke from account/ }));
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByRole("heading", { name: "Revoke Studio Mac?" })).toBeInTheDocument();
     expect(server.calls.some((call) => call.method === "DELETE")).toBe(false);
     await userEvent.click(within(dialog).getByRole("button", { name: "Revoke desktop" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/settings/desktops"));
     expect(server.reauths).toBe(1);
     expect(server.desktops).toHaveLength(0);
     expect(persist.clearPersistedCache).toHaveBeenCalledWith("d1");
@@ -237,7 +241,7 @@ describe("/desktops/:id", () => {
 
   it("follows a name that changed elsewhere while the field is untouched, and keeps edits otherwise", async () => {
     install();
-    const { queryClient } = mountApp("/desktops/d1");
+    const { queryClient } = mountApp("/settings/desktops/d1");
     const field = await screen.findByLabelText("Desktop name");
     expect(field).toHaveValue("Studio Mac");
     server.desktops[0]!.name = "Renamed elsewhere";
@@ -254,26 +258,26 @@ describe("/desktops/:id", () => {
   it("keeps a device's name and its badges together in one row group", async () => {
     keys.getDeviceKeyInfo.mockResolvedValue({ keyId: "k", deviceId: "dev1", publicKey: new Uint8Array(32) });
     install();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     const badge = await screen.findByText("Confirmed");
     await waitFor(() => expect(within(row("Chrome on macOS")).getByText("This device").parentElement).toBe(badge.parentElement));
   });
 
   it("renders a hostile device name as text only", async () => {
     install({ grants: { d1: [grant({ deviceName: "<b onclick=x>pwn</b>" })] } });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     expect(await screen.findByText("<b onclick=x>pwn</b>")).toBeInTheDocument();
     expect(document.querySelector("b")).toBeNull();
   });
 });
 
-describe("/desktops/:id avatar", () => {
+describe("/settings/desktops/:id avatar", () => {
   const patches = () => server.calls.filter((call) => call.method === "PATCH");
 
   it("saves a chosen emoji on the account and shows it in the preview", async () => {
     install();
     const user = userEvent.setup();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     const group = await screen.findByRole("radiogroup", { name: "Avatar emoji" });
     expect(screen.getByTestId("avatar-preview")).toHaveTextContent("SM");
     await user.click(within(group).getByRole("radio", { name: "Emoji \u{1F680}" }));
@@ -286,12 +290,13 @@ describe("/desktops/:id avatar", () => {
     install();
     avatarImage.prepare.mockResolvedValue({ mime: "image/webp", data: "UklGRgAAAABXRUJQ" });
     const user = userEvent.setup();
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     const file = new File(["x"], "me.png", { type: "image/png" });
     await user.upload(await screen.findByLabelText("Avatar image file"), file);
     await waitFor(() => expect(patches().at(-1)?.body).toEqual({ avatar: { kind: "image", mime: "image/webp", data: "UklGRgAAAABXRUJQ" } }));
     expect(avatarImage.prepare).toHaveBeenCalledWith(file);
-    expect(await screen.findByTestId("avatar-image")).toHaveAttribute("src", expect.stringMatching(/^\/api\/desktops\/d1\/avatar\?v=[0-9a-f]{16}$/));
+    // The settings nav shows the same avatar: look inside the avatar card of the page.
+    expect(await within(document.getElementById("desktop-avatar") as HTMLElement).findByTestId("avatar-image")).toHaveAttribute("src", expect.stringMatching(/^\/api\/desktops\/d1\/avatar\?v=[0-9a-f]{16}$/));
     await user.click(screen.getByRole("button", { name: "Use initials" }));
     await waitFor(() => expect(patches().at(-1)?.body).toEqual({ avatar: null }));
     await waitFor(() => expect(screen.getByTestId("avatar-preview")).toHaveTextContent("SM"));
@@ -302,7 +307,7 @@ describe("/desktops/:id avatar", () => {
     const { AvatarImageError } = await import("./avatarImage");
     avatarImage.prepare.mockRejectedValue(new AvatarImageError("unsupported"));
     const user = userEvent.setup({ applyAccept: false });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     await user.upload(await screen.findByLabelText("Avatar image file"), new File(["<svg/>"], "logo.svg", { type: "image/svg+xml" }));
     expect(await screen.findByText("Use a PNG, JPEG or WebP image.")).toBeInTheDocument();
     expect(patches()).toHaveLength(0);
@@ -310,7 +315,7 @@ describe("/desktops/:id avatar", () => {
 
   it("offers Use initials only when there is an avatar to clear", async () => {
     install({ desktops: [desktop({ avatar: null })] });
-    mountApp("/desktops/d1");
+    mountApp("/settings/desktops/d1");
     expect(await screen.findByRole("button", { name: "Use initials" })).toBeDisabled();
   });
 });

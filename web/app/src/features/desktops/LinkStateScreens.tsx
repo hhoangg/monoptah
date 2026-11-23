@@ -45,7 +45,7 @@ function LinkStateLayer({ desktopId }: { desktopId: string }) {
 
 // The secondary actions use the filled `secondary` variant: the 8% outline stroke is nearly invisible on dark.
 const BACK_TO_DESKTOPS = (
-  <Link to="/desktops" className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
+  <Link to="/settings/desktops" className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
     Go to desktops
   </Link>
 );
@@ -90,7 +90,7 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
         <>
           <p>This device can no longer use {name}. A revoked device comes back only as a new device.</p>
           <p>
-            To get access again, forget this device in Desktops (under "This account's devices"). That removes this device's access on every desktop. Then open the desktop again and confirm it on the desktop.
+            To get access again, forget this device in All desktops (under "Browsers with desktop access"). That removes this device's access on every desktop. Then open the desktop again and confirm it on the desktop.
           </p>
           <p>
             Before you confirm, compare the fingerprints on the confirmation screen with the ones in the dialog on your desktop. They must match exactly. If they differ, do not confirm.
@@ -114,7 +114,7 @@ function BlockingLayer({ screen, desktopId, onRetryGrant }: { screen: BlockingSc
         </>
       );
       actions = (
-        <Link to="/desktops/$id" params={{ id: desktopId }} className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
+        <Link to="/settings/desktops/$id" params={{ id: desktopId }} className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
           Manage this desktop
         </Link>
       );

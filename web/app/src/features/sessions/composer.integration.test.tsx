@@ -334,9 +334,9 @@ describe("session header menu (F-25, F-40)", () => {
     await user.click(screen.getByRole("menuitem", { name: "Copy Session ID" }));
     expect(writeText).toHaveBeenCalledWith(SESSION);
     await user.click(await screen.findByRole("button", { name: "Session actions" }));
-    expect(screen.getByRole("menuitem", { name: "Settings" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/settings`);
+    expect(screen.getByRole("menuitem", { name: "Settings" })).toHaveAttribute("href", `/settings/desktops/${DESKTOP_ID}`);
     await user.click(screen.getByRole("menuitem", { name: "Settings" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/settings`));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/settings/desktops/${DESKTOP_ID}`));
   });
 });
 

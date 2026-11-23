@@ -5,7 +5,7 @@ import { getSavedPushSubscription, hasBrowserSubscription } from "@/features/pus
 import { PUSH_CHANGED_EVENT, PUSH_RESUBSCRIBED_EVENT } from "@/features/push/subscribe";
 import { Button } from "@/ui/button";
 import { Notice } from "@/ui/Notice";
-import { SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsRow } from "@/ui/SettingsCard";
 import { settingsErrorMessage } from "./copy";
 
 export { PUSH_CHANGED_EVENT };
@@ -83,7 +83,7 @@ async function readReady(): Promise<Ready> {
 }
 
 /** "Send test notification" of this device (Settings > Notifications): a real push through the Worker, with the result inline. */
-export function PushTest() {
+export function PushTest({ id }: { id?: string } = {}) {
   const [ready, setReady] = useState<Ready>({ deviceId: null, endpoint: null });
   const [sending, setSending] = useState(false);
   const [outcome, setOutcome] = useState<TestOutcome | null>(null);
@@ -126,6 +126,8 @@ export function PushTest() {
   return (
     <>
       <SettingsRow
+        id={id}
+        className={SETTINGS_ANCHOR}
         icon="notifications"
         title="Test delivery"
         description={ready.deviceId === null ? "Turn notifications on for this device first." : "Sends a real push to this device to check that it arrives."}

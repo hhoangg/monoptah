@@ -101,7 +101,7 @@ describe("lazy grant request", () => {
     expect(dialog).toHaveTextContent(/compare the fingerprints on the confirmation screen with the ones in the dialog on your desktop/i);
     expect(dialog).toHaveTextContent("Monoptah");
     expect(dialog).not.toHaveTextContent(/My desktops/);
-    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/settings/desktops");
     expect(screen.queryByRole("button", { name: /try again|reconnect|retry/i })).toBeNull();
     expect(h.reconnect).not.toHaveBeenCalled();
     expect(grantPosts()).toHaveLength(1);
@@ -293,7 +293,7 @@ describe("blocking screens", () => {
     expect(dialog).toHaveTextContent(displayFingerprint(FP_B));
     expect(dialog).toHaveTextContent(/Waiting for confirmation on Studio Mac/);
     expect(dialog).toHaveTextContent(/updates by itself/);
-    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/settings/desktops");
     setLink({ status: "ready", permission: "control" });
     await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
   });
@@ -312,7 +312,7 @@ describe("blocking screens", () => {
     const dialog = await screen.findByRole("alertdialog", { name: "Desktop key changed" });
     expect(dialog).toHaveTextContent(displayFingerprint(FP_A));
     expect(dialog).toHaveTextContent(/Verify on another device/);
-    expect(screen.getByRole("link", { name: "Manage this desktop" })).toHaveAttribute("href", "/desktops/d1");
+    expect(screen.getByRole("link", { name: "Manage this desktop" })).toHaveAttribute("href", "/settings/desktops/d1");
     expect(screen.queryByRole("button", { name: /trust/i })).toBeNull();
     expect(screen.queryByRole("link", { name: /trust/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
@@ -326,14 +326,14 @@ describe("blocking screens", () => {
     setLink({ blocked: "policy" });
     await screen.findByRole("alertdialog", { name: "This desktop closed the connection" });
     expect(screen.queryByRole("button")).toBeNull();
-    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/settings/desktops");
   });
 
   it("desktop_refused offers Try again, which reconnects", async () => {
     setLink({ status: "closed", blocked: "desktop_refused" });
     mountSlot(<LinkStateScreens />);
     await screen.findByRole("alertdialog", { name: "This desktop did not accept this device" });
-    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/desktops");
+    expect(screen.getByRole("link", { name: "Go to desktops" })).toHaveAttribute("href", "/settings/desktops");
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(h.reconnect).toHaveBeenCalledTimes(1);
   });

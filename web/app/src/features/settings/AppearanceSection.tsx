@@ -1,7 +1,8 @@
 import { useLayoutPrefs, type LayoutMode } from "@/features/layout/layoutPrefs";
 import { useAppearance } from "@/lib/appearance";
 import { SegmentedControl } from "@/ui/SegmentedControl";
-import { SettingsCard } from "@/ui/SettingsCard";
+import { cn } from "@/lib/utils";
+import { SETTINGS_ANCHOR, SettingsCard } from "@/ui/SettingsCard";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import type { Appearance } from "@/styles/themes";
 
@@ -31,7 +32,7 @@ function LayoutPicker() {
   const desktop = useMediaQuery(DESKTOP_QUERY);
   if (!tablet) return null;
   return (
-    <div className="flex flex-col gap-2 px-1.5 py-2" data-testid="layout-picker">
+    <div id="layout" className={cn("flex flex-col gap-2 px-1.5 py-2", SETTINGS_ANCHOR)} data-testid="layout-picker">
       <SegmentedControl label="Layout" options={LAYOUT_OPTIONS} value={mode} onChange={setMode} disabled={!desktop} />
       <p className="text-small text-muted-text">
         {desktop
@@ -48,7 +49,7 @@ export function AppearanceSection() {
   const setAppearance = useAppearance((state) => state.setAppearance);
   return (
     <SettingsCard title="Appearance" footnote="System follows your device setting. These choices are saved on this device only.">
-      <div className="px-1.5 py-2">
+      <div id="colour-scheme" className={cn(SETTINGS_ANCHOR, "px-1.5 py-2")}>
         <SegmentedControl label="Colour scheme" options={OPTIONS} value={appearance} onChange={setAppearance} />
       </div>
       <LayoutPicker />

@@ -121,7 +121,7 @@ describe("catalog home", () => {
     mount("", { empty: true });
     expect(await screen.findByText("Make yourself at home.")).toBeInTheDocument();
     const choose = screen.getByRole("link", { name: "Choose projects" });
-    expect(choose).toHaveAttribute("href", `/d/${DESKTOP_ID}/settings`);
+    expect(choose).toHaveAttribute("href", `/settings/desktops/${DESKTOP_ID}#desktop-projects`);
   });
 
   it("remembers the place for `/` (F-14)", async () => {
@@ -134,7 +134,7 @@ describe("catalog home", () => {
 
 describe("last used desktop (N-12)", () => {
   it("is remembered from a screen that is no workspace place, so `/` can bring the user back", async () => {
-    mount("/settings");
+    mount("/cloud");
     await waitFor(() => expect(localStorage.getItem("monoptah.lastDesktop")).toBe(DESKTOP_ID));
     expect(localStorage.getItem(lastPlaceKey(DESKTOP_ID))).toBeNull();
   });
@@ -156,6 +156,14 @@ describe("workspace drawer (F-12)", () => {
     expect(labels).toEqual(["Monos", "Projects"]);
     const names = within(nav).getAllByRole("link").map((link) => link.textContent ?? "");
     expect(names.findIndex((t) => t.includes("Research Mono"))).toBeLessThan(names.findIndex((t) => t.includes("Example Alpha")));
+  });
+
+  it("links Desktop settings to this desktop's page in settings and All desktops to the list", async () => {
+    const user = userEvent.setup();
+    mount("");
+    const nav = await openDrawer(user);
+    expect(within(nav).getByRole("link", { name: "Desktop settings" })).toHaveAttribute("href", `/settings/desktops/${DESKTOP_ID}`);
+    expect(within(nav).getByRole("link", { name: "All desktops" })).toHaveAttribute("href", "/settings/desktops");
   });
 
   it("offers New Mono when the desktop advertises monoTools, and it opens the create dialog on the Mono list", async () => {

@@ -65,8 +65,8 @@
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   --radius-pill: 999px;
-  --radius-card: 22px;
-  --radius-row: 12px;
+  --radius-card: var(--settings-card-radius);
+  --radius-row: var(--settings-row-radius);
   --radius-sheet: 32px;
   --radius-menu-card: 26px;
   --radius-dialog: 20px;
@@ -94,6 +94,25 @@
   --breakpoint-lg: 64rem;     /* 1024 */
 }
 
+/* Settings card geometry (design-system.md section 8): a row highlight sits inside the card with the same inset on all
+   four sides, and its radius is the card radius minus that inset, so the two curves stay concentric. Change the numbers
+   here only; the radius tokens above and the card padding (ui/SettingsCard.tsx) follow. */
+:root {
+  --settings-card-radius: 22px;
+  --settings-card-inset: 10px;
+  --settings-row-radius: calc(var(--settings-card-radius) - var(--settings-card-inset));
+}
+
+/* Scroll margin of a settings anchor (SETTINGS_ANCHOR in ui/SettingsCard.tsx). The settings shell has no app header, so
+   only a little air is needed above a target. While the connection banner is shown (OfflineBanner sets the attribute)
+   the pill covers safe area + 8px + its height (`--connection-banner-height`, measured because the pill wraps to two lines on a narrow screen; 36px until measured), so the margin grows by that plus an 8px gap. */
+:root {
+  --settings-anchor-offset: calc(env(safe-area-inset-top) + 1rem);
+}
+:root[data-connection-banner="shown"] {
+  --settings-anchor-offset: calc(env(safe-area-inset-top) + 0.5rem + var(--connection-banner-height, 2.25rem) + 0.5rem);
+}
+
 @layer base {
   html { font-family: var(--font-sans); color: var(--content); background: var(--background); -webkit-text-size-adjust: 100%; }
   body { margin: 0; min-height: 100dvh; overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
@@ -116,4 +135,10 @@
 /* Squircle corners as progressive enhancement (design-system.md 3.2). */
 @supports (corner-shape: squircle) {
   .rounded-card, .rounded-sheet, .rounded-dialog, .rounded-menu-card { corner-shape: squircle; }
+  /* The row highlight inside a settings card keeps the card's corner shape, so the two curves stay concentric. */
+  [data-slot="settings-card"] [data-row-highlight] { corner-shape: squircle; }
+  /* The nav card of the settings list page exists below lg only (`max-lg:rounded-card`). */
+  @media (width < 64rem) {
+    .settings-nav-card, .settings-nav-card [data-row-highlight] { corner-shape: squircle; }
+  }
 }

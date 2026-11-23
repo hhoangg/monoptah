@@ -1,10 +1,13 @@
 // F-15: the command-style picker. Search (fuzzy, `@/lib/fuzzy`) over the projects, Monos and 20 most recent
-// sessions of the current desktop; Up/Down move, Enter opens, Esc closes. A dialog from 640px, a sheet below
+// sessions of the current desktop, plus the settings (a Settings group while a query is typed); Up/Down move, Enter opens, Esc closes. A dialog from 640px, a sheet below
 // (ResponsiveOverlay). Opened by Mod+K (shortcuts.ts) or `openCommandPalette()` from any button.
 import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useCatalog } from "@/data";
+import { meQuery } from "@/features/accounts/queries";
 import { requestCreateMono } from "@/features/monos/createRequest";
+import { SETTINGS_INDEX, searchSettings, type SettingsRoute, type SettingsSearchHit } from "@/features/settings/settingsIndex";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { fuzzyMatch } from "@/lib/fuzzy";
 import { cn } from "@/lib/utils";
@@ -22,7 +25,7 @@ export { openCommandPalette };
 
 const RECENT_SESSIONS = 20;
 
-type ItemKind = "action" | "go" | "project" | "mono" | "session";
+type ItemKind = "action" | "go" | "project" | "mono" | "session" | "setting";
 
 export interface PaletteItem {
   id: string;
@@ -38,6 +41,7 @@ const GROUPS: ReadonlyArray<{ kind: ItemKind; label: string; icon: IconName }> =
   { kind: "project", label: "Projects", icon: "folder" },
   { kind: "mono", label: "Monos", icon: "bot" },
   { kind: "session", label: "Recent sessions", icon: "chat" },
+  { kind: "setting", label: "Settings", icon: "settings" },
 ];
 
 interface Source {
@@ -48,6 +52,8 @@ interface Source {
   projects: ReadonlyArray<{ id: string; name: string; path: string }>;
   monos: ReadonlyArray<{ id: string; name: string }>;
   sessions: ReadonlyArray<{ id: string; projectId: string; title: string; updatedAt: number }>;
+  /** Settings entries already matched against the query (`searchSettings`); empty for an empty query. Listed last. */
+  settings?: ReadonlyArray<SettingsSearchHit>;
 }
 
 /** The items for `query`: grouped (projects, Monos, sessions), best match first, sessions capped at 20. */
@@ -96,6 +102,9 @@ export function paletteItems(source: Source, query: string): PaletteItem[] {
     });
   });
   add(sessions, RECENT_SESSIONS);
+  for (const hit of source.settings ?? []) {
+    items.push({ id: hit.entry.id, kind: "setting", label: hit.entry.label, detail: hit.entry.page, positions: hit.positions });
+  }
   return items;
 }
 
@@ -121,9 +130,13 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
   const toolPanels = tools.panels.join("\0");
   const hasScope = tools.scope !== null;
 
+  const me = useQuery(meQuery);
+  const admin = me.data?.user.role === "admin";
+  const settings = useMemo(() => searchSettings(query, { admin }), [query, admin]);
+
   const data = catalog.data;
   const items = useMemo(() => {
-    if (!data) return [];
+    if (!data) return paletteItems({ projects: [], monos: [], sessions: [], settings }, query);
     const actions = hasScope
       ? [
           ...(toolPanels ? toolPanels.split("\0") : []).map((kind) => ({ id: kind, label: PANEL_LABELS[kind as PanelKind] })),
@@ -132,8 +145,8 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
       : [];
     // F-13, F-75: the Mono list, and a new Mono where this device may make one.
     const places = [{ id: "monos", label: "Monos" }, ...(data.monoTools === true && !readOnly ? [{ id: "new-mono", label: "New Mono" }] : [])];
-    return paletteItems({ actions, places, projects: data.projects, monos: data.monos, sessions: data.sessions }, query);
-  }, [data, query, toolPanels, hasScope, readOnly]);
+    return paletteItems({ actions, places, projects: data.projects, monos: data.monos, sessions: data.sessions, settings }, query);
+  }, [data, query, toolPanels, hasScope, readOnly, settings]);
   const current = Math.min(active, Math.max(0, items.length - 1));
   const optionId = (index: number) => `${listId}-${index}`;
 
@@ -152,7 +165,12 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
       void navigate({ to: "/d/$desktopId/monos", params: { desktopId } });
     } else if (item.kind === "project") void navigate({ to: "/d/$desktopId/p/$projectId", params: { desktopId, projectId: item.id } });
     else if (item.kind === "mono") void navigate({ to: "/d/$desktopId/monos/$monoId", params: { desktopId, monoId: item.id } });
-    else void navigate({ to: "/d/$desktopId/s/$sessionId", params: { desktopId, sessionId: item.id } });
+    else if (item.kind === "setting") {
+      const entry = SETTINGS_INDEX.find((candidate) => candidate.id === item.id);
+      if (!entry) return;
+      if (entry.perDesktop) void navigate({ to: "/settings/desktops/$id", params: { id: desktopId }, hash: entry.anchor });
+      else void navigate({ to: entry.route as Exclude<SettingsRoute, "/settings/desktops/$id">, hash: entry.anchor });
+    } else void navigate({ to: "/d/$desktopId/s/$sessionId", params: { desktopId, sessionId: item.id } });
   };
 
   const onKeyDown = (event: React.KeyboardEvent) => {
@@ -185,12 +203,12 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
       <Input
         type="search"
         role="combobox"
-        aria-label="Search projects, Monos and sessions"
+        aria-label="Search projects, Monos, sessions and settings"
         aria-expanded="true"
         aria-controls={listId}
         aria-activedescendant={items.length > 0 ? optionId(current) : undefined}
         aria-autocomplete="list"
-        placeholder="Search projects, Monos and sessions"
+        placeholder="Search projects, Monos, sessions and settings"
         autoComplete="off"
         autoFocus
         value={query}

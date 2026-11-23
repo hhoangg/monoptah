@@ -32,7 +32,7 @@ export function WorkspaceEmpty({ desktopId }: { desktopId: string }) {
       className="min-h-[50dvh] justify-center"
       action={
         <Button asChild size="lg">
-          <Link to="/d/$desktopId/settings" params={{ desktopId }}>
+          <Link to="/settings/desktops/$id" params={{ id: desktopId }} hash="desktop-projects">
             Choose projects
           </Link>
         </Button>
@@ -72,7 +72,7 @@ export function HomeScreen({ desktopId }: { desktopId: string }) {
                 Try again
               </Button>
               <Button asChild variant="ghost" size="sm">
-                <Link to="/desktops">All desktops</Link>
+                <Link to="/settings/desktops">All desktops</Link>
               </Button>
             </div>
           </div>

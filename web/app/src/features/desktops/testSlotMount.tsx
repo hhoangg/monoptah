@@ -12,8 +12,8 @@ export function mountSlot(element: ReactElement, url = "/d/d1", options: { stric
   const page = (path: string, body: ReactElement | null) => createRoute({ getParentRoute: () => root, path, component: () => body });
   const routeTree = root.addChildren([
     page("/d/$desktopId", element),
-    page("/desktops", <p>Desktops page</p>),
-    page("/desktops/$id", <p>Manage page</p>),
+    page("/settings/desktops", <p>Desktops page</p>),
+    page("/settings/desktops/$id", <p>Manage page</p>),
   ]);
   const router = createRouter({ routeTree, history: createMemoryHistory({ initialEntries: [url] }) });
   const tree = (
