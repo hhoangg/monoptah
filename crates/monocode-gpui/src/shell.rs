@@ -1134,6 +1134,7 @@ impl Shell {
         let metadata: Vec<_> = summaries.iter().map(|s| (s.id, s.cwd.clone())).collect();
         let workspace = Workspace::restore(saved.as_deref(), &metadata, &cwd);
         monocode_core::cli::initialize(&workspace.preferences.binary_paths);
+        monocode_core::node_tool::set_override(&workspace.preferences.node_path);
         let latest_state = Arc::new(Mutex::new(serde_json::to_string(&workspace).unwrap()));
         let quit_state = latest_state.clone();
         let quit_store = store.clone();
@@ -1579,6 +1580,14 @@ impl Shell {
                     });
                 })
                 .detach();
+            },
+        ));
+        this.observations.push(cx.subscribe(
+            &monos,
+            |this, _, event: &crate::monos::NodePathChanged, cx| {
+                this.workspace.preferences.node_path = event.0.clone();
+                this.apply_preferences(cx);
+                this.persist(cx);
             },
         ));
         this.observations.push(cx.subscribe(

@@ -553,6 +553,7 @@ impl Shell {
             self.invalidate_chrome(cx);
         }
         monocode_core::cli::initialize(&self.workspace.preferences.binary_paths);
+        monocode_core::node_tool::set_override(&self.workspace.preferences.node_path);
         self.keep_visible_idle_agents(cx);
         monocode_core::provider::configure_idle_agents(
             self.workspace.preferences.idle_agents as usize,

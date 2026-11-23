@@ -13,6 +13,7 @@
 //!   [`PrereqEnv`] so tests never touch a real Chrome.
 use crate::accounts::sealed;
 use crate::git_credentials::Secret;
+use crate::node_tool::{NodeSource, NodeTools};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -447,9 +448,22 @@ pub struct PrereqEnv {
     pub chrome_binaries: Vec<PathBuf>,
     pub user_data_dir: PathBuf,
     pub search_path: String,
+    /// Node.js as the shared resolver found it (see [`crate::node_tool`]). When `None`, `search_path`
+    /// is searched, which is how tests point at fake tools.
+    pub node: Option<NodeTools>,
 }
 impl PrereqEnv {
+    /// Without starting the login shell: node is whatever the last lookup found. Safe on the UI
+    /// thread; run [`crate::node_tool::resolve`] on a worker to fill it.
     pub fn detect() -> Self {
+        Self::detect_with(crate::node_tool::cached().flatten())
+    }
+    /// For a launch: looks node up now when nobody has, which may take a few seconds. Call it
+    /// from a worker.
+    pub fn detect_blocking() -> Self {
+        Self::detect_with(crate::node_tool::resolve())
+    }
+    fn detect_with(node: Option<NodeTools>) -> Self {
         let home = crate::scm::shell::dirs_home()
             .map(PathBuf::from)
             .unwrap_or_default();
@@ -483,6 +497,7 @@ impl PrereqEnv {
             chrome_binaries: binaries,
             user_data_dir: data,
             search_path: crate::scm::shell::cached_gui_search_path(),
+            node,
         }
     }
     pub fn chrome(&self) -> Option<&Path> {
@@ -493,6 +508,27 @@ impl PrereqEnv {
     }
     pub fn local_state(&self) -> PathBuf {
         self.user_data_dir.join("Local State")
+    }
+    /// `npx` and `node`: the resolver's answer, else both on `search_path`.
+    pub fn node_tools(&self) -> Option<NodeTools> {
+        if let Some(tools) = &self.node {
+            return Some(tools.clone());
+        }
+        let npx = self.find_tool("npx")?;
+        let node = self.find_tool("node")?;
+        Some(NodeTools {
+            bin_dir: npx.parent()?.to_path_buf(),
+            npx,
+            node,
+            source: NodeSource::Path,
+        })
+    }
+    /// The PATH a spawned `npx` gets: the node folder first, so npx finds its own node.
+    pub fn spawn_path(&self) -> String {
+        match self.node_tools() {
+            Some(tools) => tools.path_with(&self.search_path),
+            None => self.search_path.clone(),
+        }
     }
     pub fn find_tool(&self, name: &str) -> Option<PathBuf> {
         std::env::split_paths(std::ffi::OsStr::new(&self.search_path)).find_map(|dir| {
@@ -560,10 +596,12 @@ pub fn check_prerequisites(env: &PrereqEnv) -> Prerequisites {
             Ok(_) => Check::Ok,
             Err(check) => check,
         },
-        node: if env.find_tool("node").is_some() && env.find_tool("npx").is_some() {
+        node: if env.node_tools().is_some() {
             Check::Ok
         } else {
-            Check::Missing("Install Node.js so that node and npx are on your PATH.".into())
+            Check::Missing(
+                "Install Node.js, or set the path to npx below, then check again.".into(),
+            )
         },
     }
 }
@@ -1103,7 +1141,11 @@ pub fn probe_runtime(
     env: &PrereqEnv,
 ) -> Runtime {
     Runtime {
-        spec: ServerSpec::new(browser, output_dir, env.find_tool("npx").as_deref()),
+        spec: ServerSpec::new(
+            browser,
+            output_dir,
+            env.node_tools().as_ref().map(|t| t.npx.as_path()),
+        ),
         token,
         trust: browser.trust,
         endpoint: None,
@@ -1153,7 +1195,7 @@ impl Attach {
 /// (Full Disk Access) is only needed to list profiles, so it is not read here, and the stored
 /// `ready` flag is ignored. See [`Attach`].
 pub fn resolve(ctx: &crate::agent::MonoContext) -> Attach {
-    resolve_with(ctx, &PrereqEnv::detect(), server::servers())
+    resolve_with(ctx, &PrereqEnv::detect_blocking(), server::servers())
 }
 /// [`resolve`] with its Chrome environment and server manager given. The Mono's server is started
 /// here when it is not running, so the launch can point the provider at it. An unavailable
@@ -1190,10 +1232,9 @@ fn attach(
     if env.chrome().is_none() {
         return Attach::Unavailable("Google Chrome was not found".into());
     }
-    let npx = env.find_tool("npx");
-    if npx.is_none() || env.find_tool("node").is_none() {
-        return Attach::Unavailable("node or npx was not found on PATH".into());
-    }
+    let Some(tools) = env.node_tools() else {
+        return Attach::Unavailable("node or npx was not found".into());
+    };
     let token = match MonoBrowserStore::at(database.clone()).token(&ctx.mono.id) {
         Ok(Some(token)) => token,
         Ok(None) => return Attach::Unavailable("no extension token is saved".into()),
@@ -1203,12 +1244,13 @@ fn attach(
     let dir = output_dir(&ctx.root, &ctx.mono.id);
     let _ = output::prepare(&dir);
     output::sweep(&dir);
-    let spec = ServerSpec::new(browser, &dir, npx.as_deref())
+    let spec = ServerSpec::new(browser, &dir, Some(&tools.npx))
         .with_session(&group_name(&ctx.mono), session_color(ctx.mono.color));
+    let search_path = env.spawn_path();
     let launch = server::ServerLaunch {
         spec: &spec,
         token: &token,
-        search_path: &env.search_path,
+        search_path: &search_path,
     };
     let (url, lease) = match servers.ensure(&ctx.mono.id, &launch) {
         Ok(started) => started,
@@ -1446,7 +1488,7 @@ impl ProcessTransport {
         let mut command = std::process::Command::new(&runtime.spec.command);
         command
             .args(&runtime.spec.args)
-            .env("PATH", &env.search_path)
+            .env("PATH", env.spawn_path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());

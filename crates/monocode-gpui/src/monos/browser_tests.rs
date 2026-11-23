@@ -7,7 +7,17 @@ use crate::monos::tests::{Setup, setup};
 use gpui::{TestAppContext, VisualTestContext};
 use monocode_core::mono::browser::recipe::manage::DryRunReport;
 use monocode_core::mono::browser::{self, BrowserTrust, MonoBrowser, MonoBrowserStore, PrereqEnv};
+use monocode_core::node_tool::{NodeSource, NodeTools};
 use std::sync::{Arc, Mutex as StdMutex};
+
+fn fake_node(source: NodeSource) -> NodeTools {
+    NodeTools {
+        npx: "/good/bin/npx".into(),
+        node: "/good/bin/node".into(),
+        bin_dir: "/good/bin".into(),
+        source,
+    }
+}
 
 // Obviously fake: not a real extension token.
 const TOKEN: &str = "fake-extension-token-0123456789-WXYZ";
@@ -21,8 +31,30 @@ struct Fake {
     /// What the next recipe dry run answers, and which ones were asked for.
     dry: StdMutex<Option<Result<DryRunReport, String>>>,
     dry_asked: StdMutex<Vec<(String, String)>>,
+    /// What a node lookup finds, how many were run, rechecks asked for, and paths applied.
+    node: StdMutex<Option<NodeTools>>,
+    lookups: StdMutex<u32>,
+    rechecks: StdMutex<u32>,
+    applied: StdMutex<Vec<String>>,
 }
 impl BrowserOps for Fake {
+    fn resolve_node(&self) -> Option<NodeTools> {
+        *self.lookups.lock().unwrap() += 1;
+        self.node.lock().unwrap().clone()
+    }
+    fn recheck_node(&self) {
+        *self.rechecks.lock().unwrap() += 1;
+    }
+    fn validate_node_path(&self, raw: &str) -> Result<NodeTools, String> {
+        if raw.starts_with("/good") {
+            Ok(fake_node(NodeSource::Override))
+        } else {
+            Err("That path does not exist or is not executable.".into())
+        }
+    }
+    fn apply_node_path(&self, path: &str) {
+        self.applied.lock().unwrap().push(path.into());
+    }
     fn open_in_profile(&self, _: &PrereqEnv, profile: &str, url: &str) -> Result<(), String> {
         self.opened
             .lock()
@@ -75,6 +107,7 @@ fn chrome_env(dir: &std::path::Path, complete: bool) -> PrereqEnv {
         chrome_binaries: vec![chrome],
         user_data_dir: data,
         search_path: bin.to_string_lossy().into_owned(),
+        node: None,
     }
 }
 
@@ -165,9 +198,35 @@ impl Page {
             .manager
             .read_with(&self.visual, |m, _| f(&m.browser_ui))
     }
+    /// Scrolls the page until `selector` is well inside it, then clicks it: the recipes
+    /// sit below the safety rules, and a click only lands on what is visible.
+    fn tap(&mut self, selector: &'static str) {
+        use gpui::{ScrollDelta, ScrollWheelEvent, point, px};
+        for _ in 0..60 {
+            self.visual.refresh().unwrap();
+            let (Some(target), Some(page)) = (
+                self.visual.debug_bounds(selector),
+                self.visual.debug_bounds("mono-browser-page"),
+            ) else {
+                break;
+            };
+            let y = target.center().y;
+            if y > page.top() + px(120.) && y < page.bottom() - px(60.) {
+                break;
+            }
+            let dy = if y > page.center().y { -240. } else { 240. };
+            self.visual.simulate_event(ScrollWheelEvent {
+                position: page.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                ..Default::default()
+            });
+            self.visual.run_until_parked();
+        }
+        self.click(selector);
+    }
     fn save_token(&mut self, token: &str) {
         self.type_into("browser-token", token);
-        self.click("mono-browser-token-save");
+        self.tap("mono-browser-token-save");
     }
 }
 
@@ -318,7 +377,7 @@ fn the_token_is_stored_sealed_and_shown_as_its_last_four(cx: &mut TestAppContext
     let mut page = open(cx);
     page.enable();
     page.choose("Profile 6");
-    page.click("mono-browser-open-token-page");
+    page.tap("mono-browser-open-token-page");
     assert_eq!(
         page.ops.opened.lock().unwrap()[0].1,
         browser::token_page_url()
@@ -390,11 +449,11 @@ fn test_connection_starts_the_pinned_server_with_the_token_and_reports_the_outco
     let mut page = open(cx);
     page.enable();
     page.choose("Profile 6");
-    page.click("mono-browser-test");
+    page.tap("mono-browser-test");
     assert!(matches!(page.ui(|u| u.test_state()), TestState::Failed(e) if e.contains("token")));
     page.save_token(TOKEN);
 
-    page.click("mono-browser-test");
+    page.tap("mono-browser-test");
     page.visual.run_until_parked();
     assert_eq!(page.ui(|u| u.test_state()), TestState::Passed);
     {
@@ -412,7 +471,7 @@ fn test_connection_starts_the_pinned_server_with_the_token_and_reports_the_outco
     assert!(page.on("mono-browser-test-result"));
 
     *page.ops.probe.lock().unwrap() = Some(Err("Token needs update: rotate it.".into()));
-    page.click("mono-browser-test");
+    page.tap("mono-browser-test");
     page.visual.run_until_parked();
     assert_eq!(
         page.ui(|u| u.test_state()),
@@ -713,32 +772,6 @@ mod recipes {
     }
 
     impl Page {
-        /// Scrolls the page until `selector` is well inside it, then clicks it: the recipes
-        /// sit below the safety rules, and a click only lands on what is visible.
-        fn tap(&mut self, selector: &'static str) {
-            use gpui::{ScrollDelta, ScrollWheelEvent, point, px};
-            for _ in 0..60 {
-                self.visual.refresh().unwrap();
-                let (Some(target), Some(page)) = (
-                    self.visual.debug_bounds(selector),
-                    self.visual.debug_bounds("mono-browser-page"),
-                ) else {
-                    break;
-                };
-                let y = target.center().y;
-                if y > page.top() + px(120.) && y < page.bottom() - px(60.) {
-                    break;
-                }
-                let dy = if y > page.center().y { -240. } else { 240. };
-                self.visual.simulate_event(ScrollWheelEvent {
-                    position: page.center(),
-                    delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
-                    ..Default::default()
-                });
-                self.visual.run_until_parked();
-            }
-            self.click(selector);
-        }
         fn recipe_store(&self) -> RecipeStore {
             RecipeStore::new(browser::recipes_dir(&self.s.root, &self.s.id))
         }
@@ -1050,4 +1083,88 @@ mod recipes {
         assert!(page.rows().is_empty());
         assert!(page.secrets().approved_hash(&page.s.id, &v1.id).is_none());
     }
+}
+
+#[gpui::test]
+fn node_is_looked_up_in_the_background_and_shown_with_its_source(cx: &mut TestAppContext) {
+    // The environment has no node on PATH: only the resolver's lookup can find it.
+    let mut page = open_with(cx, false);
+    *page.ops.node.lock().unwrap() = Some(fake_node(NodeSource::LoginShell));
+    page.manager(|m, _| m.browser_ui.node_known = false);
+    page.enable();
+    assert_eq!(*page.ops.lookups.lock().unwrap(), 1);
+    assert!(page.ui(|u| u.prereq.clone()).unwrap().node.is_ok());
+    assert!(page.on("mono-browser-node-location"));
+    let text = page.ui(|u| u.node_found.clone()).unwrap();
+    assert_eq!(text.source, NodeSource::LoginShell);
+    // Known now: a refresh does not look again.
+    page.manager(|m, cx| m.browser_refresh(cx));
+    assert_eq!(*page.ops.lookups.lock().unwrap(), 1);
+}
+
+#[gpui::test]
+fn recheck_clears_the_lookup_and_looks_again(cx: &mut TestAppContext) {
+    let mut page = open_with(cx, false);
+    page.enable();
+    assert!(!page.ui(|u| u.prereq.clone()).unwrap().node.is_ok());
+    assert!(!page.on("mono-browser-node-location"));
+    *page.ops.node.lock().unwrap() = Some(fake_node(NodeSource::WellKnown));
+    page.click("mono-browser-node-recheck");
+    assert_eq!(*page.ops.rechecks.lock().unwrap(), 1);
+    assert_eq!(*page.ops.lookups.lock().unwrap(), 1);
+    assert!(page.ui(|u| u.prereq.clone()).unwrap().node.is_ok());
+    assert!(page.on("mono-browser-node-location"));
+}
+
+#[gpui::test]
+fn a_bad_node_path_is_reported_and_not_applied(cx: &mut TestAppContext) {
+    let mut page = open_with(cx, false);
+    page.enable();
+    page.type_into("browser-node-path", "/nope/npx");
+    page.click("mono-browser-node-path-save");
+    assert!(page.on("mono-browser-node-error"));
+    assert!(page.ops.applied.lock().unwrap().is_empty());
+    assert_eq!(*page.ops.rechecks.lock().unwrap(), 0);
+}
+
+#[gpui::test]
+fn a_good_node_path_is_applied_saved_and_rechecked(cx: &mut TestAppContext) {
+    let mut page = open_with(cx, false);
+    page.enable();
+    page.type_into("browser-node-path", "/nope/npx");
+    page.click("mono-browser-node-path-save");
+    assert!(page.on("mono-browser-node-error"));
+    page.type_into("browser-node-path", "  /good/bin/npx ");
+    page.click("mono-browser-node-path-save");
+    assert!(!page.on("mono-browser-node-error"));
+    assert_eq!(
+        page.ops.applied.lock().unwrap().as_slice(),
+        ["/good/bin/npx"]
+    );
+    assert_eq!(*page.ops.rechecks.lock().unwrap(), 1);
+    assert_eq!(
+        page.s
+            .manager
+            .read_with(&page.visual, |m, _| m.prefs.node_path.clone()),
+        "/good/bin/npx"
+    );
+    // Empty goes back to automatic.
+    page.type_into("browser-node-path", "");
+    page.click("mono-browser-node-path-save");
+    assert_eq!(page.ops.applied.lock().unwrap().last().unwrap(), "");
+}
+
+#[gpui::test]
+fn a_recheck_during_a_lookup_looks_again_when_it_ends(cx: &mut TestAppContext) {
+    let mut page = open_with(cx, false);
+    *page.ops.node.lock().unwrap() = Some(fake_node(NodeSource::LoginShell));
+    page.manager(|m, cx| {
+        m.browser_ui.node_known = false;
+        m.browser_check_node(cx);
+        // The lookup is in flight: Recheck must not be lost.
+        m.browser_recheck_node(cx);
+    });
+    assert_eq!(*page.ops.rechecks.lock().unwrap(), 1);
+    assert_eq!(*page.ops.lookups.lock().unwrap(), 2);
+    assert!(page.ui(|u| u.node_found.is_some() && u.node_known && !u.node_checking));
 }
