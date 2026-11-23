@@ -1,12 +1,8 @@
-// Route of /admin/invites. Owner: WS-S (workstreams.md 3.1). Needs role admin (AdminGuard) and a fresh session.
-import { createFileRoute } from "@tanstack/react-router";
-import { AdminGuard } from "@/features/admin/AdminGuard";
-import { AdminInvites } from "@/features/admin/AdminInvites";
+// Route of /admin/invites (old URL, kept for bookmarks and links): the invite tree now lives in the settings shell.
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/admin/invites")({
-  component: Page,
+  beforeLoad: () => {
+    throw redirect({ to: "/settings/admin/invites", replace: true });
+  },
 });
-
-function Page() {
-  return <AdminGuard>{() => <AdminInvites />}</AdminGuard>;
-}

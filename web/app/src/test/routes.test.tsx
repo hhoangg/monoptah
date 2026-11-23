@@ -117,9 +117,13 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
   { url: "/settings/install", route: "/settings/install", params: {}, fullPath: "/settings/install" },
   { url: "/settings/desktops", route: "/settings/desktops", params: {}, fullPath: "/settings/desktops/" },
   { url: "/settings/desktops/dk1", route: "/settings/desktops/:id", params: { id: "dk1" }, fullPath: "/settings/desktops/$id" },
-  { url: "/admin", route: "/admin", params: {}, fullPath: "/admin/" },
-  { url: "/admin/users", route: "/admin/users", params: {}, fullPath: "/admin/users" },
-  { url: "/admin/invites", route: "/admin/invites", params: {}, fullPath: "/admin/invites" },
+  { url: "/settings/admin", route: "/settings/admin", params: {}, fullPath: "/settings/admin/" },
+  { url: "/settings/admin/users", route: "/settings/admin/users", params: {}, fullPath: "/settings/admin/users" },
+  { url: "/settings/admin/invites", route: "/settings/admin/invites", params: {}, fullPath: "/settings/admin/invites" },
+  // The old admin URLs redirect into the settings shell (see routes/settings/redirects.test.tsx).
+  { url: "/admin", route: "/settings/admin", params: {}, fullPath: "/settings/admin/" },
+  { url: "/admin/users", route: "/settings/admin/users", params: {}, fullPath: "/settings/admin/users" },
+  { url: "/admin/invites", route: "/settings/admin/invites", params: {}, fullPath: "/settings/admin/invites" },
 ];
 
 // The auth guard asks `/api/me` for every non-public route: answer it with a signed-in mock account.
@@ -202,6 +206,9 @@ const SCREENS: Record<string, string> = {
   "/admin": "Not available",
   "/admin/users": "Not available",
   "/admin/invites": "Not available",
+  "/settings/admin": "Not available",
+  "/settings/admin/users": "Not available",
+  "/settings/admin/invites": "Not available",
 };
 
 async function renderAt(url: string) {
@@ -324,7 +331,7 @@ describe("route stubs", () => {
     // The terminal tab URL renders nothing itself (the tabbed chat draws the tab) and the old /terminal URL redirects:
     // both have their own tests above.
     // The /settings layout renders its pages, and the redirect-only routes (the settings list, /desktops, /desktops/:id and
-    // /d/:desktopId/settings) end on another route: routes/settings/redirects.test.tsx covers them.
+    // /d/:desktopId/settings and the old /admin URLs) end on another route: routes/settings/redirects.test.tsx covers them.
     const layouts = new Set([
       "/",
       "/d/$desktopId",
@@ -335,6 +342,10 @@ describe("route stubs", () => {
       "/desktops/",
       "/desktops/$id/",
       "/d/$desktopId/settings/",
+      "/admin/",
+      "/admin/users",
+      "/admin/invites",
+      "/admin/$",
     ]);
     const missing = [...new Set(generated)].filter((p) => !covered.has(p) && !layouts.has(p));
     expect(missing).toEqual([]);

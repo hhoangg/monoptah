@@ -7,10 +7,11 @@ import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Field } from "@/ui/Field";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_CARD_BODY, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { grantInvites, MAX_GRANT, unblockUser, type AdminUser } from "./adminApi";
 import { BlockDialog } from "./BlockDialog";
 import { adminErrorMessage, GRANT_CONFLICT, UNBLOCK_CONFLICT } from "./copy";
+import { StatusBadges } from "./StatusBadges";
 import { descendantsOf, handleOf } from "./tree";
 
 export interface UserDetailProps {
@@ -19,8 +20,6 @@ export interface UserDetailProps {
   isSelf: boolean;
   /** The id of the acting admin: never part of a branch block (the server skips them). */
   selfId: string;
-  /** Mobile: leaves the detail and returns to the list. */
-  onBack?: () => void;
 }
 
 /** Whether `count` is a whole number the grant route accepts (1 to 100). */
@@ -37,7 +36,7 @@ export function statusText(user: AdminUser, users: readonly AdminUser[]): string
 }
 
 /** The detail panel of one user: facts, Block, Unblock and Grant invites. */
-export function UserDetail({ user, users, isSelf, selfId, onBack }: UserDetailProps) {
+export function UserDetail({ user, users, isSelf, selfId }: UserDetailProps) {
   const queryClient = useQueryClient();
   const [blocking, setBlocking] = useState(false);
   const [unblocking, setUnblocking] = useState(false);
@@ -59,17 +58,14 @@ export function UserDetail({ user, users, isSelf, selfId, onBack }: UserDetailPr
 
   return (
     <section aria-labelledby="user-detail-title" className="flex flex-col gap-4">
-      {onBack ? (
-        <Button type="button" variant="ghost" size="sm" className="self-start" onClick={onBack}>
-          <Icon name="chevronRight" size={18} className="rotate-180" />
-          All users
-        </Button>
-      ) : null}
-      <header className="min-w-0">
+      <header className="min-w-0 px-1">
         <h2 id="user-detail-title" className="text-title font-semibold wrap-anywhere text-content">
           {`@${user.handle}`}
         </h2>
         <p className="text-body wrap-anywhere text-muted-text">{user.displayName}</p>
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          <StatusBadges user={user} />
+        </div>
       </header>
 
       <SettingsCard>
@@ -84,23 +80,25 @@ export function UserDetail({ user, users, isSelf, selfId, onBack }: UserDetailPr
 
       {result ? <Notice variant="info">{result}</Notice> : null}
 
-      <div className="flex flex-col gap-3">
-        {isSelf ? <Notice variant="info">This is your account. You cannot block yourself.</Notice> : null}
-        {user.status === "blocked" ? (
-          <>
-            <p className="text-small text-muted-text">
-              Unblocking restores sign-in for this user only. People they invited stay blocked until you unblock them one by one, and revoked desktop tokens and grants are never restored.
-            </p>
-            <Button type="button" variant="outline" className="self-start" onClick={() => { unblock.reset(); setUnblocking(true); }}>
-              Unblock @{user.handle}
+      <div className={SETTINGS_CARD_BODY}>
+        <div className="flex flex-col items-start gap-3 px-1.5 py-2">
+          {isSelf ? <Notice variant="info" className="w-full">This is your account. You cannot block yourself.</Notice> : null}
+          {user.status === "blocked" ? (
+            <>
+              <p className="text-small text-muted-text">
+                Unblocking restores sign-in for this user only. People they invited stay blocked until you unblock them one by one, and revoked desktop tokens and grants are never restored.
+              </p>
+              <Button type="button" variant="outline" className="self-start" onClick={() => { unblock.reset(); setUnblocking(true); }}>
+                Unblock @{user.handle}
+              </Button>
+            </>
+          ) : !isSelf ? (
+            <Button type="button" variant="outline" className="self-start text-deletions" onClick={() => setBlocking(true)}>
+              <Icon name="shield" size={18} />
+              Block @{user.handle}
             </Button>
-          </>
-        ) : !isSelf ? (
-          <Button type="button" variant="outline" className="self-start text-deletions" onClick={() => setBlocking(true)}>
-            <Icon name="shield" size={18} />
-            Block @{user.handle}
-          </Button>
-        ) : null}
+          ) : null}
+        </div>
       </div>
 
       <GrantInvites key={user.id} user={user} onGranted={(count) => setResult(`Granted ${count} ${count === 1 ? "invite" : "invites"} to @${user.handle}.`)} />
@@ -148,30 +146,32 @@ function GrantInvites({ user, onGranted }: { user: AdminUser; onGranted: (count:
   return (
     <form
       noValidate
-      className="flex flex-col gap-3 rounded-card bg-surface p-4"
+      className={SETTINGS_CARD_BODY}
       onSubmit={(event) => {
         event.preventDefault();
         void onSubmit();
       }}
     >
-      <Field
-        label="Grant invites"
-        type="number"
-        inputMode="numeric"
-        min={1}
-        max={MAX_GRANT}
-        step={1}
-        value={value}
-        onChange={(event) => setValue(event.target.value)}
-        hint={`Adds to the invites @${user.handle} can create. From 1 to ${MAX_GRANT} at a time.`}
-        error={invalid}
-      />
-      {grant.error ? <Notice variant="error">{grant.error}</Notice> : null}
-      {grant.notice ? <Notice variant="info">{grant.notice}</Notice> : null}
-      <Button type="submit" variant="outline" className="self-start" disabled={grant.busy} aria-busy={grant.busy}>
-        <Icon name="userAdd" size={18} />
-        Grant invites
-      </Button>
+      <div className="flex flex-col gap-3 px-1.5 py-2">
+        <Field
+          label="Grant invites"
+          type="number"
+          inputMode="numeric"
+          min={1}
+          max={MAX_GRANT}
+          step={1}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+          hint={`Adds to the invites @${user.handle} can create. From 1 to ${MAX_GRANT} at a time.`}
+          error={invalid}
+        />
+        {grant.error ? <Notice variant="error">{grant.error}</Notice> : null}
+        {grant.notice ? <Notice variant="info">{grant.notice}</Notice> : null}
+        <Button type="submit" variant="outline" className="self-start" disabled={grant.busy} aria-busy={grant.busy}>
+          <Icon name="userAdd" size={18} />
+          Grant invites
+        </Button>
+      </div>
     </form>
   );
 }

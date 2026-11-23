@@ -3,7 +3,7 @@
 import { act, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
-import { createMockState, type SeedOptions } from "@/features/accounts/mock/state";
+import { createMockState, nowSeconds, type SeedOptions } from "@/features/accounts/mock/state";
 import { createMockServer } from "@/features/accounts/mock/transport";
 import { mountApp } from "@/features/desktops/testMount";
 
@@ -164,6 +164,32 @@ describe("old desktop URLs", () => {
     const { router } = mountApp("/");
     await screen.findByRole("heading", { level: 1, name: "All desktops" });
     expect(router.state.location.pathname).toBe("/settings/desktops");
+  });
+});
+
+describe("old /admin URLs", () => {
+  /** An admin account with a fresh session, so the admin pages read without asking for a passkey. */
+  function installAdmin() {
+    const state = install({ role: "admin" });
+    state.reauthAt = nowSeconds();
+  }
+
+  it.each([
+    ["/admin", "/settings/admin", "", "Admin"],
+    ["/admin/", "/settings/admin", "", "Admin"],
+    ["/admin/users", "/settings/admin/users", "", "Users"],
+    ["/admin/users?user=usr-ada", "/settings/admin/users", "?user=usr-ada", "Users"],
+    ["/admin/invites", "/settings/admin/invites", "", "Invite tree"],
+    ["/admin/whatever", "/settings/admin", "", "Admin"],
+  ])("%s ends on %s inside the settings shell", async (url, path, search, title) => {
+    installAdmin();
+    const { router } = mountApp(url);
+    await screen.findByRole("heading", { level: 1, name: title });
+    expect(router.state.location.pathname).toBe(path);
+    expect(router.state.location.searchStr).toBe(search);
+    if (search) expect(router.state.location.search).toEqual({ user: "usr-ada" });
+    expect(screen.queryByTestId("app-header")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Leave settings" }).length).toBeGreaterThanOrEqual(1);
   });
 });
 

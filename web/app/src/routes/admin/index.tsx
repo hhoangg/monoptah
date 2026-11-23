@@ -1,12 +1,8 @@
-// Route of /admin. Owner: WS-S (workstreams.md 3.1). Needs role admin (AdminGuard) and a fresh session.
-import { createFileRoute } from "@tanstack/react-router";
-import { AdminGuard } from "@/features/admin/AdminGuard";
-import { AdminHome } from "@/features/admin/AdminHome";
+// Route of /admin (old URL, kept for bookmarks and links): the admin overview now lives in the settings shell.
+import { createFileRoute, redirect } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/admin/")({
-  component: Page,
+  beforeLoad: () => {
+    throw redirect({ to: "/settings/admin", replace: true });
+  },
 });
-
-function Page() {
-  return <AdminGuard>{() => <AdminHome />}</AdminGuard>;
-}

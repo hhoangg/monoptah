@@ -45,7 +45,7 @@ describe("app shell landmarks", () => {
 
 describe("app shell frame and navigation", () => {
   it("shows only the Account avatar in the header nav, with Settings, Desktops and Install app inside its menu", async () => {
-    mountApp("/admin");
+    mountApp("/pair");
     const nav = await screen.findByRole("navigation", { name: "Main" });
     // No Desktops (monitor) or Install (download) icon beside the avatar.
     expect(within(nav).queryAllByRole("link")).toEqual([]);
@@ -60,7 +60,7 @@ describe("app shell frame and navigation", () => {
     expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/settings/install");
   });
 
-  it.each(["/settings/profile", "/settings/desktops/desktop-dev-1", "/settings/security"])("draws no app header on %s", async (url) => {
+  it.each(["/settings/profile", "/settings/desktops/desktop-dev-1", "/settings/security", "/settings/admin", "/admin"])("draws no app header on %s", async (url) => {
     mountApp(url);
     await screen.findByRole("navigation", { name: "Settings" });
     expect(screen.queryByTestId("app-header")).toBeNull();
@@ -105,7 +105,7 @@ describe("app shell frame and navigation", () => {
     }
   });
 
-  it.each(["/install", "/pair/c0de", "/desktops/dk1/verify", "/admin", "/login"])("keeps the app header on %s", async (url) => {
+  it.each(["/install", "/pair/c0de", "/desktops/dk1/verify", "/login"])("keeps the app header on %s", async (url) => {
     mountApp(url);
     expect(await screen.findByTestId("app-header")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Monoptah" })).toBeInTheDocument();
@@ -113,10 +113,12 @@ describe("app shell frame and navigation", () => {
     expect(screen.getByTestId("connection-banner").className).toContain("top-[calc(env(safe-area-inset-top)+2.75rem)]");
   });
 
-  it("marks the Account avatar as current on /admin", async () => {
-    mountApp("/admin");
-    const nav = await screen.findByRole("navigation", { name: "Main" });
-    expect(within(nav).getByRole("button", { name: "Account" })).toHaveAttribute("data-current", "true");
+  it("sends the old /admin URL into the settings shell, which has no header and so no Account avatar to mark", async () => {
+    const { router } = mountApp("/admin");
+    await screen.findByRole("navigation", { name: "Settings" });
+    expect(router.state.location.pathname).toBe("/settings/admin");
+    expect(screen.queryByTestId("app-header")).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
   });
 
   it("has no header row on /d routes: the nav icons share the desktop switcher row, right aligned", async () => {

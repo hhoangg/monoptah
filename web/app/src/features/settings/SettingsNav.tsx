@@ -213,7 +213,11 @@ export function SettingsNav({ admin }: { admin: boolean }) {
           </NavGroup>
           {admin ? (
             <NavGroup title={SETTINGS_GROUP_LABELS.admin}>
-              <NavItem to="/admin" icon="admin">Admin</NavItem>
+              <NavItem to="/settings/admin" icon="admin" exact>
+                Overview
+              </NavItem>
+              <NavItem to="/settings/admin/users" icon="people">Users</NavItem>
+              <NavItem to="/settings/admin/invites" icon="link">Invite tree</NavItem>
             </NavGroup>
           ) : null}
         </>

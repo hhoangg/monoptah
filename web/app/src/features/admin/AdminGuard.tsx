@@ -4,18 +4,17 @@ import type { ReactNode } from "react";
 import { meQuery } from "@/features/accounts/queries";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
-import { PageHeader } from "@/ui/PageHeader";
+import { SettingsPage } from "@/features/settings/SettingsPage";
 import { NOT_AVAILABLE } from "./copy";
 
 /** A plain screen with no hint that an admin area exists. */
 export function NotAvailable() {
   return (
-    <div className="mx-auto flex w-full max-w-[760px] flex-col gap-5 px-5 pt-6 sm:pt-10">
-      <PageHeader title="Not available" description={NOT_AVAILABLE} />
+    <SettingsPage title="Not available" description={NOT_AVAILABLE}>
       <Button asChild variant="outline" className="self-start">
         <Link to="/">Go to Monoptah</Link>
       </Button>
-    </div>
+    </SettingsPage>
   );
 }
 

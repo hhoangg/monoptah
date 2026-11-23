@@ -67,7 +67,7 @@ afterEach(() => {
 });
 
 describe("admin guard", () => {
-  it.each(["/admin", "/admin/users", "/admin/invites"])("%s shows Not available to a non-admin and fetches no admin data", async (path) => {
+  it.each(["/settings/admin", "/settings/admin/users", "/settings/admin/invites"])("%s shows Not available to a non-admin and fetches no admin data", async (path) => {
     install({ role: "user" });
     mount(path);
     expect(await screen.findByRole("heading", { level: 1, name: "Not available" })).toBeInTheDocument();
@@ -83,15 +83,18 @@ describe("admin guard", () => {
         ? Promise.resolve(new Response(JSON.stringify({ error: "Not allowed", code: "forbidden" }), { status: 403, headers: { "Content-Type": "application/json" } }))
         : server.transport(url, init),
     );
-    mount("/admin");
+    mount("/settings/admin");
     expect(await screen.findByText("This page is not available for your account.")).toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "Pause invites" })).not.toBeInTheDocument();
   });
 
-  it("links to /admin from the settings nav for admins only", async () => {
+  it("links to the three admin pages from the settings nav for admins only", async () => {
     install();
     mount("/settings/profile");
-    expect(await within(await screen.findByRole("navigation", { name: "Settings" })).findByRole("link", { name: "Admin" })).toHaveAttribute("href", "/admin");
+    const nav = await screen.findByRole("navigation", { name: "Settings" });
+    expect(await within(nav).findByRole("link", { name: "Overview" })).toHaveAttribute("href", "/settings/admin");
+    expect(within(nav).getByRole("link", { name: "Users" })).toHaveAttribute("href", "/settings/admin/users");
+    expect(within(nav).getByRole("link", { name: "Invite tree" })).toHaveAttribute("href", "/settings/admin/invites");
   });
 
   it("has no admin link in the settings nav for a member", async () => {
@@ -99,6 +102,158 @@ describe("admin guard", () => {
     mount("/settings/profile");
     await screen.findByRole("heading", { level: 1, name: "Profile" });
     expect(screen.queryByRole("link", { name: /^Admin/ })).not.toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Settings" });
+    expect(within(nav).queryByRole("link", { name: "Overview" })).not.toBeInTheDocument();
+    expect(within(nav).queryByRole("link", { name: "Users" })).not.toBeInTheDocument();
+    expect(within(nav).queryByRole("link", { name: "Invite tree" })).not.toBeInTheDocument();
+  });
+});
+
+describe("admin pages in the settings shell", () => {
+  it.each([
+    ["/settings/admin", "Admin"],
+    ["/settings/admin/users", "Users"],
+    ["/settings/admin/invites", "Invite tree"],
+  ])("%s renders inside the settings shell with h1 %s", async (path, title) => {
+    install();
+    mount(path);
+    expect(await screen.findByRole("heading", { level: 1, name: title })).toBeInTheDocument();
+    expect(screen.queryByTestId("app-header")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Leave settings" })).toBeInTheDocument();
+  });
+
+  it("renders the pause-invites and recent-activity anchors", async () => {
+    install();
+    mount("/settings/admin");
+    await screen.findByRole("switch", { name: "Pause invites" });
+    expect(document.getElementById("pause-invites")).not.toBeNull();
+    expect(document.getElementById("recent-activity")).not.toBeNull();
+  });
+
+  it("renders the invite-tree anchor", async () => {
+    install();
+    mount("/settings/admin/invites");
+    await screen.findByRole("list", { name: "Invite tree" });
+    expect(document.getElementById("invite-tree")).not.toBeNull();
+  });
+
+  it("links the Manage rows and the tree items to the new URLs", async () => {
+    install();
+    mount("/settings/admin");
+    expect(await screen.findByRole("link", { name: /Block, unblock and grant invites/ })).toHaveAttribute("href", "/settings/admin/users");
+    expect(screen.getByRole("link", { name: /Who invited whom/ })).toHaveAttribute("href", "/settings/admin/invites");
+  });
+
+  it("links tree items to the users page with the user selected", async () => {
+    install();
+    mount("/settings/admin/invites");
+    const tree = await screen.findByRole("list", { name: "Invite tree" });
+    expect(within(tree).getByRole("link", { name: /@ada/ })).toHaveAttribute("href", "/settings/admin/users?user=usr-ada");
+  });
+
+  describe("below 640px", () => {
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("shows the detail alone with an All users link that returns to the list", async () => {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => false,
+      }));
+      install();
+      const user = userEvent.setup();
+      const { router } = mount("/settings/admin/users");
+      const list = await screen.findByRole("list", { name: "Users" });
+      await user.click(within(list).getByRole("button", { name: /^@ada,/ }));
+      expect(await screen.findByRole("region", { name: "@ada" })).toBeInTheDocument();
+      expect(screen.queryByRole("list", { name: "Users" })).not.toBeInTheDocument();
+      await user.click(screen.getByRole("link", { name: "All users" }));
+      expect(await screen.findByRole("list", { name: "Users" })).toBeInTheDocument();
+      expect(router.state.location.search).toEqual({});
+    });
+
+    it("keeps the nesting of deep invite chains on a phone", async () => {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => false,
+      }));
+      install();
+      mount("/settings/admin/invites");
+      const tree = await screen.findByRole("list", { name: "Invite tree" });
+      const cleoList = within(tree).getByRole("list", { name: "Invited by @cleo" });
+      const malloryList = within(tree).getByRole("list", { name: "Invited by @mallory" });
+      expect(within(cleoList).getByRole("link", { name: /@dmitri/ })).toBeInTheDocument();
+      expect(within(malloryList).getByRole("link", { name: /@trent/ })).toBeInTheDocument();
+      for (const nested of [cleoList, malloryList]) {
+        expect(nested).toHaveClass("border-l", "ml-2", "pl-1.5");
+      }
+    });
+
+    it("names the inviter in the meta line past the indent cap", async () => {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => false,
+      }));
+      const { state } = install();
+      const template = state.adminUsers.find((u) => u.id === "usr-dmitri")!;
+      let parentId = template.id;
+      for (let i = 1; i <= 5; i += 1) {
+        state.adminUsers.push({ ...template, id: `usr-deep${i}`, handle: `deep${i}`, displayName: `Deep ${i}`, invitedBy: parentId });
+        parentId = `usr-deep${i}`;
+      }
+      mount("/settings/admin/invites");
+      const tree = await screen.findByRole("list", { name: "Invite tree" });
+      const deepest = within(tree).getByRole("link", { name: /^@deep5/ });
+      expect(deepest).toHaveTextContent("invited by @deep4, ");
+      const nestedUnderDeep5 = within(tree).queryByRole("list", { name: "Invited by @deep5" });
+      expect(nestedUnderDeep5).not.toBeInTheDocument();
+      expect(within(tree).getByRole("link", { name: /^@deep4/ })).toHaveTextContent("invited by @deep3, ");
+      expect(within(tree).getByRole("link", { name: /@dmitri/ })).not.toHaveTextContent("invited by");
+    });
+
+    it("shows the list and a Settings back link for an unknown ?user=", async () => {
+      vi.stubGlobal("matchMedia", (query: string) => ({
+        matches: false,
+        media: query,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        dispatchEvent: () => false,
+      }));
+      install();
+      mount("/settings/admin/users?user=usr-nobody");
+      expect(await screen.findByRole("list", { name: "Users" })).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "Settings" })).toHaveAttribute("href", "/settings");
+      expect(screen.queryByRole("link", { name: "All users" })).not.toBeInTheDocument();
+    });
+  });
+});
+
+describe("two-pane users page", () => {
+  it("selects a user without resetting the scroll", async () => {
+    install();
+    const user = userEvent.setup();
+    const { router } = mount("/settings/admin/users");
+    const list = await screen.findByRole("list", { name: "Users" });
+    const navigate = vi.spyOn(router, "navigate");
+    await user.click(within(list).getByRole("button", { name: /^@ada,/ }));
+    expect(await screen.findByRole("region", { name: "@ada" })).toBeInTheDocument();
+    expect(navigate).toHaveBeenCalledWith(expect.objectContaining({ resetScroll: false }));
   });
 });
 
@@ -106,7 +261,7 @@ describe("fresh session", () => {
   it("asks to confirm first, opens no passkey prompt on load, and shows the page after confirming", async () => {
     install({ fresh: false });
     const user = userEvent.setup();
-    mount("/admin");
+    mount("/settings/admin");
     expect(await screen.findByRole("heading", { name: "Confirm it's you" })).toBeInTheDocument();
     expect(lib.startAuthentication).not.toHaveBeenCalled();
     expect(screen.queryByRole("switch", { name: "Pause invites" })).not.toBeInTheDocument();
@@ -120,7 +275,7 @@ describe("fresh session", () => {
     install({ fresh: false });
     lib.startAuthentication.mockRejectedValue(Object.assign(new Error("closed"), { name: "NotAllowedError" }));
     const user = userEvent.setup();
-    mount("/admin");
+    mount("/settings/admin");
     await user.click(await screen.findByRole("button", { name: "Confirm with passkey" }));
     expect(await screen.findByText(/prompt was closed/)).toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "Pause invites" })).not.toBeInTheDocument();
@@ -129,7 +284,7 @@ describe("fresh session", () => {
   it("re-authenticates for a write when the window ran out, then retries it", async () => {
     const { state } = install();
     const user = userEvent.setup();
-    mount("/admin");
+    mount("/settings/admin");
     await user.click(await screen.findByRole("switch", { name: "Pause invites" }));
     expect(state.invitesPaused).toBe(true);
 
@@ -142,10 +297,10 @@ describe("fresh session", () => {
   });
 });
 
-describe("/admin", () => {
+describe("/settings/admin", () => {
   it("shows the user count of the cap, the open state and the audit log", async () => {
     install();
-    mount("/admin");
+    mount("/settings/admin");
     expect(await screen.findByText("9 of 150")).toBeInTheDocument();
     expect(screen.getByText("Invites are open")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Pause invites" })).not.toBeChecked();
@@ -155,7 +310,7 @@ describe("/admin", () => {
 
   it("says No cap when maxUsers is 0", async () => {
     install({ maxUsers: 0 });
-    mount("/admin");
+    mount("/settings/admin");
     expect(await screen.findByText("9 (No cap)")).toBeInTheDocument();
     expect(userCountText({ invitesPaused: false, maxUsers: 0, userCount: 3 })).toBe("3 (No cap)");
   });
@@ -163,7 +318,7 @@ describe("/admin", () => {
   it("the Pause invites switch PUTs {invitesPaused:true}, shows the paused state and writes an audit row", async () => {
     const { state } = install();
     const user = userEvent.setup();
-    mount("/admin");
+    mount("/settings/admin");
     await user.click(await screen.findByRole("switch", { name: "Pause invites" }));
     await screen.findByText("Invites are paused");
     expect(screen.getByRole("switch", { name: "Pause invites" })).toBeChecked();
@@ -176,7 +331,7 @@ describe("/admin", () => {
 
   it("explains a reached cap", async () => {
     install({ maxUsers: "full" });
-    mount("/admin");
+    mount("/settings/admin");
     expect(await screen.findByText("The user cap is reached")).toBeInTheDocument();
     expect(screen.getByText("9 of 9")).toBeInTheDocument();
   });
@@ -184,7 +339,7 @@ describe("/admin", () => {
   it("pages the audit log with Load more", async () => {
     install();
     const user = userEvent.setup();
-    mount("/admin");
+    mount("/settings/admin");
     await screen.findByText("Blocked a branch (2 users)");
     expect(screen.queryAllByText(/^Signed in$/)).toHaveLength(0);
     await user.click(screen.getByRole("button", { name: "Load more" }));
@@ -194,16 +349,16 @@ describe("/admin", () => {
   });
 });
 
-describe("/admin/invites", () => {
+describe("/settings/admin/invites", () => {
   it("shows \"Invites are paused\" on a paused instance", async () => {
     install({ invitesPaused: true });
-    mount("/admin/invites");
+    mount("/settings/admin/invites");
     expect(await screen.findByText("Invites are paused")).toBeInTheDocument();
   });
 
   it("shows open invites and the invite tree from invitedBy otherwise", async () => {
     install();
-    mount("/admin/invites");
+    mount("/settings/admin/invites");
     expect(await screen.findByText("Invites are open")).toBeInTheDocument();
     expect(screen.queryByText("Invites are paused")).not.toBeInTheDocument();
     const tree = await screen.findByRole("list", { name: "Invite tree" });
@@ -222,11 +377,11 @@ describe("/admin/invites", () => {
   });
 });
 
-describe("/admin/users", () => {
+describe("/settings/admin/users", () => {
   it("lists users with invited by, created and desktops, and opens a detail panel", async () => {
     install();
     const user = userEvent.setup();
-    mount("/admin/users");
+    mount("/settings/admin/users");
     const list = await screen.findByRole("list", { name: "Users" });
     expect(within(list).getAllByRole("listitem")).toHaveLength(9);
     await user.click(within(list).getByRole("button", { name: /^@ada,/ }));
@@ -239,7 +394,7 @@ describe("/admin/users", () => {
   it("blocks this user only: cascade false and the reason in the body", async () => {
     const { state } = install();
     const user = userEvent.setup();
-    mount("/admin/users?user=usr-ada");
+    mount("/settings/admin/users?user=usr-ada");
     await user.click(await screen.findByRole("button", { name: "Block @ada" }));
     const dialog = await screen.findByRole("dialog", { name: "Block @ada?" });
     expect(within(dialog).getByRole("radio", { name: /^This user only/ })).toBeChecked();
@@ -254,7 +409,7 @@ describe("/admin/users", () => {
   it("blocks a branch: cascade true, the effects are explained, descendants are blocked", async () => {
     const { state } = install();
     const user = userEvent.setup();
-    mount("/admin/users?user=usr-ada");
+    mount("/settings/admin/users?user=usr-ada");
     await user.click(await screen.findByRole("button", { name: "Block @ada" }));
     const dialog = await screen.findByRole("dialog", { name: "Block @ada?" });
     await user.click(within(dialog).getByRole("radio", { name: /This user and everyone they invited/ }));
@@ -276,7 +431,7 @@ describe("/admin/users", () => {
     // The acting admin sits inside ada's branch (and invited ada's other relatives): they must not be counted.
     const cleo = state.adminUsers.find((u) => u.id === "usr-cleo");
     if (cleo) state.adminUsers.push({ ...cleo, id: "user-dev-1", handle: "dev", displayName: "Dev User", role: "admin", invitedBy: "usr-dmitri" });
-    mount("/admin/users?user=usr-ada");
+    mount("/settings/admin/users?user=usr-ada");
     await user.click(await screen.findByRole("button", { name: "Block @ada" }));
     const dialog = await screen.findByRole("dialog", { name: "Block @ada?" });
     await user.click(within(dialog).getByRole("radio", { name: /This user and everyone they invited/ }));
@@ -290,14 +445,14 @@ describe("/admin/users", () => {
 
   it("limits the reason to 500 characters", async () => {
     install();
-    mount("/admin/users?user=usr-ada");
+    mount("/settings/admin/users?user=usr-ada");
     await userEvent.setup().click(await screen.findByRole("button", { name: "Block @ada" }));
     expect(await screen.findByLabelText("Reason (optional)")).toHaveAttribute("maxlength", "500");
   });
 
   it("does not offer Block on your own account", async () => {
     install();
-    mount("/admin/users?user=user-dev-1");
+    mount("/settings/admin/users?user=user-dev-1");
     expect(await screen.findByText("This is your account. You cannot block yourself.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /^Block @/ })).not.toBeInTheDocument();
   });
@@ -305,7 +460,7 @@ describe("/admin/users", () => {
   it("unblock explains that descendants stay blocked and nothing is restored, then unblocks only that user", async () => {
     const { state } = install();
     const user = userEvent.setup();
-    mount("/admin/users?user=usr-mallory");
+    mount("/settings/admin/users?user=usr-mallory");
     await user.click(await screen.findByRole("button", { name: "Unblock @mallory" }));
     const dialog = await screen.findByRole("dialog", { name: "Unblock @mallory?" });
     expect(within(dialog).getByText(/People they invited stay blocked until you unblock them one by one/)).toBeInTheDocument();
@@ -320,7 +475,7 @@ describe("/admin/users", () => {
   it("grants invites: 1 to 100 are sent, anything else is refused before a request", async () => {
     const { state } = install();
     const user = userEvent.setup();
-    mount("/admin/users?user=usr-ben");
+    mount("/settings/admin/users?user=usr-ben");
     const field = await screen.findByLabelText("Grant invites");
     const submit = screen.getByRole("button", { name: "Grant invites" });
     for (const bad of ["0", "101", "1.5", ""]) {
@@ -342,7 +497,7 @@ describe("/admin/users", () => {
   it("selecting a row sets ?user= so the detail can be reached and left", async () => {
     install();
     const user = userEvent.setup();
-    const { router } = mount("/admin/users");
+    const { router } = mount("/settings/admin/users");
     await user.click(await screen.findByRole("button", { name: /^@eve,/ }));
     await waitFor(() => expect(router.state.location.search).toEqual({ user: "usr-eve" }));
   });
