@@ -21,6 +21,7 @@ import { Notice } from "@/ui/Notice";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import { ResponsiveOverlay } from "@/ui/ResponsiveOverlay";
 import { OfflineBanner } from "@/features/offline";
+import { WorkspaceDrawerToggle } from "@/features/sessions/WorkspaceDrawer";
 import { useAction } from "@/features/settings/useAction";
 import { requestGrantAndRefresh, useDesktopGrants, useDesktops, type DesktopSummary } from "./api";
 import { safeName } from "./format";
@@ -31,11 +32,11 @@ import { ColorDot, desktopErrorMessage } from "./parts";
 import { markGrantRequested, readLastUsed, sortByLastUsed, touchLastUsed } from "./storage";
 import { useThisDevice } from "./thisDevice";
 
-function OnlineDot({ online }: { online: boolean }) {
+function OnlineDot({ online, compactBelow }: { online: boolean; compactBelow?: boolean }) {
   return (
     <span className="inline-flex items-center gap-1 text-caption text-muted-text">
       <span aria-hidden="true" className={cn("size-1.5 rounded-pill", online ? "bg-additions" : "bg-faint")} />
-      {online ? "Online" : "Offline"}
+      <span className={cn(compactBelow && "hidden min-[24rem]:inline")}>{online ? "Online" : "Offline"}</span>
     </span>
   );
 }
@@ -47,8 +48,10 @@ const RAIL_QUERY = "(min-width: 640px)";
  * The slim row of the /d frame: the switcher (when there is one) on the left, the app nav right aligned.
  * `railReplaces` is for the callers under the app shell: from 640 px the rail takes over and only the connection
  * banner stays (below the top safe-area inset, which the bar used to clear).
+ * `drawerDesktopId` puts the workspace list toggle (a left drawer) at the left of the row below 640 px; callers pass it
+ * only while the link is usable.
  */
-export function DesktopTopBar({ children, railReplaces = false }: { children?: ReactNode; railReplaces?: boolean }) {
+export function DesktopTopBar({ children, railReplaces = false, drawerDesktopId }: { children?: ReactNode; railReplaces?: boolean; drawerDesktopId?: string }) {
   const wide = useMediaQuery(RAIL_QUERY);
   if (railReplaces && wide) {
     return (
@@ -63,6 +66,7 @@ export function DesktopTopBar({ children, railReplaces = false }: { children?: R
     <>
       <div data-testid="desktop-top-bar" className="shrink-0 border-b border-stroke bg-background pt-[env(safe-area-inset-top)]">
         <div className="flex min-h-11 w-full items-center gap-2 pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.75rem,env(safe-area-inset-left))]">
+          {drawerDesktopId && !wide ? <WorkspaceDrawerToggle desktopId={drawerDesktopId} /> : null}
           <div className="flex min-w-0 flex-1 items-center">{children}</div>
           <AppNav className="shrink-0" />
         </div>
@@ -96,19 +100,19 @@ export function DesktopSwitcher() {
   const online = presence === null ? (current?.online ?? false) : presence === "online";
 
   return (
-    <DesktopTopBar railReplaces>
+    <DesktopTopBar railReplaces drawerDesktopId={desktopId}>
       <button
         type="button"
         aria-haspopup="dialog"
         aria-expanded={open}
-        aria-label={`Switch desktop, current: ${name}`}
+        aria-label={`Switch desktop, current: ${name}, ${online ? "online" : "offline"}`}
         onClick={() => setOpen(true)}
         className="flex min-h-11 min-w-0 max-w-full items-center gap-2 rounded-row px-2 text-label font-semibold text-content hover:bg-selection active:opacity-60 pointer-fine:min-h-9"
       >
         {current?.avatar ? <DesktopAvatarBubble desktop={current} className="size-6" /> : <ColorDot color={current?.color ?? null} />}
         <span className="min-w-0 truncate">{name}</span>
-        <OnlineDot online={online} />
-        <Icon name="chevronDown" size={16} className="shrink-0 text-faint" />
+        <OnlineDot online={online} compactBelow />
+        <Icon name="chevronDown" size={16} className="hidden shrink-0 text-faint min-[24rem]:block" />
       </button>
       {open ? <SwitcherSheet currentId={desktopId} onClose={() => setOpen(false)} /> : null}
     </DesktopTopBar>

@@ -14,7 +14,8 @@ import { Notice } from "@/ui/Notice";
 import { IconTip } from "@/ui/tooltip";
 import { SessionCard } from "./SessionCard";
 import { useCatalogUnreadMonos } from "./monoSeen";
-import { MonoRow, ProjectRow } from "./WorkspaceNav";
+import { MonoRow, ProjectRow, accentFor } from "./WorkspaceNav";
+import { ProjectMascot } from "./ProjectMascot";
 import { NewSessionScreen } from "./NewSessionScreen";
 import { SessionListBody } from "./SessionListBody";
 import { MonoHome } from "@/features/monos/MonoHome";
@@ -58,7 +59,7 @@ export function HomeScreen({ desktopId }: { desktopId: string }) {
 
   return (
     // "route-stub" is kept as the outlet marker used by link/LinkProvider.test.tsx and version/layout.test.tsx (WS-L); rename when their owner switches to a real marker.
-    <WorkspaceFrame desktopId={desktopId} title="Workspace" testId="route-stub" narrow>
+    <WorkspaceFrame desktopId={desktopId} title="Workspace" testId="route-stub" narrow hideTitle>
       {monosOnly ? (
         <MonoHome desktopId={desktopId} />
       ) : !data ? (
@@ -196,7 +197,15 @@ export function ProjectScreen({ desktopId, projectId }: { desktopId: string; pro
   );
 
   return (
-    <WorkspaceFrame desktopId={desktopId} title={project?.name ?? "Project"} subtitle={project?.path} actions={missing ? null : newSession} flush compact>
+    <WorkspaceFrame
+      desktopId={desktopId}
+      title={project?.name ?? "Project"}
+      subtitle={project?.path}
+      leading={project ? <ProjectMascot project={project.path} name={project.mascot} color={accentFor(project.name, project.color)} size={32} active={!!project.busy} className="shrink-0" /> : undefined}
+      actions={missing ? null : newSession}
+      flush
+      compact
+    >
       {missing ? (
         <section className="flex flex-col items-start gap-4 py-8">
           <h2 className="text-title font-semibold">This project is not on this device</h2>

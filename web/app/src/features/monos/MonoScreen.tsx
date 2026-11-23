@@ -7,6 +7,7 @@ import { BACKGROUND_CONTAINER_CLASS, ChatBackground, useFirstBackgroundProject }
 import { ModelNamesProvider } from "@/features/transcript/modelNames";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useMediaQuery } from "@/ui/useMediaQuery";
 import { useCatalog, useConversation } from "@/data";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
@@ -20,7 +21,7 @@ import { useMentionPreview } from "@/features/filePreview/useMentionPreview";
 import { useRememberPlace } from "@/features/sessions/lastPlace";
 import { useConfirmedMissing } from "@/features/sessions/useConfirmedMissing";
 import { markMonoSeen, markMonoUnread } from "@/features/sessions/monoSeen";
-import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
+import { WIDE_QUERY, useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { Transcript } from "@/features/transcript/Transcript";
 import type { TranscriptActions } from "@/features/transcript/context";
 import { useOlderTurns } from "@/features/transcript/useOlderTurns";
@@ -48,6 +49,8 @@ export const monoConversationId = (monoId: string) => `mono:${monoId}`;
 export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: string }) {
   useRememberPlace();
   const navigate = useNavigate();
+  // From 640 px the sidebar lists the Monos, so the chat has no Back to the list there.
+  const wide = useMediaQuery(WIDE_QUERY);
   const readOnly = useReadOnly();
   const ready = useLinkReady();
   const guard = useSendGuard();
@@ -134,14 +137,16 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
       {/* A Mono works across projects (`projectIds`) and has no background of its own: its chat shows the background of the first of its projects that has one. */}
       <ChatBackground projectId={monoBackgroundProject} />
       <header className="flex w-full shrink-0 items-center gap-2 px-2 py-2 min-[24rem]:px-5">
-        <Link
-          to="/d/$desktopId"
-          params={{ desktopId }}
-          aria-label="Back"
-          className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection"
-        >
-          <Icon name="chevronDown" size={20} className="rotate-90" />
-        </Link>
+        {wide ? null : (
+          <Link
+            to="/d/$desktopId"
+            params={{ desktopId }}
+            aria-label="Back"
+            className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection"
+          >
+            <Icon name="chevronDown" size={20} className="rotate-90" />
+          </Link>
+        )}
         <MonoAvatar monoId={monoId} name={name} mascot={mono?.mascot} color={mono?.color} working={working} size={32} />
         <div className="min-w-0 flex-1">
           <PaneHeading className="truncate text-h font-semibold">{name}</PaneHeading>

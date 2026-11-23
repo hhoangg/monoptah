@@ -23,6 +23,7 @@ import { useParams, useRouterState } from "@tanstack/react-router";
 import { useEffect, useSyncExternalStore, type ReactNode } from "react";
 import { useCatalog } from "@/data";
 import { WorkspaceNav } from "@/features/sessions/WorkspaceNav";
+import { useFooterShown } from "@/features/sessions/useFooterShown";
 import { Icon } from "@/ui/Icon";
 import { IconTip } from "@/ui/tooltip";
 import { useMediaQuery } from "@/ui/useMediaQuery";
@@ -158,7 +159,7 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
   // The project routes have no title in the chat pane (the New session page), so the session list names the project (h1).
   const projectRoute = useRouterState({ select: (state) => /\/p\/[^/]+(\/new)?\/?$/.test(state.location.pathname) });
   // On a phone the footer belongs to the workspace screen (the home of the desktop); from 640px it is on every screen.
-  const workspaceHome = useRouterState({ select: (state) => state.location.pathname.replace(/\/$/, "") === `/d/${desktopId}` });
+  const footerShown = useFooterShown(desktopId);
   useGlobalShortcuts();
 
   useEffect(() => {
@@ -194,7 +195,7 @@ function Shell({ desktopId, children }: { desktopId: string; children?: ReactNod
         <ChatPane desktopId={desktopId}>{children}</ChatPane>
         {mode === "docked" ? <RightPanel mode="docked" desktopId={desktopId} projectId={projectId} maxWidth={dockMax ?? undefined} /> : null}
       </div>
-      {wide || workspaceHome ? <FooterBar desktopId={desktopId} tabbed={wide} /> : null}
+      {footerShown ? <FooterBar desktopId={desktopId} tabbed={wide} /> : null}
       {wide ? null : <TerminalDrawer />}
       {mode === "docked" ? null : <RightPanel mode={mode} desktopId={desktopId} projectId={projectId} />}
       <CommandPalette desktopId={desktopId} />

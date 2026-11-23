@@ -1,6 +1,6 @@
 // The session-list sidebar of the classic layout (design-system.md section 11): from 1024 px the app shell puts it
 // between the workspace sidebar and the chat, for the project of the current screen (a project route, or the session's
-// project). It mirrors the native classic layout's second sidebar: project title and path, the branch picker, search,
+// project). It mirrors the native classic layout's second sidebar: project avatar, title and path, search,
 // filter and the sessions, with a "New session" button. The chat pane takes the rest of the width.
 import { Link } from "@tanstack/react-router";
 import { useCatalog } from "@/data";
@@ -9,6 +9,8 @@ import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
 import { IconTip } from "@/ui/tooltip";
 import { SessionListBody } from "./SessionListBody";
+import { accentFor } from "./WorkspaceNav";
+import { ProjectMascot } from "./ProjectMascot";
 import { useActivityTracking, useReadOnly } from "./WorkspaceFrame";
 
 export interface SessionListPaneProps {
@@ -37,6 +39,12 @@ export function SessionListPane({ desktopId, projectId, width, heading, newSessi
   return (
     <section aria-label="Project sessions" data-testid="session-list-pane" style={{ width }} className="flex h-full min-h-0 shrink-0 flex-col bg-background">
       <header className="flex shrink-0 items-start gap-2 px-4 pt-3 pb-3">
+        {project ? (
+          // The sidebar row's avatar, decorative, 28px to match the title's first line.
+          <span aria-hidden="true" data-testid="project-avatar" className="flex h-7 w-7 shrink-0 items-center justify-center">
+            <ProjectMascot project={project.path} name={project.mascot} color={accentFor(project.name, project.color)} size={28} active={!!project.busy} />
+          </span>
+        ) : null}
         <div className="min-w-0 flex-1">
           <Heading className="wrap-anywhere text-title font-semibold">{project?.name ?? "Project"}</Heading>
           {project?.path ? (

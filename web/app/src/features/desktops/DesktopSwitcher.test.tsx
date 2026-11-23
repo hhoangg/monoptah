@@ -18,6 +18,11 @@ vi.mock("@/link", async (importOriginal) => {
 });
 vi.mock("@/link/keys", async (importOriginal) => ({ ...(await importOriginal<typeof KeysModule>()), getDeviceKeyInfo: h.getDeviceKeyInfo }));
 
+// The real toggle needs a LinkProvider and the catalog; it has its own tests (sessions/screens.test.tsx).
+vi.mock("@/features/sessions/WorkspaceDrawer", () => ({
+  WorkspaceDrawerToggle: ({ desktopId }: { desktopId: string }) => <button type="button" data-testid="drawer-toggle" aria-label={`Open workspace list ${desktopId}`} />,
+}));
+
 import { setBlockingLayerShown } from "./blockingLayer";
 import { DesktopSwitcher } from "./DesktopSwitcher";
 import { createFakeServer, desktop, grant, type FakeServer } from "./testServer";
@@ -78,9 +83,48 @@ describe("desktop switcher", () => {
     expect(await screen.findByRole("button", { name: /Switch desktop/ })).toBeInTheDocument();
   });
 
+  it("puts the workspace list toggle at the left of the row, before the switcher, below 640px", async () => {
+    mountSlot(<DesktopSwitcher />);
+    const trigger = await screen.findByRole("button", { name: /Switch desktop/ });
+    const toggle = screen.getByTestId("drawer-toggle");
+    expect(toggle).toHaveAttribute("aria-label", "Open workspace list d1");
+    const row = screen.getByRole("navigation", { name: "Main" }).parentElement as HTMLElement;
+    expect(row.firstElementChild).toBe(toggle);
+    expect(toggle.compareDocumentPosition(trigger) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("keeps the presence dot but hides the Online word and the chevron below 24rem", async () => {
+    mountSlot(<DesktopSwitcher />);
+    const trigger = await screen.findByRole("button", { name: /Switch desktop/ });
+    const word = within(trigger).getByText("Online");
+    expect(word).toHaveClass("hidden", "min-[24rem]:inline");
+    expect(trigger.querySelector('span[aria-hidden="true"].bg-additions')).not.toBeNull();
+    expect(trigger.querySelector("svg")).toHaveClass("hidden", "min-[24rem]:block");
+  });
+
+  it("has no workspace list toggle while a blocking layer shows (the list is unusable)", async () => {
+    mountSlot(<DesktopSwitcher />);
+    await screen.findByRole("button", { name: /Switch desktop/ });
+    act(() => setBlockingLayerShown("d1", true));
+    expect(screen.queryByTestId("drawer-toggle")).toBeNull();
+    act(() => setBlockingLayerShown("d1", false));
+  });
+
+  it("has no workspace list toggle from 640px up, where the rail replaces the bar", async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({ matches: true, media: query, onchange: null, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {}, dispatchEvent: () => false })) as never;
+    try {
+      mountSlot(<DesktopSwitcher />);
+      await screen.findByTestId("desktop-top-bar");
+      expect(screen.queryByTestId("drawer-toggle")).toBeNull();
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
   it("shows the current desktop in a slim bar and records it as last used", async () => {
     mountSlot(<DesktopSwitcher />);
-    const trigger = await screen.findByRole("button", { name: "Switch desktop, current: Studio Mac" });
+    const trigger = await screen.findByRole("button", { name: "Switch desktop, current: Studio Mac, online" });
     expect(within(trigger).getByText("Online")).toBeInTheDocument();
     expect(JSON.parse(localStorage.getItem("monoptah.desktops.lastUsed") ?? "[]")).toEqual(["d1"]);
   });

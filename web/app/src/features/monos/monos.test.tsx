@@ -143,6 +143,19 @@ describe("Mono header (F-70)", () => {
     expect(screen.queryByText("Settings", { selector: "a" })).toBeNull();
   });
 
+  it("has the Back link to the Mono list on a phone", async () => {
+    phone();
+    mount(`/monos/${MONO}`);
+    expect(await screen.findByRole("link", { name: "Back" })).toHaveAttribute("href", `/d/${DESKTOP_ID}`);
+  });
+
+  it("has no Back link from 640px up", async () => {
+    wideScreen();
+    mount(`/monos/${MONO}`);
+    await screen.findByRole("link", { name: "Mono profile" });
+    expect(screen.queryByRole("link", { name: "Back" })).toBeNull();
+  });
+
   it("shows a Settings action instead of the profile link when monoTools is off", async () => {
     const handler = FIXTURE_HANDLERS["workspace.list"] as (p: never, c: never) => Record<string, unknown>;
     (FIXTURE_HANDLERS as Record<string, unknown>)["workspace.list"] = ((p: never, c: never) => ({ ...handler(p, c), monoTools: false })) as never;
