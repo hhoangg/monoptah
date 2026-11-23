@@ -17,7 +17,14 @@
 //! * a style attribute loses every declaration that carries a URL other than such an image, any
 //!   escape, `expression(`, `@import` or a script scheme, and `url(x.png)` becomes
 //!   `url(monoptah-asset:<index>)`;
+//! * `<use href>`, `<textPath href>` and SVG paint servers keep only a `#fragment` (an id of the
+//!   same document); a presentation attribute or style declaration (`fill`, `marker-end`, ...) may
+//!   carry `url(#id)` and no other `url(`;
 //! * every other URL attribute is dropped.
+//!
+//! Inline `<svg>` is kept with a fixed list of drawing elements ([`SVG_TAGS`]) and presentation
+//! attributes ([`SVG_ATTRIBUTES`]); `<style>`, `<script>`, `<foreignObject>`, `<image>`, `<feImage>`,
+//! animation elements and `on*` attributes are never allowed.
 //!
 //! Nothing a document says can put a non-placeholder URL in the output.
 use std::{
@@ -154,15 +161,181 @@ const URL_ATTRIBUTES: &[&str] = &[
     "lowsrc",
 ];
 
+/// Inline SVG elements that draw (no scripts, no animation, no `<image>`, no `<foreignObject>`).
+/// The names are the camelCase ones the HTML parser produces for SVG elements.
+const SVG_TAGS: &[&str] = &[
+    "svg",
+    "g",
+    "defs",
+    "symbol",
+    "use",
+    "marker",
+    "path",
+    "rect",
+    "circle",
+    "ellipse",
+    "line",
+    "polyline",
+    "polygon",
+    "text",
+    "tspan",
+    "textPath",
+    "linearGradient",
+    "radialGradient",
+    "stop",
+    "clipPath",
+    "mask",
+    "pattern",
+    "filter",
+    "feGaussianBlur",
+    "feOffset",
+    "feDropShadow",
+    "feFlood",
+    "feMerge",
+    "feMergeNode",
+    "feColorMatrix",
+    "feBlend",
+    "feComposite",
+];
+
+/// Attributes of the elements in [`SVG_TAGS`]. Names are as the HTML parser spells them
+/// (`viewBox`, `markerWidth`, `refX`). URL-carrying ones (`href`) are handled by [`filter`].
+const SVG_ATTRIBUTES: &[&str] = &[
+    "class",
+    "role",
+    "aria-label",
+    "aria-hidden",
+    "aria-labelledby",
+    "aria-describedby",
+    "viewBox",
+    "preserveAspectRatio",
+    "width",
+    "height",
+    "x",
+    "y",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "cx",
+    "cy",
+    "r",
+    "rx",
+    "ry",
+    "fx",
+    "fy",
+    "dx",
+    "dy",
+    "d",
+    "points",
+    "transform",
+    "opacity",
+    "visibility",
+    "display",
+    "overflow",
+    "fill",
+    "fill-opacity",
+    "fill-rule",
+    "clip-rule",
+    "stroke",
+    "stroke-width",
+    "stroke-opacity",
+    "stroke-dasharray",
+    "stroke-dashoffset",
+    "stroke-linecap",
+    "stroke-linejoin",
+    "stroke-miterlimit",
+    "paint-order",
+    "vector-effect",
+    "color",
+    "stop-color",
+    "stop-opacity",
+    "offset",
+    "gradientUnits",
+    "gradientTransform",
+    "spreadMethod",
+    "patternUnits",
+    "patternContentUnits",
+    "patternTransform",
+    "clipPathUnits",
+    "maskUnits",
+    "maskContentUnits",
+    "clip-path",
+    "mask",
+    "filter",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+    "markerWidth",
+    "markerHeight",
+    "markerUnits",
+    "refX",
+    "refY",
+    "orient",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
+    "font-variant",
+    "font-stretch",
+    "letter-spacing",
+    "word-spacing",
+    "text-anchor",
+    "text-decoration",
+    "dominant-baseline",
+    "alignment-baseline",
+    "baseline-shift",
+    "writing-mode",
+    "direction",
+    "rotate",
+    "textLength",
+    "lengthAdjust",
+    "startOffset",
+    "method",
+    "spacing",
+    "pathLength",
+    "href",
+    "in",
+    "in2",
+    "result",
+    "stdDeviation",
+    "flood-color",
+    "flood-opacity",
+    "values",
+    "type",
+    "mode",
+    "operator",
+    "k1",
+    "k2",
+    "k3",
+    "k4",
+    "filterUnits",
+    "primitiveUnits",
+];
+
 fn sanitizer(assets: Arc<Refs>) -> Builder<'static> {
     let mut builder = Builder::default();
+    for tag in SVG_TAGS {
+        builder.add_tags([*tag]);
+        builder.add_tag_attributes(*tag, SVG_ATTRIBUTES.iter().copied());
+    }
     builder
         .clean_content_tags(HashSet::from([
-            "script", "style", "title", "noscript", "template", "iframe", "object", "embed",
+            "script",
+            "style",
+            "title",
+            "noscript",
+            "template",
+            "iframe",
+            "object",
+            "embed",
             "textarea",
+            "foreignObject",
+            "animate",
+            "set",
         ]))
         .add_generic_attributes(["style", "id"])
-        .add_tags(["picture", "source"])
+        .add_tags(["picture", "source", "main"])
         .add_tag_attributes("img", ["srcset"])
         .add_tag_attributes("source", ["srcset"])
         .link_rel(Some("noopener noreferrer"))
@@ -184,6 +357,12 @@ fn filter<'u>(
     match (element, attribute) {
         (_, "style") => sanitize_style(value, assets).map(Cow::Owned),
         ("a", "href") => value.starts_with('#').then(|| Cow::Owned(value.to_owned())),
+        (tag, "href" | "xlink:href") if SVG_TAGS.contains(&tag) => {
+            fragment_reference(value).then_some(Cow::Borrowed(value))
+        }
+        (tag, _) if SVG_TAGS.contains(&tag) => {
+            internal_urls_only(value).then_some(Cow::Borrowed(value))
+        }
         ("a", "rel") => Some(Cow::Borrowed(value)),
         ("img", "src") => placeholder(assets, value)
             .or_else(|| data_image(value))
@@ -192,6 +371,58 @@ fn filter<'u>(
         (_, name) if URL_ATTRIBUTES.contains(&name) => None,
         _ => Some(Cow::Borrowed(value)),
     }
+}
+
+/// Whether `value` is `#id` (an id of this document) and nothing else.
+fn fragment_reference(value: &str) -> bool {
+    value
+        .trim()
+        .strip_prefix('#')
+        .is_some_and(|id| !id.is_empty() && id.chars().all(is_id_char))
+}
+
+fn is_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')
+}
+
+/// Whether the SVG attribute `value` loads nothing: every `url(...)` in it names an id of this
+/// document (`url(#id)`), and it carries no escape, comment, `@import`, script scheme or markup.
+fn internal_urls_only(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if FORBIDDEN.iter().any(|bad| lower.contains(bad))
+        || LOADING_FUNCTIONS.iter().any(|f| lower.contains(f))
+        || lower.contains("data:")
+    {
+        return false;
+    }
+    let mut rest = 0;
+    while let Some(found) = lower[rest..].find("url(") {
+        let args = rest + found + "url(".len();
+        let Some(close) = lower[args..].find(')') else {
+            return false;
+        };
+        if internal_url_argument(&value[args..args + close]).is_none() {
+            return false;
+        }
+        rest = args + close + 1;
+    }
+    true
+}
+
+/// `#id` out of the argument of a `url(...)`, quotes allowed, when it is an internal reference.
+fn internal_url_argument(argument: &str) -> Option<&str> {
+    let argument = argument.trim();
+    let argument = argument
+        .strip_prefix('"')
+        .and_then(|a| a.strip_suffix('"'))
+        .or_else(|| {
+            argument
+                .strip_prefix('\'')
+                .and_then(|a| a.strip_suffix('\''))
+        })
+        .unwrap_or(argument)
+        .trim();
+    fragment_reference(argument).then_some(argument)
 }
 
 /// Image types an inline `data:` image may have.
@@ -341,6 +572,19 @@ const FORBIDDEN: &[&str] = &[
     "/*",
 ];
 
+/// Properties that may name an id of this document with `url(#id)`.
+const PAINT_PROPERTIES: &[&str] = &[
+    "fill",
+    "stroke",
+    "marker",
+    "marker-start",
+    "marker-mid",
+    "marker-end",
+    "clip-path",
+    "mask",
+    "filter",
+];
+
 fn sanitize_declaration(declaration: &str, assets: &Refs) -> Option<String> {
     let declaration = declaration.trim();
     let (property, value) = declaration.split_once(':')?;
@@ -381,7 +625,13 @@ fn sanitize_declaration(declaration: &str, assets: &Refs) -> Option<String> {
             })
             .unwrap_or(argument)
             .trim();
-        let id = placeholder(assets, argument).or_else(|| data_image(argument))?;
+        let id = match internal_url_argument(argument) {
+            Some(fragment) if PAINT_PROPERTIES.contains(&lower_property.as_str()) => {
+                fragment.to_owned()
+            }
+            Some(_) => return None,
+            None => placeholder(assets, argument).or_else(|| data_image(argument))?,
+        };
         out.push_str(&value[rest..start]);
         out.push_str(&format!("url({id})"));
         rest = end + 1;
@@ -523,6 +773,117 @@ mod tests {
 
     fn run(source: &str) -> Document {
         transform(source, Arc::new(Fixed(HashMap::new())))
+    }
+
+    const SVG_PAGE: &str = concat!(
+        "<style>:root{--c:#0969da}svg.d{display:block;color:var(--c)}",
+        "svg.d .b{fill:var(--c);stroke:#333;stroke-width:1.2}svg.d text{font:12px sans-serif}</style>",
+        "<main><svg class=\"d\" viewBox=\"0 0 100 50\" role=\"img\" aria-label=\"Diagram\">",
+        "<defs><marker id=\"ar\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto\">",
+        "<path d=\"M0,0 L10,5 L0,10 z\" fill=\"currentColor\"/></marker>",
+        "<linearGradient id=\"g\"><stop offset=\"0\" stop-color=\"#fff\"/></linearGradient></defs>",
+        "<rect class=\"b\" x=\"1\" y=\"2\" width=\"30\" height=\"20\" fill=\"url(#g)\" stroke-dasharray=\"4 3\"/>",
+        "<g id=\"n\"><text x=\"5\" y=\"9\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-weight=\"700\">Hi</text></g>",
+        "<use href=\"#n\"/><path d=\"M1 1 L9 9\" marker-end=\"url(#ar)\" style=\"stroke:url(#g)\"/></svg></main>",
+    );
+
+    #[test]
+    fn inline_svg_keeps_shapes_camel_case_attributes_styles_and_internal_references() {
+        let doc = run(SVG_PAGE);
+        for kept in [
+            "<svg",
+            "viewBox=\"0 0 100 50\"",
+            "<defs",
+            "<marker id=\"ar\"",
+            "refX=\"9\"",
+            "markerWidth=\"7\"",
+            "markerHeight=\"7\"",
+            "<linearGradient id=\"g\"",
+            "<stop",
+            "<rect",
+            "<text",
+            "text-anchor=\"middle\"",
+            "dominant-baseline=\"middle\"",
+            "font-weight=\"700\"",
+            "stroke-dasharray=\"4 3\"",
+            "fill=\"url(#g)\"",
+            "marker-end=\"url(#ar)\"",
+            "<use href=\"#n\"",
+            "stroke: url(#g)",
+            "<main",
+            // Custom properties go to the wrapper and the svg's own rules onto the elements.
+            "--c: #0969da",
+            "fill: var(--c)",
+            "font: 12px sans-serif",
+        ] {
+            assert!(doc.html.contains(kept), "{kept} lost: {}", doc.html);
+        }
+        assert!(!doc.html.contains("<style"), "{}", doc.html);
+        assert!(doc.assets.is_empty());
+    }
+
+    #[test]
+    fn svg_reference_tricks_and_foreign_content_are_dropped() {
+        let doc = run(concat!(
+            "<svg><rect fill=\"url(\\23 x)\"/><rect fill=\"url(#a)/**/\"/><rect FILL=\"URL(HTTP://x.test/p)\"/>",
+            "<foreignObject><p>secret</p><b>inner</b></foreignObject>",
+            "<animate attributeName=\"x\"><text>anim</text></animate><set attributeName=\"y\"><text>setc</text></set>",
+            "<desc>described</desc>",
+            "<use xlink:href=\"#n\"/><rect id=\"n\" style=\"background:url(#x);fill:url(#ok)\"/></svg>",
+        ));
+        let lower = doc.html.to_ascii_lowercase();
+        for bad in [
+            "\\23", "/**/", "http", "secret", "inner", "anim", "setc", "url(#x)", "<desc",
+        ] {
+            assert!(!lower.contains(bad), "{bad} survived: {}", doc.html);
+        }
+        assert!(doc.html.contains("fill: url(#ok)"), "{}", doc.html);
+        assert!(doc.html.contains("href=\"#n\""), "{}", doc.html);
+    }
+
+    #[test]
+    fn inline_svg_loads_nothing_and_runs_nothing() {
+        let doc = run(concat!(
+            "<svg viewBox=\"0 0 10 10\" onload=\"x()\">",
+            "<script>alert(1)</script><style>@import url(https://e.test/a.css);rect{fill:url(https://e.test/p)}</style>",
+            "<rect onclick=\"x()\" fill=\"url(https://e.test/a.svg#p)\" stroke=\"url(//e.test/p)\" ",
+            "marker-end=\"url(data:image/svg+xml;base64,AAAA)\" clip-path=\"url('http://e.test/c')\" ",
+            "style=\"fill:url(https://e.test/p);stroke:url(//e.test/p);filter:url(http://e.test/f)\"/>",
+            "<a href=\"javascript:alert(1)\"><text>j</text></a>",
+            "<use href=\"https://e.test/a.svg#x\"/><use xlink:href=\"//e.test/a.svg#x\"/>",
+            "<use href=\"data:image/svg+xml;base64,AAAA\"/><use href=\"javascript:alert(1)\"/>",
+            "<image href=\"https://e.test/a.png\"/><feImage href=\"https://e.test/a.png\"/>",
+            "<animate attributeName=\"href\" to=\"javascript:alert(1)\"/><set attributeName=\"onclick\" to=\"x()\"/>",
+            "<foreignObject><div>html</div><iframe src=\"https://e.test/\"></iframe></foreignObject>",
+            "<text style=\"fill:url(#ok)\">kept</text></svg>",
+        ));
+        let lower = doc.html.to_ascii_lowercase();
+        for bad in [
+            "<script",
+            "alert",
+            "onload",
+            "onclick",
+            "@import",
+            "<style",
+            "https://",
+            "http://",
+            "//e.test",
+            "e.test",
+            "javascript:",
+            "data:",
+            "<image",
+            "<feimage",
+            "<animate",
+            "<set",
+            "<foreignobject",
+            "<iframe",
+        ] {
+            assert!(!lower.contains(bad), "{bad} survived: {}", doc.html);
+        }
+        assert!(doc.html.contains("<svg"), "{}", doc.html);
+        assert!(doc.html.contains("<rect"), "{}", doc.html);
+        assert!(doc.html.contains("fill: url(#ok)"), "{}", doc.html);
+        assert!(doc.assets.is_empty());
     }
 
     #[test]
