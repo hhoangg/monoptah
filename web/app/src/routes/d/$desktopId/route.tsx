@@ -67,7 +67,7 @@ function LinkGuards() {
     void navigate({ to: "/login", search: { redirect: href } as never, replace: true });
   }, [blocked, href, navigate]);
 
-  // The /d routes have no header, so the blocked screen keeps the nav row (the way out to /desktops).
+  // The /d routes have no header, so the blocked screen keeps the nav row (the way out to /settings/desktops).
   if (isVersionBlocked(blocked)) {
     return (
       <>
@@ -98,10 +98,10 @@ function DesktopGoneScreen() {
         <h1 className="text-body font-semibold">This desktop is no longer in your account</h1>
         <CardDescription>It was revoked or removed. Pair it again to use it from the web.</CardDescription>
         <div className="flex flex-col gap-2">
-          <Link to="/desktops" className={buttonVariants({ size: "lg", className: "w-full" })}>
+          <Link to="/settings/desktops" className={buttonVariants({ size: "lg", className: "w-full" })}>
             Go to Desktops
           </Link>
-          <Link to="/desktops" className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
+          <Link to="/settings/desktops" className={buttonVariants({ variant: "secondary", size: "lg", className: "w-full" })}>
             Pair a desktop
           </Link>
         </div>

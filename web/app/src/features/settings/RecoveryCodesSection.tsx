@@ -6,7 +6,7 @@ import { RecoveryCodes } from "@/features/accounts/RecoveryCodes";
 import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { isApiError } from "@/features/accounts/api";
 import { CODES_REPLACED_MESSAGE } from "@/features/accounts/authCopy";
 import { useAction } from "./useAction";
@@ -54,7 +54,7 @@ export function RecoveryCodesSection({ handle }: { handle: string }) {
 
   if (codes) {
     return (
-      <SettingsCard title="Recovery codes">
+      <SettingsCard id="recovery-codes" className={SETTINGS_ANCHOR} title="Recovery codes">
         <div className="flex flex-col gap-4 p-3.5">
           <p className="text-body font-semibold text-content">Your new recovery codes</p>
           <Notice variant="info">Your older codes no longer work.</Notice>
@@ -66,7 +66,7 @@ export function RecoveryCodesSection({ handle }: { handle: string }) {
   }
 
   return (
-    <SettingsCard title="Recovery codes" footnote="Recovery codes get you back in if you lose every passkey. Keep them somewhere safe.">
+    <SettingsCard id="recovery-codes" className={SETTINGS_ANCHOR} title="Recovery codes" footnote="Recovery codes get you back in if you lose every passkey. Keep them somewhere safe.">
       {action.error && !confirming ? (
         <div className="px-3.5 pt-3">
           <Notice variant="error">{action.error}</Notice>

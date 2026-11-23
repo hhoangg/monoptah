@@ -3,8 +3,8 @@
 // Public routes pass without a request. Every other route needs `ensureQueryData(meQuery)`:
 //  - a 401 redirects to `/login?redirect=<path>` (same-origin relative paths only, redirect.ts);
 //  - a `recoveryOnly` session is confined to `/recover` (the add-passkey step);
-//  - `recoveryAckAt === null` confines the session to `/settings`, which must show the forced
-//    recovery-codes regenerate screen before anything else. A `monoptah.lowCodes` flag (set by a
+//  - `recoveryAckAt === null` confines the session to `/settings/profile`, where the /settings layout route shows the
+//    forced recovery-codes regenerate screen instead of the settings shell, before anything else. A `monoptah.lowCodes` flag (set by a
 //    recover with 2 or fewer codes left, lowCodes.ts) does the same until new codes were created.
 //
 // Fragments (read in the route components, never sent to the server): `#invite=CODE` on /register,
@@ -27,8 +27,8 @@ export interface AuthGuardArgs {
 export type AuthGuard = (args: AuthGuardArgs) => void | Promise<void>;
 
 export const PUBLIC_PATHS: readonly string[] = ["/login", "/register", "/recover", "/install"];
-/** Where a session with `recoveryAckAt === null` must go before anything else. */
-export const RECOVERY_REGENERATE_PATH = "/settings";
+/** Where a session with `recoveryAckAt === null` must go before anything else (the /settings layout shows the regenerate gate). */
+export const RECOVERY_REGENERATE_PATH = "/settings/profile";
 export const RECOVERY_ADD_PASSKEY_PATH = "/recover";
 
 function normalize(pathname: string): string {

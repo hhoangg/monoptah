@@ -88,16 +88,16 @@ describe("admin guard", () => {
     expect(screen.queryByRole("switch", { name: "Pause invites" })).not.toBeInTheDocument();
   });
 
-  it("links to /admin from /settings for admins only", async () => {
+  it("links to /admin from the settings nav for admins only", async () => {
     install();
-    mount("/settings");
-    expect(await screen.findByRole("link", { name: /Admin/ })).toHaveAttribute("href", "/admin");
+    mount("/settings/profile");
+    expect(await within(await screen.findByRole("navigation", { name: "Settings" })).findByRole("link", { name: "Admin" })).toHaveAttribute("href", "/admin");
   });
 
-  it("has no admin link in /settings for a member", async () => {
+  it("has no admin link in the settings nav for a member", async () => {
     install({ role: "user" });
-    mount("/settings");
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
+    mount("/settings/profile");
+    await screen.findByRole("heading", { level: 1, name: "Profile" });
     expect(screen.queryByRole("link", { name: /^Admin/ })).not.toBeInTheDocument();
   });
 });

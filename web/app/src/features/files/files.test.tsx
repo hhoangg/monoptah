@@ -456,9 +456,10 @@ describe("quick open: which project, and when", () => {
   });
 
   it("has no project to search outside a project or session screen", async () => {
-    mount("", { shell: true, route: "/settings" });
+    // The desktop home is inside the /d app shell and belongs to no project.
+    mount("", { shell: true, route: "" });
     await screen.findByTestId("app-shell");
-    expect(currentProject("/settings")).toBeUndefined();
+    expect(currentProject(`/d/${DESKTOP_ID}`)).toBeUndefined();
     pressModP();
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(usePanels.getState().open).toBeNull();

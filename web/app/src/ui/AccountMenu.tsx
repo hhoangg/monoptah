@@ -6,14 +6,14 @@ import { Icon, type IconName } from "./Icon";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./tooltip";
 
 const ENTRIES: ReadonlyArray<{ to: string; label: string; icon: IconName }> = [
-  { to: "/settings", label: "Account settings", icon: "account" },
-  { to: "/desktops", label: "All desktops", icon: "computer" },
-  { to: "/install", label: "Install app", icon: "download" },
+  { to: "/settings/profile", label: "Settings", icon: "account" },
+  { to: "/settings/desktops", label: "Desktops", icon: "computer" },
+  { to: "/settings/install", label: "Install app", icon: "download" },
 ];
 
 /**
- * The one account control of the app: an avatar button that opens a menu with Account settings, All desktops and the
- * Install app guide (hidden once the app is installed). It is the only app-level entry of the top header, the phone
+ * The one account control of the app: an avatar button that opens a menu with Settings, Desktops and the Install app
+ * guide (hidden once the app is installed). All three are pages of the settings shell (/settings/*). It is the only app-level entry of the top header, the phone
  * switcher bar and the activity rail, so the Desktops and Install icons no longer sit beside it.
  */
 export function AccountMenu({
@@ -28,7 +28,7 @@ export function AccountMenu({
 }) {
   const pathname = useRouterState({ select: (state) => state.location.pathname.replace(/(.)\/$/, "$1") });
   const standalone = useStandalone();
-  const entries = ENTRIES.filter((entry) => !(entry.to === "/install" && standalone));
+  const entries = ENTRIES.filter((entry) => !(entry.to === "/settings/install" && standalone));
   const current = pathname.startsWith("/settings") || pathname.startsWith("/admin");
   return (
     <TooltipProvider delayDuration={300}>

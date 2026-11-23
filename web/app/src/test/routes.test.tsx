@@ -12,16 +12,18 @@ import { createAppRouter } from "@/router";
 // One entry per route of architecture.md 3.1 (and the file names of workstreams.md 3.1):
 // the concrete URL, the route shown by the stub, and the params the stub must render as text.
 const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, string>; fullPath: string }> = [
-  // `/` redirects (F-14, W-06): with no last place registered it lands on /desktops.
-  // The matched route after the redirect is /desktops, so that is its full path.
-  { url: "/", route: "/desktops", params: {}, fullPath: "/desktops/" },
+  // `/` redirects (F-14, W-06): with no last place registered it lands on /settings/desktops.
+  // The matched route after the redirect is /settings/desktops, so that is its full path.
+  { url: "/", route: "/settings/desktops", params: {}, fullPath: "/settings/desktops/" },
   { url: "/login", route: "/login", params: {}, fullPath: "/login" },
   { url: "/register#invite=ABC", route: "/register", params: {}, fullPath: "/register" },
   { url: "/recover", route: "/recover", params: {}, fullPath: "/recover" },
   { url: "/install", route: "/install", params: {}, fullPath: "/install" },
+  { url: "/pair", route: "/pair", params: {}, fullPath: "/pair/" },
   { url: "/pair/c0de", route: "/pair/:code", params: { code: "c0de" }, fullPath: "/pair/$code" },
-  { url: "/desktops", route: "/desktops", params: {}, fullPath: "/desktops/" },
-  { url: "/desktops/dk1", route: "/desktops/:id", params: { id: "dk1" }, fullPath: "/desktops/$id/" },
+  // The old desktop URLs redirect into the settings shell (see routes/settings/redirects.test.tsx).
+  { url: "/desktops", route: "/settings/desktops", params: {}, fullPath: "/settings/desktops/" },
+  { url: "/desktops/dk1", route: "/settings/desktops/:id", params: { id: "dk1" }, fullPath: "/settings/desktops/$id" },
   { url: "/desktops/dk1/verify#fp=ab12", route: "/desktops/:id/verify", params: { id: "dk1" }, fullPath: "/desktops/$id/verify" },
   { url: "/d/dk1", route: "/d/:desktopId", params: { desktopId: "dk1" }, fullPath: "/d/$desktopId/" },
   {
@@ -103,13 +105,18 @@ const CASES: ReadonlyArray<{ url: string; route: string; params: Record<string, 
     fullPath: "/d/$desktopId/monos/$monoId/profile/file/$name",
   },
   { url: "/d/dk1/cloud", route: "/d/:desktopId/cloud", params: { desktopId: "dk1" }, fullPath: "/d/$desktopId/cloud/" },
-  {
-    url: "/d/dk1/settings",
-    route: "/d/:desktopId/settings",
-    params: { desktopId: "dk1" },
-    fullPath: "/d/$desktopId/settings/",
-  },
-  { url: "/settings", route: "/settings", params: {}, fullPath: "/settings/" },
+  // The old per-desktop settings URL redirects to the desktop's page in the settings shell.
+  { url: "/d/dk1/settings", route: "/settings/desktops/:id", params: { id: "dk1" }, fullPath: "/settings/desktops/$id" },
+  // `/settings` redirects to the first page (no matchMedia here, which counts as a wide window).
+  { url: "/settings", route: "/settings/profile", params: {}, fullPath: "/settings/profile" },
+  { url: "/settings/profile", route: "/settings/profile", params: {}, fullPath: "/settings/profile" },
+  { url: "/settings/security", route: "/settings/security", params: {}, fullPath: "/settings/security" },
+  { url: "/settings/invites", route: "/settings/invites", params: {}, fullPath: "/settings/invites" },
+  { url: "/settings/appearance", route: "/settings/appearance", params: {}, fullPath: "/settings/appearance" },
+  { url: "/settings/notifications", route: "/settings/notifications", params: {}, fullPath: "/settings/notifications" },
+  { url: "/settings/install", route: "/settings/install", params: {}, fullPath: "/settings/install" },
+  { url: "/settings/desktops", route: "/settings/desktops", params: {}, fullPath: "/settings/desktops/" },
+  { url: "/settings/desktops/dk1", route: "/settings/desktops/:id", params: { id: "dk1" }, fullPath: "/settings/desktops/$id" },
   { url: "/admin", route: "/admin", params: {}, fullPath: "/admin/" },
   { url: "/admin/users", route: "/admin/users", params: {}, fullPath: "/admin/users" },
   { url: "/admin/invites", route: "/admin/invites", params: {}, fullPath: "/admin/invites" },
@@ -130,13 +137,22 @@ const SCREENS: Record<string, string> = {
   "/login": "Sign in to Monoptah",
   "/register": "Create your account",
   "/recover": "Recover your account",
-  "/settings": "Settings",
+  "/settings": "Profile",
+  "/settings/profile": "Profile",
+  "/settings/security": "Security",
+  "/settings/invites": "Invites",
+  "/settings/appearance": "Appearance",
+  "/settings/notifications": "Notifications",
+  "/settings/install": "Install app",
+  "/settings/desktops": "All desktops",
+  "/settings/desktops/dk1": "Desktop not found",
+  "/settings/desktops/:id": "Desktop not found",
   "/install": "Install Monoptah",
   // An unknown code (the mock knows only its own pairing codes) shows the expired screen.
+  "/pair": "Pair a desktop",
   "/pair/c0de": "Code expired",
   "/pair/:code": "Code expired",
-  "/d/dk1/settings": "Desktop settings",
-  "/d/:desktopId/settings": "Desktop settings",
+  "/d/dk1/settings": "Desktop not found",
   // W-06 (WS-T): the catalog home and the project screen. Without a connected desktop they show their loading state.
   "/d/dk1": "Workspace",
   "/d/:desktopId": "Workspace",
@@ -149,11 +165,10 @@ const SCREENS: Record<string, string> = {
   "/d/dk1/p/p1/new": "New session",
   "/d/:desktopId/p/:projectId/new": "New session",
   // W-04 (WS-M): the desktops list, a desktop the account does not have, and the key verify page.
-  // `/` redirects to the desktops list when there is no last place.
-  "/": "Desktops",
-  "/desktops": "Desktops",
+  // `/` redirects to the desktops list when there is no last place; /desktops and /desktops/dk1 redirect there too.
+  "/": "All desktops",
+  "/desktops": "All desktops",
   "/desktops/dk1": "Desktop not found",
-  "/desktops/:id": "Desktop not found",
   "/desktops/dk1/verify": "Verify desktop",
   "/desktops/:id/verify": "Verify desktop",
   // U-17 (WS-C): the cloud instance list, framed by the workspace with its "Cloud" h1.
@@ -204,6 +219,13 @@ async function renderAt(url: string) {
   return router;
 }
 
+/** Settings pages draw no app header: the frame has a "Leave settings" button instead (jsdom renders the wide and narrow rows). */
+function expectSettingsFrame() {
+  expect(screen.queryByTestId("app-header")).toBeNull();
+  expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+  expect(screen.getAllByRole("button", { name: "Leave settings" }).length).toBeGreaterThanOrEqual(1);
+}
+
 describe("route stubs", () => {
   it.each(CASES)("renders $route for $url", async ({ url, route, params, fullPath }) => {
     const router = await renderAt(url);
@@ -216,8 +238,9 @@ describe("route stubs", () => {
       // The sign-in family shows no app navigation. /install is public and rendered here for a signed-out
       // visitor, so it shows the brand only as well (A-9); the signed-in /install case is in settings.test.tsx.
       // The /d routes have no header: their nav sits in the desktop-switcher slot (not registered here, see Shell.test.tsx).
-      const path = new URL(url, "http://x").pathname;
-      if (["/login", "/register", "/recover", "/install"].includes(path) || path.startsWith("/d/")) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+      const path = router.state.location.pathname;
+      if (path.startsWith("/settings")) expectSettingsFrame();
+      else if (["/login", "/register", "/recover", "/install"].includes(path) || path.startsWith("/d/")) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
       else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
       return;
     }
@@ -228,8 +251,16 @@ describe("route stubs", () => {
       expect(stub.querySelector(`[data-param="${key}"]`)).toHaveTextContent(value);
     }
     // The shared shell wraps every stub: outside /d the header carries the nav, inside it the switcher row does.
-    if (new URL(url, "http://x").pathname.startsWith("/d/")) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
+    if (router.state.location.pathname.startsWith("/settings")) expectSettingsFrame();
+    else if (new URL(url, "http://x").pathname.startsWith("/d/")) expect(screen.queryByRole("navigation", { name: "Main" })).toBeNull();
     else expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+  });
+
+  it("shows the Pair a desktop page with the steps, the paste field and the app header", async () => {
+    await renderAt("/pair");
+    expect(screen.getByLabelText("Paste a pairing link")).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Leave settings" })).toBeNull();
   });
 
   it("sends the old /d/:desktopId/terminal URL to the workspace home (the terminal is a footer chip now)", async () => {
@@ -266,8 +297,8 @@ describe("route stubs", () => {
     expect(screen.getByText(/^Signed in as .+/)).toBeInTheDocument();
     expect(router.state.location.pathname).toBe("/login");
     await userEvent.click(screen.getByRole("button", { name: "Continue" }));
-    await screen.findByRole("heading", { level: 1, name: "Settings" });
-    expect(router.state.location.pathname).toBe("/settings");
+    await screen.findByRole("heading", { level: 1, name: "Profile" });
+    expect(router.state.location.pathname).toBe("/settings/profile");
   });
 
   it("offers a different passkey on /login: signs out and shows the sign-in button", async () => {
@@ -292,7 +323,19 @@ describe("route stubs", () => {
     // Pathless layouts (root, the d/$desktopId layout) render through their children.
     // The terminal tab URL renders nothing itself (the tabbed chat draws the tab) and the old /terminal URL redirects:
     // both have their own tests above.
-    const layouts = new Set(["/", "/d/$desktopId", "/d/$desktopId/t/$terminalId", "/d/$desktopId/terminal/"]);
+    // The /settings layout renders its pages, and the redirect-only routes (the settings list, /desktops, /desktops/:id and
+    // /d/:desktopId/settings) end on another route: routes/settings/redirects.test.tsx covers them.
+    const layouts = new Set([
+      "/",
+      "/d/$desktopId",
+      "/d/$desktopId/t/$terminalId",
+      "/d/$desktopId/terminal/",
+      "/settings",
+      "/settings/",
+      "/desktops/",
+      "/desktops/$id/",
+      "/d/$desktopId/settings/",
+    ]);
     const missing = [...new Set(generated)].filter((p) => !covered.has(p) && !layouts.has(p));
     expect(missing).toEqual([]);
   });

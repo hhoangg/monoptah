@@ -98,18 +98,18 @@ describe("pairing page: details and fingerprint check", () => {
     expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Deny" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "Deny and go back" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/settings/desktops"));
     expect(approveCalls()).toHaveLength(0);
     expect(state.pairings.get(normalizeUserCode(MOCK_PAIR_CODE))?.status).toBe("denied");
   });
 
-  it("Deny and go back on a mismatch denies the request first (no passkey), then leaves for /desktops", async () => {
+  it("Deny and go back on a mismatch denies the request first (no passkey), then leaves for /settings/desktops", async () => {
     const state = install();
     const user = userEvent.setup();
     const { router } = mount(`/pair/${MOCK_PAIR_CODE}${OTHER}`);
     await screen.findByRole("heading", { level: 1, name: "Do not approve this desktop" });
     await user.click(screen.getByRole("button", { name: "Deny and go back" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/desktops"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/settings/desktops"));
     expect(urlsOf(sent).filter((call) => call.includes("/deny"))).toHaveLength(1);
     expect(state.pairings.get(normalizeUserCode(MOCK_PAIR_CODE))?.status).toBe("denied");
     expect(lib.startAuthentication).not.toHaveBeenCalled();

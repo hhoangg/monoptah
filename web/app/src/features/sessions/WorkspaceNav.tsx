@@ -244,15 +244,15 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono, railed = false 
         <div className="flex flex-col gap-0.5 border-t border-stroke p-1.5">
           <Slot name="desktop-nav-items" desktopId={desktopId} />
           <Link
-            to="/d/$desktopId/settings"
-            params={{ desktopId }}
+            to="/settings/desktops/$id"
+            params={{ id: desktopId }}
             onClick={onNavigate}
-            className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04 [&.active]:bg-selection"
+            className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04"
           >
             <Icon name="settings" size={20} />
             Desktop settings
           </Link>
-          <Link to="/desktops" onClick={onNavigate} className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04">
+          <Link to="/settings/desktops" onClick={onNavigate} className="flex min-h-11 items-center gap-3 rounded-row px-2.5 text-row hover:bg-content-a04">
             <Icon name="computer" size={20} />
             All desktops
           </Link>

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { clickTarget, safeNotificationUrl } from "./safeUrl";
 
 describe("safeNotificationUrl", () => {
-  it.each(["/d/dk1/s/s9", "/d/dk1/monos/m1", "/d/dk%201/s/a%2Fb", "/d/dk1/s/s9?x=1#top", "/d/dk1/monos/m1", "/settings", "/settings?x=1"])("accepts %s", (url) => {
+  it.each(["/d/dk1/s/s9", "/d/dk1/monos/m1", "/d/dk%201/s/a%2Fb", "/d/dk1/s/s9?x=1#top", "/d/dk1/monos/m1", "/settings", "/settings?x=1", "/settings#top", "/settings/notifications", "/settings/desktops/dk1", "/settings/desktops/dk1?x=1#desktop-notifications"])("accepts %s", (url) => {
     expect(safeNotificationUrl(url)).toBe(url);
   });
 
@@ -18,6 +18,10 @@ describe("safeNotificationUrl", () => {
     ["other app path", "/login"],
     ["settings lookalike", "/settingsx"],
     ["settings dot segments", "/settings/../login"],
+    ["settings encoded dot segments", "/settings/%2e%2e/login"],
+    ["settings nested dot segments", "/settings/desktops/../../login"],
+    ["settings to protocol relative", "/settings/..//evil.example"],
+    ["settings backslash", "/settings/\\evil"],
     ["prefix lookalike", "/dx/s/1"],
     ["dot segments leave /d/", "/d/../settings"],
     ["dot segments to protocol relative", "/d/../../evil.example"],

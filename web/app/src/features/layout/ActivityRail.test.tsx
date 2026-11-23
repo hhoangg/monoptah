@@ -201,7 +201,7 @@ describe("activity rail", () => {
     const order = [...actions.querySelectorAll("a, button")].map((el) => el.getAttribute("aria-label"));
     expect(order).toEqual(["Cloud", "Desktop settings", "Account"]);
     expect(within(actions).getByRole("link", { name: "Cloud" })).toHaveAttribute("href", "/d/d1/cloud");
-    expect(within(actions).getByRole("link", { name: "Desktop settings" })).toHaveAttribute("href", "/d/d1/settings");
+    expect(within(actions).getByRole("link", { name: "Desktop settings" })).toHaveAttribute("href", "/settings/desktops/d1");
   });
 
   it("has no Terminal entry even when the desktop advertises it (the terminal is the footer chip now)", async () => {
@@ -219,15 +219,15 @@ describe("activity rail", () => {
     expect([...actions.querySelectorAll("a, button")].map((el) => el.getAttribute("aria-label"))).toEqual(["Desktop settings", "Account"]);
   });
 
-  it("opens the account menu with All desktops and Install app, and has no monitor or download icon on the rail", async () => {
+  it("opens the account menu with Settings, Desktops and Install app, and has no monitor or download icon on the rail", async () => {
     mountSlot(<Rail />);
     const rail = await screen.findByTestId("activity-rail");
     expect(rail.querySelector('[data-icon="computer"], [data-icon="download"]')).toBeNull();
     await userEvent.click(within(rail).getByRole("button", { name: "Account" }));
     const menu = await screen.findByRole("menu");
-    expect(within(menu).getByRole("menuitem", { name: "Account settings" })).toHaveAttribute("href", "/settings");
-    expect(within(menu).getByRole("menuitem", { name: "All desktops" })).toHaveAttribute("href", "/desktops");
-    expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/install");
+    expect(within(menu).getByRole("menuitem", { name: "Settings" })).toHaveAttribute("href", "/settings/profile");
+    expect(within(menu).getByRole("menuitem", { name: "Desktops" })).toHaveAttribute("href", "/settings/desktops");
+    expect(within(menu).getByRole("menuitem", { name: "Install app" })).toHaveAttribute("href", "/settings/install");
   });
 
   it("still shows the open desktop from the live link when the list does not have it", async () => {

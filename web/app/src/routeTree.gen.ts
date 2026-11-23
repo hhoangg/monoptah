@@ -14,16 +14,26 @@ import { Route as InstallRouteImport } from './routes/install'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as RecoverRouteImport } from './routes/recover'
 import { Route as RegisterRouteImport } from './routes/register'
+import { Route as SettingsRouteRouteImport } from './routes/settings/route'
 import { Route as AdminIndexRouteImport } from './routes/admin/index'
 import { Route as AdminInvitesRouteImport } from './routes/admin/invites'
 import { Route as AdminUsersRouteImport } from './routes/admin/users'
 import { Route as DDesktopIdRouteRouteImport } from './routes/d/$desktopId/route'
 import { Route as DesktopsIndexRouteImport } from './routes/desktops/index'
+import { Route as PairIndexRouteImport } from './routes/pair/index'
 import { Route as PairCodeRouteImport } from './routes/pair/$code'
 import { Route as SettingsIndexRouteImport } from './routes/settings/index'
+import { Route as SettingsAppearanceRouteImport } from './routes/settings/appearance'
+import { Route as SettingsInstallRouteImport } from './routes/settings/install'
+import { Route as SettingsInvitesRouteImport } from './routes/settings/invites'
+import { Route as SettingsNotificationsRouteImport } from './routes/settings/notifications'
+import { Route as SettingsProfileRouteImport } from './routes/settings/profile'
+import { Route as SettingsSecurityRouteImport } from './routes/settings/security'
 import { Route as DDesktopIdIndexRouteImport } from './routes/d/$desktopId/index'
 import { Route as DesktopsIdIndexRouteImport } from './routes/desktops/$id/index'
 import { Route as DesktopsIdVerifyRouteImport } from './routes/desktops/$id/verify'
+import { Route as SettingsDesktopsIndexRouteImport } from './routes/settings/desktops/index'
+import { Route as SettingsDesktopsIdRouteImport } from './routes/settings/desktops/$id'
 import { Route as DDesktopIdCloudIndexRouteImport } from './routes/d/$desktopId/cloud/index'
 import { Route as DDesktopIdMonosIndexRouteImport } from './routes/d/$desktopId/monos/index'
 import { Route as DDesktopIdSSessionIdRouteImport } from './routes/d/$desktopId/s/$sessionId'
@@ -67,6 +77,11 @@ const RegisterRoute = RegisterRouteImport.update({
   path: '/register',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SettingsRouteRoute = SettingsRouteRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AdminIndexRoute = AdminIndexRouteImport.update({
   id: '/admin/',
   path: '/admin/',
@@ -92,15 +107,50 @@ const DesktopsIndexRoute = DesktopsIndexRouteImport.update({
   path: '/desktops/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const PairIndexRoute = PairIndexRouteImport.update({
+  id: '/pair/',
+  path: '/pair/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const PairCodeRoute = PairCodeRouteImport.update({
   id: '/pair/$code',
   path: '/pair/$code',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SettingsIndexRoute = SettingsIndexRouteImport.update({
-  id: '/settings/',
-  path: '/settings/',
-  getParentRoute: () => rootRouteImport,
+  id: '/',
+  path: '/',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsAppearanceRoute = SettingsAppearanceRouteImport.update({
+  id: '/appearance',
+  path: '/appearance',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsInstallRoute = SettingsInstallRouteImport.update({
+  id: '/install',
+  path: '/install',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsInvitesRoute = SettingsInvitesRouteImport.update({
+  id: '/invites',
+  path: '/invites',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsNotificationsRoute = SettingsNotificationsRouteImport.update({
+  id: '/notifications',
+  path: '/notifications',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsProfileRoute = SettingsProfileRouteImport.update({
+  id: '/profile',
+  path: '/profile',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsSecurityRoute = SettingsSecurityRouteImport.update({
+  id: '/security',
+  path: '/security',
+  getParentRoute: () => SettingsRouteRoute,
 } as any)
 const DDesktopIdIndexRoute = DDesktopIdIndexRouteImport.update({
   id: '/',
@@ -116,6 +166,16 @@ const DesktopsIdVerifyRoute = DesktopsIdVerifyRouteImport.update({
   id: '/desktops/$id/verify',
   path: '/desktops/$id/verify',
   getParentRoute: () => rootRouteImport,
+} as any)
+const SettingsDesktopsIndexRoute = SettingsDesktopsIndexRouteImport.update({
+  id: '/desktops/',
+  path: '/desktops/',
+  getParentRoute: () => SettingsRouteRoute,
+} as any)
+const SettingsDesktopsIdRoute = SettingsDesktopsIdRouteImport.update({
+  id: '/desktops/$id',
+  path: '/desktops/$id',
+  getParentRoute: () => SettingsRouteRoute,
 } as any)
 const DDesktopIdCloudIndexRoute = DDesktopIdCloudIndexRouteImport.update({
   id: '/cloud/',
@@ -214,6 +274,7 @@ const DDesktopIdMonosMonoIdProfileHabitIdRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRouteRouteWithChildren
   '/install': typeof InstallRoute
   '/login': typeof LoginRoute
   '/recover': typeof RecoverRoute
@@ -222,12 +283,21 @@ export interface FileRoutesByFullPath {
   '/admin/invites': typeof AdminInvitesRoute
   '/admin/users': typeof AdminUsersRoute
   '/pair/$code': typeof PairCodeRoute
+  '/settings/appearance': typeof SettingsAppearanceRoute
+  '/settings/install': typeof SettingsInstallRoute
+  '/settings/invites': typeof SettingsInvitesRoute
+  '/settings/notifications': typeof SettingsNotificationsRoute
+  '/settings/profile': typeof SettingsProfileRoute
+  '/settings/security': typeof SettingsSecurityRoute
   '/admin/': typeof AdminIndexRoute
   '/desktops/': typeof DesktopsIndexRoute
+  '/pair/': typeof PairIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/desktops/$id/verify': typeof DesktopsIdVerifyRoute
+  '/settings/desktops/$id': typeof SettingsDesktopsIdRoute
   '/d/$desktopId/': typeof DDesktopIdIndexRoute
   '/desktops/$id/': typeof DesktopsIdIndexRoute
+  '/settings/desktops/': typeof SettingsDesktopsIndexRoute
   '/d/$desktopId/s/$sessionId': typeof DDesktopIdSSessionIdRoute
   '/d/$desktopId/t/$terminalId': typeof DDesktopIdTTerminalIdRoute
   '/d/$desktopId/cloud/': typeof DDesktopIdCloudIndexRoute
@@ -255,12 +325,21 @@ export interface FileRoutesByTo {
   '/admin/invites': typeof AdminInvitesRoute
   '/admin/users': typeof AdminUsersRoute
   '/pair/$code': typeof PairCodeRoute
+  '/settings/appearance': typeof SettingsAppearanceRoute
+  '/settings/install': typeof SettingsInstallRoute
+  '/settings/invites': typeof SettingsInvitesRoute
+  '/settings/notifications': typeof SettingsNotificationsRoute
+  '/settings/profile': typeof SettingsProfileRoute
+  '/settings/security': typeof SettingsSecurityRoute
   '/admin': typeof AdminIndexRoute
   '/desktops': typeof DesktopsIndexRoute
+  '/pair': typeof PairIndexRoute
   '/settings': typeof SettingsIndexRoute
   '/desktops/$id/verify': typeof DesktopsIdVerifyRoute
+  '/settings/desktops/$id': typeof SettingsDesktopsIdRoute
   '/d/$desktopId': typeof DDesktopIdIndexRoute
   '/desktops/$id': typeof DesktopsIdIndexRoute
+  '/settings/desktops': typeof SettingsDesktopsIndexRoute
   '/d/$desktopId/s/$sessionId': typeof DDesktopIdSSessionIdRoute
   '/d/$desktopId/t/$terminalId': typeof DDesktopIdTTerminalIdRoute
   '/d/$desktopId/cloud': typeof DDesktopIdCloudIndexRoute
@@ -282,6 +361,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRouteRouteWithChildren
   '/install': typeof InstallRoute
   '/login': typeof LoginRoute
   '/recover': typeof RecoverRoute
@@ -290,12 +370,21 @@ export interface FileRoutesById {
   '/admin/invites': typeof AdminInvitesRoute
   '/admin/users': typeof AdminUsersRoute
   '/pair/$code': typeof PairCodeRoute
+  '/settings/appearance': typeof SettingsAppearanceRoute
+  '/settings/install': typeof SettingsInstallRoute
+  '/settings/invites': typeof SettingsInvitesRoute
+  '/settings/notifications': typeof SettingsNotificationsRoute
+  '/settings/profile': typeof SettingsProfileRoute
+  '/settings/security': typeof SettingsSecurityRoute
   '/admin/': typeof AdminIndexRoute
   '/desktops/': typeof DesktopsIndexRoute
+  '/pair/': typeof PairIndexRoute
   '/settings/': typeof SettingsIndexRoute
   '/desktops/$id/verify': typeof DesktopsIdVerifyRoute
+  '/settings/desktops/$id': typeof SettingsDesktopsIdRoute
   '/d/$desktopId/': typeof DDesktopIdIndexRoute
   '/desktops/$id/': typeof DesktopsIdIndexRoute
+  '/settings/desktops/': typeof SettingsDesktopsIndexRoute
   '/d/$desktopId/s/$sessionId': typeof DDesktopIdSSessionIdRoute
   '/d/$desktopId/t/$terminalId': typeof DDesktopIdTTerminalIdRoute
   '/d/$desktopId/cloud/': typeof DDesktopIdCloudIndexRoute
@@ -318,6 +407,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/settings'
     | '/install'
     | '/login'
     | '/recover'
@@ -326,12 +416,21 @@ export interface FileRouteTypes {
     | '/admin/invites'
     | '/admin/users'
     | '/pair/$code'
+    | '/settings/appearance'
+    | '/settings/install'
+    | '/settings/invites'
+    | '/settings/notifications'
+    | '/settings/profile'
+    | '/settings/security'
     | '/admin/'
     | '/desktops/'
+    | '/pair/'
     | '/settings/'
     | '/desktops/$id/verify'
+    | '/settings/desktops/$id'
     | '/d/$desktopId/'
     | '/desktops/$id/'
+    | '/settings/desktops/'
     | '/d/$desktopId/s/$sessionId'
     | '/d/$desktopId/t/$terminalId'
     | '/d/$desktopId/cloud/'
@@ -359,12 +458,21 @@ export interface FileRouteTypes {
     | '/admin/invites'
     | '/admin/users'
     | '/pair/$code'
+    | '/settings/appearance'
+    | '/settings/install'
+    | '/settings/invites'
+    | '/settings/notifications'
+    | '/settings/profile'
+    | '/settings/security'
     | '/admin'
     | '/desktops'
+    | '/pair'
     | '/settings'
     | '/desktops/$id/verify'
+    | '/settings/desktops/$id'
     | '/d/$desktopId'
     | '/desktops/$id'
+    | '/settings/desktops'
     | '/d/$desktopId/s/$sessionId'
     | '/d/$desktopId/t/$terminalId'
     | '/d/$desktopId/cloud'
@@ -385,6 +493,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/settings'
     | '/install'
     | '/login'
     | '/recover'
@@ -393,12 +502,21 @@ export interface FileRouteTypes {
     | '/admin/invites'
     | '/admin/users'
     | '/pair/$code'
+    | '/settings/appearance'
+    | '/settings/install'
+    | '/settings/invites'
+    | '/settings/notifications'
+    | '/settings/profile'
+    | '/settings/security'
     | '/admin/'
     | '/desktops/'
+    | '/pair/'
     | '/settings/'
     | '/desktops/$id/verify'
+    | '/settings/desktops/$id'
     | '/d/$desktopId/'
     | '/desktops/$id/'
+    | '/settings/desktops/'
     | '/d/$desktopId/s/$sessionId'
     | '/d/$desktopId/t/$terminalId'
     | '/d/$desktopId/cloud/'
@@ -420,6 +538,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  SettingsRouteRoute: typeof SettingsRouteRouteWithChildren
   InstallRoute: typeof InstallRoute
   LoginRoute: typeof LoginRoute
   RecoverRoute: typeof RecoverRoute
@@ -430,7 +549,7 @@ export interface RootRouteChildren {
   PairCodeRoute: typeof PairCodeRoute
   AdminIndexRoute: typeof AdminIndexRoute
   DesktopsIndexRoute: typeof DesktopsIndexRoute
-  SettingsIndexRoute: typeof SettingsIndexRoute
+  PairIndexRoute: typeof PairIndexRoute
   DesktopsIdVerifyRoute: typeof DesktopsIdVerifyRoute
   DesktopsIdIndexRoute: typeof DesktopsIdIndexRoute
 }
@@ -472,6 +591,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/admin/': {
       id: '/admin/'
       path: '/admin'
@@ -507,6 +633,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof DesktopsIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/pair/': {
+      id: '/pair/'
+      path: '/pair'
+      fullPath: '/pair/'
+      preLoaderRoute: typeof PairIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/pair/$code': {
       id: '/pair/$code'
       path: '/pair/$code'
@@ -516,10 +649,52 @@ declare module '@tanstack/react-router' {
     }
     '/settings/': {
       id: '/settings/'
-      path: '/settings'
+      path: '/'
       fullPath: '/settings/'
       preLoaderRoute: typeof SettingsIndexRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/appearance': {
+      id: '/settings/appearance'
+      path: '/appearance'
+      fullPath: '/settings/appearance'
+      preLoaderRoute: typeof SettingsAppearanceRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/install': {
+      id: '/settings/install'
+      path: '/install'
+      fullPath: '/settings/install'
+      preLoaderRoute: typeof SettingsInstallRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/invites': {
+      id: '/settings/invites'
+      path: '/invites'
+      fullPath: '/settings/invites'
+      preLoaderRoute: typeof SettingsInvitesRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/notifications': {
+      id: '/settings/notifications'
+      path: '/notifications'
+      fullPath: '/settings/notifications'
+      preLoaderRoute: typeof SettingsNotificationsRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/profile': {
+      id: '/settings/profile'
+      path: '/profile'
+      fullPath: '/settings/profile'
+      preLoaderRoute: typeof SettingsProfileRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/security': {
+      id: '/settings/security'
+      path: '/security'
+      fullPath: '/settings/security'
+      preLoaderRoute: typeof SettingsSecurityRouteImport
+      parentRoute: typeof SettingsRouteRoute
     }
     '/d/$desktopId/': {
       id: '/d/$desktopId/'
@@ -541,6 +716,20 @@ declare module '@tanstack/react-router' {
       fullPath: '/desktops/$id/verify'
       preLoaderRoute: typeof DesktopsIdVerifyRouteImport
       parentRoute: typeof rootRouteImport
+    }
+    '/settings/desktops/': {
+      id: '/settings/desktops/'
+      path: '/desktops'
+      fullPath: '/settings/desktops/'
+      preLoaderRoute: typeof SettingsDesktopsIndexRouteImport
+      parentRoute: typeof SettingsRouteRoute
+    }
+    '/settings/desktops/$id': {
+      id: '/settings/desktops/$id'
+      path: '/desktops/$id'
+      fullPath: '/settings/desktops/$id'
+      preLoaderRoute: typeof SettingsDesktopsIdRouteImport
+      parentRoute: typeof SettingsRouteRoute
     }
     '/d/$desktopId/cloud/': {
       id: '/d/$desktopId/cloud/'
@@ -664,6 +853,34 @@ declare module '@tanstack/react-router' {
   }
 }
 
+interface SettingsRouteRouteChildren {
+  SettingsAppearanceRoute: typeof SettingsAppearanceRoute
+  SettingsInstallRoute: typeof SettingsInstallRoute
+  SettingsInvitesRoute: typeof SettingsInvitesRoute
+  SettingsNotificationsRoute: typeof SettingsNotificationsRoute
+  SettingsProfileRoute: typeof SettingsProfileRoute
+  SettingsSecurityRoute: typeof SettingsSecurityRoute
+  SettingsIndexRoute: typeof SettingsIndexRoute
+  SettingsDesktopsIdRoute: typeof SettingsDesktopsIdRoute
+  SettingsDesktopsIndexRoute: typeof SettingsDesktopsIndexRoute
+}
+
+const SettingsRouteRouteChildren: SettingsRouteRouteChildren = {
+  SettingsAppearanceRoute: SettingsAppearanceRoute,
+  SettingsInstallRoute: SettingsInstallRoute,
+  SettingsInvitesRoute: SettingsInvitesRoute,
+  SettingsNotificationsRoute: SettingsNotificationsRoute,
+  SettingsProfileRoute: SettingsProfileRoute,
+  SettingsSecurityRoute: SettingsSecurityRoute,
+  SettingsIndexRoute: SettingsIndexRoute,
+  SettingsDesktopsIdRoute: SettingsDesktopsIdRoute,
+  SettingsDesktopsIndexRoute: SettingsDesktopsIndexRoute,
+}
+
+const SettingsRouteRouteWithChildren = SettingsRouteRoute._addFileChildren(
+  SettingsRouteRouteChildren,
+)
+
 interface DDesktopIdRouteRouteChildren {
   DDesktopIdIndexRoute: typeof DDesktopIdIndexRoute
   DDesktopIdSSessionIdRoute: typeof DDesktopIdSSessionIdRoute
@@ -716,6 +933,7 @@ const DDesktopIdRouteRouteWithChildren = DDesktopIdRouteRoute._addFileChildren(
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  SettingsRouteRoute: SettingsRouteRouteWithChildren,
   InstallRoute: InstallRoute,
   LoginRoute: LoginRoute,
   RecoverRoute: RecoverRoute,
@@ -726,7 +944,7 @@ const rootRouteChildren: RootRouteChildren = {
   PairCodeRoute: PairCodeRoute,
   AdminIndexRoute: AdminIndexRoute,
   DesktopsIndexRoute: DesktopsIndexRoute,
-  SettingsIndexRoute: SettingsIndexRoute,
+  PairIndexRoute: PairIndexRoute,
   DesktopsIdVerifyRoute: DesktopsIdVerifyRoute,
   DesktopsIdIndexRoute: DesktopsIdIndexRoute,
 }

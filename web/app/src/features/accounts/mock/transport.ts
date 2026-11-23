@@ -334,6 +334,16 @@ const handlers: Record<string, Handler> = {
   },
 
   "GET /api/desktops": ({ state }) => ({ desktops: state.desktops }),
+  // The directory entry of one desktop. The key is a placeholder of the wrong length, so the key status reads as unreadable.
+  "GET /api/desktops/:id": ({ state, params }) => {
+    const desktop = state.desktops.find((entry) => entry.id === params.id);
+    if (!desktop) throw new MockHttpError(404, "not_found", "Desktop not found");
+    return { ...desktop, publicKey: "cHVibGljLWtleQ", fingerprint: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" };
+  },
+  "GET /api/desktops/:id/grants": ({ state, params }) => {
+    if (!state.desktops.some((desktop) => desktop.id === params.id)) throw new MockHttpError(404, "not_found", "Desktop not found");
+    return { grants: [] };
+  },
   "GET /api/pair/:userCode": ({ state, params }) => {
     const pairing = pendingPairing(state, params.userCode);
     if (!pairing) throw pairingNotFound();

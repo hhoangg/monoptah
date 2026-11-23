@@ -2,7 +2,7 @@
 //  - `batch`: the batch number the Worker returned with the codes on screen. "I saved these" sends it, and the
 //    Worker acknowledges only that batch (a newer regenerate in another tab is not acknowledged by mistake).
 //  - `shown`: true while codes are on screen waiting for the user. The Worker clears `recoveryAckAt` when it issues
-//    codes, so any refetch of `me` would send /settings to the forced regenerate screen and unmount the codes
+//    codes, so any refetch of `me` would send the /settings layout to the forced regenerate screen and unmount the codes
 //    before they are saved; the route keeps the page while this is true.
 import { useSyncExternalStore } from "react";
 

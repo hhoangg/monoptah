@@ -54,7 +54,7 @@ function pairErrorMessage(error: unknown): string {
 function BackToDesktops({ children = "Go to my desktops", variant = "default" }: { children?: ReactNode; variant?: "default" | "outline" }) {
   return (
     <Button asChild size="lg" variant={variant} className="w-full">
-      <Link to="/desktops">{children}</Link>
+      <Link to="/settings/desktops">{children}</Link>
     </Button>
   );
 }
@@ -225,7 +225,7 @@ export function PairScreen({ code }: { code: string }) {
         return;
       }
     }
-    await navigate({ to: "/desktops" });
+    await navigate({ to: "/settings/desktops" });
   }
 
   return (

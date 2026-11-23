@@ -124,6 +124,7 @@ describe("/desktops/:id/verify", () => {
     mountApp("/desktops/d1/verify#fp=ab12");
     expect(await screen.findByText("This link is incomplete")).toBeInTheDocument();
     expect(screen.getByText(/Verify on another device/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Manage this desktop" })).toHaveAttribute("href", "/settings/desktops/d1");
     expect(await pinnedFingerprint()).toBe(fingerprint(OLD_KEY));
     expect(h.reconnect).not.toHaveBeenCalled();
   });

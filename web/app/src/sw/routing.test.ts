@@ -15,7 +15,7 @@ describe("service worker routing config", () => {
     expect(NAVIGATION_DENYLIST.some((pattern) => pattern.test(pathname))).toBe(true);
   });
 
-  it.each(["/", "/desktops", "/d/dk1/s/s9", "/settings", "/apiary", "/relayed"])("serves the shell for %s", (pathname) => {
+  it.each(["/", "/desktops", "/d/dk1/s/s9", "/settings", "/settings/notifications", "/apiary", "/relayed"])("serves the shell for %s", (pathname) => {
     expect(isShellNavigation(pathname)).toBe(true);
   });
 

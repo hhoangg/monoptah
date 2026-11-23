@@ -5,7 +5,7 @@ import { Button } from "@/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/ui/dialog";
 import { Field } from "@/ui/Field";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { useAction } from "./useAction";
 
 export interface AccountSectionProps {
@@ -30,6 +30,8 @@ export function AccountSection({ handle, displayName }: AccountSectionProps) {
   return (
     <SettingsCard title="Account" footnote="Your handle identifies you to the people you invite and cannot be changed.">
       <SettingsRow
+        id="display-name"
+        className={SETTINGS_ANCHOR}
         icon="people"
         title="Display name"
         description={displayName}
@@ -49,7 +51,7 @@ export function AccountSection({ handle, displayName }: AccountSectionProps) {
           </Button>
         }
       />
-      <SettingsRow icon="key" title="Handle" description={`@${handle}`} />
+      <SettingsRow id="handle" className={SETTINGS_ANCHOR} icon="key" title="Handle" description={`@${handle}`} />
       <Dialog open={open} onOpenChange={(next) => (action.busy ? undefined : setOpen(next))}>
         <DialogContent>
           <form

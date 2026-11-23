@@ -97,7 +97,7 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
     await page.goto(`/d/${desktopId}/p/${E2E_CATALOG.projectId}`);
     await expect(page.getByTestId("session-list-pane")).toBeVisible({ timeout: 30_000 });
 
-    await page.goto("/settings");
+    await page.goto("/settings/appearance");
     const group = page.getByRole("radiogroup", { name: "Layout" });
     await expect(group.getByRole("radio", { name: "Classic" })).toBeChecked();
     await group.getByRole("radio", { name: "Focused" }).click();
@@ -108,7 +108,7 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
     await expect(page.getByTestId("workspace-frame")).toBeVisible();
     await expect(page.getByTestId("session-list-pane")).toHaveCount(0);
 
-    await page.goto("/settings");
+    await page.goto("/settings/appearance");
     await expect(page.getByRole("radiogroup", { name: "Layout" }).getByRole("radio", { name: "Focused" })).toBeChecked();
     await page.getByRole("radiogroup", { name: "Layout" }).getByRole("radio", { name: "Classic" }).click();
     await page.goto(`/d/${desktopId}/p/${E2E_CATALOG.projectId}`);
@@ -116,7 +116,7 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
   });
 
   test("layout: the picker is disabled on a tablet and absent on a phone", async () => {
-    await page.goto("/settings");
+    await page.goto("/settings/appearance");
     await page.setViewportSize({ width: 820, height: 1180 });
     await expect(page.getByRole("radiogroup", { name: "Layout" }).getByRole("radio", { name: "Focused" })).toBeDisabled();
     await page.setViewportSize({ width: 390, height: 844 });
@@ -126,7 +126,7 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
 
   test("desktop avatar: an emoji shows in the rail, on reload, and goes back to initials", async () => {
     await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto(`/desktops/${desktopId}`);
+    await page.goto(`/settings/desktops/${desktopId}`);
     await page.getByRole("radiogroup", { name: "Avatar emoji" }).getByRole("radio", { name: `Emoji ${ROCKET}` }).click({ force: true });
     await expect(page.getByTestId("avatar-preview").getByTestId("avatar-emoji")).toHaveText(ROCKET);
 
@@ -134,14 +134,14 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
     const link = page.getByTestId("activity-rail").getByRole("link", { name: new RegExp(`^${MACHINE}`) });
     await expect(link.getByTestId("avatar-emoji")).toHaveText(ROCKET, { timeout: 30_000 });
 
-    await page.goto(`/desktops/${desktopId}`);
+    await page.goto(`/settings/desktops/${desktopId}`);
     await page.getByRole("button", { name: "Use initials" }).click();
     await page.goto(`/d/${desktopId}`);
     await expect(page.getByTestId("activity-rail").getByRole("link", { name: new RegExp(`^${MACHINE}`) })).toHaveText("AH", { timeout: 30_000 });
   });
 
   test("desktop avatar: an uploaded picture is re-encoded, served by the Worker and rendered in an <img>; an SVG is refused", async () => {
-    await page.goto(`/desktops/${desktopId}`);
+    await page.goto(`/settings/desktops/${desktopId}`);
     const upload = page.getByLabel("Avatar image file");
     const sent: string[] = [];
     page.on("request", (request) => {
@@ -163,7 +163,7 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
     await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.complete && element.naturalWidth > 0)).toBe(true);
     expect(await image.evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(128);
 
-    await page.goto(`/desktops/${desktopId}`);
+    await page.goto(`/settings/desktops/${desktopId}`);
     await upload.setInputFiles({ name: "evil.svg", mimeType: "image/svg+xml", buffer: SVG });
     await expect(page.getByText("Use a PNG, JPEG or WebP image.")).toBeVisible();
     expect(await page.evaluate(() => (window as unknown as { __pwned?: number }).__pwned)).toBeUndefined();

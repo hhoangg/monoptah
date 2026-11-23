@@ -23,7 +23,11 @@ export async function readThisDevice(): Promise<ThisDevice | null> {
   }
 }
 
+/** The query behind `useThisDevice`, for callers that must tell "still loading" (`isPending`) from "no identity" (data null). */
+export function useThisDeviceQuery() {
+  return useQuery({ queryKey: desktopKeys.thisDevice, queryFn: readThisDevice, staleTime: 0, gcTime: 0 });
+}
+
 export function useThisDevice(): ThisDevice | null {
-  const query = useQuery({ queryKey: desktopKeys.thisDevice, queryFn: readThisDevice, staleTime: 0, gcTime: 0 });
-  return query.data ?? null;
+  return useThisDeviceQuery().data ?? null;
 }

@@ -1,9 +1,10 @@
-import { Link } from "@tanstack/react-router";
+import { Link, type LinkProps } from "@tanstack/react-router";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
-import { SettingsRow } from "@/ui/SettingsCard";
+import { cn } from "@/lib/utils";
+import { SETTINGS_ANCHOR, SettingsRow } from "@/ui/SettingsCard";
 import { CATEGORY_LABELS } from "./NotificationsSection";
 import { detectPlatform } from "./standalone";
 import { usePushOnboarding } from "./usePushOnboarding";
@@ -19,20 +20,21 @@ export const CATEGORY_EXPLAINERS = (["agentInput", "agentFinished", "monoMessage
 
 /**
  * The enable/disable control of push (P-05), shared by /settings and /install. `Notification.requestPermission()`
- * runs only from the button click inside `usePushOnboarding().enable`.
+ * runs only from the button click inside `usePushOnboarding().enable`. `installTo` is where "Install Monoptah" leads: the public
+ * /install page by default, /settings/install inside the settings shell.
  */
-export function PushOnboarding() {
+export function PushOnboarding({ id, installTo = "/install" }: { id?: string; installTo?: LinkProps["to"] } = {}) {
   const push = usePushOnboarding();
   const { state } = push;
   return (
-    <div className="flex flex-col gap-2 py-1.5">
+    <div id={id} className={cn("flex flex-col gap-2", SETTINGS_ANCHOR)}>
       {state === "checking" ? <DelayedSpinner label="Checking notification status" className="px-1.5" /> : null}
       {state === "not-installed" ? (
         <SettingsRow
           icon="download"
           title="Install Monoptah to get notifications"
           description="Notifications work from the installed app. On iPhone and iPad this is required."
-          to="/install"
+          to={installTo}
         />
       ) : null}
       {state === "unsupported" ? (

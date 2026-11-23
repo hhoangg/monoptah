@@ -4,7 +4,7 @@ import { useLink } from "@/link/store";
 import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import type { DesktopLink, DesktopLinkStatus } from "./desktopLink";
 import { updateStatusQuery } from "./desktopQueries";
 import { useAction } from "./useAction";
@@ -30,8 +30,21 @@ function SessionList({ sessions }: { sessions: RunningSession[] }) {
   );
 }
 
-/** "Desktop app" card: current and latest version, and a Control-only "Update and restart". */
-export function DesktopUpdateSection({ desktopId, link, status }: { desktopId: string; link: DesktopLink | null; status: DesktopLinkStatus | null }) {
+/** "Desktop app update" card: current and latest version, and a Control-only "Update and restart". */
+export function DesktopUpdateSection({
+  id,
+  desktopId,
+  link,
+  status,
+  pending = false,
+}: {
+  id?: string;
+  desktopId: string;
+  link: DesktopLink | null;
+  status: DesktopLinkStatus | null;
+  /** True while it is not yet known whether this browser uses the desktop: shows a neutral "Checking..." state. */
+  pending?: boolean;
+}) {
   const queryClient = useQueryClient();
   const permission = useLink(desktopId, (state) => state.permission);
   const knownVersion = useLink(desktopId, (state) => state.desktopVersion);
@@ -129,11 +142,11 @@ export function DesktopUpdateSection({ desktopId, link, status }: { desktopId: s
   const available = data?.updateAvailable === true;
 
   return (
-    <SettingsCard title="Desktop app">
-      <SettingsRow icon="computer" title="Current version" trailing={current ?? (link ? "Checking..." : "Unknown")} />
-      <SettingsRow icon="refresh" title="Latest version" trailing={data ? data.latest : link ? "Checking..." : "Unknown"} />
+    <SettingsCard id={id} className={SETTINGS_ANCHOR} title="Desktop app update">
+      <SettingsRow icon="computer" title="Current version" trailing={current ?? (link || pending ? "Checking..." : "Unknown")} />
+      <SettingsRow icon="refresh" title="Latest version" trailing={data ? data.latest : link || pending ? "Checking..." : "Unknown"} />
       {!link ? (
-        <SettingsRow icon="computer" title="Update and restart" description="Needs a connection to the desktop" />
+        <SettingsRow icon="computer" title="Update and restart" description={pending ? "Checking..." : "Needs a connection to the desktop"} />
       ) : (
         <>
           {query.isError ? (

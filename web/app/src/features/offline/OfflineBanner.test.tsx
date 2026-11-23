@@ -1,6 +1,7 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
-import { act, render, screen } from "@testing-library/react";
+import { createMemoryHistory, createRootRoute, createRouter, RouterProvider } from "@tanstack/react-router";
+import type { ComponentProps } from "react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
 import { createMockServer } from "@/features/accounts/mock/transport";
@@ -10,7 +11,7 @@ import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { clearSlots, registerSlot } from "@/ui/slots";
-import { SHOW_DELAY_MS, desktopIdFromPath } from "./OfflineBanner";
+import { OfflineBanner, SHOW_DELAY_MS, desktopIdFromPath } from "./OfflineBanner";
 
 function setOnline(value: boolean) {
   vi.spyOn(navigator, "onLine", "get").mockReturnValue(value);
@@ -32,9 +33,27 @@ async function renderAt(url: string) {
   return screen.findByTestId("connection-banner");
 }
 
+/** Mounts the banner alone (outside the app shell) in a router, to check the classes of each `pinned` option. */
+async function renderBanner(props: ComponentProps<typeof OfflineBanner>) {
+  const queryClient = createQueryClient();
+  const router = createRouter({
+    routeTree: createRootRoute({ component: () => <OfflineBanner {...props} /> }),
+    history: createMemoryHistory({ initialEntries: ["/"] }),
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return screen.findByTestId("connection-banner");
+}
+
 afterEach(() => {
   clearSlots();
   vi.restoreAllMocks();
+  // A test that ended offline left TanStack Query's onlineManager offline (it follows the window events), which pauses
+  // every query of the next test (the auth guard never answers, so the router renders nothing). Tell it we are back.
+  window.dispatchEvent(new Event("online"));
   clearLinkStores();
 });
 
@@ -76,6 +95,114 @@ describe("OfflineBanner", () => {
     const region = await renderAt("/settings");
     expect(region).toHaveClass("sticky");
     expect(region.className).toContain("safe-area-inset-top");
+  });
+
+  it("sticks to the top edge (notch inset only) when the page has no app header, as on settings", async () => {
+    const region = await renderBanner({ pinned: "top" });
+    expect(region).toHaveClass("sticky", "top-[env(safe-area-inset-top)]");
+    expect(region.className).not.toContain("2.75rem");
+  });
+
+  it("marks the document while a pinned toast shows, and clears it after and on unmount", async () => {
+    const root = document.documentElement;
+    const region = await renderBanner({ pinned: "top" });
+    expect(root).not.toHaveAttribute("data-connection-banner");
+    act(() => setOnline(false));
+    await vi.waitFor(() => expect(region).toHaveTextContent("You are offline"));
+    expect(root).toHaveAttribute("data-connection-banner", "shown");
+    act(() => setOnline(true));
+    await vi.waitFor(() => expect(root).not.toHaveAttribute("data-connection-banner"));
+    act(() => setOnline(false));
+    await vi.waitFor(() => expect(root).toHaveAttribute("data-connection-banner", "shown"));
+    cleanup();
+    expect(root).not.toHaveAttribute("data-connection-banner");
+  });
+
+  it("publishes the measured pill height as --connection-banner-height while a pinned toast shows, and removes it after", async () => {
+    const root = document.documentElement;
+    const callbacks: (() => void)[] = [];
+    const observed: Element[] = [];
+    let disconnects = 0;
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: () => void) {
+          callbacks.push(callback);
+        }
+        observe(target: Element) {
+          observed.push(target);
+        }
+        disconnect() {
+          disconnects += 1;
+        }
+      },
+    );
+    // Only the pill (the element with data-kind) has a height; every other element measures 0.
+    let pillHeight = 58;
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return this.hasAttribute("data-kind") ? ({ height: pillHeight } as DOMRect) : original.call(this);
+    });
+    try {
+      const region = await renderBanner({ pinned: "top" });
+      expect(root.style.getPropertyValue("--connection-banner-height")).toBe("");
+      act(() => setOnline(false));
+      await vi.waitFor(() => expect(region).toHaveTextContent("You are offline"));
+      await vi.waitFor(() => expect(root.style.getPropertyValue("--connection-banner-height")).toBe("58px"));
+      expect(observed).toHaveLength(1);
+      expect(observed[0]).toHaveAttribute("data-kind");
+      pillHeight = 80;
+      act(() => callbacks.forEach((callback) => callback()));
+      expect(root.style.getPropertyValue("--connection-banner-height")).toBe("80px");
+      expect(disconnects).toBe(0);
+      act(() => setOnline(true));
+      await vi.waitFor(() => expect(root.style.getPropertyValue("--connection-banner-height")).toBe(""));
+      expect(disconnects).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("removes --connection-banner-height and disconnects the observer when unmounted while the toast shows", async () => {
+    const root = document.documentElement;
+    let disconnects = 0;
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {
+          disconnects += 1;
+        }
+      },
+    );
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return this.hasAttribute("data-kind") ? ({ height: 58 } as DOMRect) : original.call(this);
+    });
+    try {
+      const region = await renderBanner({ pinned: "top" });
+      act(() => setOnline(false));
+      await vi.waitFor(() => expect(region).toHaveTextContent("You are offline"));
+      await vi.waitFor(() => expect(root.style.getPropertyValue("--connection-banner-height")).toBe("58px"));
+      cleanup();
+      expect(root.style.getPropertyValue("--connection-banner-height")).toBe("");
+      expect(disconnects).toBeGreaterThanOrEqual(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not mark the document for a banner that is not pinned to the top", async () => {
+    const region = await renderBanner({});
+    act(() => setOnline(false));
+    await vi.waitFor(() => expect(region).toHaveTextContent("You are offline"));
+    expect(document.documentElement).not.toHaveAttribute("data-connection-banner");
+  });
+
+  it("keeps pinnedBelowHeader working, and is not pinned by default", async () => {
+    expect(await renderBanner({ pinnedBelowHeader: true })).toHaveClass("sticky", "top-[calc(env(safe-area-inset-top)+2.75rem)]");
+    cleanup();
+    expect(await renderBanner({})).toHaveClass("relative");
   });
 
   it("shows nothing before the show delay", async () => {

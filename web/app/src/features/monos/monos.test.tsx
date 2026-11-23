@@ -148,7 +148,7 @@ describe("Mono header (F-70)", () => {
     (FIXTURE_HANDLERS as Record<string, unknown>)["workspace.list"] = ((p: never, c: never) => ({ ...handler(p, c), monoTools: false })) as never;
     mount(`/monos/${MONO}`);
     const links = await screen.findAllByRole("link", { name: "Settings" });
-    expect(links.some((link) => link.getAttribute("href") === `/d/${DESKTOP_ID}/settings` && link.textContent === "Settings")).toBe(true);
+    expect(links.some((link) => link.getAttribute("href") === `/settings/desktops/${DESKTOP_ID}` && link.textContent === "Settings")).toBe(true);
     expect(screen.queryByRole("button", { name: "Mono actions" })).toBeNull();
   });
 });

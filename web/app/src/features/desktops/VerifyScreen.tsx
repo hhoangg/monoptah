@@ -198,7 +198,7 @@ function ConfirmKey({ name, fingerprint: print, onConfirm }: { name: string; fin
 
 function Body({ id, outcome, onConfirm, onRetry }: { id: string; outcome: Outcome; onConfirm: (fingerprint: string) => Promise<void>; onRetry: () => void }) {
   const back = (
-    <Link to="/desktops/$id" params={{ id }} className={buttonVariants({ variant: "outline" })}>
+    <Link to="/settings/desktops/$id" params={{ id }} className={buttonVariants({ variant: "outline" })}>
       Manage this desktop
     </Link>
   );
@@ -251,7 +251,7 @@ function Body({ id, outcome, onConfirm, onRetry }: { id: string; outcome: Outcom
         <div className="flex flex-col gap-4">
           <Notice variant="error">This desktop was not found on your account. It may have been revoked.</Notice>
           <div>
-            <Link to="/desktops" className={buttonVariants({ variant: "outline" })}>
+            <Link to="/settings/desktops" className={buttonVariants({ variant: "outline" })}>
               Go to desktops
             </Link>
           </div>

@@ -15,12 +15,15 @@ export const MAIN_ID = "main-content";
 /** Screens of a visitor who has no session yet: no app navigation. */
 const SIGN_IN_FAMILY: readonly string[] = ["/login", "/register", "/recover"];
 
-/** Shared Wave 0 shell: 44px header on a glass pill (outside /d routes), safe-area padding, one scrolling main. */
+/** Shared Wave 0 shell: 44px header on a glass pill (outside /d and /settings routes), safe-area padding, one scrolling main. */
 export function Shell() {
   const pathname = useRouterState({ select: (state) => state.location.pathname.replace(/(.)\/$/, "$1") });
   const signInFamily = SIGN_IN_FAMILY.includes(pathname);
   // The /d/:desktopId routes have no header: their nav icons sit at the right end of the desktop switcher row.
   const inDesktop = pathname.startsWith("/d/");
+  // The settings shell has no app header either: its nav column and list page start with an exit button before the
+  // "Settings" title. Main takes over the notch inset the header used to provide.
+  const inSettings = pathname === "/settings" || pathname.startsWith("/settings/");
   // /install is public: a visitor without a session sees the brand only (the nav entries would bounce to /login).
   const me = useQuery({ ...meQuery, enabled: pathname === "/install", retry: false, networkMode: "always" });
   // Brand only until /api/me succeeds. A signed-in visitor who is merely offline (a network error, not a 401) keeps the nav.
@@ -41,8 +44,8 @@ export function Shell() {
       >
         Skip to content
       </a>
-      {inDesktop ? null : (
-        <header className="sticky top-0 z-10 flex min-h-11 shrink-0 items-center gap-2 pt-[env(safe-area-inset-top)] pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.5rem,env(safe-area-inset-left))] min-[24rem]:pr-[max(1.25rem,env(safe-area-inset-right))] min-[24rem]:pl-[max(1.25rem,env(safe-area-inset-left))]">
+      {inDesktop || inSettings ? null : (
+        <header data-testid="app-header" className="sticky top-0 z-10 flex min-h-11 shrink-0 items-center gap-2 pt-[env(safe-area-inset-top)] pr-[max(0.5rem,env(safe-area-inset-right))] pl-[max(0.5rem,env(safe-area-inset-left))] min-[24rem]:pr-[max(1.25rem,env(safe-area-inset-right))] min-[24rem]:pl-[max(1.25rem,env(safe-area-inset-left))]">
           {publicPage ? (
             <Link to="/" className="rounded-pill px-3 py-2 text-small font-semibold">
               Monoptah
@@ -58,11 +61,11 @@ export function Shell() {
         </header>
       )}
       {/* On /d the banner sits under the desktop switcher row (DesktopTopBar owns the top safe-area inset there). */}
-      {inDesktop ? null : <OfflineBanner pinnedBelowHeader />}
+      {inDesktop ? null : <OfflineBanner pinned={inSettings ? "top" : "below-header"} />}
       <main
         id={MAIN_ID}
         tabIndex={-1}
-        className={cn("outline-none", inDesktop ? "relative flex min-h-0 flex-1 flex-col overflow-y-auto" : "flex-1 pb-[calc(env(safe-area-inset-bottom)+2.5rem)]")}
+        className={cn("outline-none", inDesktop ? "relative flex min-h-0 flex-1 flex-col overflow-y-auto" : "flex-1 pb-[calc(env(safe-area-inset-bottom)+2.5rem)]", inSettings && "pt-[env(safe-area-inset-top)]")}
       >
         <Outlet />
       </main>

@@ -1,4 +1,4 @@
-// `/`: restores the last place of the last used desktop (N-12), else goes to /desktops. A desktop that is no
+// `/`: restores the last place of the last used desktop (N-12), else goes to /settings/desktops. A desktop that is no
 // longer in the account's list is dropped, so a revoked one is never opened. Owner: WS-L (workstreams.md 3.1).
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { resolveLastPlace } from "@/data/lastPlace";
@@ -20,11 +20,11 @@ export const Route = createFileRoute("/")({
   beforeLoad: async ({ context }) => {
     // The resolver is WS-T's (features/sessions/lastPlace.ts, W-06); it registers itself in data/lastPlace.ts.
     const place = resolveLastPlace();
-    if (place === null) throw redirect({ to: "/desktops", replace: true });
+    if (place === null) throw redirect({ to: "/settings/desktops", replace: true });
     const desktopId = placeDesktop(place);
     if (desktopId && !(await stillInAccount(context.queryClient, desktopId))) {
       forgetDesktop(desktopId);
-      throw redirect({ to: "/desktops", replace: true });
+      throw redirect({ to: "/settings/desktops", replace: true });
     }
     // The place is a runtime path (checked to start with a single slash) that may carry ?search and #hash:
     // `href` parses it, `to` would treat it as a bare path.

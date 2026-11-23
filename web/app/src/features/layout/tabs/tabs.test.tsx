@@ -271,10 +271,10 @@ describe("tabs", () => {
     resetLinkConnections();
     clearLinkStores();
     resetTabsStore();
-    mount(1280, "/settings");
+    mount(1280, "/cloud");
     await screen.findByRole("tablist");
     expect(tabKeys()).toHaveLength(3);
-    // Not a tab URL: nothing is selected and the settings page shows in the pane.
+    // Not a tab URL: nothing is selected and the cloud screen shows in the pane.
     expect(selectedKey()).toEqual([]);
     expect(localStorage.getItem(tabsKey("other-desktop"))).toBeNull();
   });
@@ -772,7 +772,7 @@ describe("split panes", () => {
     resetLinkConnections();
     clearLinkStores();
     resetTabsStore();
-    mount(1280, "/settings");
+    mount(1280, "/cloud");
     await waitFor(() => expect(screen.getAllByRole("tablist")).toHaveLength(2));
     expect(tabKeys(screen.getByTestId("pane-p1"))).toHaveLength(3);
   });

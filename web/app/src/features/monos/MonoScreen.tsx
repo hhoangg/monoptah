@@ -166,8 +166,8 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
             </Link>
           ) : (
             <Link
-              to="/d/$desktopId/settings"
-              params={{ desktopId }}
+              to="/settings/desktops/$id"
+              params={{ id: desktopId }}
               className="inline-flex min-h-11 items-center gap-1.5 rounded-pill bg-fill px-3 text-small hover:bg-selection pointer-fine:min-h-9"
             >
               <Icon name="settings" size={16} />

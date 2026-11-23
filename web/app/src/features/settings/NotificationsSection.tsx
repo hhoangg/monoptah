@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { PUSH_CATEGORIES } from "@monoptah/protocol";
 import { forgetPaused } from "@/features/push/pauseRecord";
 import { savePushPrefs, type PushPrefs } from "@/features/accounts/queries";
@@ -21,11 +21,26 @@ export const CATEGORY_LABELS: Record<Category, { title: string; description: str
 /** What the switches show while the saved prefs load (the same defaults the Worker applies); they are disabled until then. */
 export const DRAFT_PREFS: PushPrefs = { enabled: true, categories: { agentFinished: true, agentInput: true, monoMessages: true } };
 
+const DEFAULT_FOOTNOTE = "Saved to your account for this desktop. Permission to show notifications in this browser is asked separately.";
+
 /**
  * Notification categories of one desktop (N-15). The prefs load with `GET /api/push/prefs/:desktopId`; a desktop
  * that never saved any shows the defaults (all on), which are what the Worker applies too. Each switch saves at once.
+ * `title` heads the card (the notifications page passes the desktop name, one block per desktop); the switch labels then
+ * name the desktop too, so several blocks on one page stay distinguishable to a screen reader.
  */
-export function NotificationsSection({ desktopId }: { desktopId: string }) {
+export function NotificationsSection({
+  desktopId,
+  title = "Notifications",
+  footnote = DEFAULT_FOOTNOTE,
+  onSaved,
+}: {
+  desktopId: string;
+  title?: string;
+  footnote?: ReactNode;
+  /** Called after a choice was saved (and Pause all's record of this desktop dropped), so a page can re-read that record. */
+  onSaved?: () => void;
+}) {
   const queryClient = useQueryClient();
   const loaded = useQuery<PushPrefs>({ ...pushPrefsQuery(desktopId), staleTime: 0 });
   const [saving, setSaving] = useState(false);
@@ -43,6 +58,7 @@ export function NotificationsSection({ desktopId }: { desktopId: string }) {
       queryClient.setQueryData(pushPrefsKey(desktopId), result);
       // An explicit choice here replaces what Pause all recorded, so Resume all must not overwrite it.
       forgetPaused(desktopId);
+      onSaved?.();
     } catch (caught) {
       setError(settingsErrorMessage(caught));
     } finally {
@@ -50,8 +66,9 @@ export function NotificationsSection({ desktopId }: { desktopId: string }) {
     }
   }
 
+  const named = title === "Notifications" ? (text: string) => text : (text: string) => `${text} (${title})`;
   return (
-    <SettingsCard title="Notifications" footnote="Saved to your account for this desktop. Permission to show notifications in this browser is asked separately.">
+    <SettingsCard title={title} footnote={footnote}>
       {loaded.isError ? (
         <Notice variant="error" className="my-1.5">
           {settingsErrorMessage(loaded.error)}
@@ -61,19 +78,19 @@ export function NotificationsSection({ desktopId }: { desktopId: string }) {
       <SettingsRow
         icon="notifications"
         title="Notifications from this desktop"
-        trailing={<Switch checked={shown.enabled} disabled={saving || prefs === undefined} aria-label="Notifications from this desktop" onCheckedChange={(enabled) => void save({ ...shown, enabled })} />}
+        trailing={<Switch checked={shown.enabled} disabled={saving || prefs === undefined} aria-label={named("Notifications from this desktop")} onCheckedChange={(enabled) => void save({ ...shown, enabled })} />}
       />
       {PUSH_CATEGORIES.map((category) => (
         <SettingsRow
           key={category}
           title={CATEGORY_LABELS[category].title}
           description={CATEGORY_LABELS[category].description}
-          className="pl-[4.5rem]"
+          className="pl-[4.5rem] before:left-[4.5rem]"
           trailing={
             <Switch
               checked={shown.categories[category] ?? true}
               disabled={saving || prefs === undefined || !shown.enabled}
-              aria-label={CATEGORY_LABELS[category].title}
+              aria-label={named(CATEGORY_LABELS[category].title)}
               onCheckedChange={(on) => void save({ ...shown, categories: { ...shown.categories, [category]: on } })}
             />
           }

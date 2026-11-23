@@ -104,7 +104,7 @@ describe("desktop switcher", () => {
     expect(within(items[2] as HTMLElement).getByText("Offline")).toBeInTheDocument();
     expect(within(items[1] as HTMLElement).getByText("Online")).toBeInTheDocument();
     expect(within(dialog).getByRole("link", { name: "Open Linux box" })).toHaveAttribute("href", "/d/d2");
-    expect(within(dialog).getByRole("link", { name: "Manage desktops" })).toHaveAttribute("href", "/desktops");
+    expect(within(dialog).getByRole("link", { name: "Manage desktops" })).toHaveAttribute("href", "/settings/desktops");
   });
 
   it("offers Request access only where this device has no grant, and posts it for that desktop only", async () => {

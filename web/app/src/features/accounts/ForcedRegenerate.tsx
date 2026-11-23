@@ -14,7 +14,7 @@ import { acknowledgeRecoveryCodes, ReauthCancelledError, withFreshAuth } from ".
 import { RecoveryCodes } from "./RecoveryCodes";
 
 /**
- * Shown on /settings while `me.recoveryAckAt === null` (the guard sends every route there). The
+ * Shown in the /settings layout (at /settings/profile) while `me.recoveryAckAt === null` (the guard sends every route there). The
  * user must create and save a fresh set of codes before the app opens up.
  *
  * It calls the endpoint directly instead of `regenerateRecoveryCodes`: that helper refreshes `me`

@@ -6,7 +6,7 @@ import { Badge } from "@/ui/badge";
 import { Button } from "@/ui/button";
 import { ConfirmDialog } from "@/ui/ConfirmDialog";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { describeUserAgent, formatRelative } from "./format";
 import { QueryBoundary } from "./QueryBoundary";
 import { useAction } from "./useAction";
@@ -22,7 +22,7 @@ function details(session: Session): string {
 export function SessionsSection() {
   const query = useQuery(sessionsQuery);
   return (
-    <SettingsCard title="Signed-in browsers" footnote="Sign out a browser you no longer use or do not recognise. It has to sign in again with a passkey.">
+    <SettingsCard id="signed-in-browsers" className={SETTINGS_ANCHOR} title="Signed-in browsers" footnote="Sign out a browser you no longer use or do not recognise. It has to sign in again with a passkey.">
       <QueryBoundary query={query} label="signed-in browsers">
         {(data) => <SessionList sessions={[...data.sessions].sort((a, b) => Number(b.current) - Number(a.current) || b.lastSeenAt - a.lastSeenAt)} />}
       </QueryBoundary>

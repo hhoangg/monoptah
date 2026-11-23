@@ -76,7 +76,7 @@ export function SessionHeaderMenu({ desktopId, session, readOnly }: { desktopId:
             Copy Session ID
           </DropdownMenuItem>
           <DropdownMenuItem asChild>
-            <Link to="/d/$desktopId/settings" params={{ desktopId }}>
+            <Link to="/settings/desktops/$id" params={{ id: desktopId }}>
               <Icon name="settings" size={18} />
               Settings
             </Link>

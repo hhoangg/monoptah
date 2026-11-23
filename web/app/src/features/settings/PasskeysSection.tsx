@@ -9,7 +9,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Field } from "@/ui/Field";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
-import { SettingsCard, SettingsRow } from "@/ui/SettingsCard";
+import { SETTINGS_ANCHOR, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { formatDate, formatRelative } from "./format";
 import { QueryBoundary } from "./QueryBoundary";
 import { useAction } from "./useAction";
@@ -28,7 +28,7 @@ function details(passkey: Passkey): string {
 export function PasskeysSection() {
   const query = useQuery(passkeysQuery);
   return (
-    <SettingsCard title="Passkeys">
+    <SettingsCard id="passkeys" className={SETTINGS_ANCHOR} title="Passkeys">
       <QueryBoundary query={query} label="passkeys">
         {(data) => <PasskeyList passkeys={[...data.passkeys].sort((a, b) => a.createdAt - b.createdAt)} />}
       </QueryBoundary>

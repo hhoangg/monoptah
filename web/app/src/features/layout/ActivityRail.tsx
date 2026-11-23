@@ -1,7 +1,7 @@
 // The activity rail (tablet and desktop, from 640 px): a vertical strip at the far left of the app shell, like the
 // activity bar of an editor. Top: the account's desktops as avatars (initials, a color per desktop, an online dot, a bar
 // beside the current one); a click opens that desktop. Bottom: Cloud (only where the desktop has it), Desktop settings
-// and the account avatar, whose menu holds Account settings, All desktops and Install app. It replaces the top bar and
+// and the account avatar, whose menu holds Settings, Desktops and Install app. It replaces the top bar and
 // its desktop switcher on these widths; the phone keeps the top bar (features/desktops/DesktopSwitcher.tsx).
 import { Link } from "@tanstack/react-router";
 import { useState, type KeyboardEvent, type ReactNode } from "react";
@@ -106,14 +106,21 @@ function DesktopAvatar({ desktop, current, tabStop, onFocus }: { desktop: RailDe
   );
 }
 
-function RailLink({ to, desktopId, label, icon }: { to: "/d/$desktopId/cloud" | "/d/$desktopId/settings"; desktopId: string; label: string; icon: IconName }) {
+function RailLink({ to, desktopId, label, icon }: { to: "/d/$desktopId/cloud" | "/settings/desktops/$id"; desktopId: string; label: string; icon: IconName }) {
+  // /settings/desktops/$id names its param `id`, the desktop routes `desktopId`.
+  const link =
+    to === "/settings/desktops/$id" ? (
+      <Link to={to} params={{ id: desktopId }} aria-label={label} className={button}>
+        <Icon name={icon} />
+      </Link>
+    ) : (
+      <Link to={to} params={{ desktopId }} aria-label={label} className={button}>
+        <Icon name={icon} />
+      </Link>
+    );
   return (
     <li className="flex w-full justify-center">
-      <RailTip label={label}>
-        <Link to={to} params={{ desktopId }} aria-label={label} className={button}>
-          <Icon name={icon} />
-        </Link>
-      </RailTip>
+      <RailTip label={label}>{link}</RailTip>
     </li>
   );
 }
@@ -155,7 +162,7 @@ export function ActivityRail({ desktopId }: { desktopId: string }) {
         </ul>
         <ul data-testid="rail-actions" className="m-0 flex w-full list-none flex-col items-center gap-1 border-t border-stroke p-0 pt-2">
           {cloud ? <RailLink to="/d/$desktopId/cloud" desktopId={desktopId} label={CLOUD_NAV_LABEL} icon="cloud" /> : null}
-          <RailLink to="/d/$desktopId/settings" desktopId={desktopId} label="Desktop settings" icon="settings" />
+          <RailLink to="/settings/desktops/$id" desktopId={desktopId} label="Desktop settings" icon="settings" />
           <li className="flex w-full justify-center">
             <AccountMenu side="right" />
           </li>
