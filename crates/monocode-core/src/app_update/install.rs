@@ -164,30 +164,133 @@ fn extract_app(package: &Path, directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Fork-local. A Developer ID build, or an update that is not ad-hoc signed, must
-/// pass Gatekeeper; only an ad-hoc app replacing another ad-hoc app skips it, so a
-/// Developer ID build never accepts an ad-hoc update.
+/// Fork-local. SHA-1 of the stable self-signed certificate that signs Monoptah
+/// Native releases. Compiled in so an update must be signed by the same identity.
 #[cfg(any(target_os = "macos", test))]
-fn requires_gatekeeper_approval(running_adhoc: bool, downloaded_adhoc: bool) -> bool {
-    !(running_adhoc && downloaded_adhoc)
+const PINNED_LEAF_CERTIFICATE_SHA1: &str = "0a44567bf676438c0dad7e5b3ec5ef80708bebfe";
+
+/// Fork-local. The code requirement every release must satisfy.
+#[cfg(any(target_os = "macos", test))]
+fn pinned_requirement() -> String {
+    format!(
+        "identifier \"{}\" and certificate leaf = H\"{PINNED_LEAF_CERTIFICATE_SHA1}\"",
+        super::APP_ID
+    )
 }
 
-/// Fork-local. Reads `codesign -dv` output (written to stderr) for the
-/// `Signature=adhoc` line. Anything else, including an unreadable signature, is
-/// not ad-hoc, which keeps the Gatekeeper assessment in force.
+/// Fork-local. How an app bundle is signed, read from `codesign -dv` output.
 #[cfg(any(target_os = "macos", test))]
-fn output_reports_adhoc(output: &str) -> bool {
-    output.lines().any(|line| line.trim() == "Signature=adhoc")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignatureKind {
+    AdHoc,
+    /// Signed with a certificate (self-signed or Developer ID).
+    Signed,
+    Unknown,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum Acceptance {
+    Accept,
+    Reject(&'static str),
+    /// No identity rule applies; fall back to the Gatekeeper assessment.
+    Gatekeeper,
+}
+
+/// Fork-local. Reads `codesign -dv` output (written to stderr). Anything that is
+/// not clearly ad-hoc or certificate-signed is `Unknown`.
+#[cfg(any(target_os = "macos", test))]
+fn signature_kind(output: &str) -> SignatureKind {
+    if output.lines().any(|line| line.trim() == "Signature=adhoc") {
+        SignatureKind::AdHoc
+    } else if output
+        .lines()
+        .any(|line| line.starts_with("Authority=") || line.starts_with("Signature size="))
+    {
+        SignatureKind::Signed
+    } else {
+        SignatureKind::Unknown
+    }
+}
+
+/// Fork-local. Reads the `designated => ...` line of `codesign -d -r-` output.
+#[cfg(any(target_os = "macos", test))]
+fn designated_requirement(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("designated => "))
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_owned)
+}
+
+/// Fork-local. The acceptance policy. The feed and package signatures, bundle
+/// identity and `codesign --verify` are checked before this runs.
+/// - A download that satisfies the pinned requirement is accepted (this covers the
+///   move from an ad-hoc build to the self-signed one).
+/// - A signed running app also accepts a download that satisfies its own designated
+///   requirement. This only matters for a non-pinned signed running app (for example
+///   Developer ID). Rotating the pinned certificate needs a build signed by the old
+///   certificate that ships the new pinned hash first.
+/// - Ad-hoc replacing ad-hoc is accepted (legacy transition).
+/// - A signed app never accepts an ad-hoc download.
+/// - Anything else must pass Gatekeeper.
+#[cfg(any(target_os = "macos", test))]
+fn decide_acceptance(
+    running: SignatureKind,
+    downloaded: SignatureKind,
+    downloaded_matches_pinned: bool,
+    downloaded_matches_running_requirement: bool,
+) -> Acceptance {
+    if downloaded_matches_pinned {
+        return Acceptance::Accept;
+    }
+    if running == SignatureKind::Signed && downloaded_matches_running_requirement {
+        return Acceptance::Accept;
+    }
+    match (running, downloaded) {
+        (SignatureKind::AdHoc, SignatureKind::AdHoc) => Acceptance::Accept,
+        (SignatureKind::Signed, SignatureKind::AdHoc) => {
+            Acceptance::Reject("The downloaded app is ad-hoc signed but the installed app is not")
+        }
+        _ => Acceptance::Gatekeeper,
+    }
 }
 
 #[cfg(target_os = "macos")]
-fn is_adhoc_signed(app: &Path) -> bool {
+fn signature_kind_of(app: &Path) -> SignatureKind {
     Command::new("/usr/bin/codesign")
         .arg("-dv")
         .arg(app)
         .output()
-        .map(|o| o.status.success() && output_reports_adhoc(&String::from_utf8_lossy(&o.stderr)))
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| signature_kind(&String::from_utf8_lossy(&o.stderr)))
+        .unwrap_or(SignatureKind::Unknown)
+}
+
+#[cfg(target_os = "macos")]
+fn satisfies(app: &Path, requirement: &str) -> bool {
+    Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(format!("-R={requirement}"))
+        .arg(app)
+        .output()
+        .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn running_requirement(app: &Path) -> Option<String> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(["-d", "-r-"])
+        .arg(app)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| designated_requirement(&String::from_utf8_lossy(&output.stdout)))?
 }
 
 #[cfg(target_os = "macos")]
@@ -225,17 +328,24 @@ fn install_mac(update: &Update, package: &Path, target: &Path) -> Result<Install
             .arg(&prepared),
         "The downloaded app signature is invalid",
     )?;
-    // Fork-local: Monoptah Native releases are ad-hoc signed and not notarized, so
-    // Gatekeeper can never approve them. The assessment is skipped only when both the
-    // running app and the downloaded app are ad-hoc signed; the feed and package
-    // signatures, bundle identity and `codesign --verify` above still apply.
-    if requires_gatekeeper_approval(is_adhoc_signed(target), is_adhoc_signed(&prepared)) {
-        success(
+    // Fork-local: Monoptah Native releases are signed with a stable self-signed
+    // certificate and not notarized, so Gatekeeper can never approve them. Identity is
+    // pinned instead (see `decide_acceptance`); the feed and package signatures, bundle
+    // identity and `codesign --verify` above still apply.
+    let running = signature_kind_of(target);
+    let downloaded = signature_kind_of(&prepared);
+    let pinned = satisfies(&prepared, &pinned_requirement());
+    let matches_running = running == SignatureKind::Signed
+        && running_requirement(target).is_some_and(|r| satisfies(&prepared, &r));
+    match decide_acceptance(running, downloaded, pinned, matches_running) {
+        Acceptance::Accept => {}
+        Acceptance::Reject(reason) => return Err(reason.into()),
+        Acceptance::Gatekeeper => success(
             Command::new("/usr/sbin/spctl")
                 .args(["--assess", "--type", "execute"])
                 .arg(&prepared),
             "macOS did not approve the downloaded app",
-        )?;
+        )?,
     }
     if authorize {
         // Pass paths as quoted shell data, then quote the complete command as
@@ -316,22 +426,69 @@ mod tests {
         assert!(extract_app(&package, &stage).is_err());
         assert!(!temp.path().join("outside").exists());
     }
+    const ADHOC: &str = "Executable=/Applications/Monoptah Native.app/Contents/MacOS/monocode-gpui\nIdentifier=com.monoptah.native\nCodeDirectory v=20400 size=1 flags=0x2(adhoc) hashes=1+3 location=embedded\nSignature=adhoc\nTeamIdentifier=not set\n";
+    const SELF_SIGNED: &str = "Identifier=com.monoptah.native\nCodeDirectory v=20400 size=1 flags=0x0(none) hashes=1+3 location=embedded\nSignature size=1700\nAuthority=Monoptah Native Release Signing\nTeamIdentifier=not set\n";
     #[test]
-    fn only_an_adhoc_app_replacing_an_adhoc_app_skips_gatekeeper() {
-        assert!(!requires_gatekeeper_approval(true, true));
-        assert!(requires_gatekeeper_approval(false, true));
-        assert!(requires_gatekeeper_approval(true, false));
-        assert!(requires_gatekeeper_approval(false, false));
+    fn signature_kinds_are_read_from_codesign_output() {
+        assert_eq!(signature_kind(ADHOC), SignatureKind::AdHoc);
+        assert_eq!(signature_kind(SELF_SIGNED), SignatureKind::Signed);
+        let developer_id = "Identifier=com.monoptah.native\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Example (TEAM)\nTeamIdentifier=TEAM\n";
+        assert_eq!(signature_kind(developer_id), SignatureKind::Signed);
+        assert_eq!(signature_kind(""), SignatureKind::Unknown);
+        assert_eq!(
+            signature_kind("code object is not signed at all\n"),
+            SignatureKind::Unknown
+        );
+        assert_eq!(
+            signature_kind("Foo=Signature=adhoc\nXAuthority=a\n"),
+            SignatureKind::Unknown
+        );
     }
     #[test]
-    fn adhoc_signatures_are_recognised_from_codesign_output() {
-        let adhoc = "Executable=/Applications/Monoptah Native.app/Contents/MacOS/monocode-gpui\nIdentifier=com.monoptah.native\nCodeDirectory v=20400 size=1 flags=0x2(adhoc) hashes=1+3 location=embedded\nSignature=adhoc\nTeamIdentifier=not set\n";
-        assert!(output_reports_adhoc(adhoc));
-        let developer_id = "Identifier=com.monoptah.native\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Example (TEAM)\nTeamIdentifier=TEAM\n";
-        assert!(!output_reports_adhoc(developer_id));
-        assert!(!output_reports_adhoc(""));
-        assert!(!output_reports_adhoc("code object is not signed at all\n"));
-        assert!(!output_reports_adhoc("Authority=Signature=adhoc\n"));
+    fn designated_requirement_is_read_from_its_line() {
+        let output = "# comment\ndesignated => identifier \"com.monoptah.native\" and certificate leaf = H\"0a44\"\n";
+        assert_eq!(
+            designated_requirement(output).as_deref(),
+            Some("identifier \"com.monoptah.native\" and certificate leaf = H\"0a44\"")
+        );
+        assert_eq!(designated_requirement(""), None);
+        assert_eq!(designated_requirement("designated => \n"), None);
+        assert_eq!(designated_requirement("x designated => y\n"), None);
+    }
+    #[test]
+    fn pinned_requirement_names_the_app_and_the_certificate() {
+        assert_eq!(
+            pinned_requirement(),
+            format!(
+                "identifier \"{}\" and certificate leaf = H\"0a44567bf676438c0dad7e5b3ec5ef80708bebfe\"",
+                super::super::APP_ID
+            )
+        );
+    }
+    #[test]
+    fn acceptance_matrix() {
+        use Acceptance::*;
+        use SignatureKind::*;
+        // adhoc -> pinned, pinned -> pinned: accepted without Gatekeeper.
+        assert_eq!(decide_acceptance(AdHoc, Signed, true, false), Accept);
+        assert_eq!(decide_acceptance(Signed, Signed, true, false), Accept);
+        assert_eq!(decide_acceptance(Unknown, Signed, true, false), Accept);
+        // adhoc -> adhoc keeps the legacy transition.
+        assert_eq!(decide_acceptance(AdHoc, AdHoc, false, false), Accept);
+        // No downgrade of the signing identity.
+        assert!(matches!(
+            decide_acceptance(Signed, AdHoc, false, false),
+            Reject(_)
+        ));
+        // A signed running app also accepts its own designated requirement.
+        assert_eq!(decide_acceptance(Signed, Signed, false, true), Accept);
+        // The running requirement only counts for a signed running app.
+        assert_eq!(decide_acceptance(AdHoc, Signed, false, true), Gatekeeper);
+        // Requirement mismatch or unreadable signatures go to Gatekeeper.
+        assert_eq!(decide_acceptance(Signed, Signed, false, false), Gatekeeper);
+        assert_eq!(decide_acceptance(Signed, Unknown, false, false), Gatekeeper);
+        assert_eq!(decide_acceptance(Unknown, AdHoc, false, false), Gatekeeper);
+        assert_eq!(decide_acceptance(AdHoc, Signed, false, false), Gatekeeper);
     }
     #[test]
     fn failed_swap_restores_the_previous_executable() {
