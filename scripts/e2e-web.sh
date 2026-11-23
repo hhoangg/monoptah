@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The one command for the Monoptah web E2E harness (E-01), in CI and in sandboxes.
 #
-#   scripts/e2e-web.sh
+#   scripts/e2e-web.sh [playwright test args...]
+#
+# Any arguments go straight to `playwright test`, e.g. `--shard=2/4` (CI) or a spec path.
 #
 # Environment:
 #   CI=true                     add `--with-deps` to the Playwright browser install
@@ -70,4 +72,4 @@ if [ "${E2E_SKIP_HEADLESS_BUILD:-}" != "1" ]; then
 fi
 
 # `tee` keeps the list output in run.log; pipefail keeps the exit code of Playwright.
-pnpm --filter @monoptah/e2e run e2e 2>&1 | tee "$out/run.log"
+pnpm --filter @monoptah/e2e run e2e "$@" 2>&1 | tee "$out/run.log"
