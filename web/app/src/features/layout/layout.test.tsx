@@ -290,6 +290,17 @@ describe("classic layout: session list sidebar and chat pane (>= 1024)", () => {
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
   });
 
+  it("shows the project's avatar, decorative, before the title in the session list header", async () => {
+    mount(1280, ALPHA);
+    const list = await screen.findByTestId("session-list-pane");
+    const title = await within(list).findByRole("heading", { level: 1, name: "Example Alpha" });
+    const avatar = await within(list).findByTestId("project-avatar");
+    expect(avatar).toHaveAttribute("aria-hidden", "true");
+    expect(avatar.querySelector("svg")).not.toBeNull();
+    expect(avatar.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(list).queryByRole("button", { name: /^Workspace:/ })).toBeNull();
+  });
+
   it("feeds the activity tracker from the session list, so the now-working pill shows where no workspace frame is mounted", async () => {
     mount(1280, "/s/sess-local-1");
     const list = await screen.findByTestId("session-list-pane");
@@ -1002,11 +1013,17 @@ describe("project tools (project bar and palette)", () => {
     expect(screen.queryByTestId("panel-overlay")).toBeNull();
   });
 
-  it("is the icon row beside the branch chip below 640px in a project, and absent outside a project", async () => {
+  it("is the icon row on its own row above the session search row below 640px in a project, and absent outside a project", async () => {
     mount(390, ALPHA);
     await screen.findByTestId("app-shell");
     const bar = await screen.findByRole("toolbar", { name: "Project tools" });
     expect(bar).toHaveAttribute("data-variant", "inline");
+    // The tools have their own row above the search row, which keeps the search box and the session filter.
+    const search = screen.getByRole("searchbox", { name: "Search sessions" });
+    expect(search.parentElement).not.toContainElement(bar);
+    expect(bar.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(search.parentElement).toContainElement(screen.getByRole("button", { name: "Filter sessions" }));
+    expect(screen.queryByRole("button", { name: /^Workspace:/ })).toBeNull();
     expect(screen.queryByTestId("app-sidebar")).toBeNull();
     expect(within(bar).getAllByRole("button").map((button) => button.getAttribute("aria-label"))).toEqual(["Files", "Changes", "Git", "Background"]);
   });

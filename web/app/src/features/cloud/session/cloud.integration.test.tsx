@@ -16,6 +16,7 @@ import { clearLinkStores } from "@/link/store.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks, registerSendGuard, registerSessionCapabilities } from "@/ui/hooks";
+import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { cloudSendGuard, cloudSessionCapabilities } from "./guard";
 import { clearLivePlacements } from "./liveState";
@@ -485,14 +486,26 @@ describe("archive of a remote session (SPEC M-1)", () => {
 describe("navigation", () => {
   it("adds a Cloud entry to the desktop nav when cloud is advertised, and not otherwise", async () => {
     const user = userEvent.setup();
+    registerSlot("desktop-switcher", DesktopSwitcher);
     mount("/p/proj-alpha");
     await user.click(await screen.findByRole("button", { name: "Open workspace list" }));
     const entry = await screen.findByRole("link", { name: "Cloud" });
     expect(entry).toHaveAttribute("href", `/d/${DESKTOP_ID}/cloud`);
   });
 
+  it("closes the drawer when the Cloud entry is tapped", async () => {
+    const user = userEvent.setup();
+    registerSlot("desktop-switcher", DesktopSwitcher);
+    const { router } = mount("/p/proj-alpha");
+    await user.click(await screen.findByRole("button", { name: "Open workspace list" }));
+    await user.click(await screen.findByRole("link", { name: "Cloud" }));
+    await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/cloud`));
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Open workspace list/, hidden: true })).toHaveAttribute("aria-expanded", "false"));
+  });
+
   it("has no Cloud entry when the desktop does not advertise cloud", async () => {
     const user = userEvent.setup();
+    registerSlot("desktop-switcher", DesktopSwitcher);
     mount("/p/proj-alpha", { capabilities: ["approvals"] });
     await user.click(await screen.findByRole("button", { name: "Open workspace list" }));
     await screen.findByRole("link", { name: "Desktop settings" });

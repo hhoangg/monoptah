@@ -144,7 +144,7 @@ test.describe("W-14 flows through the UI", () => {
     });
 
     await test.step("catalog: the project and the session of the desktop are listed", async () => {
-      await expect(page.getByRole("heading", { level: 1, name: "Workspace" })).toBeVisible();
+      await expect(page.getByRole("heading", { level: 1, name: "Workspace" })).toBeAttached();
       await expect(page.getByText(E2E_CATALOG.projectName).first()).toBeVisible();
       await expect(page.getByRole("link", { name: E2E_CATALOG.sessionTitle }).first()).toBeVisible();
     });

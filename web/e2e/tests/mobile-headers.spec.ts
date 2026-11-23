@@ -1,6 +1,6 @@
 // Header and bottom-bar layout on an iPhone (WebKit, iPhone 13 descriptor, 390 px) against the dev preview of the app
 // (an in-browser mock desktop): the Mono chat header has the info link and no duplicate menu, the project header is
-// tidy (targets of 44 px, no sideways overflow, the branch chip shares a row with the panel tools), and the
+// tidy (targets of 44 px, no sideways overflow, the panel tools on a row above the search box), and the
 // bottom-anchored bars (composer, now-working pill) leave the same gap above the home indicator.
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -76,13 +76,14 @@ test.describe("headers and bottom bars on an iPhone", () => {
     expect(box!.height).toBeGreaterThanOrEqual(44);
   });
 
-  test("project header: targets are 44 px, nothing overflows, the branch chip shares a row with the panel tools", async () => {
+  test("project header: targets are 44 px, nothing overflows, the panel tools sit on a row above the search box", async () => {
     await page.goto(`${base}${PROJECT}`);
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible({ timeout: 60_000 });
     const bar = page.getByTestId("project-bar");
     await expect(bar).toBeVisible();
-    const chip = page.getByRole("button", { name: /^Workspace:/ });
-    await expect(chip).toBeVisible();
+    const search = page.getByRole("searchbox", { name: "Search sessions" });
+    await expect(search).toBeVisible();
+    await expect(page.getByRole("button", { name: /^Workspace:/ })).toHaveCount(0);
 
     const tools = await bar.getByRole("button").all();
     expect(tools.length).toBeGreaterThan(1);
@@ -92,11 +93,11 @@ test.describe("headers and bottom bars on an iPhone", () => {
       expect(box.width).toBeGreaterThanOrEqual(43.5);
     }
 
-    // The branch chip and the panel tools are on one row.
-    const chipBox = (await chip.boundingBox())!;
+    // The panel tools sit on their own row above the search row, and the search box keeps a usable width.
+    const searchBox = (await search.boundingBox())!;
     const barBox = (await bar.boundingBox())!;
-    expect(Math.abs(chipBox.y + chipBox.height / 2 - (barBox.y + barBox.height / 2))).toBeLessThanOrEqual(8);
-    expect(chipBox.x + chipBox.width).toBeLessThanOrEqual(barBox.x + 1);
+    expect(barBox.y + barBox.height).toBeLessThanOrEqual(searchBox.y + 1);
+    expect(searchBox.width).toBeGreaterThanOrEqual(200);
 
     // Nothing sticks out of the viewport or scrolls sideways.
     const found = await page.evaluate(() => {
@@ -114,18 +115,25 @@ test.describe("headers and bottom bars on an iPhone", () => {
     expect(found.doc[0]).toBeLessThanOrEqual(found.doc[1]!);
   });
 
-  test("project header at 320 px: a long branch name shrinks and truncates, the panel tools stay on screen", async () => {
+  test("project header at 320 px: the search box fills its row, the panel tools stay on screen", async () => {
     await page.setViewportSize({ width: 320, height: 700 });
     await page.goto(`${base}${PROJECT}`);
-    const chip = page.getByRole("button", { name: /^Workspace:/ });
-    await expect(chip).toBeVisible({ timeout: 60_000 });
-    // Give the chip a very long label in place, as a long branch name would.
-    await chip.locator("span.truncate").evaluate((el) => (el.textContent = "feature/a-very-long-branch-name-that-cannot-fit-in-a-phone-header-row"));
+    const search = page.getByRole("searchbox", { name: "Search sessions" });
+    await expect(search).toBeVisible({ timeout: 60_000 });
     const bar = page.getByTestId("project-bar");
+    const tools = await bar.getByRole("button").all();
+    expect(tools.length).toBeGreaterThan(1);
+    for (const button of tools) {
+      const box = (await button.boundingBox())!;
+      expect(box.width).toBeGreaterThanOrEqual(43.5);
+      expect(box.height).toBeGreaterThanOrEqual(43.5);
+    }
     const last = (await bar.getByRole("button").last().boundingBox())!;
     expect(last.x + last.width).toBeLessThanOrEqual(320);
-    const chipBox = (await chip.boundingBox())!;
-    expect(chipBox.x + chipBox.width).toBeLessThanOrEqual((await bar.boundingBox())!.x + 1);
+    const searchBox = (await search.boundingBox())!;
+    expect(searchBox.width).toBeGreaterThan(150);
+    const barBox = (await bar.boundingBox())!;
+    expect(barBox.y + barBox.height).toBeLessThanOrEqual(searchBox.y + 1);
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(320);
   });
 

@@ -1,20 +1,16 @@
-// The frame of the WS-T screens (home and project): the workspace list as a vaul drawer opened from the header
-// below 640 px (from 640 px the app shell's sidebar carries it), a header with the screen's only h1,
+// The frame of the WS-T screens (home and project): a header with the screen's only h1 (the workspace list drawer
+// below 640 px lives in the /d top bar, see WorkspaceDrawer.tsx),
 // and the shared effects of a workspace screen (remember the place, track the working sessions).
 import { Link, type LinkProps } from "@tanstack/react-router";
-import { useEffect, useState, type ReactNode } from "react";
-import { Drawer as DrawerPrimitive } from "vaul";
+import { useEffect, type ReactNode } from "react";
 import { useCatalog } from "@/data";
 import { useLinkState } from "@/link";
-import { useMediaQuery } from "@/ui/useMediaQuery";
-import { DrawerOverlay, DrawerPortal, DrawerTitle } from "@/ui/drawer";
 import { cn } from "@/lib/utils";
 import { Icon } from "@/ui/Icon";
 import { trackSessions } from "./activityStore";
 import { useRememberPlace } from "./lastPlace";
+import { useFooterShown } from "./useFooterShown";
 import { RequestControlChip } from "./RequestControlChip";
-import { useCatalogUnreadMonos } from "./monoSeen";
-import { WorkspaceNav } from "./WorkspaceNav";
 
 /** True when the device may only read (`permission: read`). */
 export function useReadOnly(): boolean {
@@ -50,68 +46,52 @@ export interface WorkspaceFrameProps {
   flush?: boolean;
   /** A one-line title (truncated, full name on hover) instead of wrapping, for headers that also carry a primary action. */
   compact?: boolean;
+  /** The title stays as the screen's h1 for assistive technology but is not shown (the top bar already says where you are). */
+  hideTitle?: boolean;
+  /** Decorative element before the title (the project avatar). */
+  leading?: ReactNode;
 }
 
-export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, testId = "workspace-frame", back, fill = false, narrow = false, flush = false, compact = false }: WorkspaceFrameProps) {
+export function WorkspaceFrame({ desktopId, title, subtitle, actions, children, testId = "workspace-frame", back, fill = false, narrow = false, flush = false, compact = false, hideTitle = false, leading }: WorkspaceFrameProps) {
   useRememberPlace();
   useActivityTracking(desktopId);
   const readOnly = useReadOnly();
-  const wide = useMediaQuery(WIDE_QUERY);
-  const [open, setOpen] = useState(false);
-  // F-17: the menu button says when a Mono has a reply not seen on this device.
-  const hasUnread = useCatalogUnreadMonos(desktopId).size > 0;
+  // The app shell's footer bar (which carries the bottom safe-area inset) shows from 640 px and, on a phone, only on the
+  // workspace home. Everywhere else the page ends at the screen edge and clears the inset itself.
+  const footerShown = useFooterShown(desktopId);
+  const showHeader = !hideTitle || !!(back || subtitle || actions || readOnly || leading);
 
   return (
     <div className={cn("mx-auto flex w-full", narrow ? "max-w-[760px]" : "max-w-[1280px]", fill ? "h-full min-h-0 flex-1" : "flex-1")} data-testid={testId}>
-      <div className={cn("min-w-0 flex-1 px-4 pt-2 min-[24rem]:px-5", fill ? "flex min-h-0 flex-col pb-2" : flush ? "pb-0" : "pb-[calc(10rem+env(safe-area-inset-bottom))]")}>
-        <header className={cn("flex shrink-0 gap-3 pb-3", compact ? "items-center" : "items-start")}>
-          {wide ? null : (
-            <DrawerPrimitive.Root direction="left" open={open} onOpenChange={setOpen}>
-              <DrawerPrimitive.Trigger asChild>
-                <button
-                  type="button"
-                  aria-label={hasUnread ? "Open workspace list, new replies" : "Open workspace list"}
-                  data-unread={hasUnread}
-                  className="relative inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection"
-                >
-                  <Icon name="sidebar" size={20} />
-                  {hasUnread ? <span aria-hidden="true" data-testid="drawer-unread-badge" className="absolute top-2 right-2 size-2.5 rounded-pill border-2 border-background bg-brand" /> : null}
-                </button>
-              </DrawerPrimitive.Trigger>
-              <DrawerPortal>
-                <DrawerOverlay />
-                <DrawerPrimitive.Content
-                  data-slot="workspace-drawer"
-                  aria-describedby={undefined}
-                  className="fixed inset-y-0 left-0 z-50 flex w-[min(82vw,330px)] flex-col border-r border-stroke bg-drawer pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] text-content"
-                >
-                  <DrawerTitle className="sr-only">Workspace</DrawerTitle>
-                  <WorkspaceNav desktopId={desktopId} onNavigate={() => setOpen(false)} />
-                </DrawerPrimitive.Content>
-              </DrawerPortal>
-            </DrawerPrimitive.Root>
-          )}
-          {back ? (
-            <Link to={back.to} params={back.params} aria-label={back.label} className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection">
-              <Icon name="chevronDown" size={20} className="rotate-90" />
-            </Link>
-          ) : null}
-          <div className="min-w-0 flex-1">
-            <h1 className={cn("text-headline font-semibold", compact ? "truncate" : "wrap-anywhere")} title={compact ? title : undefined}>
-              {title}
-            </h1>
-            {subtitle ? (
-              // A path loses its start, not the folder that tells projects apart: the ellipsis goes on the left.
-              <p className="truncate text-left text-small text-muted-text" dir={typeof subtitle === "string" && /^[/~]/.test(subtitle) ? "rtl" : undefined} title={typeof subtitle === "string" ? subtitle : undefined}>
-                <bdi>{subtitle}</bdi>
-              </p>
+      <div className={cn("min-w-0 flex-1 px-4 pt-2 min-[24rem]:px-5", fill ? "flex min-h-0 flex-col pb-2" : flush ? "pb-0" : footerShown ? "pb-10" : "pb-[calc(2.5rem+env(safe-area-inset-bottom))]")}>
+        {hideTitle ? <h1 className="sr-only">{title}</h1> : null}
+        {showHeader ? (
+          <header className={cn("flex shrink-0 gap-3 pb-3", compact ? "items-center" : "items-start")}>
+            {back ? (
+              <Link to={back.to} params={back.params} aria-label={back.label} className="inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-fill hover:bg-selection">
+                <Icon name="chevronDown" size={20} className="rotate-90" />
+              </Link>
             ) : null}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            {readOnly ? <RequestControlChip desktopId={desktopId} /> : null}
-            {actions}
-          </div>
-        </header>
+            {leading}
+            <div className="min-w-0 flex-1">
+              {hideTitle ? null : (
+                <h1 className={cn("text-headline font-semibold", compact ? "truncate" : "wrap-anywhere")} title={compact ? title : undefined}>
+                  {title}
+                </h1>
+              )}
+              {subtitle ? (
+                // A path loses its start, not the folder that tells projects apart: the ellipsis goes on the left.
+                <p className="truncate text-left text-small text-muted-text" dir={typeof subtitle === "string" && /^[/~]/.test(subtitle) ? "rtl" : undefined} title={typeof subtitle === "string" ? subtitle : undefined}>
+                  <bdi>{subtitle}</bdi>
+                </p>
+              ) : null}
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {readOnly ? <RequestControlChip desktopId={desktopId} /> : null}
+              {actions}
+            </div>
+          </header>
+        ) : null}
         {children}
       </div>
     </div>

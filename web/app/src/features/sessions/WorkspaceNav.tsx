@@ -1,10 +1,10 @@
 // F-12: the workspace list, laid out as a messaging app's chat list (ported from
 // mobile/src/features/workspace/WorkspaceDrawer.tsx): Monos with their latest line and when, then
-// Projects, narrowed by the filter (All, Unread, Working now) and the search. It is the content of the
+// Projects, always in full (no desktop name, filter or search above them; New Mono sits in the Monos heading). It is the content of the
 // vaul drawer on the mobile layout and of the persistent sidebar from 640 px up (design-system 11). The desktop nav entries
 // (`desktop-nav-items` slot, Settings, Desktops) sit at the foot, except beside the activity rail, which carries them.
 import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useCatalog } from "@/data";
 import { requestCreateMono } from "@/features/monos/createRequest";
 import { MonoAvatar } from "@/features/monos/MonoAvatar";
@@ -12,27 +12,13 @@ import { useLinkState } from "@/link";
 import { useCapability } from "@/version";
 import { safeHexColor } from "@/lib/color";
 import { cn } from "@/lib/utils";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { Icon } from "@/ui/Icon";
-import { Input } from "@/ui/input";
 import { Slot } from "@/ui/slots";
-import { useDrawerFilter, type DrawerFilter, type DrawerShow } from "./drawerFilter";
 import { markMonoSeen, useCatalogUnreadMonos } from "./monoSeen";
 import { projectColor } from "./projectColors";
 import { ProjectMascot } from "./ProjectMascot";
 import { chatListTime } from "./relativeTime";
-import { canCreateMono, filterWorkspace, monoUnread, type CatalogMono, type CatalogProject } from "./workspaceFilter";
-
-const FILTERS: ReadonlyArray<{ value: DrawerFilter; label: string }> = [
-  { value: "all", label: "All" },
-  { value: "unread", label: "Unread" },
-  { value: "working", label: "Working now" },
-];
-const SHOWS: ReadonlyArray<{ value: DrawerShow; label: string }> = [
-  { value: "both", label: "Monos and projects" },
-  { value: "monos", label: "Monos" },
-  { value: "projects", label: "Projects" },
-];
+import { canCreateMono, monoUnread, sortMonos, type CatalogMono, type CatalogProject } from "./workspaceFilter";
 
 /** The start of a message as one plain line: markdown marks dropped, a reaction shown as its emoji. */
 export function oneLine(text: string): string {
@@ -111,41 +97,6 @@ export function MonoRow({
   );
 }
 
-function FilterMenu({ filter, show, onChange }: { filter: DrawerFilter; show: DrawerShow; onChange: (patch: { filter?: DrawerFilter; show?: DrawerShow }) => void }) {
-  const on = filter !== "all" || show !== "both";
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label={on ? "Filter, on" : "Filter"}
-          data-on={on}
-          className="inline-flex size-11 items-center justify-center rounded-pill bg-fill text-content hover:bg-selection data-[on=true]:text-brand pointer-fine:size-9"
-        >
-          <Icon name="filter" size={20} />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>Show</DropdownMenuLabel>
-        {SHOWS.map((option) => (
-          <DropdownMenuItem key={option.value} onSelect={() => onChange({ show: option.value })} aria-checked={show === option.value} role="menuitemradio">
-            <span className="flex-1">{option.label}</span>
-            {show === option.value ? <Icon name="check" size={16} /> : null}
-          </DropdownMenuItem>
-        ))}
-        <DropdownMenuSeparator />
-        <DropdownMenuLabel>Which</DropdownMenuLabel>
-        {FILTERS.map((option) => (
-          <DropdownMenuItem key={option.value} onSelect={() => onChange({ filter: option.value })} aria-checked={filter === option.value} role="menuitemradio">
-            <span className="flex-1">{option.label}</span>
-            {filter === option.value ? <Icon name="check" size={16} /> : null}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
 /** The active project or Mono id from the current path. */
 function useActivePlace(desktopId: string): { projectId?: string; monoId?: string } {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
@@ -172,7 +123,6 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono, railed = false 
   const catalog = useCatalog();
   const monoTools = useCapability("monoTools");
   const readOnly = useLinkState((state) => state.permission === "read");
-  const desktopName = useLinkState((state) => state.desktopName);
   const navigate = useNavigate();
   const newMono = () => {
     if (onNewMono) {
@@ -184,38 +134,32 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono, railed = false 
     onNavigate?.();
     void navigate({ to: "/d/$desktopId/monos", params: { desktopId } });
   };
-  const [{ filter, show }, update] = useDrawerFilter();
-  const [query, setQuery] = useState("");
   const active = useActivePlace(desktopId);
   const data = catalog.data;
   const unreadIds = useCatalogUnreadMonos(desktopId);
-  const { monos, projects } = data ? filterWorkspace(data, query, { filter, show }, unreadIds) : { monos: [], projects: [] };
+  const monos = data ? sortMonos(data.monos) : [];
+  const projects = data?.projects ?? [];
+  const canNewMono = canCreateMono(monoTools) && !readOnly;
 
   // A Mono open on screen has its latest reply seen (F-17).
   const openMono = data?.monos.find((mono) => mono.id === active.monoId);
   useEffect(() => {
     if (openMono) markMonoSeen(desktopId, openMono);
   }, [desktopId, openMono]);
-  const narrowed = query.trim() !== "" || filter !== "all" || show !== "both";
 
   return (
     <nav aria-label="Workspace" data-testid="workspace-nav" className="flex h-full min-h-0 flex-col bg-drawer">
-      <div className="flex items-center gap-2.5 px-4 pt-3 pb-2">
-        <span className="min-w-0 flex-1 truncate text-title font-semibold" title={desktopName ?? undefined}>{desktopName ?? "Monoptah"}</span>
-        <FilterMenu filter={filter} show={show} onChange={update} />
-        {canCreateMono(monoTools) && !readOnly ? (
-          <button type="button" aria-label="New Mono" onClick={newMono} className="inline-flex size-11 items-center justify-center rounded-pill bg-fill hover:bg-selection pointer-fine:size-9">
-            <Icon name="add" size={20} />
-          </button>
-        ) : null}
-      </div>
-      <div className="px-4 pb-2">
-        <Input type="search" aria-label="Filter projects" placeholder="Filter projects" autoComplete="off" value={query} onChange={(event) => setQuery(event.target.value)} />
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-3">
-        {monos.length > 0 ? (
+      <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pt-3 pb-3">
+        {monos.length > 0 || canNewMono ? (
           <section aria-label="Monos" className="flex flex-col gap-0.5">
-            <h2 className="px-2.5 pb-1 text-meta font-medium text-muted-text">Monos</h2>
+            <div className="flex items-center justify-between gap-2 pb-1">
+              <h2 className="px-2.5 text-meta font-medium text-muted-text">Monos</h2>
+              {canNewMono ? (
+                <button type="button" aria-label="New Mono" onClick={newMono} className="inline-flex size-11 items-center justify-center rounded-pill hover:bg-selection pointer-fine:size-9">
+                  <Icon name="add" size={20} />
+                </button>
+              ) : null}
+            </div>
             {monos.map((mono) => (
               <MonoRow key={mono.id} desktopId={desktopId} mono={mono} active={mono.id === active.monoId} unread={unreadIds.has(mono.id)} onNavigate={onNavigate} />
             ))}
@@ -230,7 +174,7 @@ export function WorkspaceNav({ desktopId, onNavigate, onNewMono, railed = false 
           </section>
         ) : null}
         {data && monos.length === 0 && projects.length === 0 ? (
-          <p className="px-4 pt-3 text-label text-muted-text">{narrowed ? "Nothing matches." : "No Monos or projects on this desktop yet."}</p>
+          <p className="px-4 pt-3 text-label text-muted-text">No Monos or projects on this desktop yet.</p>
         ) : null}
         {!data && catalog.isPending ? <p className="px-4 pt-3 text-label text-muted-text">Loading…</p> : null}
         {!data && catalog.isError ? <div className="flex items-center gap-2 px-4 pt-3 text-label text-muted-text">

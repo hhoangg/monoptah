@@ -13,6 +13,7 @@ import { clearLinkStores, getLinkStore } from "@/link/store.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
+import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { resetSessionActivity, useActivityStore } from "./activityStore";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLinkOptions } from "./dev/mockLink";
@@ -264,8 +265,7 @@ describe("filters (F-23) and worktree scoping (F-22)", () => {
     expect(inWorktree({ branch: "main" }, null)).toBe(true);
   });
 
-  it("the workspace menu lists worktrees, scopes the list to a pick and links to the changes", async () => {
-    const user = userEvent.setup();
+  it("the session list has no workspace (branch) menu and lists the sessions of every worktree", async () => {
     mount("/p/proj-alpha", {}, {
       "project.worktrees": () => ({
         worktrees: [
@@ -274,19 +274,11 @@ describe("filters (F-23) and worktree scoping (F-22)", () => {
         ],
       }),
     });
-    await screen.findAllByTestId("session-card");
-    await user.click(screen.getByRole("button", { name: /^Workspace:/ }));
-    const menu = await screen.findByRole("menu");
-    expect(within(menu).getByRole("menuitem", { name: "View changes" })).toHaveAttribute("href", `/d/${DESKTOP_ID}/p/proj-alpha/changes`);
-    expect(within(menu).queryByRole("menuitemradio", { name: "main" })).toBeNull();
-    expect(within(menu).getByRole("menuitemradio", { name: /^Project checkout/ })).toHaveAttribute("aria-checked", "true");
-    await user.click(within(menu).getByRole("menuitemradio", { name: "feature/task-1" }));
-    await waitFor(() => {
-      const cards = screen.getAllByTestId("session-card");
-      expect(cards.length).toBeGreaterThan(0);
-      for (const element of cards) expect(element.textContent).toContain("feature/task-1");
-    });
-    expect(screen.getByRole("button", { name: "Workspace: feature/task-1" })).toBeInTheDocument();
+    const cards = await screen.findAllByTestId("session-card");
+    expect(screen.queryByRole("button", { name: /^Workspace:/ })).toBeNull();
+    // Unscoped: a session of the feature/task-1 worktree and one of another branch are both listed.
+    expect(cards.some((card) => card.textContent?.includes("feature/task-1"))).toBe(true);
+    expect(cards.some((card) => !card.textContent?.includes("feature/task-1"))).toBe(true);
   });
 });
 
@@ -306,6 +298,7 @@ describe("open after starting (F-20)", () => {
 describe("mascots (F-91)", () => {
   it("projects in the drawer show a mascot in the project's colour", async () => {
     const user = userEvent.setup();
+    registerSlot("desktop-switcher", DesktopSwitcher);
     mount("");
     await user.click(await screen.findByRole("button", { name: /^Open workspace list/ }));
     const nav = await screen.findByRole("navigation", { name: "Workspace" });
@@ -318,6 +311,7 @@ describe("mascots (F-91)", () => {
   it("a working project alternates its frames every 300 ms, and rests under reduced motion", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    registerSlot("desktop-switcher", DesktopSwitcher);
     mount("");
     await user.click(await screen.findByRole("button", { name: /^Open workspace list/ }));
     const nav = await screen.findByRole("navigation", { name: "Workspace" });
@@ -517,6 +511,7 @@ describe("Mono unread tracking (F-17)", () => {
   });
 
   it("the drawer button carries an unread badge while a Mono has an unseen reply", async () => {
+    registerSlot("desktop-switcher", DesktopSwitcher);
     mount("");
     const button = await screen.findByRole("button", { name: "Open workspace list, new replies" });
     expect(within(button).getByTestId("drawer-unread-badge")).toBeInTheDocument();

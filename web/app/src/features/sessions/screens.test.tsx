@@ -10,10 +10,10 @@ import { clearLinkStores } from "@/link/store.ts";
 import { createQueryClient } from "@/lib/queryClient";
 import { createAppRouter } from "@/router";
 import { clearHooks, registerSessionCapabilities } from "@/ui/hooks";
+import { DesktopSwitcher } from "@/features/desktops/DesktopSwitcher";
 import { clearSlots, registerSlot } from "@/ui/slots";
 import { resetSessionActivity } from "./activityStore";
 import { DESKTOP_ID, connectMockDesktop, emptyWorkspace, seedWorkspace, type MockLink, type MockLinkOptions } from "./dev/mockLink";
-import { DRAWER_FILTER_KEY } from "./drawerFilter";
 import { lastPlaceKey } from "./lastPlace";
 import { resetNewSessionDrafts } from "./newSessionDraft";
 
@@ -132,6 +132,51 @@ describe("catalog home", () => {
   });
 });
 
+describe("workspace chrome", () => {
+  beforeEach(() => registerSlot("desktop-switcher", DesktopSwitcher));
+
+  it("has the drawer toggle in the top bar, before the desktop switcher, below 640px", async () => {
+    mount("");
+    const toggle = await screen.findByRole("button", { name: /^Open workspace list/ });
+    const bar = screen.getByTestId("desktop-top-bar");
+    expect(bar).toContainElement(toggle);
+    const switcher = await screen.findByRole("button", { name: /^Switch desktop/ });
+    expect(toggle.compareDocumentPosition(switcher) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // It is not in the page header any more.
+    expect(within(screen.getByTestId("route-stub")).queryByRole("button", { name: /^Open workspace list/ })).toBeNull();
+  });
+
+  it("has no drawer toggle from 640px up, where the sidebar carries the list", async () => {
+    stubMatchMedia(true);
+    mount("");
+    await screen.findByRole("heading", { level: 1, name: "Workspace" });
+    expect(screen.queryByRole("button", { name: /^Open workspace list/ })).toBeNull();
+  });
+
+  it("keeps exactly one h1, named Workspace, with no visible title row on the home screen", async () => {
+    mount("");
+    await screen.findByRole("heading", { level: 1, name: "Workspace" });
+    expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+    expect(screen.getByRole("heading", { level: 1 })).toHaveClass("sr-only");
+    expect(within(screen.getByTestId("route-stub")).queryByRole("banner")).toBeNull();
+  });
+
+  it("does not pad the bottom of the home by 10rem", async () => {
+    mount("");
+    await screen.findByRole("heading", { level: 1, name: "Workspace" });
+    const padded = screen.getByTestId("route-stub").firstElementChild as HTMLElement;
+    expect(padded.className).not.toContain("10rem");
+    expect(padded.className).toContain("pb-10");
+  });
+
+  it("clears the bottom safe-area inset itself on a phone screen without the footer bar", async () => {
+    mount("/cloud");
+    const padded = (await screen.findByTestId("cloud-screen")).firstElementChild as HTMLElement;
+    expect(padded.className).toContain("pb-[calc(2.5rem+env(safe-area-inset-bottom))]");
+    expect(padded.className).not.toContain("pb-10");
+  });
+});
+
 describe("last used desktop (N-12)", () => {
   it("is remembered from a screen that is no workspace place, so `/` can bring the user back", async () => {
     mount("/cloud");
@@ -141,6 +186,9 @@ describe("last used desktop (N-12)", () => {
 });
 
 describe("workspace drawer (F-12)", () => {
+  // The drawer's toggle lives in the /d top bar (the desktop-switcher slot), below 640 px.
+  beforeEach(() => registerSlot("desktop-switcher", DesktopSwitcher));
+
   async function openDrawer(user: ReturnType<typeof userEvent.setup>) {
     await screen.findByRole("heading", { level: 1, name: "Workspace" });
     await user.click(screen.getByRole("button", { name: /^Open workspace list/ }));
@@ -156,6 +204,49 @@ describe("workspace drawer (F-12)", () => {
     expect(labels).toEqual(["Monos", "Projects"]);
     const names = within(nav).getAllByRole("link").map((link) => link.textContent ?? "");
     expect(names.findIndex((t) => t.includes("Research Mono"))).toBeLessThan(names.findIndex((t) => t.includes("Example Alpha")));
+  });
+
+  it("closes when the location changes without going through a nav row (history back, router navigation)", async () => {
+    const user = userEvent.setup();
+    const { router } = mount("");
+    await openDrawer(user);
+    await act(async () => {
+      await router.navigate({ to: "/d/$desktopId/cloud", params: { desktopId: DESKTOP_ID } });
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Open workspace list/, hidden: true })).toHaveAttribute("aria-expanded", "false"));
+  });
+
+  it("closes on history back", async () => {
+    const user = userEvent.setup();
+    const { router } = mount("");
+    await screen.findByRole("heading", { level: 1, name: "Workspace" });
+    await act(async () => {
+      await router.navigate({ to: "/d/$desktopId/cloud", params: { desktopId: DESKTOP_ID } });
+    });
+    await screen.findByTestId("cloud-screen");
+    await user.click(screen.getByRole("button", { name: /^Open workspace list/ }));
+    await screen.findByRole("navigation", { name: "Workspace" });
+    act(() => router.history.back());
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Open workspace list/, hidden: true })).toHaveAttribute("aria-expanded", "false"));
+  });
+
+  it("does not reopen by itself when history back returns to the path it was opened on", async () => {
+    const user = userEvent.setup();
+    const { router } = mount("");
+    await openDrawer(user);
+    await act(async () => {
+      await router.navigate({ to: "/d/$desktopId/cloud", params: { desktopId: DESKTOP_ID } });
+    });
+    await screen.findByTestId("cloud-screen");
+    act(() => router.history.back());
+    await screen.findByRole("heading", { level: 1, name: "Workspace" });
+    await waitFor(() => expect(router.state.status).toBe("idle"));
+    const toggle = () => screen.getByRole("button", { name: /^Open workspace list/, hidden: true });
+    expect(toggle()).toHaveAttribute("aria-expanded", "false");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(toggle()).toHaveAttribute("aria-expanded", "false");
   });
 
   it("links Desktop settings to this desktop's page in settings and All desktops to the list", async () => {
@@ -177,34 +268,46 @@ describe("workspace drawer (F-12)", () => {
     expect(await screen.findByTestId("create-mono")).toBeInTheDocument();
   });
 
-  it("narrows by search and the Working now filter, and keeps the filter after a reload", async () => {
+  it("has no desktop name row, Filter projects input or filter button", async () => {
     const user = userEvent.setup();
     mount("");
     const nav = await openDrawer(user);
     await within(nav).findByText("Example Alpha");
-    await user.type(within(nav).getByRole("searchbox", { name: "Filter projects" }), "gamma");
-    expect(within(nav).queryByText("Example Alpha")).toBeNull();
-    expect(within(nav).getByText("Gamma Service")).toBeInTheDocument();
-    await user.clear(within(nav).getByRole("searchbox", { name: "Filter projects" }));
-
-    await user.click(within(nav).getByRole("button", { name: "Filter" }));
-    await user.click(await screen.findByRole("menuitemradio", { name: "Working now" }));
-    expect(JSON.parse(localStorage.getItem(DRAWER_FILTER_KEY) ?? "{}")).toMatchObject({ filter: "working" });
-    // Working now keeps the busy project and the working Mono only.
-    expect(within(nav).getByText("Gamma Service")).toBeInTheDocument();
-    expect(within(nav).queryByText("Example Alpha")).toBeNull();
-    expect(within(nav).getByText("Research Mono")).toBeInTheDocument();
+    expect(within(nav).queryByRole("searchbox")).toBeNull();
+    expect(within(nav).queryByRole("button", { name: /^Filter/ })).toBeNull();
   });
 
-  it("applies the stored filter on the next load", async () => {
-    localStorage.setItem(DRAWER_FILTER_KEY, JSON.stringify({ filter: "unread", show: "monos" }));
+  it("shows every Mono and project even with a narrowing filter saved by an older version", async () => {
+    localStorage.setItem("monoptah.drawer.filter", JSON.stringify({ filter: "unread", show: "monos" }));
     const user = userEvent.setup();
     mount("");
     const nav = await openDrawer(user);
     await within(nav).findByText("Example Mono");
-    expect(within(nav).queryByText("Research Mono")).toBeNull();
-    expect(within(nav).queryByRole("region", { name: "Projects" })).toBeNull();
-    expect(within(nav).getByRole("button", { name: "Filter, on" })).toBeInTheDocument();
+    expect(within(nav).getByText("Research Mono")).toBeInTheDocument();
+    expect(within(nav).getByRole("region", { name: "Projects" })).toBeInTheDocument();
+    expect(within(nav).getByText("Example Alpha")).toBeInTheDocument();
+    expect(within(nav).getByText("Gamma Service")).toBeInTheDocument();
+    expect(within(nav).queryByRole("button", { name: /^Filter/ })).toBeNull();
+  });
+
+  it("puts New Mono in the Monos heading row", async () => {
+    const user = userEvent.setup();
+    mount("");
+    const nav = await openDrawer(user);
+    const monos = await within(nav).findByRole("region", { name: "Monos" });
+    await waitFor(() => expect(within(monos).getByRole("button", { name: "New Mono" })).toBeInTheDocument());
+    const heading = within(monos).getByRole("heading", { level: 2, name: "Monos" });
+    expect(heading.parentElement).toContainElement(within(monos).getByRole("button", { name: "New Mono" }));
+  });
+
+  it("still offers New Mono in the Monos heading when there are no Monos yet", async () => {
+    const user = userEvent.setup();
+    mount("", { seed: (desktop) => void ((desktop.world.monos() as unknown as unknown[]).length = 0) });
+    const nav = await openDrawer(user);
+    await within(nav).findByText("Example Alpha");
+    const monos = await within(nav).findByRole("region", { name: "Monos" });
+    expect(within(monos).queryAllByRole("link")).toHaveLength(0);
+    expect(within(monos).getByRole("button", { name: "New Mono" })).toBeInTheDocument();
   });
 
   it("renders the desktop-nav-items slot", async () => {
@@ -219,7 +322,13 @@ describe("workspace drawer (F-12)", () => {
 describe("project sessions list (F-18, F-21, F-24)", () => {
   it("shows the project's cards in desktop order with the working label, age, branch and model", async () => {
     mount("/p/proj-alpha");
-    expect(await screen.findByRole("heading", { level: 1, name: "Example Alpha" })).toBeInTheDocument();
+    const title = await screen.findByRole("heading", { level: 1, name: "Example Alpha" });
+    // The project's avatar (the mascot of the sidebar's project row) comes before the title, hidden from assistive technology.
+    const avatar = title.closest("header")?.querySelector("svg[data-mascot]");
+    expect(avatar).not.toBeNull();
+    expect(avatar).toHaveAttribute("aria-hidden", "true");
+    expect(avatar?.getAttribute("width")).toBe("32");
+    expect(avatar?.querySelector("path")?.getAttribute("fill")).toBe("#4f8cff");
     const list = await screen.findByTestId("sessions-list");
     const cards = await within(list).findAllByTestId("session-card");
     const working = cards.find((card) => card.dataset.sessionId === "sess-seed-0")!;
@@ -230,6 +339,12 @@ describe("project sessions list (F-18, F-21, F-24)", () => {
     // An idle session shows its age instead.
     const idle = cards.find((card) => card.dataset.sessionId === "sess-seed-5")!;
     expect(within(idle).getByText(/^\d+[mhd]$/)).toBeInTheDocument();
+  });
+
+  it("has no branch chip in the session list", async () => {
+    mount("/p/proj-alpha");
+    await screen.findByRole("searchbox", { name: "Search sessions" });
+    expect(screen.queryByRole("button", { name: /^Workspace:/ })).toBeNull();
   });
 
   it("virtualizes the rows and pages the next 30 in when the window reaches the end", async () => {
