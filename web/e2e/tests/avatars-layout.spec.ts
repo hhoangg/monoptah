@@ -171,6 +171,10 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
   });
 
   test("Mono avatar: the list, the chat header and the signature draw the mascot and color the desktop sent", async () => {
+    // Every test above reloads full pages in one session (the desktop settings page polls its list, detail, grants and
+    // push prefs), so the session reaches the Worker's 120 calls per minute just before this test: start a new window.
+    test.setTimeout(180_000);
+    await clearRateLimits();
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto(`/d/${desktopId}`);
     const sidebar = page.getByTestId("app-sidebar");
