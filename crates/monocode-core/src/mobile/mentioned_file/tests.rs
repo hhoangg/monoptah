@@ -1022,6 +1022,43 @@ fn the_same_file_spelled_two_ways_is_one_file() {
     assert!(run(&said, &work, &params("docs/./a.md")).is_ok());
 }
 
+#[test]
+fn a_bare_name_is_found_in_a_selected_project_and_never_in_one_the_device_did_not_pick() {
+    let fx = Fx::new();
+    let (picked, other) = (fx.root.join("picked"), fx.root.join("other"));
+    fx.write("picked/guide.md", "# picked");
+    fx.write("other/notes.md", "# other");
+    fx.write("home/.keep", "");
+    let texts = vec!["see `guide.md` and `notes.md`".to_owned()];
+    // What the app hands over for a device that picked one project: the search roots hold the
+    // device's own projects only.
+    let cwd = fx.text("home");
+    let roots = crate::files::links::search_roots(
+        &cwd,
+        None,
+        &[],
+        &[picked.to_string_lossy().into_owned()],
+        |_| Vec::new(),
+    );
+    let tool = write_rows_for(&texts);
+    let mut ctx = Context::new(&texts, &cwd, &roots, &[]);
+    ctx.tool_texts = &tool;
+    ctx.home = None;
+    let reply = serve(&params("guide.md"), &ctx).unwrap();
+    assert_eq!(reply.path, picked.join("guide.md").to_string_lossy());
+    // The other project is no root: the bare name finds nothing, and its absolute path is
+    // no mentioned file.
+    assert_eq!(
+        code(&serve(&params("notes.md"), &ctx)),
+        Some(Code::NotFound)
+    );
+    let absolute = other.join("notes.md").to_string_lossy().into_owned();
+    assert_eq!(
+        code(&serve(&params(&absolute), &ctx)),
+        Some(Code::Forbidden)
+    );
+}
+
 // ---- R3: more deny-list outside the projects ----
 
 #[cfg(unix)]

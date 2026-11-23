@@ -365,6 +365,31 @@ struct Scene<'a> {
     mono: bool,
 }
 
+/// The folders a relative mention is looked for in, best first: the conversation's project, the
+/// session's worktree and the project's other worktrees, the Mono's projects, then the projects
+/// the device selected. A project the device did not select is never a root, so a bare name
+/// cannot reach it (the rest of the rules in `mentioned_file` apply on top).
+fn device_search_roots(
+    project_cwd: &str,
+    exec_cwd: &str,
+    mono_roots: &[String],
+    projects: &[monocode_core::mobile::mentioned_file::Project],
+) -> Vec<String> {
+    let selected: Vec<String> = projects
+        .iter()
+        .filter(|project| project.selected)
+        .map(|project| project.root.to_string_lossy().into_owned())
+        .collect();
+    let project = mono_roots.first().map_or(project_cwd, String::as_str);
+    monocode_core::files::links::search_roots(
+        project,
+        (exec_cwd != project_cwd).then_some(exec_cwd),
+        mono_roots,
+        &selected,
+        monocode_core::files::links::project_worktrees,
+    )
+}
+
 /// The context of a call: the base folder for a relative mention, the Mono's roots, the
 /// projects, and the session's start and worktree for the freshness rule.
 fn mention_context<'a>(
@@ -1496,6 +1521,7 @@ impl Shell {
                         // A relative mention is read against what the desktop's click binds
                         // it to: a Mono's first local project, else the session's folder.
                         let cwd = roots.first().cloned().unwrap_or_else(|| exec_cwd.clone());
+                        let roots = device_search_roots(&project_cwd, &exec_cwd, &roots, &projects);
                         // The session's creation time, when the database records it.
                         let created = session.and_then(|id| {
                             locked(&store).ok()?.session_created_at(id).ok().flatten()
@@ -1675,6 +1701,7 @@ impl Shell {
                             })
                             .collect();
                         let cwd = roots.first().cloned().unwrap_or_else(|| exec_cwd.clone());
+                        let roots = device_search_roots(&project_cwd, &exec_cwd, &roots, &projects);
                         let scene = Scene {
                             created: None,
                             exec_cwd: &exec_cwd,

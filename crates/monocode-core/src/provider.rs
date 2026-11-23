@@ -567,6 +567,18 @@ impl Protocol {
                             )
                             .into();
                         }
+                        if self.request.settings.mono.is_none() {
+                            // A Mono's rules carry it already.
+                            params["developerInstructions"] = format!(
+                                "{} {}",
+                                params["developerInstructions"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .trim_end(),
+                                crate::files::links::MENTION_RULE
+                            )
+                            .into();
+                        }
                         if self.request.settings.text_only {
                             params["ephemeral"] = true.into();
                             params["developerInstructions"] = "Answer the supplied text request directly. Do not call tools or inspect the workspace.".into();
@@ -2060,6 +2072,33 @@ mod tests {
         assert!(instructions.starts_with("You are the coding agent in Monoptah."));
         assert!(instructions.contains("## Be quick"));
         assert!(instructions.contains("- /repo"));
+    }
+    #[test]
+    fn a_plain_codex_session_is_told_how_to_name_files_and_a_mono_gets_it_once() {
+        let developer = |mono: Option<crate::agent::MonoContext>| {
+            let mut p = protocol(Kind::Codex);
+            p.request.settings.mono = mono;
+            let mut out = Vec::new();
+            p.frame(json!({"id":1,"result":{}}), &mut out).unwrap();
+            let started: Value = String::from_utf8_lossy(&out)
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .find(|message| message["method"] == "thread/start")
+                .unwrap();
+            started["params"]["developerInstructions"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let rule = crate::files::links::MENTION_RULE;
+        assert!(developer(None).ends_with(rule));
+        let mono = developer(Some(crate::agent::MonoContext {
+            mono: crate::mono::Mono::default(),
+            root: "/monos".into(),
+            executable: "/bin/monocode-gpui".into(),
+            browser_database: None,
+        }));
+        assert_eq!(mono.matches(rule).count(), 1, "{mono}");
     }
     #[test]
     fn codex_rules_mention_the_browser_only_when_the_launch_added_its_server() {

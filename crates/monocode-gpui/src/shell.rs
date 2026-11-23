@@ -9678,7 +9678,7 @@ impl Render for Shell {
                     if this.open_cloud_path(&event.0, window, cx) {
                         return;
                     }
-                    let (cwd, path, location) = this.link_target(&event.0, cx);
+                    let (cwd, path, location, _) = this.link_target(&event.0, cx);
                     this.open_file_at(cwd, path, location, window, cx);
                 }),
             )
