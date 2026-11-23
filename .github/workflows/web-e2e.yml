@@ -41,9 +41,16 @@ env:
 
 jobs:
   e2e:
-    name: Web E2E (R-12, W-14, E-01)
+    name: Web E2E shard ${{ matrix.shard }}/${{ strategy.job-total }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # 4 shards were picked from per-spec durations (run 45203776323: 681 s of tests). Playwright
+    # `--shard` splits contiguous file groups by test count, so the busiest shard holds about
+    # 250 s (r12 + session-row-gestures + the webkit-mobile specs); more shards do not shorten it.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,7 +65,7 @@ jobs:
         with:
           workspaces: crates/monocode-gpui
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/web-app-impl' }}
+          save-if: ${{ matrix.shard == 1 && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/feat/web-app-impl') }}
       - name: Install Linux core dependencies
         run: |
           sudo apt-get update
@@ -78,15 +85,81 @@ jobs:
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+      # The CLI `--reporter` replaces the config reporters (list + html) in CI; the per-shard blobs
+      # are merged into one HTML report by the `report` job. Sharding runs across both projects,
+      # so webkit-mobile tests land in a shard too.
       - name: E2E
         env:
           CI: "true"
           E2E_OUTPUT_DIR: ${{ runner.temp }}/e2e
-        run: scripts/e2e-web.sh
+          PLAYWRIGHT_BLOB_OUTPUT_DIR: ${{ runner.temp }}/blob-report
+        run: scripts/e2e-web.sh --shard=${{ matrix.shard }}/${{ strategy.job-total }} --reporter=list,blob
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: web-e2e
+          name: web-e2e-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/e2e
           retention-days: 7
           if-no-files-found: ignore
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-blob-${{ matrix.shard }}
+          path: ${{ runner.temp }}/blob-report
+          retention-days: 1
+          if-no-files-found: ignore
+
+  report:
+    name: Web E2E report
+    needs: e2e
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: web/e2e/package.json
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: web-e2e-blob-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/blob-reports
+      - name: Merge reports
+        env:
+          BLOB_DIR: ${{ runner.temp }}/blob-reports
+          PLAYWRIGHT_HTML_OUTPUT_DIR: ${{ runner.temp }}/playwright-report
+          PLAYWRIGHT_HTML_OPEN: never
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./web/e2e/package.json').devDependencies['@playwright/test']")"
+          if ! compgen -G "$BLOB_DIR/*.zip" > /dev/null; then
+            echo "::notice::No blob reports found in $BLOB_DIR, nothing to merge"
+            exit 0
+          fi
+          npx --yes "playwright@$version" merge-reports --reporter html "$BLOB_DIR"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-report
+          path: ${{ runner.temp }}/playwright-report
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # One stable check that is green only when every shard passed; it does not wait for the report job.
+  e2e-result:
+    name: Web E2E (R-12, W-14, E-01)
+    needs: e2e
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check shard results
+        env:
+          RESULT: ${{ needs.e2e.result }}
+        run: |
+          echo "Shard result: $RESULT"
+          [ "$RESULT" = "success" ]
