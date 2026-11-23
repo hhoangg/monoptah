@@ -1301,3 +1301,17 @@ fn a_resolved_node_outside_path_is_ready_and_leads_the_spawn_path() {
     );
     assert_eq!(runtime.spec.command, "/n/bin/npx");
 }
+
+#[test]
+fn every_level_tells_the_mono_to_list_tabs_and_reuse_one() {
+    for trust in BrowserTrust::ALL {
+        let mut b = browser("Profile 6");
+        b.trust = trust;
+        let block = prompt_block(&b);
+        assert!(
+            block.contains("ALWAYS call `browser_tabs` with action `list` first"),
+            "{trust:?}"
+        );
+        assert!(block.contains("allow_duplicate_tab"), "{trust:?}");
+    }
+}

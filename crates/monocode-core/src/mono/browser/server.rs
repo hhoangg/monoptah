@@ -17,8 +17,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// A server nobody has asked for in this long is stopped.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// A server nobody has asked for in this long is stopped (checked when another Mono starts its
+/// own). Stopping it ends the extension connection, and the tabs of its group are left behind
+/// (see [`super::gate::tabs`]), so this is long: a Mono that is used again after hours still
+/// finds its Teams or Slack tab open and owned.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// What starts a server: the command, its arguments (no port flags yet) and the token.
 pub struct ServerLaunch<'a> {

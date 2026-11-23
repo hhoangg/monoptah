@@ -41,6 +41,7 @@ mod guard;
 mod http;
 pub mod overlay;
 mod stdio;
+pub mod tabs;
 pub use http::HttpUpstream;
 pub use stdio::StdioUpstream;
 
@@ -726,6 +727,8 @@ struct Inner {
     traces: Mutex<std::collections::HashMap<String, Trace>>,
     /// Failed recipe runs waiting for the Mono's repair patch (in memory, with an expiry).
     repairs: recipe::repair::Book,
+    /// Which tabs the agent opened and when each was used (see [`tabs`]).
+    tabs: Mutex<tabs::TabBook>,
     /// What each route (app session) read and declared this turn (see [`defense`]).
     turns: Mutex<std::collections::HashMap<String, defense::Turn>>,
     /// This gate, for the suggestion card that waits on its own thread.
@@ -787,6 +790,7 @@ impl Gate {
         let inner = Arc::new_cyclic(|me| Inner {
             me: me.clone(),
             turns: Mutex::new(Default::default()),
+            tabs: Mutex::new(Default::default()),
             state: Mutex::new(State {
                 policy,
                 upstream,
@@ -1027,6 +1031,17 @@ impl Inner {
             .cloned()
             .collect();
         for tool in &mut tools {
+            if tool["name"] == "browser_tabs" {
+                tool["inputSchema"]["properties"][tabs::DUPLICATE_FLAG] = json!({
+                    "type": "boolean",
+                    "description": "Only with action new: open a second tab even when that site is already open. Use it only when the user asked for another tab; otherwise the existing tab is reused.",
+                });
+                let description = tool["description"].as_str().unwrap_or("").to_owned();
+                tool["description"] = format!(
+                    "{description} Call action list first and reuse an open tab for the same site: a new tab to a site that is already open switches to that tab instead."
+                )
+                .into();
+            }
             if tool["name"]
                 .as_str()
                 .is_some_and(|n| CODE_TOOLS.contains(&n))
@@ -1153,6 +1168,11 @@ impl Inner {
             Ok(Authorized::Forward) => {}
         }
         let mut forwarded = args;
+        // Never sent on: Playwright does not know it.
+        let duplicate_wanted = forwarded
+            .as_object_mut()
+            .and_then(|map| map.remove(tabs::DUPLICATE_FLAG))
+            .is_some_and(|flag| flag == true);
         if CODE_TOOLS.contains(&name) {
             if let Some(map) = forwarded.as_object_mut() {
                 map.remove("explanation");
@@ -1171,17 +1191,279 @@ impl Inner {
             }
         }
         let page_before = self.lock_state().page.clone();
-        let result = {
+        let TabOutcome {
+            result,
+            note,
+            performed,
+        } = {
             let _one_at_a_time = self.run.lock().unwrap_or_else(|e| e.into_inner());
-            self.act(name, &forwarded, false)
+            self.act_tracking_tabs(route, name, &forwarded, duplicate_wanted)
         };
         if let Some(workspace) = &workspace {
-            self.trace(route, workspace, name, &forwarded, &page_before, &result);
+            // A recording keeps what was done in the browser: a call the gate made instead of the
+            // agent's (a tab switch) is what a replay must make too.
+            if performed.is_empty() {
+                self.trace(route, workspace, name, &forwarded, &page_before, &result);
+            }
+            for (done, args) in &performed {
+                self.trace(route, workspace, done, args, &page_before, &result);
+            }
             if result["isError"] != true {
                 self.maybe_suggest(route, workspace);
             }
         }
-        self.defend(route, name, result)
+        let mut result = self.defend(route, name, result);
+        // The gate's own note sits outside the page-content fence.
+        if let (Some(note), Some(parts)) = (note, result["content"].as_array_mut()) {
+            parts.push(json!({"type": "text", "text": note}));
+        }
+        result
+    }
+
+    /// The tabs the browser has now, or none when the list could not be read.
+    fn list_tabs(&self) -> Vec<tabs::Tab> {
+        let args = json!({"action": "list"});
+        match self.upstream_rpc(
+            "tools/call",
+            json!({"name": "browser_tabs", "arguments": args}),
+        ) {
+            Ok(result) if result["isError"] != true => tabs::parse_tabs(&result_text(&result)),
+            _ => Vec::new(),
+        }
+    }
+    fn lock_tabs(&self) -> std::sync::MutexGuard<'_, tabs::TabBook> {
+        self.tabs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Whether the policy lets a call the gate derives from the agent's (a tab switch, a close of
+    /// a tab the agent made, a navigation to the very address the agent asked for) run without
+    /// asking anyone. The agent's own call was authorized once, before; a derived call never
+    /// prompts, and one that would is not made.
+    fn derived_allowed(&self, route: &str, name: &str, args: &Value) -> bool {
+        let (policy, page_url) = {
+            let state = self.lock_state();
+            (state.policy.clone(), state.page.clone())
+        };
+        // The same untrusted-content check as the agent's own call gets, but never asked.
+        let verdict = policy.evaluate(name, args, &page_url);
+        let verdict = self.apply_taint(route, name, args, &page_url, verdict);
+        verdict == Verdict::Allow
+    }
+
+    /// [`Inner::act`] for an authorized call that may open a tab or change which one is in use.
+    ///
+    /// * A new tab (or a navigation) to an address whose origin is already open in a tab the
+    ///   agent made switches to that tab instead, and loads the address there. A tab the user
+    ///   owns is only switched to, and only when it already shows that page: it is never
+    ///   navigated away.
+    /// * The tabs the agent made are closed least recently used first when a ninth tab would open
+    ///   ([`tabs::MAX_TABS`]), only where the policy allows a close without asking.
+    /// * The switch is checked on the result (the current tab must be the one expected), and any
+    ///   doubt or failure falls back to the call exactly as the agent made it.
+    ///
+    /// Everything the gate does itself is reported in `performed`, so a recording replays it.
+    fn act_tracking_tabs(
+        &self,
+        route: &str,
+        name: &str,
+        forwarded: &Value,
+        duplicate_wanted: bool,
+    ) -> TabOutcome {
+        let action = forwarded["action"].as_str().unwrap_or("");
+        let opens_tab = name == "browser_tabs" && action == "new";
+        let navigates = name == "browser_navigate";
+        let url = forwarded["url"].as_str().unwrap_or("").trim().to_owned();
+        if !(opens_tab || navigates) {
+            return self.as_asked(name, forwarded, &url);
+        }
+        let list = self.list_tabs();
+        if list.is_empty() {
+            // The list could not be read: do what the agent asked, as before.
+            return self.as_asked(name, forwarded, &url);
+        }
+        self.lock_tabs().sync(&list);
+        let reuse = if url.is_empty() || (opens_tab && duplicate_wanted) {
+            None
+        } else {
+            self.lock_tabs().reusable(&list, &url)
+        };
+        if let Some(reuse) = reuse {
+            if let Some(outcome) = self.reuse_tab(route, name, forwarded, &list, reuse, &url) {
+                return outcome;
+            }
+        }
+        let note = if opens_tab && list.len() >= tabs::MAX_TABS {
+            self.close_least_used_agent_tab(route, &list)
+        } else {
+            None
+        };
+        let mut outcome = self.as_asked(name, forwarded, &url);
+        outcome.note = note;
+        outcome
+    }
+
+    /// The call as the agent made it, with the tab book kept in step.
+    fn as_asked(&self, name: &str, forwarded: &Value, url: &str) -> TabOutcome {
+        let result = self.act(name, forwarded, false);
+        if result["isError"] != true {
+            let mut book = self.lock_tabs();
+            let list = tabs::parse_tabs(&result_text(&result));
+            let opened = name == "browser_tabs" && forwarded["action"] == "new";
+            if opened && !list.is_empty() {
+                book.opened(&list, url);
+            } else if name == "browser_tabs" {
+                if forwarded["action"] == "close" {
+                    if let Some(index) = tabs::close_index(forwarded, &book) {
+                        book.closed(index);
+                    }
+                }
+                if !list.is_empty() {
+                    book.sync(&list);
+                }
+            } else {
+                book.touch_current();
+            }
+        }
+        TabOutcome {
+            result,
+            note: None,
+            performed: Vec::new(),
+        }
+    }
+
+    /// Shows `url` in the open tab `reuse`, or `None` when that is not safe or did not work (the
+    /// caller then makes the agent's own call).
+    fn reuse_tab(
+        &self,
+        route: &str,
+        name: &str,
+        forwarded: &Value,
+        list: &[tabs::Tab],
+        reuse: tabs::Reuse,
+        url: &str,
+    ) -> Option<TabOutcome> {
+        let target = &list[reuse.index];
+        let opens_tab = name == "browser_tabs";
+        let page_same = tabs::same_page(url, &target.url);
+        // Never navigate a tab the user owns: it is reusable only as it is.
+        if !reuse.agent && !page_same {
+            return None;
+        }
+        let mut performed = Vec::new();
+        let mut shown = None;
+        if !target.current {
+            let back = list.iter().position(|t| t.current);
+            let select = json!({"action": "select", "index": reuse.index});
+            if !self.derived_allowed(route, "browser_tabs", &select) {
+                return None;
+            }
+            let result = self.forward("browser_tabs", &select);
+            // The indexes may have moved since the list: the tab now in use must be the one
+            // that was meant (same address), or the switch is undone.
+            let now = tabs::parse_tabs(&result_text(&result));
+            let landed = result["isError"] != true
+                && now.iter().filter(|t| t.current).count() == 1
+                && now
+                    .get(reuse.index)
+                    .is_some_and(|t| t.current && t.url == target.url);
+            if !landed {
+                // Undo the switch once, then read the list again (no loop): the book follows
+                // whatever the browser shows now.
+                if let Some(back) = back {
+                    let _ =
+                        self.forward("browser_tabs", &json!({"action": "select", "index": back}));
+                }
+                let after = self.list_tabs();
+                if !after.is_empty() {
+                    self.lock_tabs().sync(&after);
+                }
+                return None;
+            }
+            self.lock_tabs().sync(&now);
+            performed.push(("browser_tabs".to_owned(), select));
+            shown = Some(result);
+        }
+        let note = Some(tabs::reuse_note(reuse.index, &target.url));
+        if opens_tab {
+            let result = if page_same {
+                match shown {
+                    Some(result) => result,
+                    None => self.forward("browser_tabs", &json!({"action": "list"})),
+                }
+            } else {
+                // The agent's authorized address, exactly, in the tab the agent made.
+                let navigate = json!({"url": url});
+                if !self.derived_allowed(route, "browser_navigate", &navigate) {
+                    return None;
+                }
+                let result = self.forward("browser_navigate", &navigate);
+                if result["isError"] == true {
+                    return None;
+                }
+                performed.push(("browser_navigate".to_owned(), navigate));
+                self.lock_tabs().touch_current();
+                result
+            };
+            return Some(TabOutcome {
+                result,
+                note,
+                performed,
+            });
+        }
+        // `browser_navigate`: a user's tab we switched to already shows the page; an agent tab or
+        // the current tab gets the agent's own call.
+        if !reuse.agent && !target.current {
+            let result = shown?;
+            return Some(TabOutcome {
+                result,
+                note,
+                performed,
+            });
+        }
+        let result = self.act(name, forwarded, false);
+        self.lock_tabs().touch_current();
+        performed.push((name.to_owned(), forwarded.clone()));
+        Some(TabOutcome {
+            result,
+            note,
+            performed,
+        })
+    }
+
+    /// Closes the agent-made tab used longest ago, to stay within [`tabs::MAX_TABS`]. Only when
+    /// the policy allows a close without asking (Level 1 does not), the tab is the agent's with
+    /// certainty, and a fresh list is exactly the one the choice was made on. Returns a note for
+    /// the agent when a tab was closed; otherwise the agent just opens its tab.
+    fn close_least_used_agent_tab(&self, route: &str, list: &[tabs::Tab]) -> Option<String> {
+        let (index, url) = {
+            let book = self.lock_tabs();
+            let index = book.victim()?;
+            (index, book.url_at(index)?.to_owned())
+        };
+        let close = json!({"action": "close", "index": index});
+        if !self.derived_allowed(route, "browser_tabs", &close) {
+            return None;
+        }
+        let fresh = self.list_tabs();
+        let same = fresh.len() == list.len()
+            && fresh.iter().zip(list).all(|(a, b)| a.url == b.url)
+            && fresh.get(index).is_some_and(|t| t.url == url);
+        if !same {
+            return None;
+        }
+        let result = self.forward("browser_tabs", &close);
+        if result["isError"] == true {
+            return None;
+        }
+        let mut book = self.lock_tabs();
+        book.closed(index);
+        let after = tabs::parse_tabs(&result_text(&result));
+        if !after.is_empty() {
+            book.sync(&after);
+        }
+        Some(format!(
+            "Monoptah closed the tab {url} that you opened earlier and used least, because this browser keeps at most {} tabs. Tabs the user opened are never closed.",
+            tabs::MAX_TABS
+        ))
     }
 
     /// [`Inner::forward`] with the action overlay around it: the call was authorized already. The
@@ -1538,6 +1820,8 @@ impl Inner {
         )?;
         let session = Session { key, id };
         self.lock_state().session = Some(session.clone());
+        // A new connection owns none of the tabs of the old one: nothing is the agent's to close.
+        self.lock_tabs().reset();
         Ok(session)
     }
 }
@@ -1624,6 +1908,16 @@ const FOCUS_WIDGETS: [&str; 22] = [
     "treeitem",
     "grid",
 ];
+
+/// What [`Inner::act_tracking_tabs`] did.
+struct TabOutcome {
+    result: Value,
+    /// For the agent, outside the page-content fence.
+    note: Option<String>,
+    /// The calls the gate made in place of or besides the agent's, with their arguments; empty
+    /// when it made the agent's call as it was.
+    performed: Vec<(String, Value)>,
+}
 
 enum Authorized {
     /// Run the call.

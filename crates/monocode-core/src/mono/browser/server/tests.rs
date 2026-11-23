@@ -189,3 +189,16 @@ fn the_fingerprint_follows_the_launch_and_hides_the_token() {
     assert_ne!(same, launch(&spec("Profile 6"), &t).fingerprint());
     assert_ne!(same, launch(&s, &token("b")).fingerprint());
 }
+
+#[test]
+fn a_server_outlives_an_idle_gap_of_hours() {
+    // The tabs of a Mono's group belong to its connection: stopping the server for a gap of
+    // minutes made the next run open duplicates. The idle limit is hours.
+    assert!(IDLE_TIMEOUT >= Duration::from_secs(8 * 60 * 60));
+    let (backend, servers) = manager(IDLE_TIMEOUT);
+    let (s, t) = (spec("Default"), token("a"));
+    servers.ensure("mono-a", &launch(&s, &t)).unwrap();
+    servers.ensure("mono-b", &launch(&s, &t)).unwrap();
+    servers.ensure("mono-a", &launch(&s, &t)).unwrap();
+    assert_eq!((starts(&backend), stops(&backend)), (2, 0));
+}

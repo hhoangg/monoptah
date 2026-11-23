@@ -2377,3 +2377,593 @@ fn an_untyped_element_less_action_asks_after_a_read_even_with_a_declared_write()
     assert_eq!(bare_type["isError"], true);
     assert_eq!(shown.lock().unwrap().len(), 2);
 }
+
+// ---- Tabs: reuse, cap, ownership ----
+
+/// A fake Playwright server with a tab list, like `browser_tabs` of `@playwright/mcp`.
+struct TabsUpstream {
+    tabs: Mutex<Vec<String>>,
+    current: AtomicUsize,
+    calls: Mutex<Vec<(String, Value)>>,
+    /// `select` lands on the next tab (the indexes moved under the gate).
+    select_shifts: AtomicBool,
+    /// `select` is refused.
+    select_fails: AtomicBool,
+}
+impl TabsUpstream {
+    fn new(urls: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            tabs: Mutex::new(urls.iter().map(|u| (*u).to_owned()).collect()),
+            current: AtomicUsize::new(0),
+            calls: Mutex::default(),
+            select_shifts: AtomicBool::new(false),
+            select_fails: AtomicBool::new(false),
+        })
+    }
+    fn listing(&self) -> String {
+        let current = self.current.load(Ordering::SeqCst);
+        self.tabs
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, url)| {
+                let mark = if i == current { " (current)" } else { "" };
+                format!("- {i}:{mark} [Title {i}]({url})")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    fn urls(&self) -> Vec<String> {
+        self.tabs.lock().unwrap().clone()
+    }
+    fn names(&self) -> Vec<String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, args)| match args["action"].as_str() {
+                Some(action) => format!("{name}:{action}"),
+                None => name.clone(),
+            })
+            .collect()
+    }
+    fn sent(&self, name: &str) -> Vec<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+    fn closes(&self) -> usize {
+        self.sent("browser_tabs")
+            .iter()
+            .filter(|a| a["action"] == "close")
+            .count()
+    }
+    fn navigations(&self) -> usize {
+        self.sent("browser_navigate").len()
+    }
+}
+impl Upstream for TabsUpstream {
+    fn session_survives(&self, _: &str) -> bool {
+        true
+    }
+    fn post(
+        &self,
+        _: &str,
+        _: Option<&str>,
+        message: &Value,
+    ) -> Result<(Option<Value>, Option<String>), String> {
+        let id = message["id"].clone();
+        let ok = |result: Value| {
+            Ok((
+                Some(json!({"jsonrpc": "2.0", "id": id, "result": result})),
+                None,
+            ))
+        };
+        match message["method"].as_str().unwrap_or("") {
+            "initialize" => Ok((
+                Some(json!({"jsonrpc": "2.0", "id": id, "result": {"capabilities": {}}})),
+                Some("sess-tabs".into()),
+            )),
+            "tools/list" => ok(json!({"tools": [{
+                "name": "browser_tabs", "description": "Manage tabs.",
+                "inputSchema": {"type": "object", "properties": {"action": {"type": "string"}}},
+            }]})),
+            "tools/call" => {
+                let name = message["params"]["name"].as_str().unwrap().to_owned();
+                let args = message["params"]["arguments"].clone();
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((name.clone(), args.clone()));
+                let text = match name.as_str() {
+                    "browser_tabs" => {
+                        let mut tabs = self.tabs.lock().unwrap();
+                        match args["action"].as_str().unwrap_or("") {
+                            "new" => {
+                                tabs.push(args["url"].as_str().unwrap_or("about:blank").to_owned());
+                                self.current.store(tabs.len() - 1, Ordering::SeqCst);
+                            }
+                            "select" => {
+                                if self.select_fails.load(Ordering::SeqCst) {
+                                    return ok(
+                                        json!({"content": [{"type": "text", "text": "Error: no such tab"}], "isError": true}),
+                                    );
+                                }
+                                let mut at = args["index"].as_u64().unwrap() as usize;
+                                if self.select_shifts.load(Ordering::SeqCst) {
+                                    at = (at + 1) % tabs.len();
+                                }
+                                self.current.store(at, Ordering::SeqCst);
+                            }
+                            "close" => {
+                                let at = args["index"]
+                                    .as_u64()
+                                    .map_or(self.current.load(Ordering::SeqCst), |i| i as usize);
+                                tabs.remove(at);
+                                self.current.store(0, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                        drop(tabs);
+                        self.listing()
+                    }
+                    "browser_navigate" => {
+                        let at = self.current.load(Ordering::SeqCst);
+                        self.tabs.lock().unwrap()[at] = args["url"].as_str().unwrap().to_owned();
+                        format!("- Page URL: {}", args["url"].as_str().unwrap())
+                    }
+                    _ => "ok".to_owned(),
+                };
+                ok(json!({"content": [{"type": "text", "text": text}], "isError": false}))
+            }
+            _ => Ok((None, None)),
+        }
+    }
+}
+fn tabs_gate(trust: BrowserTrust, upstream: &Arc<TabsUpstream>) -> Arc<Gate> {
+    let gate = tabs_gate_taintable(trust, upstream);
+    // Taint tracking has its own tests; here only the tab handling is under test.
+    gate.exempt_from_taint(SHARED_ROUTE);
+    gate
+}
+fn tabs_gate_taintable(trust: BrowserTrust, upstream: &Arc<TabsUpstream>) -> Arc<Gate> {
+    Gate::start_with_timeout(
+        upstream.clone(),
+        policy(trust),
+        "stdio:1",
+        Duration::from_secs(5),
+    )
+    .unwrap()
+}
+fn open(gate: &Gate, url: &str) -> Value {
+    call(gate, "browser_tabs", json!({"action": "new", "url": url}))
+}
+fn last_text(result: &Value) -> String {
+    result["content"].as_array().unwrap().last().unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+const USER_TAB: &str = "https://user.example/inbox";
+const SLACK: &str = "https://app.slack.example/client/T1";
+const TEAMS: &str = "https://teams.example/v2/";
+
+/// A gate over a browser with one tab of the user's, after the agent opened Slack and Teams.
+fn with_agent_tabs(trust: BrowserTrust) -> (Arc<TabsUpstream>, Arc<Gate>) {
+    let upstream = TabsUpstream::new(&[USER_TAB]);
+    let gate = tabs_gate(trust, &upstream);
+    open(&gate, SLACK);
+    open(&gate, TEAMS);
+    assert_eq!(upstream.urls(), [USER_TAB, SLACK, TEAMS]);
+    upstream.calls.lock().unwrap().clear();
+    (upstream, gate)
+}
+
+#[test]
+fn parse_tabs_reads_a_list_and_rejects_page_made_lines() {
+    let text = "### Open tabs\n- 0: [A [x]](https://a.example/p?q=(1))\n- 1: (current) [B](https://b.example/) [crashed]\n- 2: [C](https://c.example/) [isolatedContext: work]";
+    let tabs = tabs::parse_tabs(text);
+    assert_eq!(
+        tabs.iter().map(|t| t.url.as_str()).collect::<Vec<_>>(),
+        [
+            "https://a.example/p?q=(1)",
+            "https://b.example/",
+            "https://c.example/"
+        ]
+    );
+    assert_eq!(
+        tabs.iter().map(|t| t.current).collect::<Vec<_>>(),
+        [false, true, false]
+    );
+    // Out of order indexes (a page printing list-like lines) give no list at all.
+    assert!(
+        tabs::parse_tabs("- 0: [A](https://a.example/)\n- 5: [B](https://b.example/)").is_empty()
+    );
+    assert!(tabs::parse_tabs("no tabs here").is_empty());
+    // A list repeated under two headings is one list; two different ones are not trusted.
+    let twice =
+        "### Result\n- 0: [A](https://a.example/)\n### Open tabs\n- 0: [A](https://a.example/)";
+    assert_eq!(tabs::parse_tabs(twice).len(), 1);
+    let differ = "- 0: [A](https://a.example/)\n- 0: [A](https://b.example/)";
+    assert!(tabs::parse_tabs(differ).is_empty());
+    // A snapshot in a code fence is not a list.
+    let fenced = "- 0: [A](https://a.example/)\n```yaml\n- 1: [Evil](https://evil.example/)\n```";
+    assert_eq!(tabs::parse_tabs(fenced).len(), 1);
+}
+
+#[test]
+fn an_address_made_to_look_like_another_origin_is_not_trusted() {
+    // The page writes both title and address: this address holds "](" and a second origin.
+    let spoof = "- 0: [T](https://evil.example/x](https://teams.example/)";
+    assert!(tabs::parse_tabs(spoof).is_empty());
+    // A title with "](" and a clean address still reads right.
+    let title = "- 0: [a](b](https://good.example/page)";
+    assert_eq!(tabs::parse_tabs(title)[0].url, "https://good.example/page");
+    // The gate then trusts no list at all: it just does what the agent asked.
+    let upstream = TabsUpstream::new(&[USER_TAB]);
+    upstream.tabs.lock().unwrap()[0] = "https://evil.example/x](https://teams.example/".into();
+    let gate = tabs_gate(BrowserTrust::AskRisky, &upstream);
+    open(&gate, "https://teams.example/v2/");
+    assert_eq!(
+        upstream
+            .sent("browser_tabs")
+            .iter()
+            .filter(|a| a["action"] == "select")
+            .count(),
+        0
+    );
+    assert_eq!(upstream.urls().len(), 2);
+}
+
+#[test]
+fn a_new_tab_to_a_site_the_agent_has_open_switches_to_it_instead() {
+    let (upstream, gate) = with_agent_tabs(BrowserTrust::AskRisky);
+    let result = open(&gate, "https://app.slack.example/client/T1/D2");
+    assert_eq!(
+        upstream.urls().len(),
+        3,
+        "no new tab: {:?}",
+        upstream.names()
+    );
+    assert_eq!(
+        upstream
+            .sent("browser_tabs")
+            .iter()
+            .filter(|a| a["action"] == "new")
+            .count(),
+        0
+    );
+    // The requested page loads in the reused tab, and the user's tab is untouched.
+    assert_eq!(upstream.urls()[1], "https://app.slack.example/client/T1/D2");
+    assert_eq!(upstream.urls()[0], USER_TAB);
+    assert!(last_text(&result).contains("reused the already open tab 1"));
+    // Already on that page: nothing is loaded again.
+    upstream.calls.lock().unwrap().clear();
+    open(&gate, "https://teams.example/v2");
+    assert_eq!(upstream.navigations(), 0, "{:?}", upstream.names());
+    assert_eq!(upstream.urls().len(), 3);
+}
+
+#[test]
+fn the_duplicate_flag_opens_a_second_tab_and_never_reaches_the_server() {
+    let (upstream, gate) = with_agent_tabs(BrowserTrust::AskRisky);
+    call(
+        &gate,
+        "browser_tabs",
+        json!({"action": "new", "url": SLACK, tabs::DUPLICATE_FLAG: true}),
+    );
+    assert_eq!(upstream.urls().len(), 4);
+    for args in upstream.sent("browser_tabs") {
+        assert!(args.get(tabs::DUPLICATE_FLAG).is_none(), "{args}");
+    }
+    let listed = rpc(&gate, "tools/list", json!({}));
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "browser_tabs")
+        .unwrap()
+        .clone();
+    assert!(tool["inputSchema"]["properties"][tabs::DUPLICATE_FLAG].is_object());
+}
+
+#[test]
+fn navigating_to_a_site_open_in_another_agent_tab_switches_to_it_first() {
+    let (upstream, gate) = with_agent_tabs(BrowserTrust::ReadOnly);
+    // Level 1: switching is a read, so it works there too. Teams is current.
+    call(
+        &gate,
+        "browser_navigate",
+        json!({"url": "https://app.slack.example/client/T1/D9"}),
+    );
+    let urls = upstream.urls();
+    assert_eq!(urls.len(), 3);
+    assert_eq!(urls[2], TEAMS, "the Teams tab is untouched");
+    assert_eq!(urls[1], "https://app.slack.example/client/T1/D9");
+}
+
+#[test]
+fn a_site_that_is_not_open_still_opens_in_a_new_tab() {
+    let (upstream, gate) = with_agent_tabs(BrowserTrust::AskRisky);
+    open(&gate, "https://mail.example/");
+    assert_eq!(upstream.urls().len(), 4);
+}
+
+#[test]
+fn a_reused_tab_still_passes_the_gate_checks() {
+    let upstream = TabsUpstream::new(&[SLACK]);
+    let gate = tabs_gate(BrowserTrust::AskRisky, &upstream);
+    let result = open(&gate, "javascript:alert(1)");
+    assert_eq!(result["isError"], true);
+    assert!(upstream.names().is_empty(), "{:?}", upstream.names());
+}
+
+#[test]
+fn a_users_tab_is_never_navigated_away_and_is_switched_to_only_on_the_same_page() {
+    let upstream = TabsUpstream::new(&[SLACK, "https://other.example/"]);
+    let gate = tabs_gate(BrowserTrust::AskRisky, &upstream);
+    // Another page of a site the user has open: a new tab, the user's tab is not touched.
+    open(&gate, "https://app.slack.example/client/T1/D2");
+    assert_eq!(upstream.urls()[0], SLACK);
+    assert_eq!(upstream.urls().len(), 3);
+    assert_eq!(upstream.navigations(), 0);
+    // The very page the user has open, on a site the agent has no tab of: switch to it, load
+    // nothing.
+    upstream.calls.lock().unwrap().clear();
+    open(&gate, "https://other.example/");
+    assert_eq!(upstream.urls().len(), 3);
+    assert_eq!(upstream.navigations(), 0);
+    assert_eq!(upstream.current.load(Ordering::SeqCst), 1);
+    // The agent's own Slack tab is preferred over the user's one, and only it is navigated.
+    upstream.calls.lock().unwrap().clear();
+    call(
+        &gate,
+        "browser_navigate",
+        json!({"url": "https://app.slack.example/client/T1/D3"}),
+    );
+    assert_eq!(upstream.urls()[0], SLACK, "{:?}", upstream.urls());
+    assert_eq!(upstream.urls()[2], "https://app.slack.example/client/T1/D3");
+}
+
+#[test]
+fn a_switch_that_lands_on_another_tab_is_undone_and_the_agents_call_runs_as_asked() {
+    let (upstream, gate) = with_agent_tabs(BrowserTrust::AskRisky);
+    upstream.select_shifts.store(true, Ordering::SeqCst);
+    open(&gate, "https://app.slack.example/client/T1/D2");
+    // Nothing was navigated (no tab, the user's least of all, was sent somewhere else), and the
+    // agent's own new tab opened.
+    assert_eq!(upstream.navigations(), 0, "{:?}", upstream.names());
+    assert_eq!(upstream.urls().len(), 4);
+    assert_eq!(&upstream.urls()[..3], [USER_TAB, SLACK, TEAMS]);
+}
+
+#[test]
+fn a_refused_switch_falls_back_to_the_agents_own_new_tab() {
+    let (upstream, gate) = with_agent_tabs(BrowserTrust::AskRisky);
+    upstream.select_fails.store(true, Ordering::SeqCst);
+    let result = open(&gate, "https://app.slack.example/client/T1/D2");
+    assert_ne!(result["isError"], true);
+    assert_eq!(upstream.urls().len(), 4);
+    assert_eq!(upstream.urls()[3], "https://app.slack.example/client/T1/D2");
+}
+
+#[test]
+fn over_the_cap_the_least_used_agent_tab_closes_and_user_tabs_never_do() {
+    let user: Vec<String> = (0..3)
+        .map(|i| format!("https://user{i}.example/"))
+        .collect();
+    let refs: Vec<&str> = user.iter().map(String::as_str).collect();
+    let upstream = TabsUpstream::new(&refs);
+    let gate = tabs_gate(BrowserTrust::AskRisky, &upstream);
+    for i in 0..(tabs::MAX_TABS - 3) {
+        open(&gate, &format!("https://agent{i}.example/"));
+    }
+    assert_eq!(upstream.urls().len(), tabs::MAX_TABS);
+    let result = open(&gate, "https://extra.example/");
+    let urls = upstream.urls();
+    assert_eq!(urls.len(), tabs::MAX_TABS, "{urls:?}");
+    assert!(
+        !urls.contains(&"https://agent0.example/".to_owned()),
+        "{urls:?}"
+    );
+    assert!(urls.contains(&"https://extra.example/".to_owned()));
+    for u in &user {
+        assert!(urls.contains(u), "user tab {u} kept");
+    }
+    assert!(last_text(&result).contains("closed the tab https://agent0.example/"));
+}
+
+#[test]
+fn at_level_1_the_cap_never_closes_a_tab_and_asks_nobody() {
+    let upstream = TabsUpstream::new(&["https://user.example/"]);
+    let gate = tabs_gate(BrowserTrust::ReadOnly, &upstream);
+    for i in 0..tabs::MAX_TABS {
+        open(&gate, &format!("https://agent{i}.example/"));
+    }
+    assert_eq!(upstream.closes(), 0);
+    assert_eq!(upstream.urls().len(), tabs::MAX_TABS + 1);
+}
+
+#[test]
+fn when_every_tab_is_the_users_the_cap_closes_nothing() {
+    let user: Vec<String> = (0..tabs::MAX_TABS)
+        .map(|i| format!("https://user{i}.example/"))
+        .collect();
+    let refs: Vec<&str> = user.iter().map(String::as_str).collect();
+    let upstream = TabsUpstream::new(&refs);
+    let gate = tabs_gate(BrowserTrust::Autonomous, &upstream);
+    open(&gate, "https://extra.example/");
+    assert_eq!(upstream.closes(), 0);
+    assert_eq!(upstream.urls().len(), tabs::MAX_TABS + 1);
+}
+
+#[test]
+fn a_new_connection_forgets_which_tabs_the_agent_made() {
+    let urls: Vec<String> = (0..tabs::MAX_TABS)
+        .map(|i| format!("https://site{i}.example/"))
+        .collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let upstream = TabsUpstream::new(&refs[..tabs::MAX_TABS - 1]);
+    let gate = tabs_gate(BrowserTrust::AskRisky, &upstream);
+    open(&gate, &urls[tabs::MAX_TABS - 1]);
+    assert_eq!(gate.inner.lock_tabs().agent_tabs(), 1);
+    gate.configure(policy(BrowserTrust::AskRisky), "stdio:2", upstream.clone());
+    upstream.calls.lock().unwrap().clear();
+    open(&gate, "https://extra.example/");
+    assert_eq!(upstream.closes(), 0);
+    assert_eq!(
+        gate.inner.lock_tabs().agent_tabs(),
+        1,
+        "only the tab made since"
+    );
+}
+
+#[test]
+fn a_tab_swapped_by_the_user_is_not_closed() {
+    let upstream = TabsUpstream::new(&["https://a.example/"]);
+    let gate = tabs_gate(BrowserTrust::AskRisky, &upstream);
+    for i in 0..(tabs::MAX_TABS - 1) {
+        open(&gate, &format!("https://t{i}.example/"));
+    }
+    // The user swaps the tab at the victim's position (index 1) for another site.
+    upstream.tabs.lock().unwrap()[1] = "https://users-own.example/".into();
+    open(&gate, "https://extra.example/");
+    assert!(upstream
+        .urls()
+        .contains(&"https://users-own.example/".to_owned()));
+}
+
+#[test]
+fn the_book_keeps_the_agent_mark_only_while_identity_is_certain() {
+    let tab = |url: &str, current: bool| tabs::Tab {
+        current,
+        url: url.into(),
+    };
+    let mut book = tabs::TabBook::default();
+    book.sync(&[tab("https://a.example/", true)]);
+    book.opened(
+        &[
+            tab("https://a.example/", false),
+            tab("https://b.example/", true),
+        ],
+        "https://b.example/",
+    );
+    assert_eq!(book.agent_tabs(), 1);
+    // A popup next to the agent's tab: two tabs appeared, none is the agent's.
+    let mut popup = tabs::TabBook::default();
+    popup.sync(&[tab("https://a.example/", true)]);
+    popup.opened(
+        &[
+            tab("https://a.example/", false),
+            tab("https://b.example/", false),
+            tab("https://c.example/", true),
+        ],
+        "https://b.example/",
+    );
+    assert_eq!(popup.agent_tabs(), 0);
+    // One new tab that shows another site than asked is not marked either.
+    let mut other = tabs::TabBook::default();
+    other.sync(&[tab("https://a.example/", true)]);
+    other.opened(
+        &[
+            tab("https://a.example/", false),
+            tab("https://z.example/", true),
+        ],
+        "https://b.example/",
+    );
+    assert_eq!(other.agent_tabs(), 0);
+    // The user adds a tab with the same address as the agent's: ambiguous, so the mark is dropped.
+    book.sync(&[
+        tab("https://a.example/", false),
+        tab("https://b.example/", true),
+        tab("https://b.example/", false),
+    ]);
+    assert_eq!(book.agent_tabs(), 0);
+}
+
+#[test]
+fn the_derived_switch_and_load_do_not_ask_a_second_time() {
+    let upstream = TabsUpstream::new(&[USER_TAB]);
+    let gate = tabs_gate_taintable(BrowserTrust::AskRisky, &upstream);
+    open(&gate, SLACK);
+    // The first listing was a read: opening another address now needs one approval.
+    let (handle, shown) = user(gate.attach(SHARED_ROUTE), vec![true, true]);
+    open(&gate, "https://app.slack.example/client/T1/D2");
+    drop(gate.attach(SHARED_ROUTE));
+    handle.join().ok();
+    assert_eq!(
+        shown.lock().unwrap().len(),
+        1,
+        "one card for the agent's call only"
+    );
+    assert_eq!(upstream.urls().len(), 2);
+    assert_eq!(upstream.urls()[1], "https://app.slack.example/client/T1/D2");
+}
+
+#[test]
+fn a_recording_keeps_the_switch_the_gate_made() {
+    let root = tempfile::tempdir().unwrap();
+    let upstream = TabsUpstream::new(&[USER_TAB]);
+    let gate = tabs_gate(BrowserTrust::AskRisky, &upstream);
+    gate.set_workspace(Workspace {
+        mono_id: MONO.into(),
+        output_dir: root.path().join("browser"),
+        recipes_dir: root.path().join("recipes"),
+        database: root.path().join("none.db"),
+        recipe_options: Default::default(),
+    });
+    open(&gate, SLACK);
+    open(&gate, TEAMS);
+    open(&gate, "https://app.slack.example/client/T1/D2");
+    let traces = gate.inner.traces.lock().unwrap();
+    let tools: Vec<(String, String)> = traces[SHARED_ROUTE]
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                e.tool.clone(),
+                e.args["action"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        tools[2],
+        ("browser_tabs".into(), "select".into()),
+        "{tools:?}"
+    );
+    assert_eq!(tools[3].0, "browser_navigate", "{tools:?}");
+}
+
+#[test]
+fn a_derived_navigation_in_a_tainted_turn_is_not_made_and_asks_nobody() {
+    let upstream = TabsUpstream::new(&[USER_TAB]);
+    let gate = tabs_gate_taintable(BrowserTrust::AskRisky, &upstream);
+    open(&gate, SLACK);
+    // The turn read page content: opening an address nobody approved would need a card.
+    let (handle, shown) = user(gate.attach(SHARED_ROUTE), vec![true]);
+    let navigate = json!({"url": "https://never-approved.example/"});
+    assert!(!gate
+        .inner
+        .derived_allowed(SHARED_ROUTE, "browser_navigate", &navigate));
+    // A tab switch is no navigation and stays allowed.
+    assert!(gate.inner.derived_allowed(
+        SHARED_ROUTE,
+        "browser_tabs",
+        &json!({"action": "select", "index": 0})
+    ));
+    assert!(
+        shown.lock().unwrap().is_empty(),
+        "no card for a derived call"
+    );
+    drop(handle);
+    // Where the turn is exempt from taint tracking, the same call passes the policy.
+    gate.exempt_from_taint(SHARED_ROUTE);
+    assert!(gate
+        .inner
+        .derived_allowed(SHARED_ROUTE, "browser_navigate", &navigate));
+}
