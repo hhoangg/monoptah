@@ -1277,6 +1277,7 @@ fn the_rules_tell_the_mono_about_fences_declared_intents_and_suggested_recipes()
 }
 
 #[test]
+#[cfg(unix)]
 fn a_resolved_node_outside_path_is_ready_and_leads_the_spawn_path() {
     use crate::node_tool::{NodeSource, NodeTools};
     let dir = tempfile::tempdir().unwrap();
