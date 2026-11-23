@@ -124,17 +124,45 @@ pub(crate) fn find_on_gui_path(name: &str) -> Option<PathBuf> {
 }
 
 pub(crate) fn gui_search_path() -> String {
-    gui_search_path_from(login_shell_path(), dirs_home(), std::env::var("PATH").ok())
+    with_node_dir(gui_search_path_from(
+        login_shell_path(),
+        dirs_home(),
+        std::env::var("PATH").ok(),
+    ))
+}
+
+/// Adds the node folder the shared resolver found after the existing entries, so it never
+/// changes which binary wins, and only when it is not there yet. Reads the last lookup only:
+/// it never starts one.
+fn with_node_dir(path: String) -> String {
+    append_dir(
+        path,
+        crate::node_tool::cached().flatten().map(|t| t.bin_dir),
+    )
+}
+
+fn append_dir(path: String, dir: Option<PathBuf>) -> String {
+    let Some(dir) = dir else {
+        return path;
+    };
+    let mut parts: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    if parts.contains(&dir) {
+        return path;
+    }
+    parts.push(dir);
+    std::env::join_paths(parts)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(path)
 }
 
 /// `gui_search_path` without ever starting the login shell: its PATH is used
 /// only when something already read it.
 pub(crate) fn cached_gui_search_path() -> String {
-    gui_search_path_from(
+    with_node_dir(gui_search_path_from(
         peek_login_shell_path(&LOGIN_SHELL_ENV),
         dirs_home(),
         std::env::var("PATH").ok(),
-    )
+    ))
 }
 
 fn gui_search_path_from(
@@ -345,6 +373,15 @@ fn load_unix_login_shell_env() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_node_dir_is_appended_once_and_never_leads() {
+        let node = Some(PathBuf::from("/n/bin"));
+        assert_eq!(append_dir("/a:/b".into(), node.clone()), "/a:/b:/n/bin");
+        assert_eq!(append_dir("/a:/n/bin:/b".into(), node), "/a:/n/bin:/b");
+        assert_eq!(append_dir("/a".into(), None), "/a");
+    }
 
     #[test]
     fn gui_search_path_puts_login_path_ahead_of_fallbacks() {

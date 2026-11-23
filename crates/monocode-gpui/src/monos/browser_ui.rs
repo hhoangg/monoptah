@@ -18,6 +18,7 @@ use monocode_core::mono::browser::{
     self, AuditEntry, BrowserTrust, Check, ChromeProfile, MonoBrowser, MonoBrowserStore, PrereqEnv,
     Prerequisites,
 };
+use monocode_core::node_tool::{self, NodeTools};
 use std::sync::Arc;
 
 /// Stops the Mono's browser server (off the UI thread: ending a process can wait a moment).
@@ -93,6 +94,7 @@ fn trust_row(trust: BrowserTrust, selected: bool, cx: &mut Context<Monos>) -> An
 pub(super) const FULL_DISK_ACCESS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 const SELECT_PRIORITY: usize = 90;
+pub(super) const NODE_PATH_FIELD: &str = "browser-node-path";
 const AUDIT_ROWS: usize = 20;
 pub(super) const SUBTITLE: &str = "Let this Mono use your own Chrome, with the sessions you are signed in to, through Playwright MCP. Off by default.";
 
@@ -104,9 +106,29 @@ pub(super) trait BrowserOps: Send + Sync {
     /// A recipe's dry run through the Mono's running gate (see `Gate::dry_run_recipe`). It
     /// blocks until a run in progress ends, so it is called off the UI thread.
     fn dry_run_recipe(&self, mono_id: &str, recipe_id: &str) -> Result<DryRunReport, String>;
+    /// Looks node up (it may run the login shell for a few seconds): called off the UI thread.
+    fn resolve_node(&self) -> Option<NodeTools>;
+    /// Forgets the last lookup, so the next [`BrowserOps::resolve_node`] looks again.
+    fn recheck_node(&self);
+    /// Checks the path typed in the Browser page. Never runs a shell.
+    fn validate_node_path(&self, raw: &str) -> Result<NodeTools, String>;
+    /// Makes `path` (empty is automatic) the override every npx launch uses, now.
+    fn apply_node_path(&self, path: &str);
 }
 struct RealOps;
 impl BrowserOps for RealOps {
+    fn resolve_node(&self) -> Option<NodeTools> {
+        node_tool::resolve()
+    }
+    fn recheck_node(&self) {
+        node_tool::recheck();
+    }
+    fn validate_node_path(&self, raw: &str) -> Result<NodeTools, String> {
+        node_tool::validate_real(raw)
+    }
+    fn apply_node_path(&self, path: &str) {
+        node_tool::set_override(path);
+    }
     fn open_in_profile(&self, env: &PrereqEnv, profile_dir: &str, url: &str) -> Result<(), String> {
         browser::open_in_profile(env, profile_dir, url)
     }
@@ -158,6 +180,16 @@ pub(super) struct BrowserUi {
     pub(super) profile_anchor: AnchorSlot,
     pub(super) watching: bool,
     pub(super) error: Option<String>,
+    /// A node lookup is running in the background (it may start the login shell).
+    pub(super) node_checking: bool,
+    /// A lookup has finished since the page opened or since Recheck.
+    pub(super) node_known: bool,
+    /// What that lookup found.
+    pub(super) node_found: Option<NodeTools>,
+    /// Recheck or a new path came while a lookup was running: look again when it ends.
+    pub(super) node_requeue: bool,
+    /// Why the path typed in the page was not accepted.
+    pub(super) node_error: Option<String>,
 }
 impl BrowserUi {
     pub(super) fn new() -> Self {
@@ -168,6 +200,7 @@ impl BrowserUi {
                 chrome_binaries: Vec::new(),
                 user_data_dir: PathBuf::new(),
                 search_path: String::new(),
+                node: None,
             }),
             prereq: None,
             profiles: Vec::new(),
@@ -183,10 +216,22 @@ impl BrowserUi {
             profile_anchor: AnchorSlot::default(),
             watching: false,
             error: None,
+            node_checking: false,
+            // Tests never look node up for real.
+            node_known: cfg!(test),
+            node_found: None,
+            node_requeue: false,
+            node_error: None,
         }
     }
-    fn env(&mut self) -> PrereqEnv {
-        self.env.get_or_insert_with(PrereqEnv::detect).clone()
+    /// Chrome's and node's environment as the page sees it now. In the app the node part is the
+    /// last lookup, never a new one: that runs in [`Monos::browser_check_node`].
+    fn env(&self) -> PrereqEnv {
+        let mut env = self.env.clone().unwrap_or_else(PrereqEnv::detect);
+        if env.node.is_none() {
+            env.node = self.node_found.clone();
+        }
+        env
     }
     #[cfg(test)]
     pub(super) fn use_fakes(&mut self, ops: Arc<dyn BrowserOps>, env: PrereqEnv) {
@@ -250,6 +295,9 @@ impl Monos {
         let Some(id) = self.active.clone() else {
             return;
         };
+        if !self.browser_ui.node_known && !self.browser_ui.node_checking {
+            self.browser_check_node(cx);
+        }
         let env = self.browser_ui.env();
         let (profile_dir, profile_name) = self
             .roster
@@ -303,7 +351,68 @@ impl Monos {
             .map(|s| s.recent(&id, AUDIT_ROWS))
             .unwrap_or_default();
         self.recipes_refresh();
-        self.browser_sync(cx);
+        if self.browser_ui.node_checking {
+            // `ready` waits for the lookup: node is not known to be missing yet.
+            cx.notify();
+        } else {
+            self.browser_sync(cx);
+        }
+    }
+
+    /// Looks node up on a worker (the login shell can take seconds), then refreshes the page.
+    pub(super) fn browser_check_node(&mut self, cx: &mut Context<Self>) {
+        if self.browser_ui.node_checking {
+            self.browser_ui.node_requeue = true;
+            return;
+        }
+        self.browser_ui.node_checking = true;
+        let ops = self.browser_ui.ops.clone();
+        cx.spawn(async move |this, cx| {
+            let found = cx.background_spawn(async move { ops.resolve_node() }).await;
+            let _ = this.update(cx, |this, cx| {
+                let ui = &mut this.browser_ui;
+                ui.node_checking = false;
+                if std::mem::take(&mut ui.node_requeue) {
+                    // That answer predates the Recheck or the new path: drop it, look again.
+                    ui.node_known = false;
+                    ui.node_found = None;
+                } else {
+                    ui.node_known = true;
+                    ui.node_found = found;
+                }
+                this.browser_refresh(cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The Recheck button: forgets the last lookup and looks again.
+    pub(super) fn browser_recheck_node(&mut self, cx: &mut Context<Self>) {
+        self.browser_ui.ops.recheck_node();
+        let ui = &mut self.browser_ui;
+        ui.node_known = false;
+        ui.node_found = None;
+        self.browser_check_node(cx);
+        self.browser_refresh(cx);
+    }
+
+    /// Saves the path typed in the page. It is checked first and an unusable one is reported
+    /// and not saved. Empty goes back to finding node by itself.
+    pub(super) fn browser_save_node_path(&mut self, cx: &mut Context<Self>) {
+        let text = self.value(NODE_PATH_FIELD, cx).trim().to_owned();
+        if !text.is_empty()
+            && let Err(error) = self.browser_ui.ops.validate_node_path(&text)
+        {
+            self.browser_ui.node_error = Some(error);
+            cx.notify();
+            return;
+        }
+        self.browser_ui.node_error = None;
+        self.browser_ui.ops.apply_node_path(&text);
+        self.prefs.node_path = text.clone();
+        cx.emit(NodePathChanged(text));
+        self.browser_recheck_node(cx);
     }
 
     /// `ready` is the page's own summary: Chrome, node, a profile and a token. A launch does not
@@ -834,6 +943,7 @@ impl Monos {
         let Some(prereq) = self.browser_ui.prereq.clone() else {
             return div().into_any_element();
         };
+        let node_checking = self.browser_ui.node_checking;
         let row = |id: &'static str, label: &str, check: &Check, fix: Option<AnyElement>| {
             let (text, alpha) = match check {
                 Check::Ok => ("Ready".to_owned(), 0.7),
@@ -860,6 +970,21 @@ impl Monos {
                 }))
                 .into_any_element()
         });
+        let found = self.browser_ui.env().node_tools();
+        let node_check = if node_checking {
+            Check::Missing("Checking...".into())
+        } else {
+            prereq.node.clone()
+        };
+        let recheck = action("mono-browser-node-recheck", "Recheck")
+            .when(node_checking, |d| d.opacity(0.5))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if !this.browser_ui.node_checking {
+                    this.browser_recheck_node(cx);
+                }
+            }))
+            .into_any_element();
+        let node_path = self.browser_node_path_card(found, cx);
         card()
             .child(row(
                 "mono-browser-prereq-chrome",
@@ -878,8 +1003,83 @@ impl Monos {
             .child(row(
                 "mono-browser-prereq-node",
                 "Node.js (node and npx)",
-                &prereq.node,
-                None,
+                &node_check,
+                Some(recheck),
+            ))
+            .child(node_path)
+            .into_any_element()
+    }
+
+    /// Where node was found and how, and the field that overrides it.
+    fn browser_node_path_card(
+        &mut self,
+        found: Option<NodeTools>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let initial = self.prefs.node_path.clone();
+        let input = self.field(
+            NODE_PATH_FIELD,
+            "Path to npx or its folder (automatic when empty)",
+            initial,
+            false,
+            cx,
+        );
+        if self.field_blurs.insert(input.entity_id()) {
+            self.observations.push(
+                cx.subscribe(&input, move |this, _, _: &input::Submitted, cx| {
+                    this.browser_save_node_path(cx)
+                }),
+            );
+        }
+        let location = match (&found, self.browser_ui.node_checking) {
+            (_, true) => None,
+            (Some(tools), _) => Some(format!(
+                "{} (found via {})",
+                tools.npx.display(),
+                tools.source.label()
+            )),
+            (None, _) => None,
+        };
+        let field = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("mono-browser-node-path-input")
+                    .w(px(260.))
+                    .h(px(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(content(0.1))
+                    .child(input),
+            )
+            .child(
+                action("mono-browser-node-path-save", "Save")
+                    .on_click(cx.listener(|this, _, _, cx| this.browser_save_node_path(cx))),
+            )
+            .into_any_element();
+        div()
+            .flex()
+            .flex_col()
+            .child(div().h(px(1.)).bg(content(0.05)))
+            .when_some(location, |d, text| {
+                d.child(div().px_3().pt_2().child(note(
+                    "mono-browser-node-location",
+                    text,
+                    0.6,
+                )))
+            })
+            .when_some(self.browser_ui.node_error.clone(), |d, error| {
+                d.child(div().px_3().pt_2().child(alert("mono-browser-node-error", error)))
+            })
+            .child(setting(
+                "Node.js path",
+                Some("Only needed when Node.js is not found. The full path of npx, or of the folder that holds npx and node."),
+                field,
             ))
             .into_any_element()
     }

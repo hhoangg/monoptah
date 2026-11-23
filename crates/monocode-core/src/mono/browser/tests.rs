@@ -70,6 +70,7 @@ fn env_in(dir: &Path, chrome: bool, tools: bool) -> PrereqEnv {
         chrome_binaries: vec![chrome_path],
         user_data_dir: dir.join("Chrome"),
         search_path: bin.to_string_lossy().into_owned(),
+        node: None,
     }
 }
 fn write_local_state(env: &PrereqEnv) {
@@ -664,6 +665,7 @@ fn a_launch_adds_the_server_only_when_everything_is_ready() {
     assert!(reason(&ctx, &no_chrome).contains("Chrome was not found"));
     let no_node = PrereqEnv {
         search_path: String::new(),
+        node: None,
         ..env.clone()
     };
     assert!(reason(&ctx, &no_node).contains("node or npx"));
@@ -999,6 +1001,7 @@ fn the_process_transport_talks_to_a_server_over_stdio() {
         chrome_binaries: vec![],
         user_data_dir: PathBuf::new(),
         search_path: "/usr/bin:/bin".into(),
+        node: None,
     };
     let mut transport = ProcessTransport::spawn(&r, &env).unwrap();
     probe(&mut transport).unwrap();
@@ -1271,4 +1274,30 @@ fn the_rules_tell_the_mono_about_fences_declared_intents_and_suggested_recipes()
     browser.trust = BrowserTrust::ReadOnly;
     let rules = prompt_block(&browser);
     assert!(rules.contains("<untrusted-content-") && !rules.contains("browser_declare_intent"));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_resolved_node_outside_path_is_ready_and_leads_the_spawn_path() {
+    use crate::node_tool::{NodeSource, NodeTools};
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = env_in(dir.path(), true, false);
+    env.search_path = "/usr/bin:/bin".into();
+    assert!(!check_prerequisites(&env).node.is_ok());
+    assert_eq!(env.spawn_path(), "/usr/bin:/bin");
+    env.node = Some(NodeTools {
+        npx: "/n/bin/npx".into(),
+        node: "/n/bin/node".into(),
+        bin_dir: "/n/bin".into(),
+        source: NodeSource::LoginShell,
+    });
+    assert!(check_prerequisites(&env).node.is_ok());
+    assert_eq!(env.spawn_path(), "/n/bin:/usr/bin:/bin");
+    let runtime = probe_runtime(
+        &at(BrowserTrust::default()),
+        Secret::new(TOKEN.into()),
+        dir.path(),
+        &env,
+    );
+    assert_eq!(runtime.spec.command, "/n/bin/npx");
 }

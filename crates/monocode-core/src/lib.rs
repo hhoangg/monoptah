@@ -26,6 +26,7 @@ pub mod harness_updates;
 pub mod inbox;
 pub mod mobile;
 pub mod mono;
+pub mod node_tool;
 pub mod notes;
 pub mod process;
 pub mod project_add;

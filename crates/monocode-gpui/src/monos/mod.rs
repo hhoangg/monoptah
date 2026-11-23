@@ -76,6 +76,9 @@ pub(crate) struct TabOpened(pub String);
 pub(crate) struct ShowDetails(pub String);
 /// The Mono's emoji settings asked for the shared library: Settings > Monos > Emoji.
 pub(crate) struct ShowEmojiLibrary;
+/// The Browser tab saved a new path for npx (empty is automatic): the shell keeps it in the
+/// preferences.
+pub(crate) struct NodePathChanged(pub String);
 /// A Mono's chat has opened, so a paired phone can follow it.
 pub(crate) struct ChatOpened;
 pub(crate) use notifications::{NotificationChanged, NotificationFinished, NotificationPosted};
@@ -237,6 +240,7 @@ impl EventEmitter<Changed> for Monos {}
 impl EventEmitter<TabOpened> for Monos {}
 impl EventEmitter<ShowDetails> for Monos {}
 impl EventEmitter<ShowEmojiLibrary> for Monos {}
+impl EventEmitter<NodePathChanged> for Monos {}
 impl EventEmitter<ChatOpened> for Monos {}
 impl Monos {
     #[cfg(test)]
