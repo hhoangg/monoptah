@@ -302,6 +302,39 @@ fn whats_new_overlay_escape_does_not_stop_the_session(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_press_on_the_whats_new_scrim_dismisses_it_and_a_press_on_the_card_does_not(
+    cx: &mut TestAppContext,
+) {
+    let (window, _) = setup(cx);
+    let visual = &mut VisualTestContext::from_window(window.into(), cx);
+    window
+        .update(visual, |shell, _, cx| {
+            shell.open_whats_new("1.0.0".into(), cx)
+        })
+        .unwrap();
+    visual.run_until_parked();
+    visual.refresh().unwrap();
+    let open = |visual: &mut VisualTestContext| {
+        window
+            .update(visual, |shell, _, _| {
+                shell.notification_state.whats_new.is_some()
+            })
+            .unwrap()
+    };
+    assert!(open(visual));
+    let size = visual.update(|w, _| w.viewport_size());
+    visual.simulate_click(
+        gpui::point(size.width / 2., size.height / 2.),
+        Default::default(),
+    );
+    visual.run_until_parked();
+    assert!(open(visual), "a press on the card keeps it open");
+    visual.simulate_click(gpui::point(gpui::px(3.), gpui::px(3.)), Default::default());
+    visual.run_until_parked();
+    assert!(!open(visual), "a press on the scrim dismisses it");
+}
+
+#[gpui::test]
 fn project_background_dialog_escape_does_not_stop_the_session(cx: &mut TestAppContext) {
     overlay_case(
         cx,

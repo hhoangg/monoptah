@@ -1107,17 +1107,24 @@ impl SettingsView {
                 .absolute()
                 .inset_0()
                 .occlude()
-                .child(crate::modal::scrim("mobile-pair-scrim"))
+                // The scrim occludes, so the press that dismisses sits on the scrim itself.
+                .child(crate::modal::backdrop(
+                    "mobile-pair-scrim",
+                    div()
+                        .id("mobile-pair-scrim-hit")
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_invite(cx);
+                            }),
+                        ),
+                ))
                 .flex()
                 .items_center()
                 .justify_center()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.close_invite(cx);
-                    }),
-                )
                 .child(
                     div()
                         .id("mobile-pair-dialog")

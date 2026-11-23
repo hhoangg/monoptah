@@ -1061,7 +1061,21 @@ impl Shell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(crate::modal::scrim("whats-new-scrim"))
+                    // The scrim occludes, so the press that dismisses sits on the scrim itself.
+                    .child(crate::modal::backdrop(
+                        "whats-new-scrim",
+                        div()
+                            .id("whats-new-scrim-hit")
+                            .absolute()
+                            .inset_0()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.notification_state.whats_new = None;
+                                    cx.notify();
+                                }),
+                            ),
+                    ))
                     .track_focus(&focus)
                     .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                         if event.keystroke.key == "escape" {
@@ -1070,13 +1084,6 @@ impl Shell {
                             cx.stop_propagation();
                         }
                     }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.notification_state.whats_new = None;
-                            cx.notify();
-                        }),
-                    )
                     .child(
                         div()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())

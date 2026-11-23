@@ -419,6 +419,7 @@ impl Render for DocumentLightbox {
             .w(viewport.width)
             .h(viewport.height)
             .overflow_hidden()
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
@@ -571,6 +572,97 @@ mod tests {
         std::fs::write(&edge, vec![b'x'; MAX_BYTES as usize]).unwrap();
         assert!(matches!(read_text(&edge), Ok(Loaded::Text(_))));
         assert!(read_text(&dir.join("missing.md")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The real lightbox over a list that scrolls: the wheel on the panel (also at the end of
+    /// the document) and on the backdrop must not reach the list.
+    struct Under {
+        list: gpui::ListState,
+        lightbox: Entity<DocumentLightbox>,
+    }
+
+    impl Render for Under {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    gpui::list(self.list.clone(), |_, _, _| {
+                        div().h(px(20.)).w_full().into_any()
+                    })
+                    .size_full(),
+                )
+                .child(overlay(&self.lightbox))
+        }
+    }
+
+    #[gpui::test]
+    fn wheel_over_the_document_lightbox_never_scrolls_the_list_behind(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::VisualTestContext;
+        let dir = scratch("wheel");
+        let path = dir.join("long.md");
+        let text: String = (0..300).map(|n| format!("Line {n}\n\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        cx.update(|cx| {
+            crate::input::bind(cx);
+            cx.set_reduce_motion(true);
+        });
+        let list = gpui::ListState::new(100, gpui::ListAlignment::Top, px(10.)).measure_all();
+        let window = cx.add_window(|window, cx| {
+            let lightbox = cx.new(|cx| {
+                DocumentLightbox::new(
+                    Open {
+                        path: path.clone(),
+                        title: "long.md".into(),
+                        cloud: None,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            Under {
+                list: list.clone(),
+                lightbox,
+            }
+        });
+        let v = &mut VisualTestContext::from_window(window.into(), cx);
+        v.run_until_parked();
+        v.refresh().unwrap();
+        v.run_until_parked();
+        let panel = v.debug_bounds("document-lightbox-panel").expect("panel");
+        let wheel = |v: &mut VisualTestContext, at, dy: f32| {
+            v.simulate_mouse_move(at, None, Default::default());
+            v.run_until_parked();
+            v.refresh().unwrap();
+            v.simulate_event(gpui::ScrollWheelEvent {
+                position: at,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(dy))),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            v.run_until_parked();
+            v.refresh().unwrap();
+        };
+        let top = || {
+            let t = list.logical_scroll_top();
+            (t.item_ix, t.offset_in_item)
+        };
+        let before = top();
+        for dy in [-60., -5000., -5000., -5000., 60., 5000., 5000.] {
+            wheel(v, panel.center(), dy);
+            assert_eq!(top(), before, "panel, dy {dy}");
+        }
+        for at in [
+            gpui::point(px(2.), px(2.)),
+            gpui::point(px(1000.), px(760.)),
+        ] {
+            for dy in [-60., 60.] {
+                wheel(v, at, dy);
+                assert_eq!(top(), before, "backdrop {at:?}, dy {dy}");
+            }
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
