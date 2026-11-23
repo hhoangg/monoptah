@@ -165,6 +165,11 @@ and does not need to be: `codesign` signs with it anyway (`security find-identit
 `CSSMERR_TP_NOT_TRUSTED`). The app is still not notarized. Signing uses no hardened runtime, no
 entitlements and no timestamp, exactly like the ad-hoc signature did.
 
+The leaf SHA-1 is pinned in `crates/monocode-core/src/app_update/install.rs`
+(`PINNED_LEAF_CERTIFICATE_SHA1`): the updater skips Gatekeeper only for a download that satisfies the pinned
+requirement (or an ad-hoc app replacing an ad-hoc app). Re-creating the certificate therefore needs a release signed with the old
+certificate that ships the new pin first.
+
 ### One-time setup (on the release Mac)
 
 ```bash
