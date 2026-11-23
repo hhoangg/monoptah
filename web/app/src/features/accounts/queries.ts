@@ -3,6 +3,7 @@
 // `cancelled` result when the user dismisses the browser prompt instead of throwing.
 import { queryOptions, type QueryClient } from "@tanstack/react-query";
 import type { MeResponse, PushPrefsResponse, PushPrefsStateResponse, PushTestResponse, User } from "@monoptah/protocol";
+import { withRateLimitRetry } from "@/lib/rateLimit";
 import { forgetAccountSnapshots } from "@/features/offline/snapshots";
 import { ApiError, apiFetch } from "./api";
 import { endpoints } from "./endpoints";
@@ -22,10 +23,13 @@ type Me = ReturnType<typeof MeResponse.parse>;
 export const ME_KEY = ["me"] as const;
 
 /** 401 means "signed out": never retried, so the guard redirects at once. */
-function retryUnlessUnauthorized(failureCount: number, error: Error): boolean {
+export function retryUnlessUnauthorizedBase(failureCount: number, error: Error): boolean {
   if (error instanceof ApiError && (error.status === 401 || error.status === 403)) return false;
   return failureCount < 1;
 }
+
+/** Also retries a 429 (rateLimit.ts). The auth guard uses the base rule instead and waits for the 429 itself. */
+const retryUnlessUnauthorized = withRateLimitRetry(retryUnlessUnauthorizedBase);
 
 export const meQuery = queryOptions({
   queryKey: ME_KEY,

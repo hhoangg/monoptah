@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeResponse } from "@monoptah/protocol";
+import { clearRateLimited, useRateLimitState } from "@/lib/rateLimitState";
 import { ApiError, apiFetch, endpoint, setApiTransport } from "./api";
 import { endpoints } from "./endpoints";
 
@@ -69,6 +70,16 @@ describe("apiFetch", () => {
     const error = await apiFetch(endpoints.me).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(ApiError);
     expect(error).toMatchObject({ status: 429, code: "rate_limited", message: "Slow down", retryAfter: 30 });
+  });
+
+  it("notes a 429 on a session GET in the rate-limit store, but not a 429 on a POST", async () => {
+    clearRateLimited();
+    useTransport(() => Response.json({ error: "Slow down", code: "rate_limited" }, { status: 429, headers: { "Retry-After": "30" } }));
+    await apiFetch(endpoints.logout).catch(() => undefined);
+    expect(useRateLimitState.getState().until).toBeNull();
+    await apiFetch(endpoints.me).catch(() => undefined);
+    expect(useRateLimitState.getState().until).not.toBeNull();
+    clearRateLimited();
   });
 
   it("maps a non-JSON error body to a generic ApiError", async () => {

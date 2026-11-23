@@ -8,14 +8,17 @@ export const NETWORK_ERROR = "Cannot reach Monoptah. Check your connection and t
 export const RECOVER_ERROR = "That handle or recovery code is not valid.";
 export const UNSUPPORTED_ERROR = "This browser cannot use passkeys. Try a recent version of Safari, Chrome, Edge or Firefox.";
 
-function retryText(seconds: number | null): string {
-  if (seconds === null) return "Too many attempts. Wait a moment and try again.";
-  return seconds <= 60 ? "Too many attempts. Wait a minute and try again." : `Too many attempts. Try again in ${Math.ceil(seconds / 60)} minutes.`;
+/** The one text for a 429 (`rate_limited`): names the wait when the server's `Retry-After` is known. */
+export function rateLimitedMessage(seconds: number | null): string {
+  if (seconds === null) return "Too many requests. Wait a moment and try again.";
+  if (seconds < 60) return `Too many requests. Try again in ${Math.max(1, seconds)} ${seconds === 1 ? "second" : "seconds"}.`;
+  const minutes = Math.ceil(seconds / 60);
+  return `Too many requests. Try again in ${minutes} ${minutes === 1 ? "minute" : "minutes"}.`;
 }
 
 function common(error: unknown): string {
   if (isApiError(error, "network")) return NETWORK_ERROR;
-  if (isApiError(error, "rate_limited")) return retryText(error.retryAfter);
+  if (isApiError(error, "rate_limited")) return rateLimitedMessage(error.retryAfter);
   return GENERIC_ERROR;
 }
 

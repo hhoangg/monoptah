@@ -23,6 +23,7 @@ import {
 import { queryOptions, useQuery, type QueryClient } from "@tanstack/react-query";
 import { apiFetch, endpoint, isApiError } from "@/features/accounts/api";
 import { withFreshAuth } from "@/features/accounts/queries";
+import { withRateLimitRetry } from "@/lib/rateLimit";
 import { clearPersistedCache } from "@/data/persist";
 import { forgetDesktopLocally } from "@/features/settings/desktopLink";
 import { getLinkConnection, resetLinkConnections } from "@/link";
@@ -69,9 +70,11 @@ export const desktopKeys = {
 /** How often the lists refetch while the page is visible, so the online badge follows presence (Worker caches it 10 s). */
 export const DESKTOPS_REFRESH_MS = 15_000;
 
-function whileVisible(): number | false {
-  return typeof document === "undefined" || document.visibilityState === "visible" ? DESKTOPS_REFRESH_MS : false;
+function visibleEvery(ms: number): () => number | false {
+  return () => (typeof document === "undefined" || document.visibilityState === "visible" ? ms : false);
 }
+
+const whileVisible = visibleEvery(DESKTOPS_REFRESH_MS);
 
 // --- Queries ---
 
@@ -82,24 +85,40 @@ export const desktopsListQuery = queryOptions({
 });
 
 /** A missing or foreign desktop is a final answer: no retry, so the not-found state shows at once. */
-function retryUnlessMissing(failureCount: number, error: Error): boolean {
+const retryUnlessMissing = withRateLimitRetry((failureCount, error) => {
   if (isApiError(error, "not_found") || isApiError(error, "forbidden")) return false;
   return failureCount < 1;
-}
+});
 
+/**
+ * The directory entry of one desktop: what the list has plus the public key. It is read once (the default stale time
+ * applies) and not polled: what changes while a page is open (name, color, avatar, presence, pending count) comes from
+ * the list, which is polled once for the whole app. Mutations invalidate it.
+ */
 export const desktopDetailQuery = (id: string) =>
   queryOptions({
     queryKey: desktopKeys.detail(id),
     queryFn: ({ signal }) => apiFetch(desktopEndpoints.get, { params: { id }, signal }),
-    refetchInterval: whileVisible,
     retry: retryUnlessMissing,
   });
 
-export const desktopGrantsQuery = (id: string) =>
+/** How often the grants a screen only glances at (the cues of the rail and the switcher) refetch while the page is visible. */
+export const GRANTS_GLANCE_STALE_MS = 60_000;
+
+export interface GrantsQueryOptions {
+  /**
+   * Refetch every 15 s while visible. Only the screens that wait for a change (the access card of the desktop page,
+   * the composer that asked for control) do; a glance (the rail, the switcher) refetches every GRANTS_GLANCE_STALE_MS
+   * while visible (and is fresh for that long), instead of once per desktop every 15 s.
+   */
+  poll?: boolean;
+}
+
+export const desktopGrantsQuery = (id: string, { poll = true }: GrantsQueryOptions = {}) =>
   queryOptions({
     queryKey: desktopKeys.grants(id),
     queryFn: ({ signal }) => apiFetch(desktopEndpoints.grants, { params: { id }, signal }),
-    refetchInterval: whileVisible,
+    ...(poll ? { refetchInterval: whileVisible } : { staleTime: GRANTS_GLANCE_STALE_MS, refetchInterval: visibleEvery(GRANTS_GLANCE_STALE_MS) }),
   });
 
 export const devicesQuery = queryOptions({
@@ -115,8 +134,9 @@ export function useDesktop(id: string) {
   return useQuery(desktopDetailQuery(id));
 }
 
-export function useDesktopGrants(id: string) {
-  return useQuery(desktopGrantsQuery(id));
+export function useDesktopGrants(id: string, options: GrantsQueryOptions & { enabled?: boolean } = {}) {
+  const { enabled, ...query } = options;
+  return useQuery({ ...desktopGrantsQuery(id, query), ...(enabled === undefined ? {} : { enabled }) });
 }
 
 export function useDevices() {
@@ -201,12 +221,18 @@ export async function requestGrant(desktopId: string, deviceId: string): Promise
   return grant;
 }
 
-/** `requestGrant` plus a refresh of the grants and the pending count of that desktop. */
+/**
+ * `requestGrant` plus a refresh of the grants and the pending count of that desktop. The request is idempotent and the
+ * link repeats it on every connect, so a grant that the cache already holds unchanged costs no refetch; the list only
+ * gets marked stale (its 15 s poll and the next mount pick the pending count up).
+ */
 export async function requestGrantAndRefresh(queryClient: QueryClient, desktopId: string, deviceId: string): Promise<Grant> {
   const grant = await requestGrant(desktopId, deviceId);
+  const known = queryClient.getQueryData<{ grants: Grant[] }>(desktopKeys.grants(desktopId))?.grants.find((item) => item.deviceId === grant.deviceId);
+  const unchanged = known?.state === grant.state && known.permission === grant.permission && known.requestedPermission === grant.requestedPermission;
   await Promise.all([
-    queryClient.invalidateQueries({ queryKey: desktopKeys.grants(desktopId) }),
-    queryClient.invalidateQueries({ queryKey: desktopKeys.list, exact: true }),
+    unchanged ? undefined : queryClient.invalidateQueries({ queryKey: desktopKeys.grants(desktopId) }, { cancelRefetch: false }),
+    queryClient.invalidateQueries({ queryKey: desktopKeys.list, exact: true, refetchType: "none" }),
   ]);
   return grant;
 }

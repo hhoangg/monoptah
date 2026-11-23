@@ -188,6 +188,19 @@ describe("activity rail", () => {
     expect(router.state.location.pathname).toBe("/d/d4");
   });
 
+  it("reads the grants of the other desktops once, and none for the open one", async () => {
+    const server = createFakeServer({
+      desktops: [desktop({ id: "d1", name: "Studio Mac", online: true }), desktop({ id: "d2", name: "Linux box", online: true })],
+      grants: { d1: [grant({ deviceId: "dev1", state: "confirmed" })], d2: [grant({ deviceId: "dev1", state: "confirmed" })] },
+    });
+    restore?.();
+    restore = setApiTransport(server.transport);
+    mountSlot(<Rail />);
+    await screen.findByRole("link", { name: "Linux box, online" });
+    await vi.waitFor(() => expect(server.calls.some((call) => call.path === "/api/desktops/d2/grants")).toBe(true));
+    expect(server.calls.filter((call) => call.path.endsWith("/grants")).map((call) => call.path)).toEqual(["/api/desktops/d2/grants"]);
+  });
+
   it("scrolls when there are many desktops", async () => {
     mountSlot(<Rail />);
     const list = await screen.findByRole("list", { name: "Desktops" });

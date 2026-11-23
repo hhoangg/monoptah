@@ -64,8 +64,9 @@ function RailTip({ label, detail, children }: { label: string; detail?: string; 
 function DesktopAvatar({ desktop, current, tabStop, onFocus }: { desktop: RailDesktop; current: boolean; tabStop: boolean; onFocus: () => void }) {
   const background = desktopAvatarColor(desktop.id, desktop.color);
   const status = desktop.online ? "Online" : "Offline";
-  // The grant of this device, as the old switcher sheet showed it. The open desktop is connected, so it has access.
-  const grants = useDesktopGrants(desktop.id);
+  // The grant of this device, as the old switcher sheet showed it. The open desktop is connected, so it has access and
+  // needs no look; the others are refetched once a minute while the page is visible, not every 15 s (one call per desktop adds up).
+  const grants = useDesktopGrants(desktop.id, { poll: false, enabled: !current });
   const thisDevice = useThisDevice();
   const cue = current ? null : grantCue(grants.data?.grants, thisDevice?.deviceId ?? null);
   const cueText = cue ? GRANT_CUE_LABEL[cue] : null;
