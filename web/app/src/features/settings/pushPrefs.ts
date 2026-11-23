@@ -7,6 +7,7 @@
 import { PUSH_CATEGORIES } from "@monoptah/protocol";
 import type { QueryClient } from "@tanstack/react-query";
 import { desktopsQuery, loadPushPrefs, savePushPrefs, type PushPrefs } from "@/features/accounts/queries";
+import { isRateLimited } from "@/lib/rateLimit";
 import { loadPauseRecord, savePauseRecord } from "@/features/push/pauseRecord";
 
 export const DEFAULT_PREFS: PushPrefs = { enabled: true, categories: Object.fromEntries(PUSH_CATEGORIES.map((key) => [key, true])) as PushPrefs["categories"] };
@@ -22,6 +23,9 @@ export const pushPrefsQuery = (desktopId: string) => ({
   },
 });
 
+/** These calls answer a click: a 429 fails at once (the caller shows the error); anything else keeps one retry. */
+const ACTION_READ = { retry: (failureCount: number, error: Error) => !isRateLimited(error) && failureCount < 1, staleTime: 0 };
+
 export interface BulkResult {
   /** Desktops this call turned off or on. */
   changed: number;
@@ -32,9 +36,9 @@ export interface BulkResult {
 }
 
 export async function pauseAll(queryClient: QueryClient): Promise<BulkResult> {
-  const { desktops } = await queryClient.fetchQuery({ ...desktopsQuery, staleTime: 0 });
+  const { desktops } = await queryClient.fetchQuery({ ...desktopsQuery, ...ACTION_READ });
   const record = loadPauseRecord();
-  const current = await Promise.all(desktops.map((desktop) => queryClient.fetchQuery({ ...pushPrefsQuery(desktop.id), staleTime: 0 }).catch(() => null)));
+  const current = await Promise.all(desktops.map((desktop) => queryClient.fetchQuery({ ...pushPrefsQuery(desktop.id), ...ACTION_READ }).catch(() => null)));
   const targets = desktops.filter((_, index) => current[index]?.enabled === true);
   const outcomes = await Promise.allSettled(
     targets.map(async (desktop) => {
@@ -50,7 +54,7 @@ export async function pauseAll(queryClient: QueryClient): Promise<BulkResult> {
 }
 
 export async function resumeAll(queryClient: QueryClient): Promise<BulkResult> {
-  const { desktops } = await queryClient.fetchQuery({ ...desktopsQuery, staleTime: 0 });
+  const { desktops } = await queryClient.fetchQuery({ ...desktopsQuery, ...ACTION_READ });
   const record = loadPauseRecord();
   const targets = desktops.filter((desktop) => record[desktop.id] !== undefined);
   const outcomes = await Promise.allSettled(

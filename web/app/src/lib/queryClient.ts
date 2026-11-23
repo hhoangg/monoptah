@@ -1,4 +1,5 @@
 import { QueryClient } from "@tanstack/react-query";
+import { defaultRetry, queryRetryDelay } from "./rateLimit";
 
 /**
  * Shared TanStack Query client (architecture.md 3.2).
@@ -13,7 +14,10 @@ export function createQueryClient(): QueryClient {
       queries: {
         staleTime: 30_000,
         gcTime: 5 * 60_000,
-        retry: 1,
+        // One retry, and a few for a 429 that wait for its Retry-After (rateLimit.ts). `fetchQuery` and
+        // `ensureQueryData` read these defaults too; they only fall back to `retry: false` when none is set.
+        retry: defaultRetry,
+        retryDelay: queryRetryDelay,
         refetchOnWindowFocus: false,
       },
       mutations: { retry: 0 },

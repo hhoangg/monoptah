@@ -6,6 +6,8 @@
 // without a body. The transport defaults to `fetch`; the dev mock plugs in through `setApiTransport`.
 import { API_ERROR_CODES, ApiErrorSchema, findRoute, type ApiErrorCode, type ApiMethod, type ApiRoute } from "@monoptah/protocol";
 
+import { clearRateLimited, noteRateLimited } from "@/lib/rateLimitState";
+
 export type ApiTransport = (url: string, init: RequestInit) => Promise<Response>;
 
 /** Codes the client adds itself: no response at all, or a body that does not match the contract. */
@@ -166,10 +168,13 @@ export async function apiFetch<Res, Body = undefined>(
   }
   if (!response.ok) {
     const error = await toApiError(response);
+    // Only the session GETs show the global notice: queries retry those. A mutation or a public call keeps its own inline error.
+    if (error.status === 429 && route.method === "GET" && route.auth !== "public") noteRateLimited(error.retryAfter);
     if (error.status === 401 && route.auth !== "public") for (const listener of [...unauthorizedListeners]) listener(error);
     throw error;
   }
 
+  clearRateLimited();
   let json: unknown;
   try {
     json = await response.json();

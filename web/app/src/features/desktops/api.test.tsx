@@ -28,6 +28,7 @@ import {
   forgetDevice,
   renameDesktop,
   requestGrant,
+  requestGrantAndRefresh,
   requestSelectionTicket,
   revokeDesktop,
   revokeGrant,
@@ -94,6 +95,41 @@ describe("query hooks", () => {
     expect(queryClient.getQueryData<{ desktops: Array<{ online: boolean }> }>(desktopKeys.list)?.desktops[0]?.online).toBe(false);
   });
 
+  it("polls the grants only when asked to, and never polls the directory entry of one desktop", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"] });
+    renderHook(() => useDesktop("d1"), { wrapper });
+    renderHook(() => useDesktopGrants("d1", { poll: false }), { wrapper });
+    renderHook(() => useDesktopGrants("d2"), { wrapper });
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(31_000);
+    const count = (path: string) => server.calls.filter((call) => call.path === path).length;
+    expect(count("/api/desktops/d1")).toBe(1);
+    expect(count("/api/desktops/d1/grants")).toBe(1);
+    expect(count("/api/desktops/d2/grants")).toBe(3);
+  });
+
+  it("does not read the grants of a glance that is disabled", async () => {
+    const hidden = renderHook(() => useDesktopGrants("d1", { poll: false, enabled: false }), { wrapper });
+    await vi.waitFor(() => expect(hidden.result.current.fetchStatus).toBe("idle"));
+    expect(server.calls.filter((call) => call.path === "/api/desktops/d1/grants")).toHaveLength(0);
+  });
+
+  it("refetches the grants of a glance every 60 s while visible, not before, and never when disabled", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"] });
+    renderHook(() => useDesktopGrants("d1", { poll: false }), { wrapper });
+    renderHook(() => useDesktopGrants("d2", { poll: false, enabled: false }), { wrapper });
+    const count = (path: string) => server.calls.filter((call) => call.path === path).length;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(count("/api/desktops/d1/grants")).toBe(1);
+    await vi.advanceTimersByTimeAsync(58_000);
+    expect(count("/api/desktops/d1/grants")).toBe(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(count("/api/desktops/d1/grants")).toBe(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(count("/api/desktops/d1/grants")).toBe(3);
+    expect(count("/api/desktops/d2/grants")).toBe(0);
+  });
+
   it("does not refetch while the document is hidden", async () => {
     vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "Date"] });
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
@@ -125,6 +161,24 @@ describe("mutations", () => {
     expect(again.deviceId).toBe("dev9");
     expect(server.grants.d2).toHaveLength(1);
     expect(server.calls.at(-1)).toEqual({ method: "POST", path: "/api/desktops/d2/grants", body: { deviceId: "dev9" } });
+  });
+
+  it("requestGrantAndRefresh refetches nothing for a grant the cache already holds, and marks the list stale without fetching it", async () => {
+    const grants = renderHook(() => useDesktopGrants("d1", { poll: false }), { wrapper });
+    const list = renderHook(() => useDesktops(), { wrapper });
+    await waitFor(() => expect(grants.result.current.data?.grants).toHaveLength(1));
+    await waitFor(() => expect(list.result.current.data).toBeDefined());
+    const before = server.calls.length;
+    await requestGrantAndRefresh(queryClient, "d1", "dev1");
+    expect(server.calls.slice(before)).toEqual([{ method: "POST", path: "/api/desktops/d1/grants", body: { deviceId: "dev1" } }]);
+    expect(queryClient.getQueryState(desktopKeys.list)?.isInvalidated).toBe(true);
+  });
+
+  it("requestGrantAndRefresh refetches the grants when the answer differs from the cache", async () => {
+    const grants = renderHook(() => useDesktopGrants("d2", { poll: false }), { wrapper });
+    await waitFor(() => expect(grants.result.current.data?.grants).toHaveLength(0));
+    await requestGrantAndRefresh(queryClient, "d2", "dev9");
+    await waitFor(() => expect(grants.result.current.data?.grants).toHaveLength(1));
   });
 
   it("requestGrant rejects with a 409 conflict ApiError for a revoked grant", async () => {

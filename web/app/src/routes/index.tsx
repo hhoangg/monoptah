@@ -9,7 +9,8 @@ import type { QueryClient } from "@tanstack/react-query";
 /** False only when the account's desktop list loaded and does not hold `desktopId`; a failed load keeps the place. */
 async function stillInAccount(queryClient: QueryClient, desktopId: string): Promise<boolean> {
   try {
-    const { desktops } = await queryClient.fetchQuery({ ...desktopsListQuery, staleTime: 30_000 });
+    // No retry here: a 429 (or any failure) keeps the place at once instead of holding the redirect for a whole wait.
+    const { desktops } = await queryClient.fetchQuery({ ...desktopsListQuery, staleTime: 30_000, retry: false });
     return desktops.some((desktop) => desktop.id === desktopId);
   } catch {
     return true;

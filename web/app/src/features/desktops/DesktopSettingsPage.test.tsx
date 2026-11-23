@@ -22,6 +22,7 @@ vi.mock("@/data/persist", async (importOriginal) => ({ ...(await importOriginal<
 const avatarImage = vi.hoisted(() => ({ prepare: vi.fn() }));
 vi.mock("./avatarImage", async (importOriginal) => ({ ...(await importOriginal<typeof AvatarImageModule>()), prepareAvatarImage: avatarImage.prepare }));
 
+import { desktopKeys } from "./api";
 import { createFakeServer, desktop, grant, FP_A, FP_B, type FakeServer } from "./testServer";
 import { mountApp } from "./testMount";
 
@@ -64,6 +65,27 @@ describe("/settings/desktops/:id", () => {
     expect(screen.getByText("macOS, v1.4.0")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Open desktop" })).toHaveAttribute("href", "/d/d1");
     expect(screen.getByRole("link", { name: "Open the install guide" })).toHaveAttribute("href", "/settings/install");
+  });
+
+  it("takes the name from the polled list when only the list was read again", async () => {
+    install();
+    const { queryClient } = mountApp("/settings/desktops/d1");
+    expect(await screen.findByRole("heading", { level: 1, name: "Studio Mac" })).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    server.desktops[0]!.name = "From the list";
+    await queryClient.refetchQueries({ queryKey: desktopKeys.list, exact: true });
+    expect(await screen.findByRole("heading", { level: 1, name: "From the list" })).toBeInTheDocument();
+  });
+
+  it("does not let an older list read override a newer directory entry", async () => {
+    install();
+    const { queryClient } = mountApp("/settings/desktops/d1");
+    expect(await screen.findByRole("heading", { level: 1, name: "Studio Mac" })).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    server.desktops[0]!.name = "From the detail";
+    await queryClient.refetchQueries({ queryKey: desktopKeys.detail("d1"), exact: true });
+    expect(await screen.findByRole("heading", { level: 1, name: "From the detail" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { level: 1, name: "Studio Mac" })).toBeNull();
   });
 
   it("never shows the server's fingerprint claim: it computes one from the key and says it is not verified yet", async () => {

@@ -42,7 +42,7 @@ export function NotificationsSection({
   onSaved?: () => void;
 }) {
   const queryClient = useQueryClient();
-  const loaded = useQuery<PushPrefs>({ ...pushPrefsQuery(desktopId), staleTime: 0 });
+  const loaded = useQuery<PushPrefs>(pushPrefsQuery(desktopId));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const prefs = loaded.data;
@@ -69,7 +69,7 @@ export function NotificationsSection({
   const named = title === "Notifications" ? (text: string) => text : (text: string) => `${text} (${title})`;
   return (
     <SettingsCard title={title} footnote={footnote}>
-      {loaded.isError ? (
+      {loaded.isError && prefs === undefined ? (
         <Notice variant="error" className="my-1.5">
           {settingsErrorMessage(loaded.error)}
         </Notice>

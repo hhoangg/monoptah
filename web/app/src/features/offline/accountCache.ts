@@ -2,8 +2,8 @@
 // `GET /api/desktops` answers go through the persist adapter (encrypted at rest), so a cold start
 // without a network can pass the root auth guard and show the desktops list.
 //
-// Only a failed network (ApiError status 0, code `network`) uses a snapshot. A 401 never does, and the
-// snapshots are wiped when the session ends (`forgetAccountSnapshots`), so signing out leaves nothing
+// Only a failed network (ApiError status 0, code `network`) or a 429 (authGuard.ts)
+// uses a snapshot. A 401 never does, and the snapshots are wiped when the session ends (`forgetAccountSnapshots`), so signing out leaves nothing
 // that could pass for a session.
 import type { QueryClient } from "@tanstack/react-query";
 import { DesktopsResponse, MeResponse } from "@monoptah/protocol";

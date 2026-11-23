@@ -9,6 +9,7 @@ import { createRoot } from "react-dom/client";
 import { installSessionExpiryHandler } from "@/features/accounts/sessionExpiry";
 import { startAppearanceSync } from "@/lib/appearance";
 import { queryClient } from "@/lib/queryClient";
+import { RateLimitNotice } from "@/ui/RateLimitNotice";
 import { Toaster } from "@/ui/sonner";
 import { viewportDebugEnabled } from "@/ui/viewportDebugFlag";
 import { router } from "./router";
@@ -47,6 +48,7 @@ async function start() {
         <QueryClientProvider client={queryClient}>
           <RouterProvider router={router} />
           <Toaster />
+          <RateLimitNotice />
         </QueryClientProvider>
       </MotionConfig>
     </StrictMode>,

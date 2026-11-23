@@ -171,7 +171,7 @@ function SwitcherRow({ desktop, current, deviceId, onClose }: { desktop: Desktop
 /** The grant of this device on one desktop; read only while the sheet is open, requested only on tap. */
 function AccessAction({ desktop, name, deviceId }: { desktop: DesktopSummary; name: string; deviceId: string | null }) {
   const queryClient = useQueryClient();
-  const grants = useDesktopGrants(desktop.id);
+  const grants = useDesktopGrants(desktop.id, { poll: false });
   const action = useAction(desktopErrorMessage);
   if (!grants.data) return null;
   const mine = deviceId ? grants.data.grants.find((item) => item.deviceId === deviceId) : undefined;

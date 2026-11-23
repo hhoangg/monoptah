@@ -33,12 +33,16 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
   let desktop: HeadlessDesktop | undefined;
   let desktopId = "";
   let page: Page;
+  // Every /api response that was a 429: the Worker allows a session 120 calls per minute, and the pages that these tests
+  // reload many times must stay under it (see api-budget.spec.ts), so the limit is never reached rather than tolerated.
+  const throttled: string[] = [];
 
   test.beforeAll(clearRateLimits);
   test.afterAll(() => {
     desktop?.kill();
     pending?.dispose();
     if (dataRoot) rmSync(dataRoot, { recursive: true, force: true });
+    expect(throttled, "/api responses with status 429").toEqual([]);
   });
 
   test("setup: register, pair a desktop that publishes a Mono, confirm this browser", async ({ newSharedActor }) => {
@@ -46,6 +50,9 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
     dataRoot = mkdtempSync(join(tmpdir(), "monoptah-e2e-avatars-"));
     const actor = await newSharedActor();
     page = actor.page;
+    page.context().on("response", (response) => {
+      if (response.status() === 429 && new URL(response.url()).pathname.startsWith("/api/")) throttled.push(`${response.request().method()} ${response.url()}`);
+    });
     await page.setViewportSize({ width: 1280, height: 800 });
     await registerThroughUi(page, namedInvite("avatarslayout"), HANDLE, "Avatars Layout");
 
@@ -171,10 +178,6 @@ test.describe("layout switch, desktop avatar and Mono avatar", () => {
   });
 
   test("Mono avatar: the list, the chat header and the signature draw the mascot and color the desktop sent", async () => {
-    // Every test above reloads full pages in one session (the desktop settings page polls its list, detail, grants and
-    // push prefs), so the session reaches the Worker's 120 calls per minute just before this test: start a new window.
-    test.setTimeout(180_000);
-    await clearRateLimits();
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto(`/d/${desktopId}`);
     const sidebar = page.getByTestId("app-sidebar");

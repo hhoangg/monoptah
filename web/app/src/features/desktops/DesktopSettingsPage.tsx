@@ -18,7 +18,7 @@ import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Notice } from "@/ui/Notice";
 import { SETTINGS_ANCHOR, SETTINGS_DIVIDER_PLAIN, SettingsCard, SettingsRow } from "@/ui/SettingsCard";
 import { Slot } from "@/ui/slots";
-import { setDesktopColor, useDesktop, type DesktopDirectory } from "./api";
+import { setDesktopColor, useDesktop, useDesktops, type DesktopDirectory } from "./api";
 import { DESKTOP_COLORS, findDesktopColor } from "./colors";
 import { DesktopAccessCard } from "./DesktopAccessCard";
 import { DesktopAvatarSection } from "./DesktopAvatarSection";
@@ -50,7 +50,11 @@ const plural = (n: number, noun: string): string => `${n} ${noun}${n === 1 ? "" 
 
 export function DesktopSettingsPage({ id }: { id: string }) {
   const desktop = useDesktop(id);
-  if (desktop.data) return <DesktopSettings desktop={desktop.data} />;
+  // The directory entry is read once (it carries the public key); the list is polled for the whole app, so what changes
+  // while this page is open (name, color, avatar, presence) is taken from it when it has this desktop and is the newer read.
+  const list = useDesktops();
+  const listed = list.dataUpdatedAt >= desktop.dataUpdatedAt ? list.data?.desktops.find((item) => item.id === id) : undefined;
+  if (desktop.data) return <DesktopSettings desktop={listed ? { ...desktop.data, ...listed } : desktop.data} />;
   if (desktop.isError) {
     const missing = isApiError(desktop.error, "not_found") || isApiError(desktop.error, "forbidden");
     return (

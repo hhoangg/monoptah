@@ -21,7 +21,7 @@ import { Notice } from "@/ui/Notice";
 import { PageHeader } from "@/ui/PageHeader";
 import { Radio } from "@/ui/Radio";
 import { apiFetch, isApiError } from "../api";
-import { GENERIC_ERROR, NETWORK_ERROR } from "../authCopy";
+import { GENERIC_ERROR, NETWORK_ERROR, rateLimitedMessage } from "../authCopy";
 import { endpoints } from "../endpoints";
 import { desktopsQuery, ReauthCancelledError, withFreshAuth } from "../queries";
 import { checkFingerprint, type FingerprintCheck } from "./fingerprint";
@@ -47,7 +47,7 @@ function isGone(error: unknown): boolean {
 function pairErrorMessage(error: unknown): string {
   if (isApiError(error, "network")) return NETWORK_ERROR;
   if (isApiError(error, "quota_exceeded")) return PAIR_QUOTA_MESSAGE;
-  if (isApiError(error, "rate_limited")) return "Too many attempts. Wait a minute and try again.";
+  if (isApiError(error, "rate_limited")) return rateLimitedMessage(error.retryAfter);
   return GENERIC_ERROR;
 }
 
