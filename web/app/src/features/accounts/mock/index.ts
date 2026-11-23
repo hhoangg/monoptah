@@ -7,9 +7,9 @@
 //  - A `?mock=` query on the first page load picks a starting state, comma separated:
 //    `signedin`, `signedout`, `recoveryonly`, `noack` (recoveryAckAt null), `paused` (invites
 //    paused), `onepasskey`, `threepasskeys`, `nodesktops`, `fivedesktops` (at the desktop limit),
-//    `admin` (the account is an administrator: /admin, /admin/users, /admin/invites; without it the
+//    `admin` (the account is an administrator: /settings/admin, /settings/admin/users, /settings/admin/invites; without it the
 //    admin routes answer 403 `forbidden`), `nocap` (MAX_USERS 0), `atcap` (MAX_USERS reached).
-//    Admin example: `/admin?mock=signedin,admin`. Admin routes need a fresh session (`reauthAgeSeconds`).
+//    Admin example: `/settings/admin?mock=signedin,admin`. Admin routes need a fresh session (`reauthAgeSeconds`).
 //    Example: `/settings?mock=signedin,noack`.
 //  - Pairing codes for /pair/:code (state.ts): `WXYZ-4829` (valid, renews itself), `NAME-2345` (hostile
 //    machine name), `EXPR-2345` (expired); any other code is unknown. The matching fingerprint for the

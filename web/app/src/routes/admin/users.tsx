@@ -1,20 +1,11 @@
-// Route of /admin/users. Owner: WS-S (workstreams.md 3.1). Needs role admin (AdminGuard) and a fresh session.
-// `?user=<id>` selects the user shown in the detail panel (a full-screen detail on mobile).
-import { createFileRoute } from "@tanstack/react-router";
-import { AdminGuard } from "@/features/admin/AdminGuard";
-import { AdminUsers } from "@/features/admin/AdminUsers";
+// Route of /admin/users (old URL, kept for bookmarks and links): the users page now lives in the settings shell. A
+// selected user (`?user=<id>`) is kept.
+import { createFileRoute, redirect } from "@tanstack/react-router";
+import { validateAdminUsersSearch } from "@/features/admin/search";
 
 export const Route = createFileRoute("/admin/users")({
-  validateSearch: (search: Record<string, unknown>): { user?: string } => (typeof search.user === "string" && search.user !== "" ? { user: search.user } : {}),
-  component: Page,
+  validateSearch: validateAdminUsersSearch,
+  beforeLoad: ({ search }) => {
+    throw redirect({ to: "/settings/admin/users", search, replace: true });
+  },
 });
-
-function Page() {
-  const { user } = Route.useSearch();
-  const navigate = Route.useNavigate();
-  return (
-    <AdminGuard>
-      {(me) => <AdminUsers selfId={me.id} selectedId={user} onSelect={(id) => void navigate({ search: id ? { user: id } : {} })} />}
-    </AdminGuard>
-  );
-}

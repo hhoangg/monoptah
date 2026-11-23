@@ -42,12 +42,12 @@ test.describe("W-14 flows through the UI", () => {
       expect(me.json["recoveryAckAt"], "the recovery codes step acknowledges the codes").not.toBeNull();
     });
 
-    await test.step("login: /admin sends a signed-out visitor to /login, the passkey signs in and returns", async () => {
+    await test.step("login: /admin sends a signed-out visitor to /login, the passkey signs in and lands on /settings/admin", async () => {
       await actor.context.clearCookies();
       await page.goto("/admin");
       await expect(page).toHaveURL(/\/login\?redirect=%2Fadmin/);
       await page.getByRole("button", { name: "Sign in with passkey" }).click();
-      await expect(page).toHaveURL(/\/admin$/);
+      await expect(page).toHaveURL(/\/settings\/admin$/);
       await expect(page.getByRole("heading", { name: "Admin" })).toBeVisible();
       expect((await actor.call("GET", "/api/me")).status).toBe(200);
     });

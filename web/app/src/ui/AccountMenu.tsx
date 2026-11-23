@@ -29,7 +29,7 @@ export function AccountMenu({
   const pathname = useRouterState({ select: (state) => state.location.pathname.replace(/(.)\/$/, "$1") });
   const standalone = useStandalone();
   const entries = ENTRIES.filter((entry) => !(entry.to === "/settings/install" && standalone));
-  const current = pathname.startsWith("/settings") || pathname.startsWith("/admin");
+  const current = pathname.startsWith("/settings");
   return (
     <TooltipProvider delayDuration={300}>
       <DropdownMenu>

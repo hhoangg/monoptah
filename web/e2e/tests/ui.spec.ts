@@ -107,7 +107,7 @@ test.describe("UI pages (E-01)", () => {
     await expect(actor.page.getByRole("button", { name: "Sign in with passkey" })).toBeVisible();
   });
 
-  test("/admin: an admin session opens the admin overview", async ({ newActor }) => {
+  test("/admin: an admin session opens the admin overview in settings (and /admin redirects there)", async ({ newActor }) => {
     const actor = await newActor();
     await requirePage(actor.page, "/register", "TODO(E-01:WS-S register)");
     // The bootstrap invite makes an admin.
@@ -117,7 +117,10 @@ test.describe("UI pages (E-01)", () => {
     // /register acknowledges the codes on Continue (RegisterScreen -> POST /api/recovery-codes/ack), so the guard does not
     // confine the account to /settings. The ack is sent without waiting, so poll for it instead of reading `me` once.
     await expect.poll(async () => (await actor.call("GET", "/api/me")).json["recoveryAckAt"]).not.toBeNull();
-    await requirePage(actor.page, "/admin", "TODO(E-01:WS-S admin screens W-02)");
-    await expect(actor.page).toHaveURL(/\/admin$/);
+    await requirePage(actor.page, "/settings/admin", "TODO(E-01:WS-S admin screens W-02)");
+    await expect(actor.page).toHaveURL(/\/settings\/admin$/);
+    // The old URL still works and ends on the settings page.
+    await actor.page.goto("/admin");
+    await expect(actor.page).toHaveURL(/\/settings\/admin$/);
   });
 });

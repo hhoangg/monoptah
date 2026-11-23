@@ -46,7 +46,7 @@ const SIGNED_OUT: Screen[] = [
 const SIGNED_IN: Screen[] = [
   { name: "desktops", path: "/settings/desktops", key: (p) => p.getByRole("heading", { name: "All desktops" }) },
   { name: "settings", path: "/settings/profile", key: (p) => p.getByRole("button", { name: "Sign out" }) },
-  { name: "admin", path: "/admin", key: (p) => p.getByRole("switch", { name: "Pause invites" }) },
+  { name: "admin", path: "/settings/admin", key: (p) => p.getByRole("switch", { name: "Pause invites" }) },
 ];
 
 test.describe.serial("W-14 screens: visual, axe and keyboard", () => {

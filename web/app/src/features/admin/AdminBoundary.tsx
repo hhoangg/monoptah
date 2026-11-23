@@ -6,6 +6,7 @@ import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
 import { Icon } from "@/ui/Icon";
 import { Notice } from "@/ui/Notice";
+import { SETTINGS_CARD_BODY } from "@/ui/SettingsCard";
 import { ADMIN_KEY, isForbidden, needsFreshSession } from "./adminApi";
 import { NOT_AVAILABLE } from "./copy";
 
@@ -35,22 +36,24 @@ export function ConfirmItsYou() {
   }
 
   return (
-    <section aria-labelledby="confirm-its-you" className="flex flex-col items-start gap-3 rounded-card bg-surface p-5">
-      <span className="inline-flex size-9 items-center justify-center rounded-pill bg-fill text-muted-text">
-        <Icon name="lock" size={18} />
-      </span>
-      <h2 id="confirm-its-you" className="text-body font-semibold text-content">
-        Confirm it&apos;s you
-      </h2>
-      <p className="text-small text-muted-text">
-        Admin pages ask for your passkey again every 5 minutes. Nothing is shown until you confirm.
-      </p>
-      {action.error ? <Notice variant="error" className="w-full">{action.error}</Notice> : null}
-      {action.notice ? <Notice variant="info" className="w-full">{action.notice}</Notice> : null}
-      <Button type="button" disabled={action.busy} aria-busy={action.busy} onClick={() => void onConfirm()}>
-        <Icon name="fingerprint" size={18} />
-        Confirm with passkey
-      </Button>
+    <section aria-labelledby="confirm-its-you" className={SETTINGS_CARD_BODY}>
+      <div className="flex flex-col items-start gap-3 px-1.5 py-2">
+        <span className="inline-flex size-9 items-center justify-center rounded-pill bg-fill text-muted-text">
+          <Icon name="lock" size={18} />
+        </span>
+        <h2 id="confirm-its-you" className="text-body font-semibold text-content">
+          Confirm it&apos;s you
+        </h2>
+        <p className="text-small text-muted-text">
+          Admin pages ask for your passkey again every 5 minutes. Nothing is shown until you confirm.
+        </p>
+        {action.error ? <Notice variant="error" className="w-full">{action.error}</Notice> : null}
+        {action.notice ? <Notice variant="info" className="w-full">{action.notice}</Notice> : null}
+        <Button type="button" disabled={action.busy} aria-busy={action.busy} onClick={() => void onConfirm()}>
+          <Icon name="fingerprint" size={18} />
+          Confirm with passkey
+        </Button>
+      </div>
     </section>
   );
 }

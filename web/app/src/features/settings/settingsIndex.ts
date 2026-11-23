@@ -5,7 +5,7 @@ import { fuzzyMatch } from "@/lib/fuzzy";
 
 export type SettingsGroupId = "account" | "browser" | "desktops" | "admin";
 
-/** The pages of the settings shell (and /admin, which keeps its own screens). */
+/** The pages of the settings shell, including the admin pages (admins only). */
 export type SettingsRoute =
   | "/settings/profile"
   | "/settings/security"
@@ -15,7 +15,9 @@ export type SettingsRoute =
   | "/settings/install"
   | "/settings/desktops"
   | "/settings/desktops/$id"
-  | "/admin";
+  | "/settings/admin"
+  | "/settings/admin/users"
+  | "/settings/admin/invites";
 
 export interface SettingsIndexEntry {
   /** Unique and stable (palette option ids, React keys). */
@@ -103,7 +105,11 @@ export const SETTINGS_INDEX: readonly SettingsIndexEntry[] = [
   { id: "desktop.forget", label: "Forget in this browser", keywords: ["remove", "forget", "leave"], group: "desktops", page: "Desktop", route: "/settings/desktops/$id", anchor: "desktop-remove", perDesktop: true },
   { id: "desktop.revoke", label: "Revoke from account", keywords: ["revoke desktop", "delete desktop", "remove desktop"], group: "desktops", page: "Desktop", route: "/settings/desktops/$id", anchor: "desktop-remove", perDesktop: true },
   // Admin
-  { id: "admin", label: "Admin", keywords: ["administration", "users", "audit log", "invites"], group: "admin", page: "Admin", route: "/admin", adminOnly: true },
+  { id: "admin", label: "Admin", keywords: ["administration", "overview", "instance"], group: "admin", page: "Admin", route: "/settings/admin", adminOnly: true },
+  { id: "admin.pause-invites", label: "Pause invites", keywords: ["invites paused", "close registration", "registration", "open invites"], group: "admin", page: "Admin", route: "/settings/admin", anchor: "pause-invites", adminOnly: true },
+  { id: "admin.recent-activity", label: "Recent activity", keywords: ["audit log", "activity", "history", "events"], group: "admin", page: "Admin", route: "/settings/admin", anchor: "recent-activity", adminOnly: true },
+  { id: "admin.users", label: "Users", keywords: ["block", "unblock", "grant invites", "members", "accounts", "user cap"], group: "admin", page: "Users", route: "/settings/admin/users", adminOnly: true },
+  { id: "admin.invite-tree", label: "Invite tree", keywords: ["who invited whom", "invites", "invited by", "branch"], group: "admin", page: "Invite tree", route: "/settings/admin/invites", anchor: "invite-tree", adminOnly: true },
 ];
 
 export interface SettingsSearchHit {

@@ -114,7 +114,7 @@ Route ownership (every route of architecture.md 3.1 has exactly one owner; the r
 | `/d/:desktopId/monos/:monoId` and `.../profile` with its children | `d/$desktopId/monos/**` | WS-P |
 | `/d/:desktopId/cloud` | `d/$desktopId/cloud/**` | WS-C |
 | `/d/:desktopId/settings` (redirects to `/settings/desktops/:id`) | `d/$desktopId/settings/**` | WS-S |
-| `/settings/*`, `/admin`, `/admin/users`, `/admin/invites` | `settings/**`, `admin/**` | WS-S |
+| `/settings/*` (admin pages included), `/admin/*` (redirects) | `settings/**`, `admin/**` | WS-S |
 
 ### 3.2 Shared files: one owner, others hook in
 
@@ -288,7 +288,7 @@ Common test pyramid: unit (vitest Workers pool, or `cargo ntest` filtered to tou
 | Goal | App frame, auth screens, settings, offline and push UI, admin page |
 | Tickets | W-01 (Wave 0), W-20, W-02, W-11, W-03, W-12, U-04, P-04, P-05 |
 | Inputs | Contracts (b), (f); A-03..A-09 routes or Worker stubs |
-| Outputs | Tokens and `ui/`, auth routes, settings, `sw.ts`, push handlers, `/admin`, isolation guard |
+| Outputs | Tokens and `ui/`, auth routes, settings, `sw.ts`, push handlers, `/settings/admin`, `/settings/admin/users` and `/settings/admin/invites` (the old `/admin` URLs redirect), isolation guard |
 | Done | W-01 checklist items; W-20 red on seeded violations; no `/api` or `/relay` response cached |
 | Tests | Vitest and Testing Library; Playwright with virtual authenticator; axe; visual at 390, 768, 1280 and 200 percent zoom; push on devices by the maintainer |
 | Risks | Service worker cache bugs (W-12); iOS push quirks (P-04) |

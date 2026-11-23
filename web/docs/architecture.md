@@ -61,7 +61,7 @@ Reuse rule: code taken from the old Tauri React app (`src/`) is copied into `web
 | `/d/:desktopId/monos/:monoId/profile` | session + link | Mono profile; children: `/edit`, `/habit/:id`, `/documents`, `/file/:name` |
 | `/d/:desktopId/cloud` | session + link | Cloud instance list: state, sessions per instance, Stop and Resume (U-17) |
 | `/settings/*` | session | One settings shell with a left nav (list page below 1024px): `/settings/profile`, `/settings/security`, `/settings/invites`, `/settings/appearance`, `/settings/notifications`, `/settings/install`, plus the desktop pages above. Old URL `/settings` redirects to `/settings/profile` |
-| `/admin`, `/admin/users`, `/admin/invites` | session, role admin, fresh | Minimal admin (security.md section 4) |
+| `/settings/admin`, `/settings/admin/users`, `/settings/admin/invites` | session, role admin, fresh | Minimal admin inside the settings shell (security.md section 4). The old `/admin`, `/admin/users` and `/admin/invites` redirect here |
 | `/install` | public | Add to Home Screen guide, push enable button |
 
 Guards: the root `beforeLoad` calls `ensureQueryData(['me'])`; a 401 redirects to `/login?redirect=<path>`. `/d/*` routes mount a `LinkProvider` for the desktop id that owns the connection lifecycle (section 3.3). Route params are typed; `projectId` is the percent-encoded value from the catalog, used as received.

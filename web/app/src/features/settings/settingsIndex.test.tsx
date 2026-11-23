@@ -2,7 +2,7 @@ import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setApiTransport } from "@/features/accounts/api";
-import { createMockState, type SeedOptions } from "@/features/accounts/mock/state";
+import { createMockState, nowSeconds, type SeedOptions } from "@/features/accounts/mock/state";
 import { createMockServer } from "@/features/accounts/mock/transport";
 import { mountApp } from "@/features/desktops/testMount";
 import { WsPSettingsSections } from "@/features/themes/SettingsSections";
@@ -107,8 +107,14 @@ describe("searchSettings", () => {
 describe("anchors of the pages", () => {
   const PAGES: SettingsRoute[] = ["/settings/profile", "/settings/security", "/settings/invites", "/settings/appearance", "/settings/notifications", "/settings/install", "/settings/desktops"];
 
-  it.each(PAGES)("%s renders every anchor of the index as an element id", async (route) => {
-    install();
+  // The admin pages need an admin account and a fresh session. /settings/admin/users has no anchors (it is the page itself).
+  const ADMIN_PAGES: SettingsRoute[] = ["/settings/admin", "/settings/admin/invites"];
+  const ADMIN_PAGES_WITHOUT_ANCHORS: SettingsRoute[] = ["/settings/admin/users"];
+
+  it.each([...PAGES, ...ADMIN_PAGES])("%s renders every anchor of the index as an element id", async (route) => {
+    const admin = ADMIN_PAGES.includes(route);
+    const state = install(admin ? { role: "admin" } : {});
+    if (admin) state.reauthAt = nowSeconds();
     stubWide();
     mountApp(route);
     await screen.findByRole("heading", { level: 1 });
@@ -119,10 +125,14 @@ describe("anchors of the pages", () => {
     });
   });
 
-  it("indexes every non-per-desktop anchor on a page of the list above", () => {
-    const routes = new Set<string>(PAGES);
+  it("indexes no anchor on the admin pages that have none", () => {
+    for (const route of ADMIN_PAGES_WITHOUT_ANCHORS) expect(anchorsOf(route)).toEqual([]);
+  });
+
+  it("indexes every non-per-desktop anchor on a page of the lists above", () => {
+    const routes = new Set<string>([...PAGES, ...ADMIN_PAGES, ...ADMIN_PAGES_WITHOUT_ANCHORS]);
     for (const entry of SETTINGS_INDEX) {
-      if (entry.perDesktop || entry.route === "/admin") continue;
+      if (entry.perDesktop) continue;
       expect(routes.has(entry.route), entry.id).toBe(true);
     }
   });
@@ -161,20 +171,26 @@ describe("settings nav", () => {
     expect(offline).toHaveAttribute("href", "/settings/desktops/desktop-dev-2");
   });
 
-  it("shows Admin to admins only", async () => {
+  it("shows the Admin group (Overview, Users, Invite tree) to admins only", async () => {
     install({ role: "admin" });
     mountApp("/settings/profile");
     const nav = await screen.findByRole("navigation", { name: "Settings" });
-    expect(await within(nav).findByRole("link", { name: "Admin" })).toHaveAttribute("href", "/admin");
-    expect(within(nav).getByRole("list", { name: SETTINGS_GROUP_LABELS.admin })).toBeInTheDocument();
+    expect(await within(nav).findByRole("link", { name: "Overview" })).toHaveAttribute("href", "/settings/admin");
+    const group = within(nav).getByRole("list", { name: SETTINGS_GROUP_LABELS.admin });
+    expect(within(group).getAllByRole("link").map((link) => [link.textContent, link.getAttribute("href")])).toEqual([
+      ["Overview", "/settings/admin"],
+      ["Users", "/settings/admin/users"],
+      ["Invite tree", "/settings/admin/invites"],
+    ]);
   });
 
-  it("shows no Admin item to a member", async () => {
+  it("shows no Admin group to a member", async () => {
     install({ role: "user" });
     mountApp("/settings/profile");
     const nav = await screen.findByRole("navigation", { name: "Settings" });
     await within(nav).findByRole("link", { name: /Fake Studio Mac/ });
-    expect(within(nav).queryByRole("link", { name: "Admin" })).toBeNull();
+    for (const name of ["Overview", "Users", "Invite tree"]) expect(within(nav).queryByRole("link", { name })).toBeNull();
+    expect(within(nav).queryByRole("list", { name: SETTINGS_GROUP_LABELS.admin })).toBeNull();
   });
 
   it("marks the active page with aria-current", async () => {
@@ -311,7 +327,7 @@ describe("quick-find", () => {
     mountApp("/settings/profile");
     const { nav, input } = await box();
     await user.type(input, "administration");
-    expect(await within(nav).findByRole("link", { name: /^Admin/ })).toHaveAttribute("href", "/admin");
+    expect(await within(nav).findByRole("link", { name: /^Admin/ })).toHaveAttribute("href", "/settings/admin");
   });
 
   it("does not list the Admin entry to a member", async () => {

@@ -49,6 +49,19 @@ describe("paletteItems settings", () => {
     expect(settingsOf("admin", true).map((item) => item.id)).toContain("admin");
   });
 
+  it("lists the admin pages and cards to admins only, with their page as the detail", () => {
+    const wanted = [
+      ["Users", "admin.users", "Users"],
+      ["Invite tree", "admin.invite-tree", "Invite tree"],
+      ["Pause invites", "admin.pause-invites", "Admin"],
+      ["Recent activity", "admin.recent-activity", "Admin"],
+    ] as const;
+    for (const [query, id, detail] of wanted) {
+      expect(settingsOf(query, true).find((item) => item.id === id), id).toMatchObject({ kind: "setting", label: query, detail });
+      expect(settingsOf(query).map((item) => item.id), id).not.toContain(id);
+    }
+  });
+
   it("puts the settings after the projects, Monos and sessions", () => {
     const kinds = paletteItems({ ...catalog, settings: searchSettings("passkey") }, "passkey").map((item) => item.kind);
     expect(kinds[0]).toBe("project");
