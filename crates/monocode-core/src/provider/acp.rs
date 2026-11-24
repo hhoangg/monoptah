@@ -46,13 +46,70 @@ pub(super) struct State {
     notices: Vec<Event>,
     stale_model: Option<String>,
     mode: Option<&'static str>,
+    /// Seconds of the deadline set on the pending request, for timeout messages.
+    request_seconds: u64,
+    /// Whether the current prompt produced any visible output.
+    replied: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Shortens every ACP request deadline of the protocols driven on this thread.
+    pub(super) static DEADLINE_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The legacy `agy_acp_server.par` speaks ACP with no arguments. Every other Antigravity
+/// binary (`agy`, `agy.exe`, a user override) is the current CLI, which needs `acp`.
+pub(super) fn is_legacy_antigravity_server(binary: &Path) -> bool {
+    binary
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("par"))
+}
+pub(super) fn legacy_antigravity(request: &Request) -> bool {
+    request.kind == Kind::Antigravity && is_legacy_antigravity_server(&request.binary)
+}
+
+/// The Antigravity session mode for an access setting. A session that advertises modes gets
+/// the first preferred one it offers (none when it offers no preferred one). The legacy server
+/// that advertises none takes its own fixed ids; the CLI never gets them.
+fn antigravity_mode(
+    planning: bool,
+    access: AccessMode,
+    setup: &Value,
+    legacy_server: bool,
+) -> &'static str {
+    let (preferred, legacy): (&[&str], &'static str) = if planning || access == AccessMode::ReadOnly
+    {
+        (&["plan", "default"], "default")
+    } else {
+        match access {
+            AccessMode::FullAccess => (&["yolo", "auto"], "yolo"),
+            AccessMode::AutoAcceptEdits => (&["auto_edit", "accept-edits"], "auto_edit"),
+            AccessMode::Auto => (&["auto", "default"], "default"),
+            _ => (&["default"], "default"),
+        }
+    };
+    match setup["modes"]["availableModes"]
+        .as_array()
+        .filter(|modes| !modes.is_empty())
+    {
+        None if legacy_server => legacy,
+        None => "",
+        Some(modes) => preferred
+            .iter()
+            .copied()
+            .find(|id| modes.iter().any(|mode| mode["id"] == *id))
+            .unwrap_or(""),
+    }
 }
 
 pub(super) fn configure(command: &mut Command, request: &Request) -> Result<(), String> {
     let settings = &request.settings;
     match request.kind {
         Kind::Antigravity => {
-            if cfg!(target_os = "linux") {
+            if !legacy_antigravity(request) {
+                command.arg("acp");
+            } else if cfg!(target_os = "linux") {
                 command.arg("--uid=");
             }
         }
@@ -225,6 +282,13 @@ impl Protocol {
                 _ => None,
             }
         };
+        #[cfg(test)]
+        let seconds =
+            seconds.map(|seconds| DEADLINE_CAP.get().map_or(seconds, |cap| seconds.min(cap)));
+        self.acp.request_seconds = seconds.unwrap_or(0);
+        if method == "session/prompt" {
+            self.acp.replied = false;
+        }
         self.acp.deadline = seconds.map(|seconds| Instant::now() + Duration::from_secs(seconds));
         write_json(
             stdin,
@@ -331,17 +395,12 @@ impl Protocol {
         let settings = &self.request.settings;
         let planning = settings.plan || settings.access == AccessMode::ReadOnly;
         let mode = match kind {
-            Kind::Antigravity => {
-                if planning {
-                    "default"
-                } else {
-                    match settings.access {
-                        AccessMode::FullAccess => "yolo",
-                        AccessMode::AutoAcceptEdits => "auto_edit",
-                        _ => "default",
-                    }
-                }
-            }
+            Kind::Antigravity => antigravity_mode(
+                planning,
+                settings.access,
+                setup,
+                legacy_antigravity(&self.request),
+            ),
             Kind::Hermes => {
                 if planning {
                     "default"
@@ -552,6 +611,14 @@ impl Protocol {
             self.done = true;
             return Ok(());
         }
+        if timed_out && self.acp.stage == Stage::Initialize {
+            let label = kind.label();
+            return Err(format!(
+                "{label}: initialize timed out after {} s. {} did not answer the ACP handshake; check the {label} CLI path in Settings.",
+                self.acp.request_seconds,
+                self.request.binary.display()
+            ));
+        }
         match self.acp.stage {
             Stage::DeleteProbe => {
                 self.done = true;
@@ -636,6 +703,7 @@ impl Protocol {
                     || method == "_x.ai/ask_user_question"
                     || method == "x.ai/ask_user_question"
                 {
+                    self.acp.replied = true;
                     self.question(
                         v["id"].clone(),
                         if self.request.kind == Kind::Cursor {
@@ -648,6 +716,7 @@ impl Protocol {
                         stdin,
                     )?;
                 } else if method == "session/request_permission" {
+                    self.acp.replied = true;
                     let request = &v["params"];
                     let subject = request.get("subject").unwrap_or(request);
                     let tool = request
@@ -759,6 +828,18 @@ impl Protocol {
                 }
                 let params = v["params"].get("notification").unwrap_or(&v["params"]);
                 self.acp_update(params.get("update").unwrap_or(params), &mut events);
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        Event::Text(_)
+                            | Event::Reasoning(_)
+                            | Event::Tool(_)
+                            | Event::Approval(_)
+                            | Event::Question(_)
+                    )
+                }) {
+                    self.acp.replied = true;
+                }
             }
             return Ok(events);
         }
@@ -906,6 +987,18 @@ impl Protocol {
                         result["stopReason"].as_str().unwrap_or("")
                     ));
                 }
+                // Only Antigravity's CLI is known to end a turn it never started.
+                if self.request.kind == Kind::Antigravity
+                    && !self.probe
+                    && !self.compact
+                    && !self.acp.replied
+                    && result["stopReason"] == "end_turn"
+                {
+                    return Err(format!(
+                        "{} ended the turn without a reply.",
+                        self.request.kind.label()
+                    ));
+                }
                 if self.request.kind == Kind::Hermes
                     && !self.acp.background.is_empty()
                     && !self.acp.cancelling
@@ -1044,6 +1137,9 @@ impl Protocol {
                 }
             }
             "plan" => {
+                if update["entries"].as_array().is_some_and(|e| !e.is_empty()) {
+                    self.acp.replied = true;
+                }
                 let text = update["entries"]
                     .as_array()
                     .into_iter()
@@ -1749,5 +1845,108 @@ mod tests {
             assert!(events.is_empty());
             assert_eq!(last(&mut out)["result"]["outcome"]["optionId"], "no");
         }
+    }
+    #[test]
+    fn antigravity_cli_gets_acp_and_the_legacy_server_keeps_its_arguments() {
+        let args = |binary: &str| {
+            let mut p = protocol(Kind::Antigravity);
+            p.request.binary = binary.into();
+            let mut command = Command::new("unused");
+            configure(&mut command, &p.request).unwrap();
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        for cli in ["/bin/agy", "agy.exe", "/opt/custom-agy", "/bin/agy.par.bak"] {
+            assert_eq!(args(cli), vec!["acp"], "{cli}");
+        }
+        let legacy = if cfg!(target_os = "linux") {
+            vec!["--uid=".to_string()]
+        } else {
+            Vec::new()
+        };
+        for server in ["/x/agy_acp_server.par", "/x/AGY_ACP_SERVER.PAR"] {
+            assert_eq!(args(server), legacy, "{server}");
+        }
+        assert!(is_legacy_antigravity_server(Path::new(
+            "a/agy_acp_server.par"
+        )));
+        assert!(!is_legacy_antigravity_server(Path::new("a/agy")));
+        assert!(!is_legacy_antigravity_server(Path::new("a/agy.exe")));
+    }
+    #[test]
+    fn antigravity_alias_table_names_agy_as_the_cli() {
+        assert_eq!(Kind::Antigravity.binary_name(), "agy_acp_server.par");
+        assert_eq!(binary_alias(Kind::Antigravity), Some("agy"));
+        assert_eq!(binary_alias(Kind::Cursor), Some("agent"));
+        assert_eq!(binary_alias(Kind::Pi), Some("pi-coding-agent"));
+        assert_eq!(binary_alias(Kind::Codex), None);
+    }
+    #[test]
+    fn antigravity_modes_follow_what_the_session_advertises() {
+        let cli = json!({"modes":{"availableModes":[{"id":"default"},{"id":"accept-edits"},{"id":"auto"},{"id":"plan"}]}});
+        let none = json!({});
+        let empty = json!({"modes":{"availableModes":[]}});
+        let odd = json!({"modes":{"availableModes":[{"id":"other"}]}});
+        let cases = [
+            (false, AccessMode::FullAccess, "auto", "yolo"),
+            (
+                false,
+                AccessMode::AutoAcceptEdits,
+                "accept-edits",
+                "auto_edit",
+            ),
+            (false, AccessMode::Auto, "auto", "default"),
+            (false, AccessMode::Supervised, "default", "default"),
+            (true, AccessMode::FullAccess, "plan", "default"),
+            (false, AccessMode::ReadOnly, "plan", "default"),
+        ];
+        for (planning, access, advertised, legacy) in cases {
+            for server in [false, true] {
+                assert_eq!(antigravity_mode(planning, access, &cli, server), advertised);
+                assert_eq!(antigravity_mode(planning, access, &odd, server), "");
+            }
+            assert_eq!(antigravity_mode(planning, access, &none, true), legacy);
+            assert_eq!(antigravity_mode(planning, access, &empty, true), legacy);
+            assert_eq!(antigravity_mode(planning, access, &none, false), "");
+            assert_eq!(antigravity_mode(planning, access, &empty, false), "");
+        }
+        let yolo = json!({"modes":{"availableModes":[{"id":"yolo"},{"id":"auto"}]}});
+        assert_eq!(
+            antigravity_mode(false, AccessMode::FullAccess, &yolo, false),
+            "yolo"
+        );
+        let mut p = protocol(Kind::Antigravity);
+        p.request.settings.access = AccessMode::FullAccess;
+        p.acp_options(&cli).unwrap();
+        assert_eq!(p.acp.mode, Some("auto"));
+        p.acp.mode = None;
+        p.acp_options(&none).unwrap();
+        assert_eq!(p.acp.mode, None, "the CLI never gets the legacy ids");
+        p.acp_options(&odd).unwrap();
+        assert_eq!(p.acp.mode, None);
+        p.request.binary = "/x/agy_acp_server.par".into();
+        p.acp_options(&none).unwrap();
+        assert_eq!(p.acp.mode, Some("yolo"));
+    }
+    #[test]
+    fn an_initialize_timeout_names_the_binary_and_the_setting() {
+        let mut p = protocol(Kind::Antigravity);
+        p.request.binary = "/x/agy".into();
+        p.acp.stage = Stage::Initialize;
+        p.acp.request_seconds = 12;
+        let error = p
+            .acp_failure(
+                &json!({"message":"initialize timed out"}),
+                true,
+                &mut Vec::new(),
+            )
+            .unwrap_err();
+        assert!(
+            error.starts_with("Antigravity: initialize timed out after 12 s."),
+            "{error}"
+        );
+        assert!(error.contains("/x/agy") && error.contains("CLI path in Settings"));
     }
 }

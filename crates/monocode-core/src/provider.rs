@@ -215,12 +215,7 @@ pub fn resolve_auto(kind: Kind) -> Option<PathBuf> {
     ] {
         candidates.push(Path::new(dir).join(kind.binary_name()));
     }
-    if matches!(kind, Kind::Cursor | Kind::Pi) {
-        let alias = if kind == Kind::Cursor {
-            "agent"
-        } else {
-            "pi-coding-agent"
-        };
+    if let Some(alias) = binary_alias(kind) {
         let paths: Vec<_> = candidates
             .iter()
             .filter_map(|p| p.parent().map(|dir| dir.join(alias)))
@@ -237,6 +232,16 @@ pub fn resolve_auto(kind: Kind) -> Option<PathBuf> {
         }
         (executable(&p) && discovery::matches(kind, &p)).then_some(p)
     })
+}
+/// Another file name a provider is installed under, searched after every primary candidate.
+/// For Antigravity the primary name is the legacy ACP server, and `agy` is the current CLI.
+fn binary_alias(kind: Kind) -> Option<&'static str> {
+    match kind {
+        Kind::Cursor => Some("agent"),
+        Kind::Pi => Some("pi-coding-agent"),
+        Kind::Antigravity => Some("agy"),
+        _ => None,
+    }
 }
 fn executable(path: &Path) -> bool {
     let Ok(meta) = path.metadata() else {
@@ -1439,6 +1444,43 @@ pub(crate) fn catalog_for(kind: Kind, account: crate::accounts::Profile) -> Resu
     .ok_or_else(|| format!("{} returned no model catalog", kind.label()))
 }
 
+/// How much skipped non-JSON stdout is kept for error messages.
+const SKIPPED_TAIL_BYTES: usize = 2048;
+
+/// Providers whose errors say what the process printed (stderr and skipped stdout). Opt-in, so
+/// the errors of the other providers stay as they are.
+fn shows_output(kind: Kind) -> bool {
+    kind == Kind::Antigravity
+}
+
+/// `error` ended with a sentence, followed by the bounded process output when there is any.
+fn with_output(mut error: String, stderr: &[u8], skipped: &[u8]) -> String {
+    let mut output = String::from_utf8_lossy(stderr).trim().to_owned();
+    let printed = String::from_utf8_lossy(skipped);
+    if !printed.trim().is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(printed.trim());
+    }
+    if !output.is_empty() {
+        if !error.trim_end().ends_with(['.', '!', '?']) {
+            error.push('.');
+        }
+        error.push_str(&format!(" Output: {}", last_bytes(&output, 1024)));
+    }
+    error
+}
+
+/// The last `limit` bytes of `text`, cut on a character boundary.
+fn last_bytes(text: &str, limit: usize) -> &str {
+    let mut start = text.len().saturating_sub(limit);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 fn run_process(
     request: Request,
     cancel: Arc<AtomicBool>,
@@ -1698,7 +1740,7 @@ fn run_operation(
         _ => acp::configure(&mut command, &request)?,
     }
     command
-        .current_dir(if request.kind == Kind::Antigravity {
+        .current_dir(if acp::legacy_antigravity(&request) {
             request.binary.parent().unwrap_or(&request.cwd)
         } else {
             &request.cwd
@@ -1741,6 +1783,11 @@ fn run_operation(
         pending.push(Event::SessionId(id));
     }
     let mut stop_confirmed = false;
+    // Output that is not provider JSON, and whether any JSON frame arrived. They turn a silent
+    // or mis-launched provider into an error that says what it printed.
+    let mut skipped = Vec::<u8>::new();
+    let mut frames = 0usize;
+    let mut annotated = false;
     let result = (|| {
         protocol.probe = probe;
         protocol.compact = compact;
@@ -1842,10 +1889,15 @@ fn run_operation(
                                 .find(|b| !b.is_ascii_whitespace())
                                 .is_some_and(|b| b == b'{') =>
                         {
+                            skipped.extend_from_slice(line.trim_ascii());
+                            skipped.push(b'\n');
+                            let excess = skipped.len().saturating_sub(SKIPPED_TAIL_BYTES);
+                            skipped.drain(..excess);
                             continue;
                         }
                         Err(e) => return Err(format!("Invalid provider JSON: {e}")),
                     };
+                    frames += 1;
                     if std::env::var_os("MONOCODE_NATIVE_TRACE").is_some() {
                         let method = value["method"].as_str().unwrap_or("");
                         let item = &value["params"]["item"];
@@ -1941,9 +1993,17 @@ fn run_operation(
                     if interrupted {
                         return Err("Stopped".into());
                     }
-                    return Err(format!(
-                        "Provider exited before completing the turn. {}",
-                        String::from_utf8_lossy(&tail.lock().unwrap())
+                    if !shows_output(protocol.request.kind) {
+                        return Err(format!(
+                            "Provider exited before completing the turn. {}",
+                            String::from_utf8_lossy(&tail.lock().unwrap())
+                        ));
+                    }
+                    annotated = true;
+                    return Err(with_output(
+                        "Provider exited before completing the turn.".into(),
+                        &tail.lock().unwrap(),
+                        &skipped,
                     ));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1974,7 +2034,7 @@ fn run_operation(
                 Kind::Cursor | Kind::Grok => Some(15),
                 Kind::Hermes => Some(30),
                 Kind::Pi | Kind::Omp => Some(45),
-                Kind::Antigravity => None,
+                Kind::Antigravity => Some(30),
                 _ => Some(60),
             };
             if probe
@@ -1985,6 +2045,17 @@ fn run_operation(
             }
         }
     })();
+    let result = match result {
+        Err(error)
+            if frames == 0
+                && !annotated
+                && error != "Stopped"
+                && shows_output(protocol.request.kind) =>
+        {
+            Err(with_output(error, &tail.lock().unwrap(), &skipped))
+        }
+        other => other,
+    };
     // A card still open when the turn ends can no longer be answered.
     protocol.gate_clear();
     // Cancellation can arrive while publishing an event batch. Its callback
@@ -2881,5 +2952,257 @@ for line in sys.stdin:
         let (_tmp, request) = fixture("#!/bin/sh\nIFS= read -r init\nprintf '{invalid json\\n'\n");
         let error = run(request, Arc::new(AtomicBool::new(false)), |_| Ok(())).unwrap_err();
         assert!(error.starts_with("Invalid provider JSON:"), "{error}");
+    }
+
+    /// A fake Antigravity binary. `snippet` defines `custom(method, params, id)`, which returns
+    /// True when it answered the request itself.
+    const AGY_HEADER: &str = r#"#!/usr/bin/env python3
+import json, os, sys
+HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+def send(value):
+    print(json.dumps(value), flush=True)
+def ok(id, result):
+    return {'jsonrpc': '2.0', 'id': id, 'result': result}
+def fail(id, message):
+    return {'jsonrpc': '2.0', 'id': id, 'error': {'code': -32603, 'message': message}}
+def note(name, text):
+    with open(os.path.join(HERE, name), 'w') as f:
+        f.write(text)
+SESSION = json.loads('''{"sessionId":"c8775056","models":{"availableModels":[{"modelId":"gemini-4-neon-high","name":"Gemini 4 Neon (High)"}]},
+"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"accept-edits","name":"Accept edits"},{"id":"auto","name":"Auto"},{"id":"plan","name":"Plan"}]},
+"configOptions":[
+{"id":"model","name":"Model","category":"model","type":"select","currentValue":"gemini-4-neon","options":[{"value":"gemini-4-neon","name":"Gemini 4 Neon"},{"value":"gemini-4-carbon","name":"Gemini 4 Carbon"},{"value":"claude-opus-5-5","name":"Claude Opus 5.5"},{"value":"gpt-oss-120b-medium","name":"GPT-OSS 120B (Medium)"}]},
+{"id":"thought_level","name":"Thinking Level","category":"thought_level","type":"select","currentValue":"high","options":[{"value":"low","name":"Low"},{"value":"medium","name":"Medium"},{"value":"high","name":"High"},{"value":"xhigh","name":"Extra"}]},
+{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"accept-edits","name":"Accept edits"},{"value":"auto","name":"Auto"},{"value":"plan","name":"Plan"}]}],
+"_meta":{}}''')
+"#;
+    const AGY_LOOP: &str = r#"
+if os.path.basename(sys.argv[0]) == 'agy' and sys.argv[1:] != ['acp']:
+    sys.stdin.read()
+    sys.exit(0)
+note('argv', ' '.join(sys.argv[1:]))
+note('cwd', os.getcwd())
+for line in sys.stdin:
+    msg = json.loads(line)
+    method, id, params = msg.get('method'), msg.get('id'), msg.get('params', {})
+    if id is None:
+        continue
+    if custom(method, params, id):
+        continue
+    if method == 'initialize':
+        send(ok(id, {'protocolVersion': 1}))
+    elif method == 'session/new':
+        send(ok(id, SESSION))
+    else:
+        send(ok(id, {}))
+"#;
+    const AGY_PLAIN: &str = "def custom(method, params, id):\n    return False\n";
+    const AGY_REPLY: &str = r#"def custom(method, params, id):
+    if method == 'session/set_mode':
+        note('mode', params['modeId'])
+    if method == 'session/prompt':
+        send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': SESSION['sessionId'], 'update': {'sessionUpdate': 'agent_message_chunk', 'content': {'type': 'text', 'text': 'pong'}}}})
+        send(ok(id, {'stopReason': 'end_turn'}))
+        return True
+    return False
+"#;
+    fn agy(name: &str, snippet: &str) -> (tempfile::TempDir, Request) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(name);
+        std::fs::write(&path, format!("{AGY_HEADER}{snippet}{AGY_LOOP}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let request = Request {
+            kind: Kind::Antigravity,
+            binary: path,
+            cwd,
+            prompt: "ping".into(),
+            provider_id: None,
+            model: None,
+            settings: Default::default(),
+        };
+        (tmp, request)
+    }
+    /// Shortens ACP request deadlines for the current test thread until dropped.
+    struct Deadlines;
+    impl Deadlines {
+        fn capped(seconds: u64) -> Self {
+            acp::DEADLINE_CAP.set(Some(seconds));
+            Self
+        }
+    }
+    impl Drop for Deadlines {
+        fn drop(&mut self) {
+            acp::DEADLINE_CAP.set(None);
+        }
+    }
+    fn probe(request: Request) -> Result<Option<Value>, String> {
+        run_process(
+            request,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            true,
+            |_| Ok(()),
+        )
+    }
+    fn turn(request: Request) -> (Result<(), String>, String, bool) {
+        let (mut text, mut done) = (String::new(), false);
+        let result = run(request, Arc::new(AtomicBool::new(false)), |events| {
+            for event in events {
+                match event {
+                    Event::Text(t) => text.push_str(&t),
+                    Event::Done => done = true,
+                    _ => {}
+                }
+            }
+            Ok(())
+        });
+        (result, text, done)
+    }
+    #[test]
+    fn antigravity_cli_model_listing_runs_agy_acp() {
+        let (_tmp, request) = agy("agy", AGY_PLAIN);
+        let value = probe(request).unwrap().unwrap();
+        let models = crate::catalog::acp_models(&value);
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gemini-4-neon",
+                "gemini-4-carbon",
+                "claude-opus-5-5",
+                "gpt-oss-120b-medium"
+            ]
+        );
+        assert!(models
+            .iter()
+            .all(|m| m.efforts == ["low", "medium", "high", "xhigh"]));
+        assert!(models[0].default);
+    }
+    #[test]
+    fn antigravity_model_listing_times_out_with_the_cli_path_hint() {
+        let _cap = Deadlines::capped(1);
+        let (_tmp, request) = agy("agy", "def custom(method, params, id):\n    return True\n");
+        let binary = request.binary.display().to_string();
+        let started = Instant::now();
+        let error = probe(request).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "{error}");
+        assert!(
+            error.contains("Antigravity: initialize timed out after 1 s."),
+            "{error}"
+        );
+        assert!(
+            error.contains(&binary) && error.contains("CLI path in Settings"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn antigravity_model_listing_reports_rpc_errors() {
+        for (failing, message) in [
+            ("initialize", "no handshake"),
+            ("session/new", "no session"),
+        ] {
+            let (_tmp, request) = agy(
+                "agy",
+                &format!(
+                    "def custom(method, params, id):\n    if method == '{failing}':\n        send(fail(id, '{message}'))\n        return True\n    return False\n"
+                ),
+            );
+            let error = probe(request).unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+    #[test]
+    fn antigravity_turn_runs_in_the_work_dir_with_an_advertised_mode() {
+        let (tmp, mut request) = agy("agy", AGY_REPLY);
+        request.settings.access = AccessMode::FullAccess;
+        let cwd = request.cwd.clone();
+        let (result, text, done) = turn(request);
+        result.unwrap();
+        assert_eq!(text, "pong");
+        assert!(done);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("mode")).unwrap(),
+            "auto"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("argv")).unwrap(),
+            "acp"
+        );
+        assert_eq!(
+            std::fs::canonicalize(std::fs::read_to_string(tmp.path().join("cwd")).unwrap())
+                .unwrap(),
+            std::fs::canonicalize(cwd).unwrap()
+        );
+    }
+    #[test]
+    fn antigravity_plan_only_turn_counts_as_a_reply() {
+        let (_tmp, mut request) = agy(
+            "agy",
+            "def custom(method, params, id):\n    if method == 'session/prompt':\n        send({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': SESSION['sessionId'], 'update': {'sessionUpdate': 'plan', 'entries': [{'content': 'Step one', 'status': 'pending'}]}}})\n        send(ok(id, {'stopReason': 'end_turn'}))\n        return True\n    return False\n",
+        );
+        request.settings.access = AccessMode::ReadOnly;
+        let (result, _, done) = turn(request);
+        result.unwrap();
+        assert!(done);
+    }
+    #[test]
+    fn antigravity_turn_reports_a_prompt_error() {
+        let (_tmp, request) = agy(
+            "agy",
+            "def custom(method, params, id):\n    if method == 'session/prompt':\n        send(fail(id, 'quota exhausted'))\n        return True\n    return False\n",
+        );
+        let (result, text, done) = turn(request);
+        assert!(result.unwrap_err().contains("quota exhausted"));
+        assert!(text.is_empty() && !done);
+    }
+    #[test]
+    fn antigravity_turn_without_a_reply_is_an_error() {
+        let (_tmp, request) = agy(
+            "agy",
+            "def custom(method, params, id):\n    if method == 'session/prompt':\n        send(ok(id, {'stopReason': 'end_turn'}))\n        return True\n    return False\n",
+        );
+        let (result, _, done) = turn(request);
+        assert_eq!(
+            result.unwrap_err(),
+            "Antigravity ended the turn without a reply."
+        );
+        assert!(!done);
+    }
+    #[test]
+    fn antigravity_output_that_is_not_json_is_shown_when_it_exits() {
+        let (_tmp, request) = agy(
+            "agy",
+            "sys.stdin.readline()\nprint('usage: agy [command] [flags]', flush=True)\nsys.exit(2)\ndef custom(method, params, id):\n    return True\n",
+        );
+        let (result, _, _) = turn(request);
+        let error = result.unwrap_err();
+        assert!(error.contains("Provider exited"), "{error}");
+        assert!(error.contains("usage: agy [command] [flags]"), "{error}");
+    }
+    #[test]
+    fn legacy_antigravity_server_gets_no_acp_argument_and_runs_in_its_own_directory() {
+        // The legacy server does not advertise session modes.
+        let legacy_reply = format!(
+            "{AGY_REPLY}\nSESSION.pop('modes', None)\nSESSION['configOptions'] = [o for o in SESSION['configOptions'] if o['id'] != 'mode']\n"
+        );
+        let (tmp, mut request) = agy("agy_acp_server.par", &legacy_reply);
+        request.settings.access = AccessMode::FullAccess;
+        let (result, text, _) = turn(request);
+        result.unwrap();
+        assert_eq!(text, "pong");
+        let argv = std::fs::read_to_string(tmp.path().join("argv")).unwrap();
+        assert!(!argv.contains("acp"), "{argv}");
+        assert_eq!(
+            std::fs::canonicalize(std::fs::read_to_string(tmp.path().join("cwd")).unwrap())
+                .unwrap(),
+            std::fs::canonicalize(tmp.path()).unwrap()
+        );
+        // The legacy server takes its fixed mode ids.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("mode")).unwrap(),
+            "yolo"
+        );
     }
 }
