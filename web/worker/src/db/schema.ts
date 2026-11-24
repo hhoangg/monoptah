@@ -205,7 +205,7 @@ export const desktops = sqliteTable(
     /** `emoji`, `image` or null (initials). See migration 0008. */
     avatarKind: text("avatar_kind"),
     avatarEmoji: text("avatar_emoji"),
-    /** First 16 hex of the SHA-256 of the image: the cache key of its URL. */
+    /** The version of the image URL: 16 hex, a random token per upload (older rows keep the content hash they were stored with). */
     avatarHash: text("avatar_hash"),
     /** Base64 of the re-encoded PNG, JPEG or WebP (at most 20 KiB). */
     avatarImage: text("avatar_image"),

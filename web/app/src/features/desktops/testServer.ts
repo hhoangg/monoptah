@@ -60,6 +60,7 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
   const mock = createMockServer({ signedIn: true });
   const requireFresh = options.requireFresh ?? true;
   let fresh = false;
+  let avatarUploads = 0;
   const server: FakeServer = {
     desktops: options.desktops ?? [],
     devices: options.devices ?? [],
@@ -110,8 +111,8 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
         }
         if (method === "PATCH") {
           const patch = body as { name?: string; color?: string | null; avatar?: { kind: "emoji"; emoji: string } | { kind: "image"; data: string } | null };
-          // Like the real server: an emoji is kept, an image becomes a hash the page builds its URL from, null clears.
-          const avatar = patch.avatar === undefined ? {} : { avatar: patch.avatar === null ? null : patch.avatar.kind === "emoji" ? patch.avatar : { kind: "image" as const, hash: "0123456789abcdef" } };
+          // Like the real server: an emoji is kept, an image becomes a new random-looking token per upload (here a counter) the page builds its URL from, null clears.
+          const avatar = patch.avatar === undefined ? {} : { avatar: patch.avatar === null ? null : patch.avatar.kind === "emoji" ? patch.avatar : { kind: "image" as const, hash: (avatarUploads += 1).toString(16).padStart(16, "0") } };
           Object.assign(target, patch.name !== undefined ? { name: patch.name.trim() } : {}, patch.color !== undefined ? { color: patch.color } : {}, avatar);
           return json(200, { desktop: target });
         }

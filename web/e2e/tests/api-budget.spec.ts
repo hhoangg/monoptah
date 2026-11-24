@@ -246,6 +246,64 @@ test.describe("API call budget", () => {
     }
   });
 
+  test("avatar: the picture is fetched once and a reload serves it from the browser cache", async () => {
+    test.setTimeout(120_000);
+    await freshWindow();
+    const png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4zwAE/xkgFAAb8gP91pbyKwAAAABJRU5ErkJggg==";
+    const patched = await actor.call("PATCH", `/api/desktops/${desktopId}`, { body: { avatar: { kind: "image", mime: "image/png", data: png } } });
+    expect(patched.status).toBe(200);
+    const avatarPath = new RegExp(`^/api/desktops/${desktopId}/avatar\\?v=[0-9a-f]{16}$`);
+    // No page.route here: it turns the HTTP cache off in Playwright. The DevTools protocol reports where each response came from.
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Network.enable");
+    const loads = new Map<string, { url: string; cached: boolean }>();
+    const isAvatar = (url: string) => avatarPath.test(new URL(url).pathname + new URL(url).search);
+    cdp.on("Network.requestWillBeSent", (event) => {
+      if (isAvatar(event.request.url)) loads.set(event.requestId, { url: event.request.url, cached: false });
+    });
+    cdp.on("Network.requestServedFromCache", (event) => {
+      const load = loads.get(event.requestId);
+      if (load) load.cached = true;
+    });
+    cdp.on("Network.responseReceived", (event) => {
+      const load = loads.get(event.requestId);
+      if (load && event.response.fromDiskCache) load.cached = true;
+    });
+    const railImage = () => page.getByTestId("activity-rail").getByRole("link", { name: new RegExp(`^${MACHINE}`) }).getByTestId("avatar-image");
+    const rendered = async () => {
+      await expect(railImage()).toHaveAttribute("src", avatarPath, { timeout: 30_000 });
+      await expect.poll(() => railImage().evaluate((element: HTMLImageElement) => element.complete && element.naturalWidth > 0)).toBe(true);
+      await page.waitForLoadState("networkidle");
+    };
+    try {
+      await page.goto(`/d/${desktopId}`);
+      await rendered();
+      // Control: the first load did reach the network, so the observation below is not blind.
+      expect([...loads.values()].filter((load) => !load.cached).length, "first load fetches the picture").toBeGreaterThanOrEqual(1);
+
+      loads.clear();
+      await page.reload();
+      await rendered();
+      const refetched = [...loads.values()].filter((load) => !load.cached).map((load) => load.url);
+      expect(refetched, "avatar requests that went to the network after the reload").toEqual([]);
+      const timing = await page.evaluate(() =>
+        performance
+          .getEntriesByType("resource")
+          .filter((entry) => /\/avatar\?v=/.test(entry.name))
+          .map((entry) => ({ transferSize: (entry as PerformanceResourceTiming).transferSize, decodedBodySize: (entry as PerformanceResourceTiming).decodedBodySize })),
+      );
+      expect(timing.length, "the reloaded page requested the picture").toBeGreaterThanOrEqual(1);
+      for (const entry of timing) {
+        expect(entry.transferSize).toBe(0);
+        expect(entry.decodedBodySize).toBeGreaterThan(0);
+      }
+    } finally {
+      await cdp.detach();
+      const cleared = await actor.call("PATCH", `/api/desktops/${desktopId}`, { body: { avatar: null } });
+      expect(cleared.status).toBe(200);
+    }
+  });
+
   test("no /api response was a 429 during the whole spec", () => {
     expect(throttled).toEqual([]);
   });

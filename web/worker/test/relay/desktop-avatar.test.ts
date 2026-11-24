@@ -1,6 +1,7 @@
 // The avatar of a desktop (migration 0008): an emoji or a small PNG, JPEG or WebP, per account.
 import { DESKTOP_AVATAR_MAX_BYTES } from "@monoptah/protocol";
 import { describe, expect, it } from "vitest";
+import { AVATAR_CACHE_CONTROL } from "../../src/modules/desktops/avatar.ts";
 import { authedCall } from "../support/accounts.ts";
 import { env, json, newAccount, pairDesktop } from "./support/api-support.ts";
 
@@ -18,6 +19,14 @@ interface Summary {
 
 async function patch(account: Awaited<ReturnType<typeof newAccount>>, id: string, body: unknown) {
   return authedCall(account.session, `/api/desktops/${id}`, json(body, "PATCH"));
+}
+
+async function uploadPng(account: Awaited<ReturnType<typeof newAccount>>, id: string, bytes: number[] = PNG): Promise<string> {
+  const res = await patch(account, id, { avatar: { kind: "image", mime: "image/png", data: toBase64(bytes) } });
+  expect(res.status).toBe(200);
+  const hash = ((await res.json()) as { desktop: Summary }).desktop.avatar?.hash;
+  expect(hash).toMatch(/^[0-9a-f]{16}$/);
+  return hash ?? "";
 }
 
 describe("PATCH /api/desktops/:id avatar", () => {
@@ -70,15 +79,19 @@ describe("PATCH /api/desktops/:id avatar", () => {
     expect(image.headers.get("Content-Type")).toBe(type);
     expect(image.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(image.headers.get("Content-Security-Policy")).toContain("sandbox");
-    expect(image.headers.get("Cache-Control")).toBe("no-store");
+    expect(image.headers.get("Cache-Control")).toBe("private, max-age=31536000, immutable");
+    expect(image.headers.get("Vary")).toBe("Cookie");
+    expect(image.headers.get("Content-Length")).toBe(String(bytes.length));
+    expect(image.headers.get("Strict-Transport-Security")).not.toBeNull();
     expect(Array.from(new Uint8Array(await image.arrayBuffer()))).toEqual(bytes);
   });
 
   it("takes the type from the bytes, not from the mime the client claims", async () => {
     const mine = await newAccount();
     const paired = await pairDesktop(mine);
-    await patch(mine, paired.desktopId, { avatar: { kind: "image", mime: "image/png", data: toBase64(JPEG) } });
-    const image = await authedCall(mine.session, `/api/desktops/${paired.desktopId}/avatar`);
+    const res = await patch(mine, paired.desktopId, { avatar: { kind: "image", mime: "image/png", data: toBase64(JPEG) } });
+    const hash = ((await res.json()) as { desktop: Summary }).desktop.avatar?.hash;
+    const image = await authedCall(mine.session, `/api/desktops/${paired.desktopId}/avatar?v=${hash}`);
     expect(image.headers.get("Content-Type")).toBe("image/jpeg");
   });
 
@@ -119,11 +132,21 @@ describe("PATCH /api/desktops/:id avatar", () => {
     const mine = await newAccount();
     const theirs = await newAccount();
     const paired = await pairDesktop(mine);
-    await patch(mine, paired.desktopId, { avatar: { kind: "image", mime: "image/png", data: toBase64(PNG) } });
+    const hash = await uploadPng(mine, paired.desktopId);
+    const url = `/api/desktops/${paired.desktopId}/avatar?v=${hash}`;
     expect((await patch(theirs, paired.desktopId, { avatar: { kind: "emoji", emoji: ROCKET } })).status).toBe(404);
-    expect((await authedCall(theirs.session, `/api/desktops/${paired.desktopId}/avatar`)).status).toBe(404);
-    expect((await authedCall({ cookie: "" }, `/api/desktops/${paired.desktopId}/avatar`)).status).toBe(401);
-    expect((await authedCall(mine.session, `/api/desktops/${paired.desktopId}/avatar`)).status).toBe(200);
+    expect((await authedCall(mine.session, url)).status).toBe(200);
+    // Another account with the right id and the right token gets neither the bytes nor a cacheable answer.
+    for (const withToken of [url, `/api/desktops/${paired.desktopId}/avatar`]) {
+      const other = await authedCall(theirs.session, withToken);
+      expect(other.status).toBe(404);
+      expect(other.headers.get("Cache-Control")).toBe("no-store");
+      expect(other.headers.get("Vary")).toBeNull();
+      expect(other.headers.get("Content-Type")).not.toMatch(/^image\//);
+    }
+    const anonymous = await authedCall({ cookie: "" }, url);
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.headers.get("Cache-Control")).toBe("no-store");
   });
 
   it("does not put the image bytes in the list or the directory answers", async () => {
@@ -135,6 +158,79 @@ describe("PATCH /api/desktops/:id avatar", () => {
     for (const text of [list, detail]) {
       expect(text).not.toContain(toBase64(PNG));
       expect(text).not.toContain("avatar_image");
+    }
+  });
+});
+
+describe("GET /api/desktops/:id/avatar caching", () => {
+  it("serves the bytes cacheable under the current v, with the security headers kept", async () => {
+    const mine = await newAccount();
+    const paired = await pairDesktop(mine);
+    const hash = await uploadPng(mine, paired.desktopId);
+    const res = await authedCall(mine.session, `/api/desktops/${paired.desktopId}/avatar?v=${hash}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Cache-Control")).toBe(AVATAR_CACHE_CONTROL);
+    expect(res.headers.get("Vary")).toBe("Cookie");
+    expect(res.headers.get("Content-Type")).toBe("image/png");
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(res.headers.get("Content-Security-Policy")).toBe("default-src 'none'; sandbox");
+  });
+
+  it.each([["a stale v", "0000000000000000"], ["no v", ""], ["a malformed v", "zz"]])("redirects %s to the current URL, uncached", async (_name, v) => {
+    const mine = await newAccount();
+    const paired = await pairDesktop(mine);
+    const hash = await uploadPng(mine, paired.desktopId);
+    const path = `/api/desktops/${paired.desktopId}/avatar`;
+    const res = await authedCall(mine.session, v === "" ? path : `${path}?v=${v}`, { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe(`${path}?v=${hash}`);
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+    expect(await res.text()).toBe("");
+  });
+
+  it("gives the same bytes uploaded twice two different tokens, and the old one redirects to the new", async () => {
+    const mine = await newAccount();
+    const paired = await pairDesktop(mine);
+    const first = await uploadPng(mine, paired.desktopId);
+    const second = await uploadPng(mine, paired.desktopId);
+    expect(second).not.toBe(first);
+    const path = `/api/desktops/${paired.desktopId}/avatar`;
+    const old = await authedCall(mine.session, `${path}?v=${first}`, { redirect: "manual" });
+    expect(old.status).toBe(302);
+    expect(old.headers.get("Location")).toBe(`${path}?v=${second}`);
+    expect(old.headers.get("Cache-Control")).toBe("no-store");
+    expect((await authedCall(mine.session, `${path}?v=${second}`)).status).toBe(200);
+  });
+
+  it("keeps the token and the cacheable URL when only the name or only the color is patched", async () => {
+    const mine = await newAccount();
+    const paired = await pairDesktop(mine);
+    const hash = await uploadPng(mine, paired.desktopId);
+    const url = `/api/desktops/${paired.desktopId}/avatar?v=${hash}`;
+    for (const body of [{ name: "Renamed" }, { color: "#39c363" }]) {
+      const res = await patch(mine, paired.desktopId, body);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { desktop: Summary }).desktop.avatar).toEqual({ kind: "image", hash });
+      const list = (await (await authedCall(mine.session, "/api/desktops")).json()) as { desktops: Summary[] };
+      expect(list.desktops[0]?.avatar).toEqual({ kind: "image", hash });
+      const image = await authedCall(mine.session, url);
+      expect(image.status).toBe(200);
+      expect(image.headers.get("Cache-Control")).toBe(AVATAR_CACHE_CONTROL);
+    }
+  });
+
+  it("is 404 and uncached for a revoked desktop, an emoji desktop and an initials desktop", async () => {
+    const mine = await newAccount();
+    const revoked = await pairDesktop(mine);
+    const hash = await uploadPng(mine, revoked.desktopId);
+    await env.DB.prepare("UPDATE desktops SET revoked_at = 5 WHERE id = ?").bind(revoked.desktopId).run();
+    const emoji = await pairDesktop(mine);
+    await patch(mine, emoji.desktopId, { avatar: { kind: "emoji", emoji: ROCKET } });
+    const initials = await pairDesktop(mine);
+    for (const [id, v] of [[revoked.desktopId, hash], [emoji.desktopId, hash], [initials.desktopId, hash]] as const) {
+      const res = await authedCall(mine.session, `/api/desktops/${id}/avatar?v=${v}`);
+      expect(res.status, id).toBe(404);
+      expect(res.headers.get("Cache-Control"), id).toBe("no-store");
     }
   });
 });

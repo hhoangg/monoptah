@@ -1,7 +1,8 @@
 // Auth resolver, one per route (architecture.md 4.1, security.md 3.3). Resolves the cookie session for the
 // routes of `auth` kind `session`, `fresh`, `admin` and `session+grant`, puts the principal on the Hono context
 // (`c.get("auth")`, read it with `requireAuth(c)`), and answers 401 or 403. Then it applies the general
-// 120-per-session-per-minute limit (in memory, best effort, see modules/ratelimit/memory.ts).
+// 120-per-session-per-minute limit, or the separate 300-per-minute avatar bucket for `GET /api/desktops/:id/avatar`
+// (in memory, best effort, see modules/ratelimit/memory.ts).
 //
 // - `public`: nothing is resolved and the cookie is never read.
 // - `session`: cookie present, row exists, not revoked, before `idle_expires_at` and `expires_at`, user exists
@@ -20,8 +21,12 @@ import type { ApiRoute } from "@monoptah/protocol";
 import { apiError, type AppContext, type AppEnv } from "../http.ts";
 import { sha256Hex } from "../lib/crypto.ts";
 import { nowSeconds } from "../lib/time.ts";
-import { auditBreach, consumeSession } from "../modules/ratelimit/index.ts";
-import { SESSION_LIMIT, SESSION_WINDOW_SECONDS } from "../modules/ratelimit/memory.ts";
+import { AVATAR_ROUTE_KEY, AVATAR_SESSION_LIMIT, auditBreach, consumeAvatarSession, consumeSession } from "../modules/ratelimit/index.ts";
+import {
+  SESSION_LIMIT,
+  SESSION_WINDOW_SECONDS,
+  type MemoryLimitResult,
+} from "../modules/ratelimit/memory.ts";
 import { clearSessionCookie, FRESH_SECONDS, IDLE_SECONDS, readSessionToken, TOUCH_INTERVAL_SECONDS, type SessionAmr } from "../modules/sessions/session.ts";
 
 export interface AuthUser {
@@ -139,12 +144,22 @@ async function touch(c: AppContext, session: AuthSession, now: number): Promise<
   }
 }
 
-/** The general limit: 120 per session per minute, in memory. The first breach of a window is audited. */
-async function applySessionLimit(c: AppContext, principal: Principal): Promise<Response | null> {
-  const result = consumeSession(principal.session.idHash);
+interface SessionBucket {
+  group: "session" | "session-avatar";
+  limit: number;
+  consume: (idHash: string) => MemoryLimitResult;
+}
+
+const GENERAL_BUCKET: SessionBucket = { group: "session", limit: SESSION_LIMIT, consume: (idHash) => consumeSession(idHash) };
+/** Avatar GETs do not count toward the general limit (security.md 3.5). */
+const AVATAR_BUCKET: SessionBucket = { group: "session-avatar", limit: AVATAR_SESSION_LIMIT, consume: (idHash) => consumeAvatarSession(idHash) };
+
+/** The general limit (120 per session per minute) or the avatar one (300), in memory. The first breach of a window is audited. */
+async function applySessionLimit(c: AppContext, principal: Principal, bucket: SessionBucket): Promise<Response | null> {
+  const result = bucket.consume(principal.session.idHash);
   if (result.ok) return null;
   if (result.firstBreach) {
-    await auditBreach(c, "session", { limit: SESSION_LIMIT, windowSeconds: SESSION_WINDOW_SECONDS }, principal.user.id);
+    await auditBreach(c, bucket.group, { limit: bucket.limit, windowSeconds: SESSION_WINDOW_SECONDS }, principal.user.id);
   }
   c.header("Retry-After", String(result.retryAfter));
   return apiError(c, 429, "rate_limited", "Too many requests");
@@ -157,6 +172,7 @@ export function authResolver(route: ApiRoute): MiddlewareHandler<AppEnv> {
     return (_c, next) => next();
   }
   const routeKey = `${route.method} ${route.path}`;
+  const bucket = routeKey === AVATAR_ROUTE_KEY ? AVATAR_BUCKET : GENERAL_BUCKET;
   const recoveryOnlyAllowed = route.allowRecoveryOnly === true || RECOVERY_ONLY_ALLOWLIST.has(routeKey);
 
   return async (c, next) => {
@@ -167,7 +183,7 @@ export function authResolver(route: ApiRoute): MiddlewareHandler<AppEnv> {
     const { principal, status } = resolved;
     if (status === "blocked") return apiError(c, 403, "blocked", "Account blocked");
 
-    const limited = await applySessionLimit(c, principal);
+    const limited = await applySessionLimit(c, principal, bucket);
     if (limited) return limited;
 
     if (principal.session.recoveryOnly) {

@@ -4,6 +4,9 @@
 import { DESKTOP_AVATAR_MAX_BYTES, type DesktopAvatar } from "@monoptah/protocol";
 import { toHex } from "../../lib/crypto.ts";
 
+/** `Cache-Control` of an avatar answered for its current version: the URL changes with every upload, so the bytes never go stale. */
+export const AVATAR_CACHE_CONTROL = "private, max-age=31536000, immutable";
+
 export type AvatarMime = "image/png" | "image/jpeg" | "image/webp";
 
 const startsWith = (bytes: Uint8Array, prefix: readonly number[], offset = 0): boolean => prefix.every((value, index) => bytes[offset + index] === value);
@@ -29,23 +32,28 @@ export function decodeBase64(text: string): Uint8Array | null {
   }
 }
 
-/** The first 16 hex characters of the SHA-256 of the image: the cache key of its URL. */
-export async function imageHash(bytes: Uint8Array): Promise<string> {
-  return toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))).slice(0, 16);
+/**
+ * A fresh random version token for an uploaded image: 16 lowercase hex characters (8 random bytes). It is the `v` of the
+ * avatar URL, so it is not derived from the image: the same picture uploaded twice gets a new URL, and nobody can
+ * compute the URL of a picture they have.
+ */
+export function newAvatarToken(): string {
+  return toHex(crypto.getRandomValues(new Uint8Array(8)));
 }
 
 export interface ImageAvatar {
+  /** The random version token (`newAvatarToken`), stored in `avatar_hash`. */
   hash: string;
   /** The base64 that is stored: the client's text, which decodes to exactly the checked bytes. */
   data: string;
 }
 
 /** Checks the base64 of an uploaded image: valid, within the size cap and a PNG, JPEG or WebP by its magic bytes. Null refuses it. */
-export async function checkImage(base64: string): Promise<ImageAvatar | null> {
+export function checkImage(base64: string): ImageAvatar | null {
   const bytes = decodeBase64(base64);
   if (!bytes || bytes.length === 0 || bytes.length > DESKTOP_AVATAR_MAX_BYTES) return null;
   if (sniffImage(bytes) === null) return null;
-  return { hash: await imageHash(bytes), data: base64 };
+  return { hash: newAvatarToken(), data: base64 };
 }
 
 export interface AvatarColumns {

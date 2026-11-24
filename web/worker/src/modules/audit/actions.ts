@@ -78,6 +78,7 @@ export const RATE_LIMIT_AUDIT_GROUPS = [
   "invite",
   "handle",
   "session",
+  "session-avatar",
 ] as const;
 
 interface ActionSpec {

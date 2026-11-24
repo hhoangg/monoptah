@@ -1,5 +1,5 @@
-// In-memory limits of security.md 3.5: the general authenticated limit (120 calls per session per minute) and the
-// per-isolate pre-filter in front of the D1 per-IP limits.
+// In-memory limits of security.md 3.5: the general authenticated limit (120 calls per session per minute), the separate
+// avatar bucket (300 per session per minute) and the per-isolate pre-filter in front of the D1 per-IP limits.
 // Best effort: every isolate has its own counters, so the effective limit can be higher when requests are
 // spread over isolates, and a counter is lost when the isolate is recycled. In exchange it writes nothing
 // to D1 (the free plan has 100,000 writes per day).
@@ -7,6 +7,9 @@ import { nowSeconds } from "../../lib/time.ts";
 
 export const SESSION_LIMIT = 120;
 export const SESSION_WINDOW_SECONDS = 60;
+/** Avatar GETs have their own bucket, so a page of avatars does not eat the general limit. */
+export const AVATAR_SESSION_LIMIT = 300;
+export const AVATAR_ROUTE_KEY = "GET /api/desktops/:id/avatar";
 /** Upper bound of tracked sessions per isolate; the table is purged and then trimmed beyond it. */
 export const MAX_TRACKED_SESSIONS = 5000;
 /** Upper bound of tracked (group, IP) keys per isolate, with the same purge and trim. */
@@ -80,11 +83,17 @@ class MemoryCounters {
 }
 
 const sessions = new MemoryCounters(MAX_TRACKED_SESSIONS);
+const avatarSessions = new MemoryCounters(MAX_TRACKED_SESSIONS);
 const ips = new MemoryCounters(MAX_TRACKED_IPS);
 
 /** Counts one call of the session `idHash` (fixed window of 60 s, in memory). */
 export function consumeSession(idHash: string, now: number = nowSeconds()): MemoryLimitResult {
   return sessions.consume(idHash, SESSION_LIMIT, SESSION_WINDOW_SECONDS, now);
+}
+
+/** Counts one avatar GET of the session `idHash` (own bucket: 300 per 60 s, in memory). */
+export function consumeAvatarSession(idHash: string, now: number = nowSeconds()): MemoryLimitResult {
+  return avatarSessions.consume(idHash, AVATAR_SESSION_LIMIT, SESSION_WINDOW_SECONDS, now);
 }
 
 /**
@@ -109,6 +118,7 @@ export function trackedIps(): number {
 /** Forgets every session counter (tests). */
 export function resetSessionLimits(): void {
   sessions.clear();
+  avatarSessions.clear();
 }
 
 /** Forgets every IP pre-filter counter (tests). */

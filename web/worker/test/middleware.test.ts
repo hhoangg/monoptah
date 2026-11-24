@@ -2,7 +2,8 @@ import { env } from "cloudflare:workers";
 import { Hono } from "hono";
 import { describe, expect, it, vi } from "vitest";
 import { API_ROUTES, ApiErrorSchema, type ApiRoute } from "@monoptah/protocol";
-import { buildCsp, COMPANION_HEADERS } from "../src/middleware/security.ts";
+import { buildCsp, COMPANION_HEADERS, securityHeaders } from "../src/middleware/security.ts";
+import { AVATAR_CACHE_CONTROL } from "../src/modules/desktops/avatar.ts";
 import { ignoreCookies, isCookieAuthenticated } from "../src/middleware/browser.ts";
 import type { AppEnv } from "../src/http.ts";
 import { BROWSER_HEADERS, call, callWithEnv, ORIGIN } from "./helpers.ts";
@@ -137,6 +138,41 @@ describe("response headers", () => {
     for (const path of ["/api/health", "/api/nope", "/api/me", "/relay/desktop/x", "/relay/nope"]) {
       const res = await call(path);
       expect(res.headers.get("Cache-Control"), path).toBe("no-store");
+    }
+  });
+
+  it("keeps a cacheable Cache-Control only on a 200 of the avatar route with the avatar value", async () => {
+    const app = new Hono<AppEnv>();
+    app.use("*", securityHeaders);
+    const cacheable = (c: { header: (name: string, value: string) => void; body: (data: string | null, status?: 200 | 302 | 404) => Response }, status: 200 | 302 | 404 = 200) => {
+      c.header("Cache-Control", AVATAR_CACHE_CONTROL);
+      return c.body(status === 200 ? "x" : null, status);
+    };
+    app.get("/api/desktops/:id/avatar", (c) => cacheable(c));
+    app.get("/api/desktops/:id/other", (c) => cacheable(c));
+    app.get("/api/desktops/:id/avatar/extra", (c) => cacheable(c));
+    app.get("/api/avatar", (c) => cacheable(c));
+    app.get("/relay/desktops/:id/avatar", (c) => cacheable(c));
+    app.get("/api/desktops/:id/redirect/avatar", (c) => cacheable(c));
+    app.get("/api/desktops/:id/avatar-302", (c) => cacheable(c, 302));
+    expect((await app.request("/api/desktops/d1/avatar")).headers.get("Cache-Control")).toBe(AVATAR_CACHE_CONTROL);
+    for (const path of ["/api/desktops/d1/other", "/api/desktops/d1/avatar/extra", "/api/avatar", "/relay/desktops/d1/avatar", "/api/desktops/d1/redirect/avatar", "/api/desktops/d1/avatar-302"]) {
+      expect((await app.request(path)).headers.get("Cache-Control"), path).toBe("no-store");
+    }
+  });
+
+  it("forces no-store on the avatar route for a 302, a 404 or any other Cache-Control value", async () => {
+    const app = new Hono<AppEnv>();
+    app.use("*", securityHeaders);
+    app.get("/api/desktops/:id/avatar", (c) => {
+      const mode = c.req.query("mode");
+      if (mode === "302") return new Response(null, { status: 302, headers: { Location: "/x", "Cache-Control": AVATAR_CACHE_CONTROL } });
+      if (mode === "404") return new Response("no", { status: 404, headers: { "Cache-Control": AVATAR_CACHE_CONTROL } });
+      if (mode === "other") return new Response("x", { headers: { "Cache-Control": "public, max-age=60" } });
+      return new Response("x");
+    });
+    for (const mode of ["302", "404", "other", "none"]) {
+      expect((await app.request(`/api/desktops/d1/avatar?mode=${mode}`)).headers.get("Cache-Control"), mode).toBe("no-store");
     }
   });
 

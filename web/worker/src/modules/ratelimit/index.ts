@@ -17,7 +17,16 @@ import { consume, rateLimitKey } from "./limiter.ts";
 import { consumeIp } from "./memory.ts";
 
 export { consume, rateLimitKey, type ConsumeResult } from "./limiter.ts";
-export { consumeSession, resetIpLimits, resetSessionLimits, SESSION_LIMIT, SESSION_WINDOW_SECONDS } from "./memory.ts";
+export {
+  AVATAR_ROUTE_KEY,
+  AVATAR_SESSION_LIMIT,
+  consumeAvatarSession,
+  consumeSession,
+  resetIpLimits,
+  resetSessionLimits,
+  SESSION_LIMIT,
+  SESSION_WINDOW_SECONDS,
+} from "./memory.ts";
 export { limitOutstandingPairings, MAX_OUTSTANDING_PAIRINGS } from "./pairings.ts";
 
 type Group = (typeof RATE_LIMIT_AUDIT_GROUPS)[number];

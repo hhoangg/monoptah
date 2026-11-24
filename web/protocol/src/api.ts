@@ -235,7 +235,7 @@ export const DESKTOP_AVATAR_MIMES = ["image/png", "image/jpeg", "image/webp"] as
 /** One emoji (pictographs joined by ZWJ, with variation selectors, skin tones and keycap marks), at most 16 UTF-16 units. */
 export const DESKTOP_AVATAR_EMOJI = /^\p{Extended_Pictographic}(?:\p{Extended_Pictographic}|\p{Emoji_Modifier}|\u200d|\ufe0f|\u20e3)*$/u;
 
-/** The avatar a desktop shows in the activity rail and the switcher: an emoji, or an image served by `GET /api/desktops/:id/avatar?v=<hash>`. */
+/** The avatar a desktop shows in the activity rail and the switcher: an emoji, or an image served by `GET /api/desktops/:id/avatar?v=<hash>`, where `hash` is a random 16-hex version token chosen per upload (not a content hash; avatars uploaded before that keep a content-hash token until re-uploaded). */
 export const DesktopAvatarSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("emoji"), emoji: z.string().max(16).regex(DESKTOP_AVATAR_EMOJI) }),
   z.object({ kind: z.literal("image"), hash: z.string().regex(/^[0-9a-f]{16}$/) }),

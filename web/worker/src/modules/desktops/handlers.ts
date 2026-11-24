@@ -12,7 +12,7 @@ import { nowSeconds } from "../../lib/time.ts";
 import { requireAuth } from "../../middleware/auth.ts";
 import { presenceOf, revokeInRooms } from "../../relay/rooms.ts";
 import { auditStatement, PREVIOUS_CHANGED } from "../audit/audit.ts";
-import { avatarOf, checkImage, decodeBase64, sniffImage } from "./avatar.ts";
+import { AVATAR_CACHE_CONTROL, avatarOf, checkImage, decodeBase64, sniffImage } from "./avatar.ts";
 import { requireDesktopToken } from "./token.ts";
 
 const REVOKED = 4003;
@@ -36,7 +36,7 @@ export const GET_DESKTOP_SQL = `SELECT ${DESKTOP_COLUMNS}, public_key, fingerpri
 export const PATCH_DESKTOP_SQL =
   "UPDATE desktops SET name = coalesce(?, name), color = CASE WHEN ? = 1 THEN ? ELSE color END, avatar_kind = CASE WHEN ? = 1 THEN ? ELSE avatar_kind END, avatar_emoji = CASE WHEN ? = 1 THEN ? ELSE avatar_emoji END, avatar_hash = CASE WHEN ? = 1 THEN ? ELSE avatar_hash END, avatar_image = CASE WHEN ? = 1 THEN ? ELSE avatar_image END WHERE id = ? AND user_id = ? AND revoked_at IS NULL";
 /** The stored image of an owned, live desktop. */
-export const GET_AVATAR_SQL = "SELECT avatar_image FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND avatar_kind = 'image'";
+export const GET_AVATAR_SQL = "SELECT avatar_image, avatar_hash FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL AND avatar_kind = 'image'";
 /** Condition of the revoke batch: the desktop is the user's and still live. */
 const LIVE_OWN = "EXISTS (SELECT 1 FROM desktops WHERE id = ? AND user_id = ? AND revoked_at IS NULL)";
 export const REVOKE_DESKTOP_TOKENS_SQL = `UPDATE desktop_tokens SET revoked_at = ? WHERE desktop_id = ? AND revoked_at IS NULL AND ${LIVE_OWN}`;
@@ -118,7 +118,7 @@ export const patchDesktop: Handler<AppEnv> = async (c) => {
   let image: { hash: string; data: string } | null = null;
   if (input?.kind === "emoji") emoji = input.emoji;
   if (input?.kind === "image") {
-    image = await checkImage(input.data);
+    image = checkImage(input.data);
     if (!image) return apiError(c, 400, "invalid", "The avatar must be a PNG, JPEG or WebP image of at most 20 KiB");
   }
   const flag = avatarGiven ? 1 : 0;
@@ -131,20 +131,33 @@ export const patchDesktop: Handler<AppEnv> = async (c) => {
   return respond(c, PatchDesktopResponse, { desktop: summaryOf(found.row, found.online, found.pending) });
 };
 
-/** `GET /api/desktops/:id/avatar`: the stored image. The type comes from the magic bytes; every response header limits what a browser may do with it. */
+/**
+ * `GET /api/desktops/:id/avatar?v=<token>`: the stored image. The type comes from the magic bytes; every response header
+ * limits what a browser may do with it. The bytes are cacheable only under the current token (`avatar_hash`), so the
+ * cached bytes of a URL always match its version; a missing or stale `v` is a `302` to the current URL, never cached.
+ */
 export const getAvatar: Handler<AppEnv> = async (c) => {
   const { user } = requireAuth(c);
-  const row = await c.env.DB.prepare(GET_AVATAR_SQL).bind(c.req.param("id") ?? "", user.id).first<{ avatar_image: string | null }>();
+  const id = c.req.param("id") ?? "";
+  const row = await c.env.DB.prepare(GET_AVATAR_SQL).bind(id, user.id).first<{ avatar_image: string | null; avatar_hash: string | null }>();
   const bytes = row?.avatar_image ? decodeBase64(row.avatar_image) : null;
   const type = bytes ? sniffImage(bytes) : null;
-  if (!bytes || !type) return notFound(c);
+  if (!row?.avatar_hash || !bytes || !type) return notFound(c);
+  if (c.req.query("v") !== row.avatar_hash) {
+    return new Response(null, {
+      status: 302,
+      headers: { Location: `/api/desktops/${encodeURIComponent(id)}/avatar?v=${encodeURIComponent(row.avatar_hash)}`, "Cache-Control": "no-store" },
+    });
+  }
   return new Response(bytes, {
     headers: {
+      "Cache-Control": AVATAR_CACHE_CONTROL,
+      Vary: "Cookie",
       "Content-Type": type,
       "Content-Length": String(bytes.length),
       "X-Content-Type-Options": "nosniff",
       "Content-Security-Policy": "default-src 'none'; sandbox",
-      // `Cache-Control: no-store` is added for every /api route by the security headers middleware.
+      // The security headers middleware keeps this `Cache-Control` only for this route with the current token.
     },
   });
 };

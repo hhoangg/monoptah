@@ -6,10 +6,10 @@ import type { AppEnv } from "../src/http.ts";
 import { sha256Hex } from "../src/lib/crypto.ts";
 import { ipHash } from "../src/lib/ip.ts";
 import { consume, CONSUME_SQL } from "../src/modules/ratelimit/limiter.ts";
-import { consumeIp, consumeSession, MAX_TRACKED_IPS, MAX_TRACKED_SESSIONS, resetIpLimits, resetSessionLimits, SESSION_LIMIT, trackedIps, trackedSessions } from "../src/modules/ratelimit/memory.ts";
+import { AVATAR_SESSION_LIMIT, consumeIp, consumeSession, MAX_TRACKED_IPS, MAX_TRACKED_SESSIONS, resetIpLimits, resetSessionLimits, SESSION_LIMIT, trackedIps, trackedSessions } from "../src/modules/ratelimit/memory.ts";
 import { IP_LIMITS, LIMITS, limitHandleAttempts, limitOutstandingPairings } from "../src/modules/ratelimit/index.ts";
 import { BROWSER_HEADERS, call } from "./helpers.ts";
-import { createTestInvite, postJson, registerOptions } from "./support/accounts.ts";
+import { authedCall, createTestInvite, createTestUser, loginAs, postJson, registerOptions } from "./support/accounts.ts";
 import { VirtualAuthenticator } from "./support/authenticator.ts";
 
 let counter = 0;
@@ -407,6 +407,41 @@ describe("the per-invite-code limit on both registration routes", () => {
     // Another code is unaffected.
     const other = await createTestInvite(env);
     expect((await postJson("/api/auth/register/options", { invite: other.code, handle: `inv-${crypto.randomUUID().slice(0, 8)}`, displayName: "X" })).status).toBe(200);
+  });
+});
+
+describe("avatar limit: 300 per session per minute, separate from the general one", () => {
+  const missing = () => `/api/desktops/${crypto.randomUUID()}/avatar`;
+
+  it("does not charge the general bucket, and normal calls do not charge the avatar bucket", async () => {
+    resetSessionLimits();
+    const session = await loginAs((await createTestUser(env)).id);
+    for (let i = 0; i < SESSION_LIMIT + 10; i += 1) expect((await authedCall(session, missing())).status, `avatar ${i + 1}`).toBe(404);
+    for (let i = 0; i < SESSION_LIMIT; i += 1) expect((await authedCall(session, "/api/me")).status, `me ${i + 1}`).toBe(200);
+    await expectLimited(await authedCall(session, "/api/me"), 60);
+    // The general bucket is spent; avatars still have their own.
+    expect((await authedCall(session, missing())).status).toBe(404);
+    resetSessionLimits();
+  });
+
+  it("answers 429 with Retry-After after 300 avatar GETs and audits the first breach once", async () => {
+    resetSessionLimits();
+    const user = await createTestUser(env);
+    const session = await loginAs(user.id);
+    for (let i = 0; i < AVATAR_SESSION_LIMIT; i += 1) expect((await authedCall(session, missing())).status, `call ${i + 1}`).toBe(404);
+    const over = await authedCall(session, missing());
+    await expectLimited(over, 60);
+    await expectLimited(await authedCall(session, missing()), 60);
+    // The general bucket is untouched.
+    expect((await authedCall(session, "/api/me")).status).toBe(200);
+    const { results } = await env.DB.prepare("SELECT meta FROM audit_log WHERE action = 'ratelimit.breach' AND actor_user_id = ?").bind(user.id).all<{ meta: string }>();
+    expect(results).toHaveLength(1);
+    expect(JSON.parse(results[0]?.meta ?? "{}")).toMatchObject({ group: "session-avatar", limit: 300, windowSeconds: 60 });
+    resetSessionLimits();
+  });
+
+  it("still answers 401 without a session before any counting", async () => {
+    expect((await authedCall({ cookie: "" }, missing())).status).toBe(401);
   });
 });
 
