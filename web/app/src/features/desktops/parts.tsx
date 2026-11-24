@@ -13,14 +13,19 @@ import { presenceLabel } from "./format";
  * Without a chosen color it is a hollow ring, so it never reads as a grey "offline" dot next to the presence badge.
  */
 export function ColorDot({ color, className }: { color: string | null; className?: string }) {
-  if (color === null) return <span aria-hidden="true" className={cn("inline-block size-3 shrink-0 rounded-pill border border-faint", className)} />;
+  if (color === null) return <span aria-hidden="true" className={cn("inline-block size-3 shrink-0 rounded-pill border border-muted-text", className)} />;
   return <span aria-hidden="true" className={cn("inline-block size-3 shrink-0 rounded-pill", className)} style={{ backgroundColor: resolveDesktopColor(color).value }} />;
+}
+
+/** The small online/offline dot. Offline is muted-text, never faint, so it stays readable on the top bar. */
+export function PresenceDot({ online, className }: { online: boolean; className?: string }) {
+  return <span aria-hidden="true" className={cn("size-1.5 rounded-pill", online ? "bg-additions" : "bg-muted-text", className)} />;
 }
 
 export function PresenceBadge({ online }: { online: boolean }) {
   return (
     <Badge variant={online ? "default" : "outline"} className="gap-1">
-      <span aria-hidden="true" className={cn("size-1.5 rounded-pill", online ? "bg-additions" : "bg-faint")} />
+      <PresenceDot online={online} />
       {presenceLabel(online)}
     </Badge>
   );

@@ -65,6 +65,53 @@ describe("windowing and the end (F-32)", () => {
   });
 });
 
+describe("the composer grows under the transcript", () => {
+  const observers: Array<(entries: unknown[]) => void> = [];
+  beforeEach(() => {
+    observers.length = 0;
+    vi.stubGlobal("ResizeObserver", class { constructor(cb: (entries: unknown[]) => void) { observers.push(cb); } observe() {} unobserve() {} disconnect() {} });
+  });
+  afterEach(() => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+  });
+  const resizeTo = (height: number) => {
+    Object.defineProperty(scroller(), "clientHeight", { configurable: true, value: height });
+    act(() => observers.forEach((cb) => cb([])));
+  };
+
+  it("keeps the last line above the composer when the scroller gets shorter at the end", async () => {
+    render(<Transcript turns={turns(0, 20)} />);
+    await screen.findByText("Reply number 19");
+    await waitFor(() => expect(scroller().scrollTop).toBe(scroller().scrollHeight - VIEW));
+    resizeTo(VIEW - 150);
+    expect(scroller().scrollTop).toBe(scroller().scrollHeight - (VIEW - 150));
+    resizeTo(VIEW - 250);
+    expect(scroller().scrollTop).toBe(scroller().scrollHeight - (VIEW - 250));
+  });
+
+  it("keeps an anchored message in place when the scroller gets shorter", async () => {
+    const pending: OptimisticTurn = { id: "pending:1", text: "Question sent here", at: 1, attachments: 0, status: "sending", baseline: 0 };
+    const { rerender } = render(<Transcript turns={turns(0, 20)} />);
+    await screen.findByText("Reply number 19");
+    rerender(<Transcript turns={turns(0, 20)} optimistic={[pending]} />);
+    await screen.findByText("Question sent here");
+    const anchored = rowStart("pending:1") - 8;
+    await waitFor(() => expect(scroller().scrollTop).toBe(anchored));
+    resizeTo(VIEW - 150);
+    expect(scroller().scrollTop).toBe(anchored);
+    resizeTo(VIEW - 250);
+    expect(scroller().scrollTop).toBe(anchored);
+  });
+
+  it("does not move a reader who scrolled up when the scroller gets shorter", async () => {
+    render(<Transcript turns={turns(0, 20)} />);
+    await screen.findByText("Reply number 19");
+    scrollTo(500);
+    resizeTo(VIEW - 150);
+    expect(scroller().scrollTop).toBe(500);
+  });
+});
+
 describe("anchoring the latest user message (F-32)", () => {
   const userTurn = (id: string): Turn => ({ id, items: [{ type: "user", id: `${id}:u`, text: `Question ${id}` }] });
   const pendingTurn = (id = "pending:1"): OptimisticTurn => ({ id, text: "Question sent here", at: 1, attachments: 0, status: "sending", baseline: 0 });

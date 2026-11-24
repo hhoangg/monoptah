@@ -9,6 +9,7 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMediaQuery } from "@/ui/useMediaQuery";
 import { useCatalog, useConversation } from "@/data";
+import { useMonoTools } from "@/features/sessions/workspaceFilter";
 import { assertFitsRequest, toWire } from "@/features/composer/attachments";
 import { useRequestControl } from "@/features/composer/useRequestControl";
 import { readChatDraft, writeChatDraft } from "@/features/composer/chatDraft";
@@ -57,7 +58,7 @@ export function MonoScreen({ desktopId, monoId }: { desktopId: string; monoId: s
   const catalogQuery = useCatalog();
   const catalog = catalogQuery.data;
   const mono = catalog?.monos.find((candidate) => candidate.id === monoId);
-  const monoTools = catalog?.monoTools === true;
+  const monoTools = useMonoTools();
   const conversationId = monoConversationId(monoId);
   const conversation = useConversation(conversationId);
   const state = conversation.state;

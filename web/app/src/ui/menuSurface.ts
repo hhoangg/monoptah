@@ -19,3 +19,7 @@ export const MENU_ITEM_ATTR = { "data-menu-item": "" } as const;
 /** The highlight of the active item, for items that set a class (the `/` menu) and for Radix items (`data-highlighted`). */
 export const MENU_ITEM_ACTIVE = "bg-selection";
 export const MENU_ITEM_HIGHLIGHTED = "data-[highlighted]:bg-selection";
+/** A Radix menu row (dropdown and context menu): min 44 high (36 on `pointer: fine`), concentric radius, shared highlight. */
+export const MENU_ROW = `flex min-h-11 cursor-default items-center gap-3 ${MENU_ITEM} px-3 text-row outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-40 ${MENU_ITEM_HIGHLIGHTED} pointer-fine:min-h-9`;
+export const MENU_ROW_DESTRUCTIVE = "text-deletions";
+export const MENU_SEPARATOR = "mx-3 my-1 h-px bg-stroke";

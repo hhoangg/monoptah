@@ -4,6 +4,7 @@ import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { FIXTURE_HANDLERS } from "@monoptah/mock-desktop";
 import { registerPersistAdapter, MemoryPersistAdapter, type PersistAdapter } from "@/data";
 import { getLinkConnection, resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
@@ -266,6 +267,31 @@ describe("workspace drawer (F-12)", () => {
     await user.click(await within(nav).findByRole("button", { name: "New Mono" }));
     await waitFor(() => expect(router.state.location.pathname).toBe(`/d/${DESKTOP_ID}/monos`));
     expect(await screen.findByTestId("create-mono")).toBeInTheDocument();
+  });
+
+  it("offers New Mono when only the catalog carries monoTools, as the real desktop sends it (capability not advertised)", async () => {
+    const user = userEvent.setup();
+    mount("", { capabilities: ["approvals", "cloud"] });
+    expect(link.desktop.capabilities).not.toContain("monoTools");
+    const nav = await openDrawer(user);
+    await within(nav).findByText("Example Alpha");
+    expect(await within(nav).findByRole("button", { name: "New Mono" })).toBeInTheDocument();
+  });
+
+  it("offers no New Mono when neither the catalog nor the capability carries monoTools", async () => {
+    const handlers = FIXTURE_HANDLERS as unknown as Record<string, (p: never, c: never) => Record<string, unknown>>;
+    const list = handlers["workspace.list"]!;
+    handlers["workspace.list"] = (p, c) => ({ ...list(p, c), monoTools: false });
+    try {
+      const user = userEvent.setup();
+      mount("", { capabilities: ["approvals", "cloud"] });
+      expect(link.desktop.capabilities).not.toContain("monoTools");
+      const nav = await openDrawer(user);
+      await within(nav).findByText("Example Alpha");
+      expect(within(nav).queryByRole("button", { name: "New Mono" })).toBeNull();
+    } finally {
+      handlers["workspace.list"] = list;
+    }
   });
 
   it("has no desktop name row, Filter projects input or filter button", async () => {

@@ -294,7 +294,7 @@ export function TabStrip({ desktopId, pane, number, paneCount, focused, selected
                 </button>
               </DropdownMenuTrigger>
             </IconTip>
-            <DropdownMenuContent align="end" className="max-h-80 max-w-72 overflow-y-auto">
+            <DropdownMenuContent align="end" className="max-w-72">
               {pane.tabs.map((key) => {
                 const info = titleOf(key);
                 return (

@@ -100,4 +100,24 @@ describe("composer morph (F-47)", () => {
   it("morphs over 280 ms with out-cubic, the duration of design-system.md section 6.2", () => {
     expect(MORPH_TRANSITION).toEqual({ duration: 0.28, ease: [0.215, 0.61, 0.355, 1] });
   });
+
+  it("drops the toolbar to its own row when the card is narrow, keeping Send on the first row", async () => {
+    const user = userEvent.setup();
+    render(<Composer onSubmit={() => Promise.resolve()} toolbar={<span>tools</span>} />);
+    await user.click(screen.getByRole("textbox", { name: "Message" }));
+    const slot = screen.getByText("tools").closest<HTMLElement>("[data-composer-extra]")!;
+    expect(slot.parentElement).toHaveClass("@container", "flex-wrap");
+    expect(slot).toHaveClass("@max-[26rem]:order-last", "@max-[26rem]:basis-full");
+    expect(screen.getByRole("button", { name: "Send" })).toHaveClass("@max-[26rem]:ml-auto");
+  });
+
+  it("leaves the narrow-card row classes off when there is no toolbar", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Composer onSubmit={() => Promise.resolve()} />);
+    await user.click(screen.getByRole("textbox", { name: "Message" }));
+    const slot = container.querySelector<HTMLElement>("[data-composer-extra]")!;
+    expect(slot).not.toHaveClass("@max-[26rem]:order-last");
+    expect(slot).not.toHaveClass("@max-[26rem]:basis-full");
+    expect(screen.getByRole("button", { name: "Send" })).not.toHaveClass("@max-[26rem]:ml-auto");
+  });
 });

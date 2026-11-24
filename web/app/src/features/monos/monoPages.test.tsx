@@ -10,6 +10,7 @@ import { MemoryPersistAdapter, registerPersistAdapter, type PersistAdapter } fro
 import { resetLinkConnections } from "@/link";
 import { clearLinkStores } from "@/link/store.ts";
 import { resetSessionActivity } from "@/features/sessions/activityStore";
+import { KNOWN_CAPABILITIES } from "@monoptah/protocol";
 import { DESKTOP_ID, connectMockDesktop, seedWorkspace, type MockLinkOptions } from "@/features/sessions/dev/mockLink";
 import { resetMonoSeen } from "@/features/sessions/monoSeen";
 import { stubTranscriptLayout } from "@/features/transcript/layoutStub";
@@ -384,7 +385,7 @@ describe("create Mono (F-75)", () => {
   it("is not offered when the desktop does not advertise monoTools", async () => {
     const list = original["workspace.list"] as unknown as (p: never, c: never) => Record<string, unknown>;
     handlers["workspace.list"] = (p: never, c: never) => ({ ...list(p, c), monoTools: false });
-    mount("/monos");
+    mount("/monos", { capabilities: KNOWN_CAPABILITIES.filter((name) => name !== "monoTools") });
     await screen.findAllByTestId("mono-row");
     expect(screen.queryByRole("button", { name: "New Mono" })).toBeNull();
     expect(called("mono.create")).toHaveLength(0);

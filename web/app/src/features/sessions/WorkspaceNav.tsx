@@ -9,7 +9,6 @@ import { useCatalog } from "@/data";
 import { requestCreateMono } from "@/features/monos/createRequest";
 import { MonoAvatar } from "@/features/monos/MonoAvatar";
 import { useLinkState } from "@/link";
-import { useCapability } from "@/version";
 import { safeHexColor } from "@/lib/color";
 import { cn } from "@/lib/utils";
 import { Icon } from "@/ui/Icon";
@@ -19,7 +18,7 @@ import { markMonoSeen, useCatalogUnreadMonos } from "./monoSeen";
 import { projectColor } from "./projectColors";
 import { ProjectMascot } from "./ProjectMascot";
 import { chatListTime } from "./relativeTime";
-import { canCreateMono, monoUnread, sortMonos, type CatalogMono, type CatalogProject } from "./workspaceFilter";
+import { canCreateMono, monoUnread, sortMonos, useMonoTools, type CatalogMono, type CatalogProject } from "./workspaceFilter";
 
 /** The start of a message as one plain line: markdown marks dropped, a reaction shown as its emoji. */
 export function oneLine(text: string): string {
@@ -122,7 +121,7 @@ export interface WorkspaceNavProps {
 
 export function WorkspaceNav({ desktopId, onNavigate, onNewMono, railed = false }: WorkspaceNavProps) {
   const catalog = useCatalog();
-  const monoTools = useCapability("monoTools");
+  const monoTools = useMonoTools();
   const readOnly = useLinkState((state) => state.permission === "read");
   const navigate = useNavigate();
   const newMono = () => {
