@@ -7,9 +7,18 @@
 import { useEffect, useRef } from "react";
 import type { SlashCommand } from "@monoptah/protocol";
 import { cn } from "@/lib/utils";
+import { useAnchoredPlacement, revealInList } from "@/ui/anchoredPlacement";
 import { Icon, type IconName } from "@/ui/Icon";
+import { MENU_ITEM, MENU_ITEM_ACTIVE, MENU_ITEM_ATTR, MENU_SURFACE, MENU_SURFACE_ATTR } from "@/ui/menuSurface";
 
 export const SLASH_MENU_LABEL = "Skills and commands";
+
+/** Tallest popover (18rem). */
+const POPOVER_MAX_PX = 288;
+/** The phone sheet takes at most this share of the visual viewport (not `dvh`: that ignores the on-screen keyboard). */
+const SHEET_SHARE = 0.55;
+const popoverCap = () => POPOVER_MAX_PX;
+const sheetCap = (viewportHeight: number) => viewportHeight * SHEET_SHARE;
 
 /** The design system's icon for a command id (the desktop names the icon after the command). */
 const ICONS: Record<string, IconName> = {
@@ -48,33 +57,49 @@ export interface SlashMenuProps {
 }
 
 export function SlashMenu({ id, owner, rows, loading, failed = false, active, sheet, onActive, onChoose, onClose }: SlashMenuProps) {
+  const root = useRef<HTMLDivElement>(null);
   const list = useRef<HTMLUListElement>(null);
+  // Fits the visible area (visual viewport and clipping ancestors) above the composer, or below when there is no room.
+  const placement = useAnchoredPlacement(root, true, { cap: sheet ? sheetCap : popoverCap });
+  const side = placement?.side ?? "above";
+  // Only the list scrolls to keep the active row in view: `scrollIntoView` would also move the page.
+  // Keyed by the ids, not the `rows` array: the composer rebuilds it on every render, and a re-render must not snap a
+  // list the user is scrolling back to the active row.
+  const rowsKey = rows.map((row) => `${row.kind}-${row.id}`).join("|");
   useEffect(() => {
     const current = list.current?.querySelector<HTMLElement>('[aria-selected="true"]');
-    current?.scrollIntoView?.({ block: "nearest" });
-  }, [active, rows]);
+    if (list.current && current) revealInList(list.current, current);
+  }, [active, rowsKey, placement?.maxHeight]);
 
   return (
     <div
+      ref={root}
+      {...MENU_SURFACE_ATTR}
       data-testid="slash-menu"
       data-overlay-owner={owner}
       data-layout={sheet ? "sheet" : "popover"}
+      data-side={side}
+      style={placement ? { maxHeight: placement.maxHeight } : undefined}
       className={cn(
-        "absolute bottom-full z-30 mb-2 flex flex-col overflow-hidden border border-stroke bg-popover text-popover-foreground",
-        sheet ? "inset-x-0 max-h-[55dvh] rounded-t-card pb-1" : "left-0 max-h-72 w-[min(26rem,100%)] rounded-card",
+        "absolute z-30 flex flex-col overflow-hidden",
+        MENU_SURFACE,
+        side === "above" ? "bottom-full mb-2" : "top-full mt-2",
+        // `max-h-72` only holds until the first measure: the measured height replaces it.
+        "max-h-72",
+        sheet ? "inset-x-0" : "left-0 w-[min(26rem,100%)]",
       )}
       // Keep the caret in the field: a press on the menu must not blur it.
       onMouseDown={(event) => event.preventDefault()}
     >
       {sheet ? (
-        <div className="flex shrink-0 items-center gap-2 px-4 pb-1 pt-2">
+        <div className="relative flex h-11 shrink-0 items-center px-3">
           <span aria-hidden="true" className="mx-auto block h-1 w-9 rounded-pill bg-stroke" />
-          <button type="button" aria-label="Close" onClick={onClose} className="absolute right-2 top-1 inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection">
+          <button type="button" aria-label="Close" onClick={onClose} className="absolute right-0 top-0 inline-flex size-11 items-center justify-center rounded-pill text-muted-text hover:bg-selection">
             <Icon name="close" size={16} />
           </button>
         </div>
       ) : null}
-      <ul ref={list} id={id} role="listbox" aria-label={SLASH_MENU_LABEL} className="m-0 min-h-0 flex-1 list-none overflow-y-auto p-1">
+      <ul ref={list} id={id} role="listbox" aria-label={SLASH_MENU_LABEL} className="m-0 min-h-0 flex-1 list-none overflow-y-auto p-0">
         {rows.length === 0 ? (
           <li role="presentation" className="px-3 py-3 text-meta text-muted-text">
             {failed ? "Could not load the commands. Try typing / again." : loading ? "Loading..." : "No matching command or skill"}
@@ -92,10 +117,11 @@ export function SlashMenu({ id, owner, rows, loading, failed = false, active, sh
             title={row.available ? undefined : row.reason}
             onPointerMove={() => index !== active && onActive(index)}
             onClick={() => onChoose(row)}
+            {...MENU_ITEM_ATTR}
             className={cn(
-              "flex cursor-pointer items-center gap-3 rounded-row px-3 text-row",
+              `flex cursor-pointer items-center gap-3 ${MENU_ITEM} px-3 text-row`,
               sheet ? "min-h-12" : "min-h-10 py-1.5",
-              index === active && "bg-selection",
+              index === active && MENU_ITEM_ACTIVE,
               !row.available && "cursor-not-allowed opacity-50",
             )}
           >

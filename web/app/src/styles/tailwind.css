@@ -137,6 +137,8 @@
   .rounded-card, .rounded-sheet, .rounded-dialog, .rounded-menu-card { corner-shape: squircle; }
   /* The row highlight inside a settings card keeps the card's corner shape, so the two curves stay concentric. */
   [data-slot="settings-card"] [data-row-highlight] { corner-shape: squircle; }
+  /* Same for the item highlight inside a popup menu surface (ui/menuSurface.ts). */
+  [data-menu-surface] [data-menu-item] { corner-shape: squircle; }
   /* The nav card of the settings list page exists below lg only (`max-lg:rounded-card`). */
   @media (width < 64rem) {
     .settings-nav-card, .settings-nav-card [data-row-highlight] { corner-shape: squircle; }
