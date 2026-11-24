@@ -324,6 +324,28 @@ describe("/settings/desktops/:id avatar", () => {
     await waitFor(() => expect(screen.getByTestId("avatar-preview")).toHaveTextContent("SM"));
   });
 
+  it("points the avatar image at the new version after each upload", async () => {
+    install();
+    avatarImage.prepare.mockResolvedValue({ mime: "image/webp", data: "UklGRgAAAABXRUJQ" });
+    const user = userEvent.setup();
+    mountApp("/settings/desktops/d1");
+    const card = async () => within(document.getElementById("desktop-avatar") as HTMLElement);
+    const upload = async () => user.upload(await screen.findByLabelText("Avatar image file"), new File(["x"], "me.png", { type: "image/png" }));
+    await upload();
+    const first = await waitFor(async () => {
+      const src = (await card()).getByTestId("avatar-image").getAttribute("src");
+      expect(src).toMatch(/^\/api\/desktops\/d1\/avatar\?v=[0-9a-f]{16}$/);
+      return src as string;
+    });
+    // The same picture again: the server issues a new token, so the URL changes and the browser fetches it anew.
+    await upload();
+    await waitFor(async () => {
+      const src = (await card()).getByTestId("avatar-image").getAttribute("src");
+      expect(src).toMatch(/^\/api\/desktops\/d1\/avatar\?v=[0-9a-f]{16}$/);
+      expect(src).not.toBe(first);
+    });
+  });
+
   it("shows why a refused picture was refused and sends nothing", async () => {
     install();
     const { AvatarImageError } = await import("./avatarImage");

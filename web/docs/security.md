@@ -94,7 +94,7 @@ Layered: `SameSite=Strict`; an `Origin` header check on every non-GET **cookie-a
 
 ### 3.5 Rate limits
 
-The groups below the last row use the D1 `rate_limits` table (fixed windows; low-volume endpoints only) because the Workers Rate Limiting binding's availability on the free plan is unverified (https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/, read 2026-11). The general authenticated limit is an in-memory per-isolate counter, best effort (isolates are not shared, so the effective limit can be higher), so it writes nothing to D1 and stays inside the 100,000 writes/day free budget. Relay limits are in the DO (architecture.md 4.4).
+The per-IP, per-code, per-handle and per-user groups in the table use the D1 `rate_limits` table (fixed windows; low-volume endpoints only) because the Workers Rate Limiting binding's availability on the free plan is unverified (https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/, read 2026-11). The general authenticated limit (120 per session per minute) and the separate avatar bucket (300 per session per minute, `GET /api/desktops/:id/avatar`) are in-memory per-isolate counters, best effort (isolates are not shared, so the effective limit can be higher), so they write nothing to D1 and stay inside the 100,000 writes/day free budget. Relay limits are in the DO (architecture.md 4.4).
 
 | Endpoint group | Limit |
 |---|---|
@@ -106,6 +106,7 @@ The groups below the last row use the D1 `rate_limits` table (fixed windows; low
 | `push/notify` | 30 per desktop token per minute; WS-A addition: 120 per IP per minute, checked first |
 | `terminal-ticket` | 20 per user per 10 min (counted in the handler, after auth, keyed by a salted hash of the user id; a breach is audited with the user as actor) |
 | `push/test` | 3 per user per 10 min (counted in the handler, after auth, keyed by a salted hash of the user id; a breach is audited with the user as actor). No per-IP limit: the IP middleware runs before auth and would add an unauthenticated D1 write, so unauthenticated calls get 401 with no write |
+| `GET /api/desktops/:id/avatar` | 300 per session per minute, in its own in-memory bucket (per isolate, best effort); these calls do not count toward the general 120. The session is resolved first (401 and 403 as everywhere); the first breach of a window is audited with group `session-avatar` |
 | Everything else authenticated | 120 per session per minute (in memory, per isolate, best effort) |
 
 How the D1 limiter spends writes (WS-A):
@@ -229,7 +230,9 @@ The user can add patterns per project; the defaults cannot be removed by a remot
 
 ### Desktop avatar uploads
 
-`PATCH /api/desktops/:id` takes an `avatar` (an emoji, or the base64 of an image) and `GET /api/desktops/:id/avatar` serves it. Both are owner-only session routes with the usual Origin and CSRF checks. The browser re-encodes the picture to 128 px; the Worker does not trust that. It decodes the base64, refuses more than 20 KiB, accepts only a PNG, JPEG or WebP by its magic bytes (SVG, HTML and GIF are refused whatever `mime` says; the claimed `mime` is ignored), stores the text in D1 (`desktops.avatar_image`) and answers with the `Content-Type` of the sniffed bytes, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox` and `Cache-Control: no-store`. The page only ever shows it through `<img src>` (CSP `img-src 'self'`), never inline, so no script can run. An emoji must match one pictograph sequence (at most 16 UTF-16 units). The list answers carry a 16-hex hash instead of the bytes.
+`PATCH /api/desktops/:id` takes an `avatar` (an emoji, or the base64 of an image) and `GET /api/desktops/:id/avatar` serves it. Both are owner-only session routes with the usual Origin and CSRF checks. The browser re-encodes the picture to 128 px; the Worker does not trust that. It decodes the base64, refuses more than 20 KiB, accepts only a PNG, JPEG or WebP by its magic bytes (SVG, HTML and GIF are refused whatever `mime` says; the claimed `mime` is ignored), stores the text in D1 (`desktops.avatar_image`) and answers with the `Content-Type` of the sniffed bytes, `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none'; sandbox`. The page only ever shows it through `<img src>` (CSP `img-src 'self'`), never inline, so no script can run. An emoji must match one pictograph sequence (at most 16 UTF-16 units). The list answers carry a 16-hex version token instead of the bytes.
+
+Caching: every upload stores a fresh random token of 16 hex (8 bytes from `crypto.getRandomValues`) in `desktops.avatar_hash`, not a hash of the image, so the same picture uploaded twice gets a new URL and, for avatars uploaded after this change, nobody can compute the URL of a picture they hold. The client asks for `/api/desktops/:id/avatar?v=<token>`. With the current token the answer is `200` with `Cache-Control: private, max-age=31536000, immutable` and `Vary: Cookie`, so a reload does not download the picture again; with a missing or stale token it is a `302` (relative `Location`, empty body, `no-store`) to the current URL, so the bytes cached under a URL always match its token. The ownership check is unchanged and runs on every request that reaches the Worker: another account gets `404` with `no-store`, never the bytes. Residual risk: on a shared browser profile the bytes stay in the HTTP cache after sign-out or after the desktop is revoked, until the browser evicts them, and anyone with the OS account can read that disk cache. Another account in the same profile would need the desktop id and the 64-bit token to hit the cache, and otherwise gets a server miss (`404`); `Vary: Cookie` adds a miss where the browser honors it. Avatars uploaded before this change keep a content-hash token until they are re-uploaded (there is no data migration). For those rows, someone who holds the exact image bytes and the desktop id can compute the URL, and that URL is now cacheable.
 
 ### File transfers
 
@@ -422,8 +425,10 @@ Referrer-Policy: no-referrer
 Permissions-Policy: camera=(), microphone=(self), geolocation=(), payment=(), usb=()
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Resource-Policy: same-origin
-Cache-Control: no-store            (on /api/* and /relay/*)
+Cache-Control: no-store            (on /api/* and /relay/*, one exception below)
 ```
+
+The one exception is `GET /api/desktops/:id/avatar`: a `200` under the current `v` keeps its `Cache-Control: private, max-age=31536000, immutable` and `Vary: Cookie`. A stale or missing `v` is a `302` with `no-store`; every other answer of that route (404, 401, 403, 429) and every other route is `no-store`, even if a handler sets another value. See "Desktop avatar uploads".
 
 `microphone=(self)` and not `microphone=()`: the composer dictation button uses the Web Speech API, which Chromium gates on the `microphone` permission policy, so an empty allowlist would make dictation end at once with `not-allowed`. Only the app's own origin may ask; the browser still prompts the user, and the only embedded frame is the app's own sandboxed `blob:` preview of a mentioned html file (`sandbox=""`, no script), which gets nothing. Camera, geolocation, payment and USB stay off.
 
