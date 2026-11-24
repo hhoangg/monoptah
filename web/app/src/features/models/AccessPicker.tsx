@@ -4,6 +4,7 @@
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui";
 import type { RuntimeMode, SendableRuntimeMode } from "@monoptah/protocol";
 import { cn } from "@/lib/utils";
+import { MENU_ITEM, MENU_ITEM_ATTR, MENU_ITEM_HIGHLIGHTED } from "@/ui/menuSurface";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuTrigger } from "@/ui/dropdown-menu";
 import { Check, ChevronDown, Lock, Pencil, Shield, Sparkles } from "@/ui/icons";
 import { ACCESS_MODES, FULL_ACCESS_DISPLAY, accessMode, isFullAccess, type AccessMode } from "./access";
@@ -82,7 +83,8 @@ export function AccessPicker({
               <DropdownMenuPrimitive.RadioItem
                 key={mode.id}
                 value={mode.id}
-                className="flex min-h-11 cursor-default items-start gap-2.5 rounded-row px-3 py-2 outline-none select-none data-[highlighted]:bg-selection pointer-fine:min-h-9"
+                {...MENU_ITEM_ATTR}
+                className={`flex min-h-11 cursor-default items-start gap-2.5 ${MENU_ITEM} px-3 py-2 outline-none select-none ${MENU_ITEM_HIGHLIGHTED} pointer-fine:min-h-9`}
               >
                 <ModeIcon size={14} className="mt-1 shrink-0 text-muted-text" />
                 <span className="min-w-0 flex-1">
