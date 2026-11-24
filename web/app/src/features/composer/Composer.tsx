@@ -593,7 +593,9 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
           style={{ minHeight: fieldMin, maxHeight: INPUT_MAX_PX }}
         />
 
-        <div className={card ? "flex min-w-0 items-center gap-2" : "contents"}>
+        {/* A container query (the card's own width, not the viewport): below 26rem the toolbar drops to its own row under
+            the buttons, so the model pill and the access chip keep their full size next to Stop and Send. */}
+        <div className={card ? "@container flex min-w-0 flex-wrap items-center gap-2" : "contents"}>
           <input
             ref={picker}
             type="file"
@@ -616,7 +618,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
             <Icon name="add" size={18} />
           </button>
           <DictationButton onText={insertText} disabled={readOnly} className={cn("size-11 pointer-fine:size-9", !card && "order-2")} />
-          <div data-composer-extra className={card ? "flex min-w-0 flex-1 items-center" : "order-4 size-0 overflow-hidden"}>{toolbar}</div>
+          <div data-composer-extra className={card ? cn("flex min-w-0 flex-1 items-center", toolbar && "@max-[26rem]:order-last @max-[26rem]:basis-full") : "order-4 size-0 overflow-hidden"}>{toolbar}</div>
           {showStop ? (
             <button
               type="button"
@@ -630,6 +632,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
                 "inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-pill bg-primary text-primary-foreground disabled:opacity-40 aria-disabled:opacity-60 pointer-fine:h-9",
                 stopping ? "px-3 text-meta font-medium" : "w-11 pointer-fine:w-9",
                 !card && "order-5",
+                card && toolbar && "@max-[26rem]:ml-auto",
               )}
             >
               {stopping ? <Icon name="spinner" size={16} className="animate-spin" /> : <span aria-hidden="true" className="block size-3 rounded-[3px] bg-current" />}
@@ -647,7 +650,7 @@ export function Composer({ onSubmit, busy = false, onStop, readOnly = false, req
               disabled={!canSend}
               aria-busy={submitting}
               onClick={() => void submit()}
-              className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 pointer-fine:size-9", !card && "order-5")}
+              className={cn("inline-flex size-11 shrink-0 items-center justify-center rounded-pill bg-primary text-primary-foreground disabled:opacity-40 pointer-fine:size-9", !card && "order-5", card && toolbar && !showStop && "@max-[26rem]:ml-auto")}
             >
               <Icon name="send" size={18} />
             </button>

@@ -5,6 +5,7 @@
 import { Link } from "@tanstack/react-router";
 import { Fragment, useState } from "react";
 import { useCatalog } from "@/data";
+import { useMonoTools } from "@/features/sessions/workspaceFilter";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { ProjectMascot } from "@/features/sessions/ProjectMascot";
 import { safeHexColor } from "@/lib/color";
@@ -25,6 +26,7 @@ const DOCUMENTS_SHOWN = 5;
 export function MonoProfileScreen({ desktopId, monoId }: { desktopId: string; monoId: string }) {
   const catalog = useCatalog().data;
   const readOnly = useReadOnly();
+  const monoTools = useMonoTools();
   const mono = catalog?.monos.find((candidate) => candidate.id === monoId);
   const { profile, loading, error, refreshing, refresh } = useMonoProfile(monoId);
   const assigned = (catalog?.projects ?? []).filter((project) => mono?.projectIds?.includes(project.id));
@@ -53,7 +55,7 @@ export function MonoProfileScreen({ desktopId, monoId }: { desktopId: string; mo
             <span>{mono.model}</span>
           </p>
         ) : null}
-        {readOnly || catalog?.monoTools !== true ? null : (
+        {readOnly || !monoTools ? null : (
           <Button asChild variant="outline" size="sm">
             <Link to="/d/$desktopId/monos/$monoId/profile/edit" params={{ desktopId, monoId }}>
               <Icon name="edit" size={16} />

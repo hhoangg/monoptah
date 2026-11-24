@@ -50,7 +50,7 @@ export function AccessPicker({
           title={`${hint}${busy ? " Changes apply to the next turn." : ""}`}
           aria-label={`Access: ${label}`}
           className={cn(
-            "flex max-w-52 min-h-11 min-w-0 shrink-[4] items-center gap-1.5 text-caption pointer-fine:min-h-9 text-content disabled:opacity-40 data-[state=open]:bg-selection",
+            "flex max-w-52 min-h-11 min-w-14 shrink-[4] items-center gap-1.5 text-caption pointer-fine:min-h-9 text-content disabled:opacity-40 data-[state=open]:bg-selection",
             variant === "plain" ? "rounded-row px-2 hover:bg-selection" : "rounded-pill bg-selection px-3",
           )}
         >

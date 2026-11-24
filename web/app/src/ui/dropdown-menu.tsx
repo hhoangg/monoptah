@@ -1,7 +1,8 @@
 import { DropdownMenu as DropdownMenuPrimitive } from "radix-ui";
 import type { ComponentProps } from "react";
 import { cn } from "@/lib/utils";
-import { MENU_ITEM, MENU_ITEM_ATTR, MENU_ITEM_HIGHLIGHTED, MENU_SURFACE, MENU_SURFACE_ATTR } from "./menuSurface";
+import { VISIBLE_MARGIN_PX } from "./anchoredPlacement";
+import { MENU_ITEM_ATTR, MENU_ROW, MENU_ROW_DESTRUCTIVE, MENU_SEPARATOR, MENU_SURFACE, MENU_SURFACE_ATTR } from "./menuSurface";
 import { useOverlayOwnerAttr } from "./overlayOwner";
 
 // Dropdown menu for `pointer: fine` (design-system.md section 8): bg sheet, menu-card radius,
@@ -16,7 +17,7 @@ export const DropdownMenuPortal = DropdownMenuPrimitive.Portal;
 export function DropdownMenuContent({
   className,
   sideOffset = 6,
-  collisionPadding = 8,
+  collisionPadding = VISIBLE_MARGIN_PX,
   ...props
 }: ComponentProps<typeof DropdownMenuPrimitive.Content>) {
   const owner = useOverlayOwnerAttr();
@@ -48,8 +49,8 @@ export function DropdownMenuItem({
       {...MENU_ITEM_ATTR}
       data-slot="dropdown-menu-item"
       className={cn(
-        `flex min-h-11 cursor-default items-center gap-3 ${MENU_ITEM} px-3 text-row outline-none select-none data-[disabled]:pointer-events-none data-[disabled]:opacity-40 ${MENU_ITEM_HIGHLIGHTED} pointer-fine:min-h-9`,
-        destructive && "text-deletions",
+        MENU_ROW,
+        destructive && MENU_ROW_DESTRUCTIVE,
         className,
       )}
       {...props}
@@ -71,7 +72,7 @@ export function DropdownMenuSeparator({ className, ...props }: ComponentProps<ty
   return (
     <DropdownMenuPrimitive.Separator
       data-slot="dropdown-menu-separator"
-      className={cn("mx-3 my-1 h-px bg-stroke", className)}
+      className={cn(MENU_SEPARATOR, className)}
       {...props}
     />
   );

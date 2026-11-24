@@ -9,7 +9,7 @@ import { useCatalog } from "@/data";
 import { markMonoSeen, markMonoUnread, useUnreadMonos } from "@/features/sessions/monoSeen";
 import { oneLine } from "@/features/sessions/WorkspaceNav";
 import { chatListTime } from "@/features/sessions/relativeTime";
-import type { CatalogMono } from "@/features/sessions/workspaceFilter";
+import { useMonoTools, type CatalogMono } from "@/features/sessions/workspaceFilter";
 import { cn } from "@/lib/utils";
 import { Button } from "@/ui/button";
 import { DelayedSpinner } from "@/ui/DelayedSpinner";
@@ -36,7 +36,8 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
   const unread = useUnreadMonos(desktopId, monos ?? []);
   const hidden = useMemo(() => new Set(hiddenIds ?? []), [hiddenIds]);
   const sorted = useMemo(() => [...(monos ?? [])].sort((a, b) => (b.lastActiveAt ?? 0) - (a.lastActiveAt ?? 0)), [monos]);
-  const canCreate = catalog.data?.monoTools === true && !readOnly;
+  const monoTools = useMonoTools();
+  const canCreate = monoTools && !readOnly;
   // "New Mono" asked for from the command palette: the dialog opens once the catalog says this device may create.
   const createRequested = useCreateMonoRequest((state) => state.requested);
   const catalogLoaded = !!catalog.data;
@@ -55,7 +56,7 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
     </Button>
   ) : null;
   // A device that cannot create says why, instead of hiding the button without a word.
-  const cannotCreate = !catalog.data ? null : readOnly ? "This device is read-only, so it cannot create Monos." : catalog.data.monoTools !== true ? "This desktop does not offer creating Monos from the web." : null;
+  const cannotCreate = !catalog.data ? null : readOnly ? "This device is read-only, so it cannot create Monos." : !monoTools ? "This desktop does not offer creating Monos from the web." : null;
   // As a page of its own (`titleAs="h1"`) the list sits in the workspace frame: drawer button, back to the list, New Mono in the header.
   const framed = Title === "h1";
 

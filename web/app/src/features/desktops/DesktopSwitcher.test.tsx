@@ -102,6 +102,17 @@ describe("desktop switcher", () => {
     expect(trigger.querySelector("svg")).toHaveClass("hidden", "min-[24rem]:block");
   });
 
+  it("keeps the bar row readable: no dimming, and no faint token on the chevron or the status", async () => {
+    mountSlot(<DesktopSwitcher />);
+    const trigger = await screen.findByRole("button", { name: /Switch desktop/ });
+    const bar = screen.getByTestId("desktop-top-bar");
+    for (const el of [bar, ...Array.from(bar.querySelectorAll("*"))]) {
+      expect(el.className.toString()).not.toMatch(/(^|\s)(opacity-|text-faint|bg-faint|border-faint)/);
+    }
+    expect(trigger.querySelector("svg")).toHaveClass("text-muted-text");
+    expect(within(trigger).getByText("Online").parentElement).toHaveClass("text-muted-text");
+  });
+
   it("has no workspace list toggle while a blocking layer shows (the list is unusable)", async () => {
     mountSlot(<DesktopSwitcher />);
     await screen.findByRole("button", { name: /Switch desktop/ });

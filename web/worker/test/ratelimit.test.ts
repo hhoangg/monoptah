@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { Hono } from "hono";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiErrorSchema, API_ROUTES } from "@monoptah/protocol";
 import type { AppEnv } from "../src/http.ts";
 import { sha256Hex } from "../src/lib/crypto.ts";
@@ -28,6 +28,25 @@ function expectPassed(res: Response, path: string, message?: string) {
   expect([429, 403, 501], message).not.toContain(res.status);
   if (PAIRING_PATHS.has(path)) expect(res.status, message).toBe(400);
 }
+
+/**
+ * Freezes Date (only Date: timers and I/O keep running) `secondsIn` seconds into a fresh minute, so a test that sends many
+ * real requests cannot see its 60 s window roll over on a slow runner. The limiters read the clock through `nowSeconds()`.
+ */
+function freezeInsideMinute(secondsIn = 20): number {
+  const real = Math.floor(Date.now() / 1000);
+  const frozen = real - (real % 60) + secondsIn;
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(frozen * 1000);
+  return frozen;
+}
+/** Same for tests with no session: 20 s into the 31st minute of an hour, inside every window up to 3600 s (and 3 s, 600 s). */
+function freezeMidWindow(): void {
+  const real = Math.floor(Date.now() / 1000);
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime((real - (real % 3600) + 1820) * 1000);
+}
+afterEach(() => vi.useRealTimers());
 
 async function expectLimited(res: Response, windowSeconds: number) {
   expect(res.status).toBe(429);
@@ -104,6 +123,7 @@ describe("consume (D1 fixed window)", () => {
   });
 
   it("keeps keys independent", async () => {
+    freezeInsideMinute();
     const a = `test:a:${freshIp()}`;
     const b = `test:b:${freshIp()}`;
     await consume(env, a, 1, 60);
@@ -113,6 +133,7 @@ describe("consume (D1 fixed window)", () => {
 
   it("uses one statement per call", async () => {
     // One INSERT ... ON CONFLICT ... RETURNING: after two calls the table holds one row with count 2.
+    freezeInsideMinute();
     const key = `test:one:${freshIp()}`;
     await consume(env, key, 10, 60);
     await consume(env, key, 10, 60);
@@ -122,6 +143,8 @@ describe("consume (D1 fixed window)", () => {
 });
 
 describe("IP keyed groups", () => {
+  beforeEach(freezeMidWindow);
+
   it.each([
     ["register", "/api/auth/register/options", 10, 3600],
     ["login", "/api/auth/login/options", 30, 600],
@@ -181,6 +204,8 @@ describe("IP keyed groups", () => {
 });
 
 describe("pair/poll: 1 per 3 s per deviceCode", () => {
+  beforeEach(freezeMidWindow);
+
   it("limits per device code, hashed in the key, at the middleware level", async () => {
     const ip = freshIp();
     const deviceCode = `device-code-${ip}`;
@@ -211,6 +236,8 @@ describe("pair/poll: 1 per 3 s per deviceCode", () => {
 });
 
 describe("push/notify: 30 per desktop token per minute", () => {
+  beforeEach(freezeMidWindow);
+
   it("limits per bearer token (hashed), not per IP", async () => {
     const ip = freshIp();
     const token = `desktop-token-${ip}`;
@@ -224,6 +251,8 @@ describe("push/notify: 30 per desktop token per minute", () => {
 });
 
 describe("the in-memory pre-filter in front of the D1 per-IP limits", () => {
+  beforeEach(freezeMidWindow);
+
   it("answers 429 without touching D1 once the isolate has seen the IP over its limit", async () => {
     const ip = freshIp();
     const hash = await ipHash(env, ip);
@@ -285,6 +314,8 @@ describe("the in-memory pre-filter in front of the D1 per-IP limits", () => {
 });
 
 describe("per-IP bound of pair/poll and push/notify (attacker-chosen keys)", () => {
+  beforeEach(freezeMidWindow);
+
   it("has the documented numbers", () => {
     expect(IP_LIMITS["pair-poll"]).toEqual({ limit: 120, windowSeconds: 60 });
     expect(IP_LIMITS["push-notify"]).toEqual({ limit: 120, windowSeconds: 60 });
@@ -311,6 +342,8 @@ describe("per-IP bound of pair/poll and push/notify (attacker-chosen keys)", () 
 });
 
 describe("IPv6 clients are limited per /64", () => {
+  beforeEach(freezeMidWindow);
+
   it("two addresses of one /64 share the counter, another /64 does not", async () => {
     const prefix = `2001:db8:${(counter += 1).toString(16)}:7`;
     for (let i = 0; i < 5; i += 1) expectPassed(await post("/api/pair/start", `${prefix}::${i + 1}`), "/api/pair/start");
@@ -370,6 +403,7 @@ describe("limitOutstandingPairings (3 outstanding per IP)", () => {
 });
 
 describe("limits that handlers call", () => {
+  beforeEach(freezeMidWindow);
   function app() {
     const a = new Hono<AppEnv>();
         a.post("/handle", async (c) => (await limitHandleAttempts(c, c.req.query("v") ?? "")) ?? c.json({ ok: true }));
@@ -387,6 +421,7 @@ describe("limits that handlers call", () => {
 });
 
 describe("the per-invite-code limit on both registration routes", () => {
+  beforeEach(freezeMidWindow);
   it("5 attempts per hour over register/options and register/verify together, hashed in the key; the 6th is 429 on either route", async () => {
     const invite = await createTestInvite(env);
     const key = await VirtualAuthenticator.generate();
@@ -414,23 +449,28 @@ describe("avatar limit: 300 per session per minute, separate from the general on
   const missing = () => `/api/desktops/${crypto.randomUUID()}/avatar`;
 
   it("does not charge the general bucket, and normal calls do not charge the avatar bucket", async () => {
+    freezeInsideMinute();
     resetSessionLimits();
     const session = await loginAs((await createTestUser(env)).id);
     for (let i = 0; i < SESSION_LIMIT + 10; i += 1) expect((await authedCall(session, missing())).status, `avatar ${i + 1}`).toBe(404);
     for (let i = 0; i < SESSION_LIMIT; i += 1) expect((await authedCall(session, "/api/me")).status, `me ${i + 1}`).toBe(200);
-    await expectLimited(await authedCall(session, "/api/me"), 60);
+    const spent = await authedCall(session, "/api/me");
+    await expectLimited(spent, 60);
+    expect(spent.headers.get("Retry-After")).toBe("40"); // frozen 20 s into the minute
     // The general bucket is spent; avatars still have their own.
     expect((await authedCall(session, missing())).status).toBe(404);
     resetSessionLimits();
   });
 
   it("answers 429 with Retry-After after 300 avatar GETs and audits the first breach once", async () => {
+    freezeInsideMinute();
     resetSessionLimits();
     const user = await createTestUser(env);
     const session = await loginAs(user.id);
     for (let i = 0; i < AVATAR_SESSION_LIMIT; i += 1) expect((await authedCall(session, missing())).status, `call ${i + 1}`).toBe(404);
     const over = await authedCall(session, missing());
     await expectLimited(over, 60);
+    expect(over.headers.get("Retry-After")).toBe("40"); // frozen 20 s into the minute
     await expectLimited(await authedCall(session, missing()), 60);
     // The general bucket is untouched.
     expect((await authedCall(session, "/api/me")).status).toBe(200);

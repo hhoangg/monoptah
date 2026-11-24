@@ -368,6 +368,8 @@ describe("tab strip structure and keyboard", () => {
       const menu = await screen.findByRole("menu");
       // An item per tab to open it, then one per tab to close it.
       expect(within(menu).getAllByRole("menuitem")).toHaveLength(6);
+      expect(menu).toHaveClass("max-h-[var(--radix-dropdown-menu-content-available-height)]", "overflow-y-auto");
+      expect(menu).not.toHaveClass("max-h-80");
       await user.click(within(menu).getAllByRole("menuitem")[0]!);
       await waitFor(() => expect(path(router)).toBe(`/d/${DESKTOP_ID}${S(0)}`));
     } finally {

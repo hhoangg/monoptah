@@ -9,6 +9,7 @@ import { Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import type { ModelCatalog, ParamsOf } from "@monoptah/protocol";
 import { catalogKey, useCatalog, useLinkMutation } from "@/data";
+import { useMonoTools } from "@/features/sessions/workspaceFilter";
 import { ModelControls } from "@/features/models/ModelControls";
 import { ModelPicker, summarizeSelection } from "@/features/models/ModelPicker";
 import { useModelCatalog } from "@/features/models/hooks";
@@ -39,7 +40,7 @@ export function MonoEditScreen({ desktopId, monoId }: { desktopId: string; monoI
   const readOnly = useReadOnly();
   const catalog = useCatalog();
   const mono = catalog.data?.monos.find((candidate) => candidate.id === monoId);
-  const monoTools = catalog.data?.monoTools === true;
+  const monoTools = useMonoTools();
   const back = (
     <Link to="/d/$desktopId/monos/$monoId/profile" params={{ desktopId, monoId }} aria-label="Back" className={BACK_LINK_CLASS}>
       <BackIcon />

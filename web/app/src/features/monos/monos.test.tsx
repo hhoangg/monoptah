@@ -161,7 +161,7 @@ describe("Mono header (F-70)", () => {
   it("shows a Settings action instead of the profile link when monoTools is off", async () => {
     const handler = FIXTURE_HANDLERS["workspace.list"] as (p: never, c: never) => Record<string, unknown>;
     (FIXTURE_HANDLERS as Record<string, unknown>)["workspace.list"] = ((p: never, c: never) => ({ ...handler(p, c), monoTools: false })) as never;
-    mount(`/monos/${MONO}`);
+    mount(`/monos/${MONO}`, { capabilities: KNOWN_CAPABILITIES.filter((name) => name !== "monoTools") });
     const links = await screen.findAllByRole("link", { name: "Settings" });
     expect(links.some((link) => link.getAttribute("href") === `/settings/desktops/${DESKTOP_ID}` && link.textContent === "Settings")).toBe(true);
     expect(screen.queryByRole("button", { name: "Mono actions" })).toBeNull();

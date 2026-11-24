@@ -10,6 +10,7 @@
 // the whole time and only a reader who scrolled away keeps their place.
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type { Turn } from "@monoptah/protocol";
 import type { OptimisticTurn } from "@/data";
 import { sendErrorMessage } from "@/features/composer/sendErrors";
@@ -99,6 +100,9 @@ export function Transcript({
   const [errorOpen, setErrorOpen] = useState(false);
   const [revealed, setRevealed] = useState(false);
   const [opened, setOpened] = useState(false);
+  // The scroller's height as the ResizeObserver last saw it. It lives in state so the blank room and the end pin
+  // are computed from the same height in one pass (a height read from the DOM during render lags the observer).
+  const [viewport, setViewport] = useState<number | undefined>(undefined);
   const following = useRef(true);
   const adjustments = useRef<number | undefined>(undefined);
   // True from the jump button's press until the scroller rests at the real end or the reader takes over.
@@ -154,7 +158,7 @@ export function Transcript({
   const measuredTotal = virtualizer.getTotalSize();
   const anchorStart = anchoring && anchorIndex >= 0 ? virtualizer.measurementsCache[anchorIndex]?.start : undefined;
   // The blank room under the anchored message: the anchor position is exactly the end of the scroll height.
-  const blank = anchorStart !== undefined && scroller ? Math.max(0, Math.max(0, anchorStart - ANCHOR_REST_PX) + scroller.clientHeight - measuredTotal) : 0;
+  const blank = anchorStart !== undefined && scroller ? Math.max(0, Math.max(0, anchorStart - ANCHOR_REST_PX) + (viewport ?? scroller.clientHeight) - measuredTotal) : 0;
   const total = measuredTotal + blank;
 
   // Re-evaluates the end-follow state and the jump button from the scroller's geometry.
@@ -246,7 +250,29 @@ export function Transcript({
     if (!scroller || rows.length === 0) return;
     if (following.current) scrollToEnd(false);
     visibility.setVisible(!jumping.current && isAwayFromBottom(scroller));
-  }, [scroller, rows.length, total, scrollToEnd, visibility]);
+  }, [scroller, rows.length, total, viewport, scrollToEnd, visibility]);
+
+  // The scroller is a flex sibling of the composer: when the composer grows (the card opens, a long draft, the
+  // keyboard lifts it) the scroller gets shorter but its scrollTop stays, so the last line would end up behind the
+  // composer. The observer only records the new height (and that the reader was at the end); the layout effect
+  // above then re-pins in the same pass that recomputes the blank room, so an anchored message stays put.
+  useEffect(() => {
+    if (!scroller || typeof ResizeObserver === "undefined") return;
+    let height = scroller.clientHeight;
+    const observer = new ResizeObserver(() => {
+      if (scroller.clientHeight === height) return;
+      // Was the reader at the end before this change? `following` alone can lag behind a burst of resizes.
+      const wasAtEnd = scroller.scrollHeight - height - scroller.scrollTop <= FOLLOW_PX;
+      height = scroller.clientHeight;
+      if (wasAtEnd && !jumping.current) following.current = true;
+      // A ResizeObserver callback has no event, so a plain update would commit after the next paint: the shrunk
+      // scroller would show the old scrollTop for one frame. Committing synchronously re-pins before that paint.
+      const next = height;
+      flushSync(() => setViewport(next));
+    });
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [scroller]);
 
   // Reveal after the first scroll to the end, so the list appears in place (design-system.md: 280 ms).
   useEffect(() => {

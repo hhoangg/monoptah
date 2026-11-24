@@ -5,6 +5,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useCatalog } from "@/data";
+import { useMonoTools } from "@/features/sessions/workspaceFilter";
 import { meQuery } from "@/features/accounts/queries";
 import { requestCreateMono } from "@/features/monos/createRequest";
 import { SETTINGS_INDEX, searchSettings, type SettingsRoute, type SettingsSearchHit } from "@/features/settings/settingsIndex";
@@ -126,6 +127,7 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
   const listRef = useRef<HTMLDivElement>(null);
 
   const readOnly = useReadOnly();
+  const monoTools = useMonoTools();
   const tools = useProjectTools();
   const toolPanels = tools.panels.join("\0");
   const hasScope = tools.scope !== null;
@@ -144,9 +146,9 @@ function PaletteBody({ desktopId }: { desktopId: string }) {
         ]
       : [];
     // F-13, F-75: the Mono list, and a new Mono where this device may make one.
-    const places = [{ id: "monos", label: "Monos" }, ...(data.monoTools === true && !readOnly ? [{ id: "new-mono", label: "New Mono" }] : [])];
+    const places = [{ id: "monos", label: "Monos" }, ...(monoTools && !readOnly ? [{ id: "new-mono", label: "New Mono" }] : [])];
     return paletteItems({ actions, places, projects: data.projects, monos: data.monos, sessions: data.sessions, settings }, query);
-  }, [data, query, toolPanels, hasScope, readOnly, settings]);
+  }, [data, query, toolPanels, hasScope, readOnly, monoTools, settings]);
   const current = Math.min(active, Math.max(0, items.length - 1));
   const optionId = (index: number) => `${listId}-${index}`;
 

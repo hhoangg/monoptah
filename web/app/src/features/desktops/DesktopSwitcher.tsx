@@ -28,15 +28,15 @@ import { safeName } from "./format";
 import { useBlockingLayerShown } from "./blockingLayer";
 import { isLinkBlocking } from "./linkStateModel";
 import { DesktopAvatarBubble } from "./DesktopAvatarFace";
-import { ColorDot, desktopErrorMessage } from "./parts";
+import { ColorDot, desktopErrorMessage, PresenceDot } from "./parts";
 import { markGrantRequested, readLastUsed, sortByLastUsed, touchLastUsed } from "./storage";
 import { useThisDevice } from "./thisDevice";
 
 function OnlineDot({ online, compactBelow }: { online: boolean; compactBelow?: boolean }) {
   return (
     <span className="inline-flex items-center gap-1 text-caption text-muted-text">
-      <span aria-hidden="true" className={cn("size-1.5 rounded-pill", online ? "bg-additions" : "bg-faint")} />
-      <span className={cn(compactBelow && "hidden min-[24rem]:inline")}>{online ? "Online" : "Offline"}</span>
+      <PresenceDot online={online} />
+      <span className={cn("font-medium", compactBelow && "hidden min-[24rem]:inline")}>{online ? "Online" : "Offline"}</span>
     </span>
   );
 }
@@ -112,7 +112,7 @@ export function DesktopSwitcher() {
         {current?.avatar ? <DesktopAvatarBubble desktop={current} className="size-6" /> : <ColorDot color={current?.color ?? null} />}
         <span className="min-w-0 truncate">{name}</span>
         <OnlineDot online={online} compactBelow />
-        <Icon name="chevronDown" size={16} className="hidden shrink-0 text-faint min-[24rem]:block" />
+        <Icon name="chevronDown" size={16} className="hidden shrink-0 text-muted-text min-[24rem]:block" />
       </button>
       {open ? <SwitcherSheet currentId={desktopId} onClose={() => setOpen(false)} /> : null}
     </DesktopTopBar>
