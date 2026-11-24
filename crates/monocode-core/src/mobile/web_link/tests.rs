@@ -2206,6 +2206,46 @@ mod seam {
         );
     }
 
+    #[test]
+    fn a_mono_reset_ticket_counts_only_when_the_server_answers_200_and_names_the_mono() {
+        let verify = |status: u16, device: &str| {
+            let handler: Handler = Arc::new(move |_| (status, r#"{"ok":true}"#.into()));
+            let stub = world(handler, false);
+            let base = format!("http://127.0.0.1:{}", stub.hub.port);
+            let check =
+                desktop_api::verify_mono_reset_ticket(&base, TOKEN, device, "tkt", "mono-1");
+            let sent = stub.hub.requests(
+                "POST",
+                &format!("/api/desktop/grants/{device}/mono-reset-ticket"),
+            );
+            (check, sent)
+        };
+        let (check, sent) = verify(200, "dev-1");
+        assert_eq!(check, TicketCheck::Accepted);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].auth, bearer());
+        assert_eq!(sent[0].body["ticket"], "tkt");
+        assert_eq!(sent[0].body["monoId"], "mono-1");
+        assert_eq!(verify(404, "dev-1").0, TicketCheck::Rejected);
+        assert_eq!(verify(500, "dev-1").0, TicketCheck::Unreachable);
+        assert_eq!(verify(403, "dev-1").0, TicketCheck::Unreachable);
+        // A device id that is not a plain id never reaches the network.
+        let (check, sent) = verify(200, "../x");
+        assert_eq!(check, TicketCheck::NoIdentity);
+        assert!(sent.is_empty());
+        // Nothing listens on port 1: no answer is a refusal.
+        assert_eq!(
+            desktop_api::verify_mono_reset_ticket(
+                "http://127.0.0.1:1",
+                TOKEN,
+                "dev-1",
+                "tkt",
+                "mono-1"
+            ),
+            TicketCheck::Unreachable
+        );
+    }
+
     #[tokio::test]
     async fn a_web_device_that_leaves_is_revoked_and_never_comes_back_as_pending() {
         use crate::mobile::web_link::desktop_api::ServerGrant;

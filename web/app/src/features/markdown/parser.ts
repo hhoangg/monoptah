@@ -364,7 +364,7 @@ function matchLink(text: string, open: number, minLabel: number, memo: LinkMemo)
   if (text[end] !== ")") return fail();
   return { label: text.slice(open + 1, close), href, end: end + 1 };
 }
-const BARE_URL = /https?:\/\/[^\s<>()]{1,2000}/y;
+const BARE_URL = /https?:\/\/[^\s<>()\ue100-\ue13f]{1,2000}/y;
 
 function sticky(pattern: RegExp, text: string, index: number): RegExpExecArray | null {
   pattern.lastIndex = index;

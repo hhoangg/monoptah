@@ -889,7 +889,8 @@ mod tests {
                 "mentionedFiles",
                 "mentionedFiles2",
                 "fileTransfer",
-                "slashCommands"
+                "slashCommands",
+                "monoEmoji"
             ])
         );
         policy::set_flags(policy::PolicyFlags {
@@ -904,7 +905,8 @@ mod tests {
                 "mentionedFiles",
                 "mentionedFiles2",
                 "fileTransfer",
-                "slashCommands"
+                "slashCommands",
+                "monoEmoji"
             ])
         );
         policy::set_flags(before);
@@ -967,7 +969,7 @@ mod tests {
                 "state": "confirmed",
                 "permission": "read",
                 "proto": 1,
-                "capabilities": ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer", "slashCommands"],
+                "capabilities": ["cloud", "mentionedFiles", "mentionedFiles2", "fileTransfer", "slashCommands", "monoEmoji"],
                 "desktop": {"name": "Test Desktop", "version": "1.2.3"},
             })]
         );

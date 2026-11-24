@@ -136,8 +136,8 @@ export function createFakeServer(options: FakeServerOptions = {}): FakeServer {
           list.push(created);
           return json(200, { grant: created });
         }
-        if (parts.length === 6 && parts[5] === "selection-ticket" && method === "POST") {
-          // Like the real route: fresh, and only for a confirmed Control grant.
+        if (parts.length === 6 && (parts[5] === "selection-ticket" || parts[5] === "mono-reset-ticket") && method === "POST") {
+          // Like the real routes (selection and Mono reset tickets): fresh, and only for a confirmed Control grant.
           const blocked = gate();
           if (blocked) return blocked;
           const current = list.find((item) => item.deviceId === parts[4]);

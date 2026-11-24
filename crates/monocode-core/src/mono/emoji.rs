@@ -7,6 +7,7 @@
 //! `emoji/.staging-<uuid>/` (an import that is not confirmed yet).
 
 pub mod import;
+pub mod resolve;
 pub mod sort;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -63,6 +64,16 @@ impl Format {
             Format::Jpeg => "JPG",
             Format::Gif => "GIF",
             Format::Webp => "WebP",
+        }
+    }
+
+    /// The MIME type of the stored file, as a browser needs it.
+    pub fn mime(self) -> &'static str {
+        match self {
+            Format::Png => "image/png",
+            Format::Jpeg => "image/jpeg",
+            Format::Gif => "image/gif",
+            Format::Webp => "image/webp",
         }
     }
 

@@ -110,6 +110,8 @@ pub enum Lifecycle {
     TerminalClose,
     /// The user switched "Allow web terminal" for a device.
     TerminalToggle,
+    /// A web Mono reset was refused for its ticket. The ticket is never logged.
+    MonoResetTicketRefused,
 }
 
 impl Lifecycle {
@@ -131,6 +133,7 @@ impl Lifecycle {
             Lifecycle::TerminalOpen => "terminal_open",
             Lifecycle::TerminalClose => "terminal_close",
             Lifecycle::TerminalToggle => "terminal_toggle",
+            Lifecycle::MonoResetTicketRefused => "mono_reset_ticket_refused",
         }
     }
 }
@@ -143,6 +146,8 @@ pub struct AuditEvent {
     pub transport: Transport,
     pub method: String,
     pub project_id: Option<String>,
+    /// The Mono a `mono.*` call names (an id, never content).
+    pub mono_id: Option<String>,
     pub outcome: Outcome,
     pub command_id: Option<String>,
     /// The call is not a read once its parameters are looked at (a
@@ -168,6 +173,10 @@ impl AuditEvent {
             transport,
             method: method.into(),
             project_id: request["params"]["projectId"].as_str().map(Into::into),
+            mono_id: request["params"]["monoId"]
+                .as_str()
+                .filter(|_| method.starts_with("mono."))
+                .map(Into::into),
             outcome: Outcome::Ok,
             command_id: request["id"].as_str().map(Into::into),
             writes: !matches!(
@@ -393,6 +402,9 @@ impl Log {
             "outcome": event.outcome.text(),
             "commandId": capped_opt(&event.command_id, ID_CHARS),
         });
+        if let Some(mono) = &event.mono_id {
+            line["monoId"] = capped(mono, ID_CHARS).into();
+        }
         if !known {
             line["detail"] = capped(&event.method, METHOD_CHARS).into();
         }
@@ -804,6 +816,7 @@ mod tests {
             transport: Transport::Web,
             method: method.into(),
             project_id: Some("p1".into()),
+            mono_id: None,
             outcome,
             command_id: Some("c1".into()),
             writes: false,
@@ -883,6 +896,28 @@ mod tests {
         assert_eq!(line["projectId"], "p1");
         assert_eq!(line["outcome"], "ok");
         assert_eq!(line["commandId"], "c1");
+    }
+
+    #[test]
+    fn a_mono_call_records_which_mono_and_never_the_ticket() {
+        let request = json!({"id": "c9", "params": {"monoId": "mono-7", "ticket": "fake-ticket"}});
+        let event =
+            AuditEvent::for_call("abcdef0123456789", Transport::Web, "mono.reset", &request);
+        assert_eq!(event.mono_id.as_deref(), Some("mono-7"));
+        // Only `mono.*` calls name a Mono.
+        let other = AuditEvent::for_call(
+            "abcdef0123456789",
+            Transport::Web,
+            "session.start",
+            &request,
+        );
+        assert_eq!(other.mono_id, None);
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::new(dir.path());
+        log.record(&device(), &event);
+        let lines = lines(dir.path());
+        assert_eq!(lines[0]["monoId"], "mono-7");
+        assert!(!lines[0].to_string().contains("fake-ticket"));
     }
 
     #[test]

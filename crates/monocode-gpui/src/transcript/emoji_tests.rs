@@ -797,3 +797,83 @@ fn a_turn_that_ends_in_an_error_reports_the_error(cx: &mut TestAppContext) {
     );
     assert_eq!(recovered, "Done");
 }
+
+/// What native draws for `text`: the picture file and whether it is large, in source order.
+fn native_pictures(text: &str, emoji: &MonoEmoji, streaming: bool) -> Vec<(String, bool)> {
+    let rows = rows_of_stream(text, Some(emoji), streaming);
+    let mut out = Vec::new();
+    let mut take = |runs: &[InlineRun]| {
+        for run in runs {
+            if let Some(pick) = &run.style.emoji {
+                let file = pick
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((file, pick.large));
+            }
+        }
+    };
+    for row in &rows {
+        match &row.part {
+            Part::Text { runs, .. } => take(runs),
+            Part::Table { cells, .. } => cells.iter().flatten().for_each(|runs| take(runs)),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn the_pictures_sent_to_the_web_are_the_ones_native_draws() {
+    use monocode_core::mono::emoji::resolve::resolve;
+    let fx = fixture(true);
+    let cases: [(&str, bool); 19] = [
+        ("Great :emo[happy] job", false),
+        ("Hello\n:emo[celebrate]\nbye", false),
+        ("Done.\n:emo[celebrate]", true),
+        ("Done.\n:emo[celebrate]\n", true),
+        ("Done.\n\n:emo[celebrate]", true),
+        ("Done.\n\n:emo[celebrate]", false),
+        ("Done.\n\n:emo[celebrate]\n\nNext", false),
+        ("a :emo[happy] b :emo[celebrate] c\n:emo[happy]\n", false),
+        ("Hi :emo[nonsense] :emo[happy] there :emo[sad]", false),
+        ("x :emo[ HAPPY ] y", false),
+        (
+            "# Title :emo[happy]\n\n- :emo[celebrate]\n> :emo[happy]",
+            false,
+        ),
+        ("| a | b |\n|---|---|\n| :emo[happy] | x |\n", false),
+        (
+            "Run `:emo[happy]` ok :emo[happy]\n\n```\n:emo[happy]\n```\n",
+            false,
+        ),
+        (
+            "a :emo[happy] b :emo[happy] c :emo[happy] d :emo[happy]",
+            false,
+        ),
+        ("a\n\n:emo[happy] :emo[celebrate]\n\nb", false),
+        ("Intro\n:emo[happy] :emo[celebrate]", false),
+        ("Ça va :emo[happy]\n\n:emo[happy]", false),
+        ("- a\n- :emo[happy] :emo[celebrate]", false),
+        ("> :emo[happy] :emo[celebrate]\n> more", false),
+    ];
+    for (text, streaming) in cases {
+        let native = native_pictures(text, &fx.emoji, streaming);
+        let (_, web) = resolve(
+            &fx.emoji.library,
+            &fx.emoji.dir,
+            &fx.emoji.packs,
+            &fx.emoji.session,
+            text,
+            streaming,
+            &|path| fx.emoji.file_exists(path),
+        );
+        let web: Vec<(String, bool)> = web
+            .into_iter()
+            .map(|pick| (pick.hash.trim_start_matches("hash-").to_owned(), pick.large))
+            .collect();
+        assert_eq!(web, native, "{text:?} (streaming {streaming})");
+    }
+}

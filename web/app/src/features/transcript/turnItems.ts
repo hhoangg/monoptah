@@ -2,7 +2,7 @@
 // with extra fields), so the shapes of mobile `workspace/types.ts` are re-stated here and a turn is
 // narrowed once, in `readItems`. An item of a type this client does not know (a newer desktop) is
 // dropped, as mobile does (F-34).
-import type { Turn } from "@monoptah/protocol";
+import { MONO_EMOJI_MAX_PICKS, MonoEmojiPickSchema, type MonoEmojiPick, type Turn } from "@monoptah/protocol";
 
 export type WorkKind = "research" | "edit" | "run" | "agent" | "other" | "think" | "note";
 export interface WorkStep {
@@ -38,7 +38,8 @@ export type UserItem = {
   attachments?: number;
   compact?: boolean;
 };
-export type TextItem = { type: "text"; id: string; text: string; streaming?: boolean };
+/** `emoji`: the pictures of a Mono reply, each at a UTF-16 offset of `text` (a Mono transcript only; validated by `readEmoji`). */
+export type TextItem = { type: "text"; id: string; text: string; streaming?: boolean; emoji?: MonoEmojiPick[] };
 export type HeaderItem = {
   type: "header";
   id: string;
@@ -73,6 +74,22 @@ const KINDS = new Set<string>(["research", "edit", "run", "agent", "other", "thi
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const str = (value: unknown, fallback = ""): string => (typeof value === "string" ? value : fallback);
 const num = (value: unknown): number | undefined => (typeof value === "number" && Number.isFinite(value) ? value : undefined);
+
+/**
+ * The valid pictures of a text item: invalid entries dropped, at most `MONO_EMOJI_MAX_PICKS`, in the order of
+ * their offsets (a stable sort, so picks at the same offset keep their order) and each offset clamped to the text.
+ */
+function readEmoji(value: unknown, textLength: number): MonoEmojiPick[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const picks: MonoEmojiPick[] = [];
+  for (const raw of value) {
+    const parsed = MonoEmojiPickSchema.safeParse(raw);
+    if (parsed.success) picks.push({ ...parsed.data, at: Math.min(parsed.data.at, textLength) });
+    if (picks.length >= MONO_EMOJI_MAX_PICKS) break;
+  }
+  if (picks.length === 0) return undefined;
+  return picks.sort((a, b) => a.at - b.at);
+}
 
 function steps(value: unknown): WorkStep[] {
   if (!Array.isArray(value)) return [];
@@ -144,8 +161,11 @@ export function readItem(raw: unknown): TurnItem | null {
         ...(num(raw.attachments) ? { attachments: num(raw.attachments) } : {}),
         ...(raw.compact === true ? { compact: true } : {}),
       };
-    case "text":
-      return { type: "text", id, text: str(raw.text), ...(raw.streaming === true ? { streaming: true } : {}) };
+    case "text": {
+      const text = str(raw.text);
+      const emoji = readEmoji(raw.emoji, text.length);
+      return { type: "text", id, text, ...(raw.streaming === true ? { streaming: true } : {}), ...(emoji ? { emoji } : {}) };
+    }
     case "header":
       return {
         type: "header",

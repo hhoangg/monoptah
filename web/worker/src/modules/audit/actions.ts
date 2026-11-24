@@ -75,6 +75,7 @@ export const RATE_LIMIT_AUDIT_GROUPS = [
   "push-notify",
   "push-test",
   "terminal-ticket",
+  "mono-reset-ticket",
   "invite",
   "handle",
   "session",
@@ -130,6 +131,10 @@ export const AUDIT_ACTIONS = {
   "terminal.ticket": spec(["user"], { deviceId: Id, desktopId: Id }),
   /** The desktop consumed such a ticket: the terminal is about to open. */
   "terminal.ticket.consumed": spec(["desktop"], { deviceId: Id, desktopId: Id }),
+  /** A web device got a single-use ticket to reset a Mono's conversation on a desktop (fresh passkey re-auth, bound to one Mono). */
+  "mono.reset.ticket": spec(["user"], { deviceId: Id, desktopId: Id }),
+  /** The desktop consumed such a ticket: the reset is going ahead. */
+  "mono.reset.ticket.consumed": spec(["desktop"], { deviceId: Id, desktopId: Id }),
   // Admin
   "user.block": spec(["admin"], { cascade: z.boolean(), count: Count }),
   "user.unblock": spec(["admin"], { cascade: z.boolean().optional() }),

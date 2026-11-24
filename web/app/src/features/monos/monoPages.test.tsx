@@ -403,11 +403,13 @@ describe("denied methods (security.md section 7)", () => {
     ["list", "/monos", "Monos"],
   ];
 
-  it.each(PAGES)("never calls mono.reset, mono.delete or mono.saveFile from the %s page", async (_name, path, heading) => {
+  // Reset has its own entry on the profile page (ResetMono.test.tsx); no page ever deletes a Mono or saves a file from here, and none resets on load.
+  it.each(PAGES)("never calls mono.reset, mono.delete or mono.saveFile from the %s page", async (name, path, heading) => {
     mount(path);
     await screen.findByRole("heading", { level: 1, name: heading });
-    expect(screen.queryByText(/reset conversation|delete mono|\bsave\b/i)).toBeNull();
-    expect(screen.queryByRole("button", { name: /reset|delete|save/i })).toBeNull();
+    const reset = name === "profile" ? "" : "reset conversation|";
+    expect(screen.queryByText(new RegExp(`${reset}delete mono|\\bsave\\b`, "i"))).toBeNull();
+    expect(screen.queryByRole("button", { name: new RegExp(`${name === "profile" ? "" : "reset|"}delete|save`, "i") })).toBeNull();
     for (const method of ["mono.reset", "mono.delete", "mono.saveFile"]) expect(called(method)).toHaveLength(0);
   });
 });

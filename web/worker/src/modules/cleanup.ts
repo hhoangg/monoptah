@@ -26,6 +26,8 @@ export const RETENTION = {
   selectionTickets: HOUR,
   /** `terminal_tickets`: removed 1 hour after they expire (used tickets go with them). */
   terminalTickets: HOUR,
+  /** `mono_reset_tickets`: removed 1 hour after they expire (used tickets go with them). */
+  monoResetTickets: HOUR,
   /** `audit_log`: 180 days. */
   auditLog: 180 * DAY,
 } as const;

@@ -18,6 +18,52 @@ import {
 } from "./parser";
 import { closeOpenMarkers, useStreamedText, useWordFade, type WordClock } from "./wordReveal";
 
+/** First of the private-use characters that stand for a picture in the text handed to the parser. */
+const MARK_BASE = 0xe100;
+/** How many pictures one text can hold (the protocol's most picks of a text item). */
+const MARK_COUNT = 64;
+const MARK = /[\ue100-\ue13f]/;
+const MARKS = /[\ue100-\ue13f]/g;
+const MARK_SPLIT = /([\ue100-\ue13f])/;
+
+/** Pictures drawn inside the text: `at` are UTF-16 offsets of `text`, `render(k)` draws the k-th one. */
+export interface MarkdownEmoji {
+  at: readonly number[];
+  /** Which of the pictures are large (a line of their own). */
+  large?: readonly boolean[];
+  render: (index: number) => ReactNode;
+}
+
+/**
+ * `text` with one private-use character at each offset. The parser treats it as a letter, the renderer swaps it for
+ * the picture, and every place that is not prose (code, link targets, alt text) drops it. Text that already holds
+ * such a character is left alone, so a real one can never be mistaken for a picture.
+ */
+export function markEmoji(text: string, at: readonly number[], large: readonly boolean[] = []): string {
+  if (at.length === 0 || at.length > MARK_COUNT || MARK.test(text)) return text;
+  let out = "";
+  let from = 0;
+  for (let index = 0; index < at.length; ) {
+    const to = Math.min(Math.max(at[index] ?? 0, from), text.length);
+    let end = index;
+    while (end < at.length && Math.min(Math.max(at[end] ?? 0, from), text.length) === to) end++;
+    out += text.slice(from, to);
+    from = to;
+    let alone = false;
+    for (let k = index; k < end; k++) {
+      out += String.fromCharCode(MARK_BASE + k);
+      alone ||= large[k] === true;
+    }
+    // A large picture is a line of its own (the desktop removed that line, so its offset is the start of the next kept
+    // one): end the line, or the marker would keep the next line from starting a heading, list item, quote or fence.
+    if (alone && (to === 0 || text[to - 1] === "\n")) out += "\n";
+    index = end;
+  }
+  return out + text.slice(from);
+}
+
+const withoutMarks = (text: string): string => (MARK.test(text) ? text.replace(MARKS, "") : text);
+
 export interface MarkdownProps {
   text: string;
   /** As the desktop's `zen-fold-prose`: muted ink, headings as bold lines. */
@@ -35,10 +81,13 @@ export interface MarkdownProps {
   renderImage?: (src: string, alt: string) => ReactNode;
   /** Called for in-app `/d/...` links; without it they navigate as plain links. */
   onNavigate?: (href: string) => void;
+  /** Mono pictures to draw at their offsets of `text` (a Mono's reply only). */
+  emoji?: MarkdownEmoji;
   className?: string;
 }
 
 interface Handlers {
+  renderEmoji?: (index: number) => ReactNode;
   onOpenFile?: (path: string, line?: number) => void;
   renderImage?: (src: string, alt: string) => ReactNode;
   onNavigate?: (href: string) => void;
@@ -55,10 +104,15 @@ export const Markdown = memo(function Markdown({
   onOpenFile,
   renderImage,
   onNavigate,
+  emoji,
   className,
 }: MarkdownProps) {
   const reduceMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
-  const shown = useStreamedText(text, streaming && !reduceMotion);
+  const emojiAt = emoji?.at;
+  const emojiLarge = emoji?.large;
+  const marked = useMemo(() => (emojiAt ? markEmoji(text, emojiAt, emojiLarge) : text), [text, emojiAt, emojiLarge]);
+  const renderEmoji = emoji?.render;
+  const shown = useStreamedText(marked, streaming && !reduceMotion);
   const { blocks, count, ranges } = useMemo(() => {
     const parsed = parseMarkdown(streaming ? closeOpenMarkers(shown) : shown, { localImages: renderImage !== undefined });
     return { blocks: parsed, ...numberWords(parsed) };
@@ -66,7 +120,7 @@ export const Markdown = memo(function Markdown({
   const { clock, now, fadeMs, live } = useWordFade(count, (animate || streaming) && !reduceMotion);
   const from = clock.firstFading(now, fadeMs);
   const fade: Fade | undefined = reduceMotion || !live ? undefined : { clock, now, ms: fadeMs, from };
-  const handlers = useMemo<Handlers>(() => ({ onOpenFile, renderImage, onNavigate }), [onOpenFile, renderImage, onNavigate]);
+  const handlers = useMemo<Handlers>(() => ({ onOpenFile, renderImage, onNavigate, renderEmoji }), [onOpenFile, renderImage, onNavigate, renderEmoji]);
   const last = blocks.length - 1;
   return (
     <div
@@ -153,7 +207,7 @@ const BlockView = memo(function BlockView({ block, fade, handlers, streamingTail
       );
     }
     case "code":
-      return <CodeBlock code={block.text} language={block.lang} isIncomplete={streamingTail} />;
+      return <CodeBlock code={withoutMarks(block.text)} language={block.lang} isIncomplete={streamingTail} />;
     case "list": {
       const Tag = block.ordered ? "ol" : "ul";
       return (
@@ -223,17 +277,35 @@ function Inlines({
   );
 }
 
+/** A run of text with each picture mark swapped for its picture; marks are dropped when nothing draws them. */
+function withEmoji(text: string, handlers: Handlers): ReactNode {
+  if (!MARK.test(text)) return text;
+  return text.split(MARK_SPLIT).map((part, index) =>
+    part.length === 1 && MARK.test(part) ? (
+      <Fragment key={index}>{handlers.renderEmoji?.(part.charCodeAt(0) - MARK_BASE)}</Fragment>
+    ) : (
+      part
+    ),
+  );
+}
+
 /**
  * A run of text with its fading words in their own spans. Words already in stay one plain
  * string; a word keeps its span, by its number, until it has settled.
  */
-function FadingText({ text, word, fade }: { text: string; word: number; fade: Fade }) {
+function FadingText({ text, word, fade, handlers }: { text: string; word: number; fade: Fade; handlers: Handlers }) {
   const out: ReactNode[] = [];
   let plain = "";
   let index = word;
   for (const part of splitWords(text)) {
     if (/^\s/.test(part) || index < fade.from) {
-      plain += part;
+      if (MARK.test(part)) {
+        if (plain) out.push(plain);
+        plain = "";
+        out.push(<Fragment key={`m${index}`}>{withEmoji(part, handlers)}</Fragment>);
+      } else {
+        plain += part;
+      }
       if (!/^\s/.test(part)) index++;
       continue;
     }
@@ -241,7 +313,7 @@ function FadingText({ text, word, fade }: { text: string; word: number; fade: Fa
     plain = "";
     out.push(
       <span key={index} className="md-word">
-        {part}
+        {withEmoji(part, handlers)}
       </span>,
     );
     index++;
@@ -274,22 +346,23 @@ function renderInline(node: Inline, fade: Fade | undefined, handlers: Handlers):
   switch (node.type) {
     case "text":
       return fade && node.word !== undefined ? (
-        <FadingText text={node.text} word={node.word} fade={fade} />
+        <FadingText text={node.text} word={node.word} fade={fade} handlers={handlers} />
       ) : (
-        node.text
+        withEmoji(node.text, handlers)
       );
     case "code": {
-      const file = inlineFileReference(node.text);
-      if (!file) return <code className="md-inline-code">{node.text}</code>;
+      const code = withoutMarks(node.text);
+      const file = inlineFileReference(code);
+      if (!file) return <code className="md-inline-code">{code}</code>;
       return (
         <FileRef path={file.path} line={file.line} handlers={handlers}>
           <FileTypeIcon name={file.path} isDir={false} size={14} className="md-file-icon" />
-          <code className="md-inline-code md-file-name">{node.text}</code>
+          <code className="md-inline-code md-file-name">{code}</code>
         </FileRef>
       );
     }
     case "image":
-      return handlers.renderImage?.(node.src, node.alt) ?? node.alt;
+      return handlers.renderImage?.(withoutMarks(node.src), withoutMarks(node.alt)) ?? withoutMarks(node.alt);
     case "strong":
       return (
         <strong>
@@ -309,8 +382,9 @@ function renderInline(node: Inline, fade: Fade | undefined, handlers: Handlers):
         </del>
       );
     case "link": {
-      const children = <Inlines nodes={node.children} fade={fade} handlers={handlers} />;
-      const target = classifyLink(node.href);
+      // Native draws no picture inside a link: the marks of its text are dropped.
+      const children = <Inlines nodes={node.children} fade={fade} handlers={handlers.renderEmoji ? { ...handlers, renderEmoji: undefined } : handlers} />;
+      const target = classifyLink(withoutMarks(node.href));
       if (!target) return <span className="md-link-blocked">{children}</span>;
       switch (target.kind) {
         case "file":
@@ -341,7 +415,7 @@ function renderInline(node: Inline, fade: Fade | undefined, handlers: Handlers):
           );
         case "external":
           return (
-            <ExternalLink href={target.href} insecure={target.insecure} label={inlineText(node.children)}>
+            <ExternalLink href={target.href} insecure={target.insecure} label={withoutMarks(inlineText(node.children))}>
               {children}
             </ExternalLink>
           );

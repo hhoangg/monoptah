@@ -2,6 +2,32 @@ import { describe, expect, it } from "vitest";
 import type { Turn } from "@monoptah/protocol";
 import { readItem, readItems, readMetrics } from "./turnItems";
 
+describe("emoji picks of a text item", () => {
+  const hash = "a".repeat(64);
+  const pick = (at: number, extra: Record<string, unknown> = {}) => ({ at, emotion: "Happy", name: "wave", hash, format: "png", ...extra });
+
+  it("keeps valid picks sorted by offset, stable for equal offsets, and clamped to the text", () => {
+    const item = readItem({ type: "text", id: "t", text: "Hello", emoji: [pick(9, { name: "late" }), pick(2, { name: "first" }), pick(2, { name: "second" }), pick(0, { large: true })] });
+    expect(item).toMatchObject({ type: "text", text: "Hello" });
+    const emoji = item?.type === "text" ? item.emoji : undefined;
+    expect(emoji?.map((entry) => [entry.at, entry.name])).toEqual([[0, "wave"], [2, "first"], [2, "second"], [5, "late"]]);
+    expect(emoji?.[0]?.large).toBe(true);
+  });
+
+  it("drops invalid entries and leaves the field out when none is valid", () => {
+    const bad = [{ at: -1, emotion: "x", name: "n", hash, format: "png" }, { at: 1, emotion: "x", name: "n", hash: "short", format: "png" }, { at: 1, emotion: "x", name: "n", hash, format: "bmp" }, "nope", null];
+    expect(readItem({ type: "text", id: "t", text: "Hello", emoji: bad })).toEqual({ type: "text", id: "t", text: "Hello" });
+    const mixed = readItem({ type: "text", id: "t", text: "Hello", emoji: [...bad, pick(1)] });
+    expect(mixed?.type === "text" && mixed.emoji).toHaveLength(1);
+    expect(readItem({ type: "text", id: "t", text: "Hello", emoji: "wave" })).toEqual({ type: "text", id: "t", text: "Hello" });
+  });
+
+  it("keeps at most 64 picks", () => {
+    const item = readItem({ type: "text", id: "t", text: "x".repeat(100), emoji: Array.from({ length: 70 }, (_, index) => pick(index)) });
+    expect(item?.type === "text" && item.emoji).toHaveLength(64);
+  });
+});
+
 describe("readItem", () => {
   it("narrows the eight known types", () => {
     expect(readItem({ type: "user", id: "u", text: "hi", at: 5, attachments: 2 })).toEqual({ type: "user", id: "u", text: "hi", at: 5, attachments: 2 });

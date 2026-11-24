@@ -12,6 +12,8 @@ import {
   GrantResponse,
   GrantsResponse,
   HealthResponse,
+  MonoResetTicketBody,
+  MonoResetTicketResponse,
   PatchDesktopBody,
   PatchDesktopResponse,
   PutGrantBody,
@@ -51,6 +53,7 @@ export const desktopEndpoints = {
   requestGrant: endpoint("POST", "/api/desktops/:id/grants", GrantResponse, RequestGrantBody),
   putGrant: endpoint("PUT", "/api/desktops/:id/grants/:deviceId", GrantResponse, PutGrantBody),
   selectionTicket: endpoint("POST", "/api/desktops/:id/grants/:deviceId/selection-ticket", SelectionTicketResponse),
+  monoResetTicket: endpoint("POST", "/api/desktops/:id/grants/:deviceId/mono-reset-ticket", MonoResetTicketResponse, MonoResetTicketBody),
   terminalTicket: endpoint("POST", "/api/desktops/:id/grants/:deviceId/terminal-ticket", TerminalTicketResponse, TerminalTicketBody),
 };
 
@@ -275,6 +278,18 @@ export async function requestSelectionTicket(desktopId: string, deviceId: string
  */
 export async function requestTerminalTicket(desktopId: string, deviceId: string, projectId: string): Promise<string> {
   const { ticket } = await withFreshAuth(() => apiFetch(desktopEndpoints.terminalTicket, { params: { id: desktopId, deviceId }, body: { projectId } }));
+  return ticket;
+}
+
+/**
+ * A single-use ticket (60 s) that proves a fresh passkey re-auth to the desktop for resetting the conversation of
+ * `monoId`. Fresh route, like `requestTerminalTicket`: the passkey prompt shows when the server asks for it. The ticket
+ * is bound to this user, desktop, device and Mono, travels to the desktop inside `mono.reset` and is never stored or
+ * logged. Each reset asks for a new one. 403 `forbidden` means the grant is not Control; 429 `rate_limited` means too
+ * many tickets were asked for lately (`ApiError`).
+ */
+export async function requestMonoResetTicket(desktopId: string, deviceId: string, monoId: string): Promise<string> {
+  const { ticket } = await withFreshAuth(() => apiFetch(desktopEndpoints.monoResetTicket, { params: { id: desktopId, deviceId }, body: { monoId } }));
   return ticket;
 }
 

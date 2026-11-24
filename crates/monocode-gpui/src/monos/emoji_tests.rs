@@ -539,3 +539,109 @@ fn a_failed_library_edit_after_a_pack_removal_still_pushes_the_chats(cx: &mut Te
     assert!(mono_emoji(&s, &visual).packs.is_empty());
     assert_eq!(rebuilds(&s, &visual), before + 1, "the chat was pushed");
 }
+
+mod web_pictures {
+    use super::*;
+    use base64::Engine as _;
+    use monocode_core::mobile::policy::Code;
+    use std::sync::{Arc, Mutex};
+
+    /// The Mono uses `packs` with its switch `enabled`.
+    fn configure(s: &Setup, enabled: bool, packs: &[&str], visual: &mut VisualTestContext) {
+        s.manager.update(visual, |m, _| {
+            m.roster.get_mut(&s.id).unwrap().emoji = emoji::MonoEmoji {
+                enabled,
+                frequency: emoji::Frequency::Sometimes,
+                packs: packs.iter().map(|p| p.to_string()).collect(),
+            };
+        });
+    }
+
+    fn fetch(
+        s: &Setup,
+        hash: &str,
+        visual: &mut VisualTestContext,
+    ) -> Result<serde_json::Value, Code> {
+        let slot: Arc<Mutex<Option<Result<serde_json::Value, Code>>>> = Default::default();
+        let out = slot.clone();
+        s.manager.update(visual, |m, cx| {
+            let task = m.mobile_emoji_file(&s.id, hash, cx);
+            cx.spawn(async move |_, _| *out.lock().unwrap() = Some(task.await))
+                .detach();
+        });
+        visual.run_until_parked();
+        let answer = slot.lock().unwrap().clone();
+        answer.expect("the read finished")
+    }
+
+    #[gpui::test]
+    fn mono_emoji_serves_only_pictures_of_the_packs_the_mono_selected(cx: &mut TestAppContext) {
+        let (s, mut visual) = open(cx);
+        visual.run_until_parked();
+        two_packs(&s, &mut visual);
+        configure(&s, true, &["pack-a"], &mut visual);
+
+        let png = fetch(&s, "hash-a.png", &mut visual).unwrap();
+        assert_eq!(png["hash"], "hash-a.png");
+        assert_eq!(png["mime"], "image/png");
+        assert_eq!(png["encoding"], "base64");
+        let on_disk =
+            std::fs::read(emoji::pack_dir(&emoji_dir(&s), "pack-a").join("a.png")).unwrap();
+        assert_eq!(
+            png["data"],
+            base64::engine::general_purpose::STANDARD.encode(on_disk)
+        );
+        let gif = fetch(&s, "hash-b.gif", &mut visual).unwrap();
+        assert_eq!(gif["mime"], "image/gif", "the format comes from the bytes");
+        // A picture of a pack the Mono did not select, and one nobody has.
+        assert_eq!(fetch(&s, "hash-c.png", &mut visual), Err(Code::NotFound));
+        assert_eq!(fetch(&s, "hash-none", &mut visual), Err(Code::NotFound));
+    }
+
+    #[gpui::test]
+    fn mono_emoji_is_not_found_while_the_switch_is_off(cx: &mut TestAppContext) {
+        let (s, mut visual) = open(cx);
+        visual.run_until_parked();
+        two_packs(&s, &mut visual);
+        configure(&s, false, &["pack-a"], &mut visual);
+        assert_eq!(fetch(&s, "hash-a.png", &mut visual), Err(Code::NotFound));
+        let source = s
+            .manager
+            .read_with(&visual, |m, cx| m.mobile_emoji_source(&s.id, cx));
+        assert!(source.is_none(), "no picks are sent with the switch off");
+    }
+
+    #[gpui::test]
+    fn mono_emoji_refuses_a_file_over_four_mebibytes(cx: &mut TestAppContext) {
+        let (s, mut visual) = open(cx);
+        visual.run_until_parked();
+        two_packs(&s, &mut visual);
+        configure(&s, true, &["pack-a"], &mut visual);
+        let path = emoji::pack_dir(&emoji_dir(&s), "pack-a").join("a.png");
+        let mut big = vec![0u8; 4 * 1024 * 1024 + 1];
+        big[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        std::fs::write(&path, &big).unwrap();
+        assert_eq!(fetch(&s, "hash-a.png", &mut visual), Err(Code::TooLarge));
+        // Exactly at the limit is still served.
+        big.pop();
+        std::fs::write(&path, &big).unwrap();
+        assert!(fetch(&s, "hash-a.png", &mut visual).is_ok());
+        // Not an image: no answer, whatever the extension says.
+        std::fs::write(&path, b"not an image").unwrap();
+        assert_eq!(fetch(&s, "hash-a.png", &mut visual), Err(Code::NotFound));
+    }
+
+    #[gpui::test]
+    fn the_emoji_source_carries_the_mono_session_and_packs(cx: &mut TestAppContext) {
+        let (s, mut visual) = open(cx);
+        visual.run_until_parked();
+        two_packs(&s, &mut visual);
+        configure(&s, true, &["pack-a"], &mut visual);
+        let source = s
+            .manager
+            .read_with(&visual, |m, cx| m.mobile_emoji_source(&s.id, cx))
+            .expect("the switch is on and the library is loaded");
+        assert_eq!(source.session, s.session.to_string());
+        assert_eq!(source.packs, ["pack-a"]);
+    }
+}

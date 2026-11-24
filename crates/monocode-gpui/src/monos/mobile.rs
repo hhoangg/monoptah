@@ -7,10 +7,24 @@ use super::*;
 use crate::shell::monos::MonoSession;
 use crate::visuals::calendar::levels;
 use chrono::{DateTime, Local};
+use monocode_core::mobile::policy::Code;
 use monocode_core::mono::files;
+use monocode_core::mono::provider_files::{self, MonoProviderFiles};
 use monocode_core::project_appearance::MASCOTS;
 use monocode_core::time::{now_ms, relative};
 use serde_json::{Value, json};
+
+/// The largest emoji file `mono.emoji` sends (`MAX_MONO_EMOJI_BYTES` of the web protocol).
+pub(crate) const MAX_MONO_EMOJI_BYTES: u64 = 4 * 1024 * 1024;
+
+/// `resetFiles` as the web's reset dialog reads it.
+pub(crate) fn reset_files_json(files: &MonoProviderFiles) -> Value {
+    let mut value = json!({ "label": files.label, "supported": files.supported });
+    if let Some(note) = &files.note {
+        value["note"] = json!(note);
+    }
+    value
+}
 
 impl Monos {
     /// The Overview as data, read from what the desktop already holds: the
@@ -157,6 +171,90 @@ impl Monos {
         }))
     }
 
+    /// A Mono's label as a notice names it, or `None` when it is gone.
+    pub(crate) fn mono_label(&self, id: &str) -> Option<String> {
+        self.roster.get(id).map(|mono| mono.label())
+    }
+
+    /// What the reset dialog would offer to delete (`resetFiles` of
+    /// `mono.profile`), read off the main thread. `None` when the Mono has no
+    /// saved conversation or the read failed.
+    pub(crate) fn mobile_reset_files(
+        &self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<Option<Value>> {
+        let session = self.roster.get(id).and_then(|mono| mono.session_id);
+        let store = self.store.clone();
+        cx.background_executor().spawn(async move {
+            let db = locked(&store).ok()?;
+            let files = provider_files::read_reset(&db, session?).ok()?.files?;
+            Some(reset_files_json(&files))
+        })
+    }
+
+    /// The emoji library and settings of a Mono as phones and the web need them to resolve
+    /// the pictures of its replies. `None` when the Mono is gone, its switch is off, or the
+    /// shared library is not loaded yet.
+    pub(crate) fn mobile_emoji_source(
+        &self,
+        id: &str,
+        cx: &App,
+    ) -> Option<crate::transcript::emoji::MonoEmoji> {
+        let mono = self.roster.get(id)?;
+        let store = self.emoji_store.read(cx);
+        if !mono.emoji.enabled || !store.loaded() {
+            return None;
+        }
+        let mut source = crate::transcript::emoji::MonoEmoji::new(
+            store.library().clone(),
+            store.dir().to_path_buf(),
+            mono.emoji.packs.clone(),
+        )
+        .with_exists_cache(self.emoji_exists.clone());
+        source.session = mono.session_id?.to_string();
+        Some(source)
+    }
+
+    /// `mono.emoji`: one picture of a pack this Mono selected, by content hash, for the web
+    /// to draw. The path comes only from the library, never from the request. The file is
+    /// read off the main thread.
+    pub(crate) fn mobile_emoji_file(
+        &self,
+        id: &str,
+        hash: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<Result<Value, Code>> {
+        use base64::Engine as _;
+        use monocode_core::mono::emoji::{image_path, import::sniff, resolve::find_by_hash};
+        use std::io::Read as _;
+        let found = self
+            .mobile_emoji_source(id, cx)
+            .and_then(|source| {
+                let (pack, emoji) = find_by_hash(&source.library, &source.packs, hash)?;
+                Some((image_path(&source.dir, pack, emoji), emoji.hash.clone()))
+            })
+            .ok_or(Code::NotFound);
+        cx.background_executor().spawn(async move {
+            let (path, hash) = found?;
+            let file = std::fs::File::open(&path).map_err(|_| Code::NotFound)?;
+            let mut bytes = Vec::new();
+            file.take(MAX_MONO_EMOJI_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Code::NotFound)?;
+            if bytes.len() as u64 > MAX_MONO_EMOJI_BYTES {
+                return Err(Code::TooLarge);
+            }
+            let format = sniff(&bytes).ok_or(Code::NotFound)?;
+            Ok(json!({
+                "hash": hash,
+                "mime": format.mime(),
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }))
+        })
+    }
+
     /// A new Mono from the phone's drawer, with the roster's next mascot and
     /// colour and no projects yet, its chat ready to talk to.
     pub(crate) fn mobile_create(&mut self, cx: &mut Context<Self>) -> Result<Value, String> {
@@ -167,11 +265,14 @@ impl Monos {
         Ok(json!({ "monoId": id }))
     }
 
-    /// The phone's Reset conversation, confirmed there. It runs the desktop's
-    /// own reset, with the dialog's default for deleting provider files.
+    /// The phone's or web's Reset conversation, confirmed there. It runs the
+    /// desktop's own reset. `delete_files` is `Some(false)` when the caller
+    /// asked to keep the provider files; otherwise the dialog's default
+    /// applies (delete exactly when the provider supports it).
     pub(crate) fn mobile_reset(
         &mut self,
         id: &str,
+        delete_files: Option<bool>,
         cx: &mut Context<Self>,
     ) -> gpui::Task<Result<Value, String>> {
         if self.roster.get(id).is_none() {
@@ -185,7 +286,8 @@ impl Monos {
             self.reset = None;
         }
         self.phone_resets.insert(id.to_string());
-        let reset = self.run_reset(id.to_string(), None, None, cx);
+        let delete_files = (delete_files == Some(false)).then_some(false);
+        let reset = self.run_reset(id.to_string(), delete_files, None, cx);
         cx.spawn(async move |_, _| reset.await.map(|()| Value::Null))
     }
     /// The phone's Delete Mono, confirmed there.

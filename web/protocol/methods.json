@@ -162,6 +162,11 @@
       "transport": "app"
     },
     {
+      "name": "mono.emoji",
+      "class": "read",
+      "transport": "app"
+    },
+    {
       "name": "mono.file",
       "class": "read",
       "transport": "app"
@@ -173,7 +178,7 @@
     },
     {
       "name": "mono.reset",
-      "class": "denied",
+      "class": "control",
       "transport": "app"
     },
     {

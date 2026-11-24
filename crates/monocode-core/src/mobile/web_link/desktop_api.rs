@@ -63,6 +63,36 @@ pub fn verify_terminal_ticket(
     }
 }
 
+/// `POST /api/desktop/grants/:deviceId/mono-reset-ticket`: whether the server
+/// accepted the single-use passkey ticket for resetting `mono_id` (200,
+/// `Accepted`) and has now consumed it. Same answers as
+/// [`verify_terminal_ticket`]: 404 is `Rejected`, anything else `Unreachable`.
+pub fn verify_mono_reset_ticket(
+    base: &str,
+    token: &str,
+    device_id: &str,
+    ticket: &str,
+    mono_id: &str,
+) -> TicketCheck {
+    let Ok(id) = path_id(device_id) else {
+        return TicketCheck::NoIdentity;
+    };
+    let path = format!("/api/desktop/grants/{id}/mono-reset-ticket");
+    let body = json!({"ticket": ticket, "monoId": mono_id});
+    match call(
+        "POST",
+        base,
+        &path,
+        Some(token),
+        Some(&body),
+        TICKET_TIMEOUT,
+    ) {
+        Ok(answer) if answer.status == 200 => TicketCheck::Accepted,
+        Ok(answer) if answer.status == 404 => TicketCheck::Rejected,
+        _ => TicketCheck::Unreachable,
+    }
+}
+
 /// `DELETE /api/desktop/me` runs while the user waits for "Unpair".
 pub(crate) const UNPAIR_TIMEOUT: Duration = Duration::from_secs(8);
 /// A web server answer is a small JSON document.

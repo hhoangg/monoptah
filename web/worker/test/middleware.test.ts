@@ -31,7 +31,7 @@ describe("route classification", () => {
     const others = API_ROUTES.filter((r) => nonGet(r) && !cookieRoutes.includes(r) && !tokenOrPairingRoutes.includes(r));
     expect(others.map((r) => `${r.method} ${r.path}`)).toEqual([]);
     expect(cookieRoutes.length).toBeGreaterThan(20);
-    expect(tokenOrPairingRoutes.length).toBe(7);
+    expect(tokenOrPairingRoutes.length).toBe(8);
   });
 
   it("matches isCookieAuthenticated on every non-GET route", () => {

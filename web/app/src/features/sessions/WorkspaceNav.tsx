@@ -14,6 +14,7 @@ import { safeHexColor } from "@/lib/color";
 import { cn } from "@/lib/utils";
 import { Icon } from "@/ui/Icon";
 import { Slot } from "@/ui/slots";
+import { stripEmoTokens } from "@/features/monos/emoji";
 import { markMonoSeen, useCatalogUnreadMonos } from "./monoSeen";
 import { projectColor } from "./projectColors";
 import { ProjectMascot } from "./ProjectMascot";
@@ -73,7 +74,7 @@ export function MonoRow({
   onNavigate?: () => void;
 }) {
   const unread = unreadGiven ?? monoUnread(mono);
-  const detail = mono.status === "working" ? "Working…" : mono.status === "needs-you" ? "Needs you" : oneLine(mono.lastMessage ?? "") || "No messages yet";
+  const detail = mono.status === "working" ? "Working…" : mono.status === "needs-you" ? "Needs you" : oneLine(stripEmoTokens(mono.lastMessage ?? "")) || "No messages yet";
   return (
     <Link
       to="/d/$desktopId/monos/$monoId"

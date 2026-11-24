@@ -517,6 +517,8 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "fileTransfer",
     "terminal",
     "slashCommands",
+    "monoEmoji",
+    "monoReset",
 ];
 
 /// Codes in the ERROR relay frame body.

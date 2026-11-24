@@ -5,7 +5,10 @@ import type { Handler } from "hono";
 import {
   DesktopGrantStateBody,
   DesktopSelectionTicketBody,
+  DesktopMonoResetTicketBody,
   DesktopTerminalTicketBody,
+  MonoResetTicketBody,
+  MonoResetTicketResponse,
   TerminalTicketBody,
   TerminalTicketResponse,
   SelectionTicketResponse,
@@ -349,5 +352,67 @@ export const consumeTerminalTicket: Handler<AppEnv> = async (c) => {
   const used = await c.env.DB.prepare(CONSUME_TERMINAL_TICKET_SQL).bind(now, await sha256Hex(body.data.ticket), auth.desktopId, deviceId, body.data.projectId).run();
   if (used.meta.changes !== 1) return apiError(c, 404, "not_found", "Ticket not found");
   await auditStatement(c.env, { action: "terminal.ticket.consumed", actorKind: "desktop", actorUserId: auth.userId, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId: auth.desktopId } }).run();
+  return c.json({ ok: true as const });
+};
+
+/** Lifetime of a Mono reset ticket, seconds. It is sent to the desktop right after it is minted. */
+export const MONO_RESET_TICKET_TTL_SECONDS = 60;
+/** How recent the passkey re-auth must be to mint a Mono reset ticket, seconds (same rule as a selection ticket). */
+export const MONO_RESET_TICKET_REAUTH_SECONDS = 60;
+export const INSERT_MONO_RESET_TICKET_SQL =
+  "INSERT INTO mono_reset_tickets (token_hash, user_id, desktop_id, device_id, mono_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)";
+/** Single use: only one caller changes the row, and only for the desktop, device and Mono it was made for. */
+export const CONSUME_MONO_RESET_TICKET_SQL =
+  "UPDATE mono_reset_tickets SET used_at = ?1 WHERE token_hash = ?2 AND desktop_id = ?3 AND device_id = ?4 AND mono_id = ?5 AND used_at IS NULL AND expires_at >= ?1 AND EXISTS (SELECT 1 FROM device_grants g JOIN devices dv ON dv.id = g.device_id WHERE g.desktop_id = mono_reset_tickets.desktop_id AND g.device_id = mono_reset_tickets.device_id AND dv.revoked_at IS NULL AND g.state = 'confirmed' AND g.permission = 'control')";
+
+/**
+ * `POST /api/desktops/:id/grants/:deviceId/mono-reset-ticket {monoId}` (fresh session): a single-use ticket that
+ * proves a passkey re-auth to the desktop before it resets that Mono's conversation. Only the SHA-256 is stored.
+ * 10 per user per 10 minutes, counted here because the user is known only after auth.
+ */
+export const createMonoResetTicket: Handler<AppEnv> = async (c) => {
+  const { user, session } = requireAuth(c);
+  const desktopId = c.req.param("id") ?? "";
+  const deviceId = c.req.param("deviceId") ?? "";
+  const body = MonoResetTicketBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return apiError(c, 400, "invalid", "Invalid Mono reset ticket request");
+  if (session.reauthAt === null || session.reauthAt < nowSeconds() - MONO_RESET_TICKET_REAUTH_SECONDS) return apiError(c, 403, "fresh_required", "Re-authentication required");
+  if (!(await ownsDesktop(c, desktopId, user.id))) return notFound(c);
+  if ((await c.env.DB.prepare(CONTROL_GRANT_SQL).bind(desktopId, deviceId, user.id).first()) === null) return apiError(c, 403, "forbidden", "This device does not have Control access to this desktop");
+
+  // The user id is hashed (salted) so it never appears in `rate_limits`; the breach audit names the user as actor.
+  const limit = await consume(c.env, rateLimitKey("mono-reset-ticket", "user", await identifierHash(c.env, "user", user.id)), LIMITS["mono-reset-ticket"].limit, LIMITS["mono-reset-ticket"].windowSeconds);
+  if (!limit.ok) {
+    if (limit.firstBreach) await auditBreach(c, "mono-reset-ticket", LIMITS["mono-reset-ticket"], user.id);
+    c.header("Retry-After", String(limit.retryAfter));
+    return apiError(c, 429, "rate_limited", "Too many requests");
+  }
+
+  const ticket = randomToken(32);
+  const now = nowSeconds();
+  const expiresAt = now + MONO_RESET_TICKET_TTL_SECONDS;
+  await c.env.DB.batch([
+    c.env.DB.prepare(INSERT_MONO_RESET_TICKET_SQL).bind(await sha256Hex(ticket), user.id, desktopId, deviceId, body.data.monoId, now, expiresAt),
+    auditStatement(c.env, { action: "mono.reset.ticket", actorUserId: user.id, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId } }),
+  ]);
+  return respond(c, MonoResetTicketResponse, { ticket, expiresAt });
+};
+
+/**
+ * `POST /api/desktop/grants/:deviceId/mono-reset-ticket {ticket, monoId}` (token `grants`): the desktop asks
+ * whether a ticket the web sent with `mono.reset` is valid for this desktop, device and Mono, and consumes
+ * it. 200 once; any failure is 404. Refusals are not audited here: a desktop token could otherwise turn them
+ * into a D1 write flood, and the desktop records its own refusal.
+ */
+export const consumeMonoResetTicket: Handler<AppEnv> = async (c) => {
+  const auth = await requireDesktopToken(c, "grants");
+  if (auth instanceof Response) return auth;
+  const deviceId = c.req.param("deviceId") ?? "";
+  const body = DesktopMonoResetTicketBody.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) return apiError(c, 400, "invalid", "Invalid ticket");
+  const now = nowSeconds();
+  const used = await c.env.DB.prepare(CONSUME_MONO_RESET_TICKET_SQL).bind(now, await sha256Hex(body.data.ticket), auth.desktopId, deviceId, body.data.monoId).run();
+  if (used.meta.changes !== 1) return apiError(c, 404, "not_found", "Ticket not found");
+  await auditStatement(c.env, { action: "mono.reset.ticket.consumed", actorKind: "desktop", actorUserId: auth.userId, targetType: "grant", targetId: deviceId, meta: { deviceId, desktopId: auth.desktopId } }).run();
   return c.json({ ok: true as const });
 };
