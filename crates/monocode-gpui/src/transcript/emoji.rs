@@ -27,8 +27,11 @@ pub(crate) struct MonoEmoji {
     pub session: String,
     /// Whether each picked file exists, found out once per library push so laying out a
     /// message does not touch the disk for every token.
-    exists: Arc<Mutex<HashMap<PathBuf, bool>>>,
+    exists: ExistsCache,
 }
+
+/// Whether each emoji file exists, by path.
+pub(crate) type ExistsCache = Arc<Mutex<HashMap<PathBuf, bool>>>;
 
 impl MonoEmoji {
     pub(crate) fn new(library: Arc<Library>, dir: PathBuf, packs: Vec<String>) -> Self {
@@ -41,7 +44,14 @@ impl MonoEmoji {
         }
     }
 
-    fn file_exists(&self, path: &Path) -> bool {
+    /// Shares one existence cache between sources, so laying out many messages makes no
+    /// per-token filesystem call.
+    pub(crate) fn with_exists_cache(mut self, cache: ExistsCache) -> Self {
+        self.exists = cache;
+        self
+    }
+
+    pub(crate) fn file_exists(&self, path: &Path) -> bool {
         let Ok(mut known) = self.exists.lock() else {
             return path.is_file();
         };
@@ -217,19 +227,20 @@ impl<'a> MessageTokens<'a> {
     fn pick(&self, name: &str, index: usize, large: bool) -> Option<EmojiPick> {
         let emoji = self.emoji?;
         let start = self.starts.get(index).copied().unwrap_or(self.text.len());
-        let seed = token::seed_for(&emoji.session, &self.text[..start], index);
-        let (pack, picked) = token::pick(&emoji.library, &emoji.packs, name, seed)?;
+        let (pack, picked, emotion) = monocode_core::mono::emoji::resolve::pick_token(
+            &emoji.library,
+            &emoji.packs,
+            &emoji.session,
+            self.text,
+            start,
+            index,
+            name,
+        )?;
         let path = image_path(&emoji.dir, pack, picked);
         // A file that is gone draws nothing and takes no room.
         if !emoji.file_exists(&path) {
             return None;
         }
-        let emotion = emoji
-            .library
-            .emotions
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(name))
-            .map_or_else(|| name.to_owned(), |e| e.name.clone());
         Some(EmojiPick {
             path,
             name: picked.name.clone(),

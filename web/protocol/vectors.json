@@ -809,7 +809,9 @@
       "mentionedFiles2",
       "fileTransfer",
       "terminal",
-      "slashCommands"
+      "slashCommands",
+      "monoEmoji",
+      "monoReset"
     ],
     "messages": [
       {
@@ -833,7 +835,9 @@
           "mentionedFiles2",
           "fileTransfer",
           "terminal",
-          "slashCommands"
+          "slashCommands",
+          "monoEmoji",
+          "monoReset"
         ],
         "desktop": {
           "name": "Example Desktop",

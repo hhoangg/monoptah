@@ -327,6 +327,13 @@ export const CloudStartOptionsResultSchema = z.looseObject({
 // --- Mono ---
 
 const MonoFile = z.enum(["soul", "memory"]);
+const MonoEmojiHash = z.string().regex(/^[0-9a-f]{64}$/);
+const MonoEmojiMime = z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+/** `mono.profile` stays open; `resetFiles` is what the desktop's reset dialog offers (absent without a saved conversation or on an old desktop; a malformed one reads as absent). */
+export const MonoProfileResultSchema = z.looseObject({
+  resetFiles: z.object({ label: z.string(), supported: z.boolean(), note: z.string().optional() }).optional().catch(undefined),
+});
+export type MonoProfileResult = z.infer<typeof MonoProfileResultSchema>;
 const MonoSubsessions = z.object({
   harness: HarnessSchema.optional(),
   model: z.string().max(256).optional(),
@@ -735,7 +742,13 @@ export const METHODS = {
     params: z.object({ documentId: z.string().min(1) }),
     result: Open,
   }),
-  "mono.profile": method({ class: "read", transport: "app", params: z.object({ monoId: z.string().min(1) }), result: Open }),
+  "mono.profile": method({ class: "read", transport: "app", params: z.object({ monoId: z.string().min(1) }), result: MonoProfileResultSchema }),
+  "mono.emoji": method({
+    class: "read",
+    transport: "app",
+    params: z.object({ monoId: z.string().min(1).max(256), hash: MonoEmojiHash }),
+    result: z.looseObject({ hash: z.string(), mime: MonoEmojiMime, encoding: z.literal("base64"), data: z.string() }),
+  }),
   "mono.file": method({
     class: "read",
     transport: "app",
@@ -757,14 +770,25 @@ export const METHODS = {
     }),
     result: Json,
   }),
-  // Denied for web in v1 (security.md 7): hidden in the UI.
+  // `mono.saveFile` and `mono.delete` are denied for web in v1 (security.md 7): hidden in the UI.
   "mono.saveFile": method({
     class: "denied",
     transport: "app",
     params: z.object({ monoId: z.string().min(1), file: MonoFile, text: z.string(), expectedHash: z.string().optional() }),
     result: z.looseObject({ hash: z.string() }),
   }),
-  "mono.reset": method({ class: "denied", transport: "app", params: z.object({ monoId: z.string().min(1) }), result: Json }),
+  // A web device must send a single-use `ticket` (minted by the Worker after a passkey re-auth); the desktop answers
+  // `fresh_required` without a valid one. `deleteFiles: false` keeps the provider session files.
+  "mono.reset": method({
+    class: "control",
+    transport: "app",
+    params: z.object({
+      monoId: z.string().min(1).max(256),
+      ticket: z.string().min(1).max(4096).optional(),
+      deleteFiles: z.boolean().optional(),
+    }),
+    result: Json,
+  }),
   "mono.delete": method({ class: "denied", transport: "app", params: z.object({ monoId: z.string().min(1) }), result: Json }),
 
   // Answered in core (host)

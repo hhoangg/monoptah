@@ -4342,10 +4342,15 @@ mod reset_flow {
 
     /// Starts a phone reset of the Mono; the answer lands in the returned slot once it is done.
     fn phone_reset(s: &Setup, cx: &mut TestAppContext) -> Answer {
+        phone_reset_with(s, None, cx)
+    }
+    fn phone_reset_with(s: &Setup, delete_files: Option<bool>, cx: &mut TestAppContext) -> Answer {
         let answer: Answer = Default::default();
         let slot = answer.clone();
         cx.update(|cx| {
-            let task = s.manager.update(cx, |m, cx| m.mobile_reset(&s.id, cx));
+            let task = s
+                .manager
+                .update(cx, |m, cx| m.mobile_reset(&s.id, delete_files, cx));
             cx.spawn(async move |_| *slot.lock().unwrap() = Some(task.await))
                 .detach();
         });
@@ -4400,6 +4405,67 @@ mod reset_flow {
         );
         assert!(gone, "the cleanup runs after the row is gone");
         assert_eq!(cx.update(|cx| s.manager.read(cx).error.clone()), None);
+    }
+
+    #[gpui::test]
+    fn a_reset_that_asks_to_keep_the_files_never_runs_the_cleanup(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[("claude", B)]);
+        let calls = recorder(&s, Vec::new(), cx);
+        let answer = phone_reset_with(&s, Some(false), cx);
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert!(!old_exists(&s), "the conversation is still deleted");
+        assert!(session_of(&s, cx).is_some());
+        assert!(calls.lock().unwrap().is_empty(), "the files are kept");
+    }
+
+    #[gpui::test]
+    fn a_reset_with_delete_files_true_cleans_like_an_absent_flag(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let calls = recorder(&s, Vec::new(), cx);
+        let answer = phone_reset_with(&s, Some(true), cx);
+        cx.run_until_parked();
+
+        assert_eq!(answer_of(&answer), Some(Ok(Value::Null)));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// What `mono.profile` would carry as `resetFiles` for `id`, once its read is done.
+    fn reset_files(s: &Setup, id: &str, cx: &mut TestAppContext) -> Option<Value> {
+        let slot: Arc<Mutex<Option<Option<Value>>>> = Default::default();
+        let out = slot.clone();
+        cx.update(|cx| {
+            let task = s.manager.update(cx, |m, cx| m.mobile_reset_files(id, cx));
+            cx.spawn(async move |_| *out.lock().unwrap() = Some(task.await))
+                .detach();
+        });
+        cx.run_until_parked();
+        let answer = slot.lock().unwrap().clone();
+        answer.expect("the read finished")
+    }
+
+    #[gpui::test]
+    fn the_profile_offers_the_provider_files_a_reset_could_delete(cx: &mut TestAppContext) {
+        let s = setup(cx);
+        conversation(&s, "claude", Some(A), &[]);
+        let files = reset_files(&s, &s.id, cx).expect("a saved conversation has files");
+        assert_eq!(files["label"], "Claude Code");
+        assert_eq!(files["supported"], true);
+        assert_eq!(
+            files["note"],
+            Value::Null,
+            "no note when nothing is held back"
+        );
+        // A provider that cannot delete its files says why.
+        conversation(&s, "cursor", Some(A), &[]);
+        let files = reset_files(&s, &s.id, cx).unwrap();
+        assert_eq!(files["supported"], false);
+        assert!(files["note"].as_str().is_some_and(|note| !note.is_empty()));
+        // An unknown Mono, or one with no conversation, has none.
+        assert_eq!(reset_files(&s, "nobody", cx), None);
     }
 
     #[gpui::test]
@@ -4491,7 +4557,10 @@ mod reset_flow {
     #[gpui::test]
     fn a_phone_reset_of_an_unknown_mono_is_refused(cx: &mut TestAppContext) {
         let s = setup(cx);
-        let task = cx.update(|cx| s.manager.update(cx, |m, cx| m.mobile_reset("nobody", cx)));
+        let task = cx.update(|cx| {
+            s.manager
+                .update(cx, |m, cx| m.mobile_reset("nobody", None, cx))
+        });
         let answer: Answer = Default::default();
         let slot = answer.clone();
         cx.update(|cx| {
@@ -4567,7 +4636,7 @@ mod reset_flow {
                     .unwrap()
                     .pending_reports
                     .push("Habit finished.".into());
-                let task = m.mobile_reset(&s.id, cx);
+                let task = m.mobile_reset(&s.id, None, cx);
                 cx.spawn(async move |_, _| *out.lock().unwrap() = Some(task.await))
                     .detach();
                 m.dispatch(&s.id, cx);
@@ -4612,7 +4681,7 @@ mod reset_flow {
                 let mono = m.roster.get_mut(&s.id).unwrap();
                 mono.outbox.push(queued("queued"));
                 mono.pending_reports.push("Habit finished.".into());
-                m.mobile_reset(&s.id, cx).detach();
+                m.mobile_reset(&s.id, None, cx).detach();
                 m.dispatch(&s.id, cx);
                 assert!(m.inflight.is_empty());
                 let mono = m.roster.get(&s.id).unwrap();
@@ -4648,7 +4717,7 @@ mod reset_flow {
         cx.update(|cx| {
             s.manager.update(cx, |m, cx| {
                 m.chats.remove(&s.id);
-                m.mobile_reset(&s.id, cx).detach();
+                m.mobile_reset(&s.id, None, cx).detach();
                 m.ensure_chat(&s.id, cx);
                 assert!(m.loading_chats.is_empty(), "opening waits for the reset");
             })
@@ -4679,7 +4748,7 @@ mod reset_flow {
         cx.update(|cx| {
             s.manager.update(cx, |m, cx| {
                 m.chats.remove(&s.id);
-                let task = m.mobile_reset(&s.id, cx);
+                let task = m.mobile_reset(&s.id, None, cx);
                 cx.spawn(async move |_, _| *out.lock().unwrap() = Some(task.await))
                     .detach();
             })
@@ -4797,7 +4866,7 @@ mod reset_flow {
                 s.manager.update(cx, |m, cx| {
                     m.request_reset(&s.id, w, cx);
                     // The phone's reset starts before the read lands.
-                    m.mobile_reset(&s.id, cx).detach();
+                    m.mobile_reset(&s.id, None, cx).detach();
                 })
             })
             .unwrap();

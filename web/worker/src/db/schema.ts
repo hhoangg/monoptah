@@ -346,6 +346,34 @@ export const terminalTickets = sqliteTable(
   ],
 );
 
+/** Single-use proof of a fresh passkey re-auth that lets a web device reset a Mono's conversation on a desktop, bound to one Mono (0009). */
+export const monoResetTickets = sqliteTable(
+  "mono_reset_tickets",
+  {
+    /** SHA-256 hex of the ticket; the ticket itself is never stored. */
+    tokenHash: text("token_hash").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    desktopId: text("desktop_id")
+      .notNull()
+      .references(() => desktops.id, { onDelete: "cascade" }),
+    deviceId: text("device_id")
+      .notNull()
+      .references(() => devices.id, { onDelete: "cascade" }),
+    monoId: text("mono_id").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    usedAt: integer("used_at"),
+  },
+  (t) => [
+    index("mono_reset_tickets_user_id_idx").on(t.userId),
+    index("mono_reset_tickets_desktop_id_idx").on(t.desktopId),
+    index("mono_reset_tickets_device_id_idx").on(t.deviceId),
+    index("mono_reset_tickets_expires_at_idx").on(t.expiresAt),
+  ],
+);
+
 // --- Push ---
 
 export const pushSubscriptions = sqliteTable(
@@ -497,6 +525,7 @@ export const TABLES = {
   deviceGrants,
   selectionTickets,
   terminalTickets,
+  monoResetTickets,
   pushSubscriptions,
   pushPrefs,
   pairingRequests,

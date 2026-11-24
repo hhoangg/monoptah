@@ -29,6 +29,7 @@ import {
   renameDesktop,
   requestGrant,
   requestGrantAndRefresh,
+  requestMonoResetTicket,
   requestSelectionTicket,
   revokeDesktop,
   revokeGrant,
@@ -233,6 +234,17 @@ describe("mutations", () => {
     webauthn.getPasskey.mockResolvedValue(ASSERTION);
     server.grants.d1 = [grant({ permission: "read" })];
     await expect(requestSelectionTicket("d1", "dev1")).rejects.toMatchObject({ code: "forbidden" });
+  });
+
+  it("requestMonoResetTicket posts the Mono id to its own route, re-authenticates once and is refused for a read grant", async () => {
+    server.grants.d1 = [grant({ permission: "control" })];
+    await expect(requestMonoResetTicket("d1", "dev1", "mono-1")).resolves.toBe("ticket-1");
+    const posts = server.calls.filter((call) => call.path.endsWith("/mono-reset-ticket"));
+    expect(posts.map((call) => `${call.method} ${call.path}`)).toEqual(Array(2).fill("POST /api/desktops/d1/grants/dev1/mono-reset-ticket"));
+    expect(posts.every((call) => JSON.stringify(call.body) === JSON.stringify({ monoId: "mono-1" }))).toBe(true);
+    expect(server.reauths).toBe(1);
+    server.grants.d1 = [grant({ permission: "read" })];
+    await expect(requestMonoResetTicket("d1", "dev1", "mono-1")).rejects.toMatchObject({ code: "forbidden" });
   });
 
   it("revokeGrant surfaces a cancelled passkey prompt and sends nothing more", async () => {

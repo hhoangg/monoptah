@@ -178,8 +178,15 @@ fn in_code(ranges: &[Range<usize>], at: usize) -> bool {
 /// tokens is removed with its line break; an inline token takes one neighbouring space
 /// with it so no double space is left.
 pub fn strip(markdown: &str) -> String {
+    strip_with_marks(markdown).0
+}
+
+/// [`strip`], and for every token outside code (in source order, as [`outside_code`] lists
+/// them) the byte offset in the stripped text where its picture goes. An offset is never
+/// past the end of the text and always on a character boundary.
+pub fn strip_with_marks(markdown: &str) -> (String, Vec<usize>) {
     if !markdown.contains(PREFIX) {
-        return markdown.to_owned();
+        return (markdown.to_owned(), Vec::new());
     }
     let code = code_ranges(markdown, false);
     let tokens: Vec<Range<usize>> = find(markdown)
@@ -188,16 +195,18 @@ pub fn strip(markdown: &str) -> String {
         .filter(|r| !in_code(&code, r.start))
         .collect();
     if tokens.is_empty() {
-        return markdown.to_owned();
+        return (markdown.to_owned(), Vec::new());
     }
+    let mut marks = vec![usize::MAX; tokens.len()];
     let mut out = String::with_capacity(markdown.len());
     let mut offset = 0;
     for line in markdown.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
-        let here: Vec<&Range<usize>> = tokens
+        let here: Vec<(usize, &Range<usize>)> = tokens
             .iter()
-            .filter(|r| r.start >= start && r.end <= offset)
+            .enumerate()
+            .filter(|(_, r)| r.start >= start && r.end <= offset)
             .collect();
         if here.is_empty() {
             out.push_str(line);
@@ -206,10 +215,12 @@ pub fn strip(markdown: &str) -> String {
         let body = line.trim_end_matches(['\n', '\r']);
         let ending = &line[body.len()..];
         let mut kept = String::new();
+        let mut line_marks = Vec::with_capacity(here.len());
         let mut at = 0;
-        for range in here {
+        for (index, range) in here {
             let (from, to) = (range.start - start, range.end - start);
             kept.push_str(&body[at..from]);
+            line_marks.push((index, kept.len()));
             at = to;
             if kept.ends_with(' ') {
                 if body[at..].starts_with(' ') {
@@ -220,12 +231,133 @@ pub fn strip(markdown: &str) -> String {
             }
         }
         kept.push_str(&body[at..]);
-        if !kept.trim().is_empty() && !only_block_prefix(&kept) {
+        let keeps = !kept.trim().is_empty() && !only_block_prefix(&kept);
+        for (index, mark) in line_marks {
+            // A removed line puts its pictures where the line was.
+            marks[index] = out.len() + if keeps { mark.min(kept.len()) } else { 0 };
+        }
+        if keeps {
             out.push_str(&kept);
             out.push_str(ending);
         }
     }
-    out
+    for mark in &mut marks {
+        *mark = (*mark).min(out.len());
+    }
+    (out, marks)
+}
+
+/// For every token outside code, in source order: whether native draws its picture large
+/// (alone on its line, or in a paragraph of tokens only) rather than inline. Never in a
+/// heading or a table. While a reply streams, a token that ends the text stays inline:
+/// nothing says yet that it will stay alone on its line.
+pub fn large_flags(markdown: &str, streaming: bool) -> Vec<bool> {
+    let tokens = outside_code(markdown);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let alone = standalone(markdown);
+    let open_tail = (streaming && tokens.last().is_some_and(|t| t.range.end == markdown.len()))
+        .then(|| tokens.len() - 1);
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut at = 0;
+    for line in markdown.split_inclusive('\n') {
+        starts.push(at);
+        at += line.len();
+    }
+    let table = table_lines(&lines);
+    let row_of = |at: usize| starts.partition_point(|&s| s <= at).saturating_sub(1);
+    let tail_row = open_tail.map(|index| row_of(tokens[index].range.start));
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| {
+            let row = row_of(token.range.start);
+            let Some(line) = lines.get(row).copied() else {
+                return false;
+            };
+            if open_tail == Some(index) || is_heading(line) || table[row] {
+                return false;
+            }
+            let own_line = alone
+                .get(index)
+                .is_some_and(|(name, alone)| *alone && *name == token.name);
+            own_line || (tail_row != Some(row) && only_tokens_paragraph(&lines, row))
+        })
+        .collect()
+}
+
+fn is_heading(line: &str) -> bool {
+    let rest = line.trim_start();
+    let hashes = rest.bytes().take_while(|b| *b == b'#').count();
+    (1..=6).contains(&hashes) && rest[hashes..].starts_with([' ', '\t'])
+}
+
+/// Which lines belong to a table: a run of lines holding `|` that has a delimiter row.
+fn table_lines(lines: &[&str]) -> Vec<bool> {
+    let delimiter = |line: &str| {
+        let cells = line.trim().trim_matches('|');
+        line.contains('|')
+            && !cells.is_empty()
+            && cells.split('|').all(|cell| {
+                let cell = cell.trim().trim_matches(':');
+                !cell.is_empty() && cell.bytes().all(|b| b == b'-')
+            })
+    };
+    let mut flags = vec![false; lines.len()];
+    let mut from = 0;
+    while from < lines.len() {
+        if !lines[from].contains('|') {
+            from += 1;
+            continue;
+        }
+        let to = (from..lines.len())
+            .find(|&i| !lines[i].contains('|'))
+            .unwrap_or(lines.len());
+        if lines[from..to].iter().any(|line| delimiter(line)) {
+            flags[from..to].fill(true);
+        }
+        from = to;
+    }
+    flags
+}
+
+/// Whether the line holds tokens and nothing else but a quote or list marker, and is a
+/// paragraph of tokens only: a list item is a row of its own, while a plain or quoted line
+/// shares its row with the lines next to it unless they are blank.
+fn only_tokens_paragraph(lines: &[&str], row: usize) -> bool {
+    let line = lines[row];
+    let mut left = String::new();
+    let mut at = 0;
+    for token in find(line) {
+        left.push_str(&line[at..token.range.start]);
+        at = token.range.end;
+    }
+    left.push_str(&line[at..]);
+    if !block_prefix(left.trim_start()).trim().is_empty() || at == 0 {
+        return false;
+    }
+    // What a line holds once its quote markers are gone.
+    let inner = |line: &str| {
+        let mut rest = line.trim_start();
+        while let Some(after) = rest.strip_prefix('>') {
+            rest = after.trim_start();
+        }
+        rest.to_owned()
+    };
+    let own = inner(line);
+    if block_prefix(&own).len() != own.len() {
+        return true;
+    }
+    let blank = |i: Option<usize>| {
+        i.is_none_or(|i| {
+            lines
+                .get(i)
+                .is_none_or(|other| inner(other).trim().is_empty())
+        })
+    };
+    blank(row.checked_sub(1)) && blank(Some(row + 1))
 }
 
 /// The tokens outside code, in source order.

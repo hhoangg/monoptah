@@ -133,6 +133,9 @@ pub(crate) struct Monos {
     cleanup: reset::CleanupRunner,
     /// The one emoji library every Mono picks packs from.
     emoji_store: Entity<crate::emoji_library::EmojiStore>,
+    /// Whether each emoji file exists, shared by every picture list built for phones and the
+    /// web; cleared whenever the library changes.
+    emoji_exists: crate::transcript::emoji::ExistsCache,
     emoji_ui: emoji_ui::EmojiUi,
     browser_ui: browser_ui::BrowserUi,
     notice_region: AnchorSlot,
@@ -464,6 +467,7 @@ impl Monos {
             error: roster_error,
             reset: None,
             phone_resets: HashSet::new(),
+            emoji_exists: Default::default(),
             cleanup: reset::default_cleanup(),
             emoji_store,
             emoji_ui: emoji_ui::EmojiUi::new(),

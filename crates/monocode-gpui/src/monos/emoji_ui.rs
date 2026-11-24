@@ -131,6 +131,9 @@ impl Monos {
     /// The library changed, or was loaded: hand it to the chats whose picture of it changed.
     /// A chat lays out every message again, so it is only told when something it draws changed.
     pub(super) fn emoji_changed(&mut self, cx: &mut Context<Self>) {
+        if let Ok(mut known) = self.emoji_exists.lock() {
+            known.clear();
+        }
         let library = self.emoji_store.read(cx).library().clone();
         let stale: Vec<String> = self
             .roster

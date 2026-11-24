@@ -382,13 +382,25 @@ impl Shell {
 
     /// A banner on this computer, whatever the notification settings of sessions say: someone
     /// remote changed the app, so the person here is always told.
-    fn remote_update_notice(&mut self, body: &str, _cx: &mut Context<Self>) {
+    fn remote_update_notice(&mut self, body: &str, cx: &mut Context<Self>) {
+        self.remote_notice("monocode-remote-update", "Remote update", body, cx);
+    }
+
+    /// The banner behind [`Self::remote_update_notice`], also used for other
+    /// actions a remote device took on this computer.
+    pub(super) fn remote_notice(
+        &mut self,
+        tag: &str,
+        subtitle: &str,
+        body: &str,
+        _cx: &mut Context<Self>,
+    ) {
         #[cfg(test)]
         _cx.default_global::<State>().notices.push(body.to_owned());
         let sequence = monocode_core::time::now_ms();
         let _ = platform::show(platform::Notification {
-            tag: format!("monocode-remote-update:{sequence}"),
-            subtitle: "Remote update".into(),
+            tag: format!("{tag}:{sequence}"),
+            subtitle: subtitle.into(),
             body: crate::notifications::delivery::clip_body(body),
             sound: self.workspace.preferences.sounds,
         });

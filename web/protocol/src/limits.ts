@@ -112,6 +112,10 @@ export const MAX_COMMAND_ID_LENGTH = 128;
 export const PENDING_CONFIRMATION_TIMEOUT_MS = 5 * 60 * 1000;
 /** Attachments per message (mobile_host.rs:37). */
 export const MAX_ATTACHMENTS = 10;
+/** Raw bytes of one emoji image the desktop answers to `mono.emoji`; larger is `too_large`. */
+export const MAX_MONO_EMOJI_BYTES = 4 * 1024 * 1024;
+/** Most emoji picks the desktop sends on one Mono transcript text item. */
+export const MONO_EMOJI_MAX_PICKS = 64;
 /** Message text limit (mobile_host.rs:38). */
 export const MAX_MESSAGE_CHARS = 100_000;
 

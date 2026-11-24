@@ -1,6 +1,7 @@
 // One valid parameter set per method of the protocol. Typed as a Record so a method added
 // to `@monoptah/protocol` fails the typecheck here until it gets a sample.
 import type { MethodName } from "@monoptah/protocol";
+import { MONO_EMOJI_FIXTURE_HASH } from "../src/fixtures.ts";
 
 export const SAMPLE_PARAMS: Record<MethodName, Record<string, unknown>> = {
   "conversation.read": { conversationId: "sess-local-1" },
@@ -42,7 +43,8 @@ export const SAMPLE_PARAMS: Record<MethodName, Record<string, unknown>> = {
   "mono.create": {},
   "mono.update": { monoId: "mono-example", name: "Renamed Mono" },
   "mono.saveFile": { monoId: "mono-example", file: "memory", text: "example" },
-  "mono.reset": { monoId: "mono-example" },
+  "mono.emoji": { monoId: "mono-example", hash: MONO_EMOJI_FIXTURE_HASH },
+  "mono.reset": { monoId: "mono-example", ticket: "ticket-1" },
   "mono.delete": { monoId: "mono-example" },
   "workspace.list": {},
   "sessions.list": { projectId: "proj-alpha" },

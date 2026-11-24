@@ -8,7 +8,7 @@
 //! (the live header still says `waiting`); there are no Mono habits, operator
 //! prompts or background-task labels; and assignment wrappers stay in user
 //! text, as the desktop shows them.
-use crate::transcript::{self as desk, attachments, dates, phases};
+use crate::transcript::{self as desk, attachments, dates, emoji::MonoEmoji, phases};
 use monocode_core::{
     agent::TurnInfo,
     tool::{
@@ -43,6 +43,10 @@ pub(crate) struct Source<'a> {
     /// The sessions a Mono started, as the phone's cards show them, by
     /// session: where each runs and how it stands. Only these get cards.
     pub launches: &'a HashMap<i64, Value>,
+    /// The emoji library and the Mono's settings, to resolve the pictures of its replies
+    /// for a web device. `None` when the Mono's emoji switch is off or the library is not
+    /// loaded.
+    pub emoji: Option<&'a MonoEmoji>,
 }
 
 /// An approval or question waiting on the desktop.
@@ -684,6 +688,69 @@ fn agent_turn(source: &Source, turn: &Turn, live: bool) -> Value {
     Value::Object(out)
 }
 
+/// A Mono's last message as the catalog shows it: no `:emo[..]` token, and no token still
+/// streaming in. Phones and the web draw the pictures from the turns, never from this.
+pub(crate) fn mono_preview(text: Value) -> Value {
+    let Value::String(raw) = &text else {
+        return text;
+    };
+    let mut shown = monocode_core::mono::emoji::token::strip(raw);
+    if let Some(cut) = monocode_core::mono::emoji::token::incomplete_tail(&shown) {
+        shown.truncate(cut);
+        shown.truncate(shown.trim_end().len());
+    }
+    Value::String(shown)
+}
+
+/// The pictures of a Mono reply for the web: `{at, emotion, name, hash, format, large?}` per
+/// token that resolves, exactly as native shows it. `raw` is the reply with its tokens, and
+/// `text` what is sent: the same without them. `at` counts UTF-16 code units into `text`.
+fn emoji_picks(emoji: Option<&MonoEmoji>, raw: &str, streaming: bool, text: &str) -> Vec<Value> {
+    use monocode_core::mono::emoji::{Format, resolve::resolve, token};
+    let Some(emoji) = emoji.filter(|_| raw.contains(":emo[")) else {
+        return Vec::new();
+    };
+    // Native hides a token still streaming in, then lays out what is left.
+    let shown = match streaming.then(|| token::incomplete_tail(raw)).flatten() {
+        Some(cut) => &raw[..cut],
+        None => raw,
+    };
+    let (_, picks) = resolve(
+        &emoji.library,
+        &emoji.dir,
+        &emoji.packs,
+        &emoji.session,
+        shown,
+        streaming,
+        &|path| emoji.file_exists(path),
+    );
+    picks
+        .into_iter()
+        .map(|pick| {
+            let mut at = pick.at.min(text.len());
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            let mut value = json!({
+                "at": text[..at].encode_utf16().count(),
+                "emotion": pick.emotion,
+                "name": pick.name,
+                "hash": pick.hash,
+                "format": match pick.format {
+                    Format::Png => "png",
+                    Format::Jpeg => "jpeg",
+                    Format::Gif => "gif",
+                    Format::Webp => "webp",
+                },
+            });
+            if pick.large {
+                value["large"] = true.into();
+            }
+            value
+        })
+        .collect()
+}
+
 fn reaction(text: &str) -> Option<&str> {
     text.trim()
         .strip_prefix("<reaction>")
@@ -711,8 +778,9 @@ fn mono_turn(source: &Source, turn: &Turn, live: bool, name: &str) -> Value {
             let role = rows[at].role.as_str();
             let mut text = joined(&rows[at..end]);
             if role == "assistant" {
-                // The phone has no emoji library: it never shows a token.
-                text = monocode_core::mono::emoji::token::strip(&text);
+                let raw = std::mem::take(&mut text);
+                // The text never carries a token: a picture goes at an `emoji` offset.
+                text = monocode_core::mono::emoji::token::strip(&raw);
                 if live && end == rows.len() {
                     // A token still streaming in would flash as text.
                     if let Some(cut) = monocode_core::mono::emoji::token::incomplete_tail(&text) {
@@ -759,6 +827,10 @@ fn mono_turn(source: &Source, turn: &Turn, live: bool, name: &str) -> Value {
                     object(json!({"type": "text", "id": format!("r{at}"), "text": text}));
                 if live && end == rows.len() {
                     item.insert("streaming".into(), true.into());
+                }
+                let pictures = emoji_picks(source.emoji, &raw, live && end == rows.len(), &text);
+                if !pictures.is_empty() {
+                    item.insert("emoji".into(), Value::Array(pictures));
                 }
                 copy.push(text.replace("\r\n", "\n").trim().to_owned());
                 items.push(Value::Object(item));
@@ -945,6 +1017,7 @@ mod tests {
             mono: None,
             pending: &[],
             launches: Box::leak(Box::default()),
+            emoji: None,
         }
     }
     fn all(source: &Source) -> Vec<Value> {
@@ -1002,6 +1075,164 @@ mod tests {
         let turn = &all(&mono)[0];
         assert_eq!(types(turn), ["user", "header", "text"]);
         assert_eq!(turn["items"][1]["live"], false);
+    }
+
+    /// A library with two "happy" pictures and a "celebrate" GIF written to a temp folder.
+    fn emoji_fixture(selected: bool) -> (MonoEmoji, std::path::PathBuf) {
+        use monocode_core::mono::emoji::{Emoji, Format, Library, image_path};
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "monoptah-web-picks-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let item = |file: &str, name: &str, format, emotion: &str| Emoji {
+            file: file.into(),
+            hash: format!("hash-{file}"),
+            name: name.into(),
+            format,
+            emotion: Some(emotion.into()),
+        };
+        let mut library = Library::default();
+        let pack_id = library.add_pack(
+            "Pack",
+            None,
+            vec![
+                item("h1.png", "Smile", Format::Png, "happy"),
+                item("h2.png", "Grin", Format::Png, "happy"),
+                item("c1.gif", "Dance", Format::Gif, "celebrate"),
+                item("s1.png", "Gone", Format::Png, "sad"),
+            ],
+        );
+        let pack = library.packs.iter().find(|p| p.id == pack_id).unwrap();
+        for emoji in pack.emoji.iter().filter(|e| e.file != "s1.png") {
+            let path = image_path(&dir, pack, emoji);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        }
+        let mut source = MonoEmoji::new(
+            std::sync::Arc::new(library),
+            dir.clone(),
+            if selected { vec![pack_id] } else { Vec::new() },
+        );
+        source.session = "7".into();
+        (source, dir)
+    }
+
+    /// The text item of a Mono's only reply to "Hi" with `reply`.
+    fn mono_reply(reply: &str, emoji: Option<&MonoEmoji>, live: bool) -> Value {
+        let rows = [sent("user", "Hi", 1_000), row("assistant", reply)];
+        let infos = HashMap::new();
+        let mut mono = source(&rows, &infos, live);
+        mono.mono = Some("Ada");
+        mono.emoji = emoji;
+        let turn = all(&mono).remove(0);
+        turn["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "text")
+            .cloned()
+            .expect("a text item")
+    }
+
+    #[test]
+    fn a_mono_reply_keeps_its_text_clean_and_lists_where_the_pictures_go() {
+        let (emoji, dir) = emoji_fixture(true);
+        let item = mono_reply("Great :emo[happy] job", Some(&emoji), false);
+        assert_eq!(item["text"], "Great job");
+        let pictures = item["emoji"].as_array().unwrap();
+        assert_eq!(pictures.len(), 1);
+        let picture = &pictures[0];
+        assert_eq!(picture["at"], 6, "after \"Great \"");
+        assert_eq!(picture["emotion"], "happy");
+        assert_eq!(picture["format"], "png");
+        assert!(picture["hash"].as_str().unwrap().starts_with("hash-h"));
+        assert!(picture["name"].as_str().is_some());
+        assert!(picture.get("large").is_none(), "inline is the default");
+        // Without the library, the switch off, or no pack, the same text and no picks.
+        let (off, off_dir) = emoji_fixture(false);
+        for emoji in [None, Some(&off)] {
+            let item = mono_reply("Great :emo[happy] job", emoji, false);
+            assert_eq!(item["text"], "Great job");
+            assert!(item.get("emoji").is_none());
+        }
+        let _ = (
+            std::fs::remove_dir_all(dir),
+            std::fs::remove_dir_all(off_dir),
+        );
+    }
+
+    #[test]
+    fn picture_offsets_count_utf16_code_units_after_wide_characters() {
+        let (emoji, dir) = emoji_fixture(true);
+        // "é" is 1 unit (2 bytes) and the party popper is 2 units (4 bytes).
+        let item = mono_reply("é🎉 :emo[celebrate] fin", Some(&emoji), false);
+        assert_eq!(item["text"], "é🎉 fin");
+        let at = item["emoji"][0]["at"].as_u64().unwrap();
+        assert_eq!(at, 4, "1 + 2 + 1 space, not the byte offset 7");
+        let units: Vec<u16> = item["text"].as_str().unwrap().encode_utf16().collect();
+        assert_eq!(String::from_utf16(&units[..at as usize]).unwrap(), "é🎉 ");
+        assert_eq!(item["emoji"][0]["format"], "gif");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_picture_alone_on_its_line_is_large_and_the_others_are_inline() {
+        let (emoji, dir) = emoji_fixture(true);
+        let item = mono_reply(
+            "Done :emo[happy]\n:emo[celebrate]\nbye",
+            Some(&emoji),
+            false,
+        );
+        let pictures = item["emoji"].as_array().unwrap();
+        assert_eq!(pictures.len(), 2);
+        assert!(pictures[0].get("large").is_none());
+        assert_eq!(pictures[1]["large"], true);
+        assert!(pictures[0]["at"].as_u64() <= pictures[1]["at"].as_u64());
+        // Streaming: a token that ends the text stays inline until a line break follows.
+        let open = emoji_picks(Some(&emoji), "Done.\n:emo[celebrate]", true, "Done.");
+        assert!(open[0].get("large").is_none());
+        let closed = emoji_picks(Some(&emoji), "Done.\n:emo[celebrate]\n", true, "Done.");
+        assert_eq!(closed[0]["large"], true);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_unresolved_token_leaves_no_entry_and_no_text() {
+        let (emoji, dir) = emoji_fixture(true);
+        let item = mono_reply(
+            "a :emo[nonsense] b :emo[] c :emo[sad] d",
+            Some(&emoji),
+            false,
+        );
+        assert_eq!(item["text"], "a b c d");
+        assert!(
+            item.get("emoji").is_none(),
+            "unknown, empty and missing file"
+        );
+        // A token still streaming in is neither shown nor counted.
+        assert!(emoji_picks(Some(&emoji), "Hello :emo[hap", true, "Hello").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn at_most_sixty_four_pictures_are_sent_for_one_message() {
+        let (emoji, dir) = emoji_fixture(true);
+        let item = mono_reply(&":emo[happy] ".repeat(80), Some(&emoji), false);
+        assert_eq!(item["emoji"].as_array().unwrap().len(), 64);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_catalog_preview_never_shows_a_token() {
+        assert_eq!(
+            mono_preview(json!("Great :emo[happy] job")),
+            json!("Great job")
+        );
+        assert_eq!(mono_preview(json!("Soon :emo[ha")), json!("Soon"));
+        assert_eq!(mono_preview(json!("Plain")), json!("Plain"));
+        assert_eq!(mono_preview(Value::Null), Value::Null);
     }
 
     #[test]

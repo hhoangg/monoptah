@@ -17,6 +17,7 @@ const SPEC_COLUMNS: Record<string, string[]> = {
   devices: ["id", "user_id", "name", "public_key", "fingerprint", "created_at", "last_seen_at", "revoked_at"],
   device_grants: ["device_id", "desktop_id", "state", "permission", "requested_permission", "confirmed_at", "updated_at"],
   selection_tickets: ["token_hash", "user_id", "desktop_id", "device_id", "created_at", "expires_at", "used_at"],
+  mono_reset_tickets: ["token_hash", "user_id", "desktop_id", "device_id", "mono_id", "created_at", "expires_at", "used_at"],
   terminal_tickets: ["token_hash", "user_id", "desktop_id", "device_id", "project_id", "created_at", "expires_at", "used_at"],
   push_subscriptions: ["id", "user_id", "device_id", "endpoint", "p256dh", "auth", "vapid_key_id", "ua", "created_at", "last_success_at", "failures"],
   push_prefs: ["user_id", "desktop_id", "enabled", "categories"],
@@ -79,6 +80,14 @@ const MIGRATION_0007_INDEXES: [string, string[]][] = [
   ["terminal_tickets", ["expires_at"]],
 ];
 
+// Single-use Mono reset tickets (migration 0009): same index set as the terminal tickets.
+const MIGRATION_0009_INDEXES: [string, string[]][] = [
+  ["mono_reset_tickets", ["user_id"]],
+  ["mono_reset_tickets", ["desktop_id"]],
+  ["mono_reset_tickets", ["device_id"]],
+  ["mono_reset_tickets", ["expires_at"]],
+];
+
 interface TableInfoRow {
   name: string;
   type: string;
@@ -106,7 +115,7 @@ async function indexes(table: string): Promise<{ name: string; unique: boolean; 
 }
 
 describe("D1 schema = architecture.md 4.3", () => {
-  it("has exactly the 17 tables of the spec (plus the migrations bookkeeping table)", async () => {
+  it("has exactly the 18 tables of the spec (plus the migrations bookkeeping table)", async () => {
     const { results } = await env.DB.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' AND name <> 'd1_migrations' ORDER BY name`).all<{ name: string }>();
     expect(results.map((r) => r.name)).toEqual(Object.keys(SPEC_COLUMNS).sort());
   });
@@ -166,7 +175,7 @@ describe("D1 schema = architecture.md 4.3", () => {
   });
 
   it("has every index of the spec and the cleanup indexes", async () => {
-    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES, ...MIGRATION_0003_INDEXES, ...MIGRATION_0004_INDEXES, ...MIGRATION_0006_INDEXES, ...MIGRATION_0007_INDEXES]) {
+    for (const [table, columns] of [...SPEC_INDEXES, ...CLEANUP_INDEXES, ...MIGRATION_0003_INDEXES, ...MIGRATION_0004_INDEXES, ...MIGRATION_0006_INDEXES, ...MIGRATION_0007_INDEXES, ...MIGRATION_0009_INDEXES]) {
       const found = await indexes(table);
       expect(found.some((i) => i.columns.join() === columns.join()), `${table}(${columns.join()})`).toBe(true);
     }

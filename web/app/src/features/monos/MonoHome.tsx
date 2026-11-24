@@ -1,6 +1,7 @@
 // F-13: the messaging-style Mono home, shown when "Monos only" is on (and at `/d/:desktopId/monos`): the Monos
 // newest first with their last reply, an unread dot (F-17) and a context menu (mark read or unread, details,
-// hide). "Reset" and "Delete" are denied for web (security.md section 7) and not offered. Hiding is
+// hide, and Reset conversation for a Control device whose desktop advertises `monoReset`). "Delete" is denied for web
+// (security.md section 7) and not offered. Hiding is
 // device-local and can be undone from the "Hidden" line at the foot.
 import { Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
@@ -17,6 +18,8 @@ import { Notice } from "@/ui/Notice";
 import { WorkspaceFrame, useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { EmptyState } from "@/ui/EmptyState";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "./contextMenu";
+import { stripEmoTokens } from "./emoji";
+import { ResetMonoDialog, useCanResetMono } from "./ResetMonoDialog";
 import { CreateMonoDialog } from "./CreateMonoDialog";
 import { clearCreateMonoRequest, useCreateMonoRequest } from "./createRequest";
 import { MonoAvatar } from "./MonoAvatar";
@@ -128,8 +131,11 @@ export function MonoHome({ desktopId, titleAs: Title = "h2" }: { desktopId: stri
 function MonoRow({ desktopId, mono, unread, onHide }: { desktopId: string; mono: CatalogMono; unread: boolean; onHide: () => void }) {
   const working = mono.status === "working";
   const needsYou = mono.status === "needs-you";
-  const preview = mono.lastMessage ? oneLine(mono.lastMessage) : "";
+  const preview = mono.lastMessage ? oneLine(stripEmoTokens(mono.lastMessage)) : "";
+  const canReset = useCanResetMono();
+  const [resetting, setResetting] = useState(false);
   return (
+    <>
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <Link
@@ -172,7 +178,15 @@ function MonoRow({ desktopId, mono, unread, onHide }: { desktopId: string; mono:
           <Icon name="archive" size={18} />
           Hide
         </ContextMenuItem>
+        {canReset ? (
+          <ContextMenuItem destructive onSelect={() => setResetting(true)}>
+            <Icon name="refresh" size={18} />
+            Reset conversation
+          </ContextMenuItem>
+        ) : null}
       </ContextMenuContent>
     </ContextMenu>
+    {resetting ? <ResetMonoDialog desktopId={desktopId} monoId={mono.id} name={mono.name} onOpenChange={setResetting} /> : null}
+    </>
   );
 }

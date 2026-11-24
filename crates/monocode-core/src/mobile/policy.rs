@@ -445,10 +445,11 @@ pub const METHODS: &[Entry] = &[
     app("mono.document", Class::Read),
     app("mono.profile", Class::Read),
     app("mono.update", Class::Control),
-    app("mono.reset", Class::Denied),
+    app("mono.reset", Class::Control),
     app("mono.delete", Class::Denied),
     app("mono.create", Class::Control),
     app("mono.file", Class::Read),
+    app("mono.emoji", Class::Read),
     app("mono.saveFile", Class::Denied),
     app("cloud.instances", Class::Read),
     app("cloud.startOptions", Class::Read),
@@ -851,6 +852,23 @@ pub fn capabilities(flags: &PolicyFlags) -> Vec<String> {
 /// web device that has Control and the desktop's "Allow web terminal" toggle.
 pub fn device_capabilities(flags: &PolicyFlags, device: &Device) -> Vec<String> {
     let mut list = capabilities(flags);
+    let hidden = |name: &str| {
+        HIDDEN_CAPABILITIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|hidden| hidden == name)
+    };
+    if device.kind == DeviceKind::Web {
+        // Mono emoji pictures are display only: every web device gets them.
+        if !hidden("monoEmoji") {
+            list.push("monoEmoji".to_owned());
+        }
+        // Resetting a Mono is a Control action (and needs a fresh passkey ticket).
+        if device.permission == Permission::Control && !hidden("monoReset") {
+            list.push("monoReset".to_owned());
+        }
+    }
     if device.kind == DeviceKind::Web
         && device.permission == Permission::Control
         && terminal_allowed(&device.id)
@@ -998,9 +1016,11 @@ mod tests {
                 Access::DeniedForRemote
             );
         }
-        for method in ["mono.saveFile", "mono.reset", "mono.delete"] {
+        for method in ["mono.saveFile", "mono.delete"] {
             assert_eq!(c(method, json!({})), Access::DeniedForWeb);
         }
+        assert_eq!(c("mono.reset", json!({})), Access::Control);
+        assert_eq!(c("mono.emoji", json!({})), Access::Read);
         // A plain read stays a read; a write through mono.file is a save.
         assert_eq!(c("mono.file", json!({"file": "soul"})), Access::Read);
         assert_eq!(
@@ -1266,9 +1286,18 @@ mod tests {
     fn web_cannot_write_monos_and_git_push_needs_the_toggle() {
         let off = PolicyFlags::default();
         let web = ctx(DeviceKind::Web, Permission::Control);
-        for method in ["mono.saveFile", "mono.reset", "mono.delete"] {
+        for method in ["mono.saveFile", "mono.delete"] {
             assert_eq!(call(&web, method, json!({}), &ON), Some(Code::Forbidden));
         }
+        // A web Control device may reset a Mono (host.rs adds the passkey ticket check).
+        assert_eq!(call(&web, "mono.reset", json!({}), &ON), None);
+        let web_reader = ctx(DeviceKind::Web, Permission::Read);
+        assert_eq!(
+            call(&web_reader, "mono.reset", json!({}), &ON),
+            Some(Code::ReadOnly)
+        );
+        let phone_control = ctx(DeviceKind::Phone, Permission::Control);
+        assert_eq!(call(&phone_control, "mono.reset", json!({}), &ON), None);
         let pushes = [
             json!({"action": "sync"}),
             json!({"action": "pr"}),
@@ -2098,6 +2127,35 @@ mod tests {
             .contains("saved-device"));
         std::fs::remove_dir_all(&dir).unwrap();
         install_settings(before);
+    }
+
+    #[test]
+    fn mono_reset_is_advertised_to_control_web_devices_only_and_emoji_to_every_web_device() {
+        let row = |kind, permission| Device {
+            id: "caps-test-device".into(),
+            name: "Laptop".into(),
+            fingerprint: "f".into(),
+            push: None,
+            kind,
+            permission,
+            projects: None,
+            monos: None,
+            server_device_id: None,
+            created_at: None,
+            last_seen: None,
+        };
+        let flags = PolicyFlags::default();
+        let has = |device: &Device, name: &str| {
+            device_capabilities(&flags, device)
+                .iter()
+                .any(|cap| cap == name)
+        };
+        let web_control = row(DeviceKind::Web, Permission::Control);
+        let web_read = row(DeviceKind::Web, Permission::Read);
+        let phone = row(DeviceKind::Phone, Permission::Control);
+        assert!(has(&web_control, "monoReset") && has(&web_control, "monoEmoji"));
+        assert!(!has(&web_read, "monoReset") && has(&web_read, "monoEmoji"));
+        assert!(!has(&phone, "monoReset") && !has(&phone, "monoEmoji"));
     }
 
     #[test]

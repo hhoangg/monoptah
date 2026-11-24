@@ -2,12 +2,16 @@
 // laid out as AgentTranscript does: the prompt in a bubble on the right, the work folded behind one
 // status line, the answer as full-width Markdown, and when it landed underneath. A Mono's turn signs
 // with its name in a pill and keeps its work in that line.
-import { memo, use, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, use, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import type { Turn } from "@monoptah/protocol";
 import { cn } from "@/lib/utils";
 import { HarnessIcon } from "@/ui/HarnessIcon";
 import { Icon, type IconName } from "@/ui/Icon";
-import { Markdown } from "@/features/markdown/Markdown";
+import { Markdown, type MarkdownEmoji } from "@/features/markdown/Markdown";
+import { stripEmoTokens } from "@/features/monos/emoji";
+import { MonoEmojiImage } from "@/features/monos/MonoEmoji";
+import { useCapability } from "@/version";
+import type { MonoEmojiPick } from "@monoptah/protocol";
 import { Collapsible } from "./Collapsible";
 import { TranscriptOpened, useTranscriptActions, type TranscriptAgent } from "./context";
 import { useModelName } from "./modelNames";
@@ -49,7 +53,11 @@ export const TranscriptTurn = memo(function TranscriptTurn({ turn, agent }: Tran
           case "text":
             return (
               <div key={item.id} className={cn("px-5 pb-1", previous && previous.type !== "user" && previous.type !== "text" ? "pt-1" : "pt-3")}>
-                <Reply text={item.text} streaming={!!item.streaming} />
+                {agent ? (
+                  <MonoReply text={item.text} streaming={!!item.streaming} {...(agent.id ? { monoId: agent.id } : {})} {...(item.emoji ? { emoji: item.emoji } : {})} />
+                ) : (
+                  <Reply text={item.text} streaming={!!item.streaming} />
+                )}
               </div>
             );
           case "sessions":
@@ -68,7 +76,7 @@ export const TranscriptTurn = memo(function TranscriptTurn({ turn, agent }: Tran
             );
         }
       })}
-      {turn.footer ? <TurnFooter turn={turn} /> : null}
+      {turn.footer ? <TurnFooter turn={turn} mono={!!agent} /> : null}
     </div>
   );
 });
@@ -93,14 +101,14 @@ function ErrorNotice({ item, onPress }: { item: NoticeItem; onPress: () => void 
 }
 
 /** What a finished turn leaves under the answer: copy the reply, its token metrics, and when it landed. */
-function TurnFooter({ turn }: { turn: Turn }) {
+function TurnFooter({ turn, mono }: { turn: Turn; mono: boolean }) {
   const [showMetrics, setShowMetrics] = useState(false);
   const metrics = readMetrics(turn);
   const shown = hasTurnMetrics(metrics) ? metrics : undefined;
   return (
     <div className="flex items-center gap-2.5 pt-1 pr-5 pb-3 pl-4">
       <div className="flex items-center gap-1">
-        {turn.copyText ? <CopyButton text={turn.copyText} /> : null}
+        {turn.copyText ? <CopyButton text={mono ? stripEmoTokens(turn.copyText, { trimTail: false }) : turn.copyText} /> : null}
         {shown ? (
           <button
             type="button"
@@ -159,15 +167,29 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function Reply({ text, streaming }: { text: string; streaming: boolean }) {
+function Reply({ text, streaming, emoji }: { text: string; streaming: boolean; emoji?: MarkdownEmoji }) {
   const opened = use(TranscriptOpened);
   const [animate] = useState(opened);
   const { onOpenFile, onNavigate } = useTranscriptActions();
   return (
     <div data-chat-message-role="assistant">
-      <Markdown text={text} streaming={streaming} animate={animate} onOpenFile={onOpenFile} onNavigate={onNavigate} />
+      <Markdown text={text} streaming={streaming} animate={animate} onOpenFile={onOpenFile} onNavigate={onNavigate} {...(emoji ? { emoji } : {})} />
     </div>
   );
+}
+
+/**
+ * A Mono's reply. The pictures the desktop resolved are drawn where it put them (`emoji`, only when it advertises
+ * `monoEmoji`). A text without them never shows a raw `:emo[...]` token (an older desktop sends it as is).
+ */
+function MonoReply({ text, streaming, monoId, emoji }: { text: string; streaming: boolean; monoId?: string; emoji?: MonoEmojiPick[] }) {
+  const supported = useCapability("monoEmoji");
+  const picks = supported && monoId ? emoji : undefined;
+  const render = useCallback((index: number) => (monoId && picks?.[index] ? <MonoEmojiImage monoId={monoId} pick={picks[index]} /> : null), [monoId, picks]);
+  const drawn = useMemo<MarkdownEmoji | undefined>(() => (picks ? { at: picks.map((pick) => pick.at), large: picks.map((pick) => pick.large === true), render } : undefined), [picks, render]);
+  // The offsets of the pictures are into the text as the desktop stripped it: leave it as it is when they are drawn.
+  const shown = useMemo(() => (drawn ? text : stripEmoTokens(text, { trimTail: streaming })), [drawn, text, streaming]);
+  return <Reply text={shown} streaming={streaming} {...(drawn ? { emoji: drawn } : {})} />;
 }
 
 function DaySeparator({ at }: { at: number }) {

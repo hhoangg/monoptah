@@ -135,6 +135,16 @@ const PROJECTS = [
   { id: "proj-beta", name: "Example Beta", path: "/example/beta", machine: "example-machine", branch: "main", color: "#e0894a", defaultHarness: "claude", defaultModel: "example-model-1" },
 ] as const;
 
+/** A real 1x1 PNG a browser renders; the Mono emoji fixture. */
+const MONO_EMOJI_PNG_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+/**
+ * The sha256 hex of the fixture PNG bytes (content addressed, as on the desktop). A constant: the mock also runs in the
+ * browser (the dev preview), where node:crypto does not exist. test/methods.test.ts checks it against the bytes.
+ */
+export const MONO_EMOJI_FIXTURE_HASH = "c414cd0e204de974f73753c7e28d7638e7b3691bb8b1a2bab6b25bb7fed7ce77";
+/** The Mono whose conversation carries emoji picks. */
+export const MONO_EMOJI_FIXTURE_MONO_ID = "mono-example";
+
 // `mascot` and `color` are what the desktop sends for every Mono (a pixel mascot name and `#rrggbb`).
 const MONOS = [{ id: "mono-example", name: "Example Mono", mascot: "frog", color: "#39c363", projectIds: ["proj-alpha"], unread: 0, status: "idle" }] as const;
 
@@ -191,6 +201,28 @@ export class MockWorld {
     const starting = this.#addSession({ id: "sess-codespace-starting", projectId: "proj-beta", title: "Starting codespace work", target: { kind: "codespace", instance: "fake-codespace-two" }, cloudState: "starting" });
     this.#beginStartup(starting, 1);
     this.folders.push({ id: "folder-parser", projectId: "proj-alpha", name: "Parser work", sessionIds: ["sess-local-1", "sess-local-approval"], collapsed: false });
+    // A Mono conversation (`mono:<id>`): the desktop strips `:emo[...]` tokens from `text` and sends the picks with UTF-16 offsets.
+    const monoChat = this.#addSession({ id: `mono:${MONO_EMOJI_FIXTURE_MONO_ID}`, projectId: "proj-alpha", title: "Example Mono", target: { kind: "local" } });
+    // The large pick sits alone on the empty line, as native draws a token that is alone on its line.
+    const monoText = "Good morning !\n\nAll done.";
+    const monoPick = { emotion: "Happy", name: "wave", hash: MONO_EMOJI_FIXTURE_HASH, format: "png" };
+    monoChat.turns.push({
+      id: `${monoChat.id}-t3`,
+      stampAt: at - 30_000,
+      completedAt: at - 20_000,
+      durationMs: 10_000,
+      items: [
+        {
+          type: "text",
+          id: `${monoChat.id}-a2`,
+          text: monoText,
+          emoji: [
+            { at: monoText.indexOf(" !") + 1, ...monoPick },
+            { at: monoText.indexOf("\n") + 1, ...monoPick, large: true },
+          ],
+        },
+      ],
+    });
     this.#addSession({ id: "sess-remote-1", projectId: "proj-beta", title: "Work on a remote machine", target: { kind: "remote", instance: "example-remote" }, cloudState: "available" });
   }
 
@@ -993,12 +1025,20 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: HandlerOf<M> } = {
   },
 
   "mono.document": (p) => ({ id: p.documentId, title: "Example document", kind: "note" }),
-  "mono.profile": (p) => ({ id: p.monoId, name: "Example Mono" }),
+  "mono.profile": (p) => ({ id: p.monoId, name: "Example Mono", ...(p.monoId === MONO_EMOJI_FIXTURE_MONO_ID ? { resetFiles: { label: "Claude Code", supported: true } } : {}) }),
+  "mono.emoji": (p) => {
+    if (p.hash !== MONO_EMOJI_FIXTURE_HASH) throw new FixtureError("No such emoji", "not_found");
+    return { hash: p.hash, mime: "image/png", encoding: "base64", data: MONO_EMOJI_PNG_BASE64 };
+  },
   "mono.file": (p) => ({ text: `Example ${p.file} text.`, hash: "example-hash-0001" }),
   "mono.create": () => ({ monoId: "mono-created" }),
   "mono.update": () => ({}),
   "mono.saveFile": () => ({ hash: "example-hash-0002" }),
-  "mono.reset": () => ({}),
+  // A real desktop checks the ticket with the Worker for a web device; the mock cannot, so any non-empty ticket passes.
+  "mono.reset": (p) => {
+    if (p.ticket === undefined || p.ticket === "") throw new FixtureError("Confirm with your passkey to reset the conversation", "fresh_required");
+    return {};
+  },
   "mono.delete": () => ({}),
 
   "workspace.list": (_p, ctx) => {
@@ -1007,7 +1047,7 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: HandlerOf<M> } = {
     return {
       projects: world.projects().filter((p) => visible(p.id)).map((p) => ({ ...p })),
       monos: world.monos().filter((m) => ctx.device.selection.monos === null || ctx.device.selection.monos.includes(m.id)).map((m) => ({ ...m, projectIds: [...m.projectIds] })),
-      sessions: world.visibleSessions().filter((s) => visible(s.projectId)).map((s) => world.card(s)),
+      sessions: world.visibleSessions().filter((s) => !s.id.startsWith("mono:") && visible(s.projectId)).map((s) => world.card(s)),
       folders: world.folders.flatMap((f) => (visible(f.projectId) ? [world.folderCard(f, () => true)] : [])).filter((f) => f !== null),
       monoTools: true,
       monoFiles: true,
@@ -1018,7 +1058,7 @@ export const FIXTURE_HANDLERS: { [M in MethodName]: HandlerOf<M> } = {
     const { world } = ctx;
     const all = world
       .visibleSessions()
-      .filter((s) => s.projectId === p.projectId && selected(ctx, s.projectId))
+      .filter((s) => !s.id.startsWith("mono:") && s.projectId === p.projectId && selected(ctx, s.projectId))
       .filter((s) => !p.query || s.title.toLowerCase().includes(p.query.toLowerCase()))
       .filter((s) => p.since === undefined || s.updatedAt >= p.since);
     const offset = p.offset ?? 0;

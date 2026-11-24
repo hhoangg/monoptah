@@ -7,6 +7,7 @@ use crate::{
     mobile::{approvals, catalog as mobile_catalog, cloud, project, transcript as turns},
     notifications::delivery,
     pickers,
+    transcript::emoji::MonoEmoji,
 };
 use gpui::{EntityId, Task};
 use monocode_core::mobile::policy::Failure;
@@ -122,10 +123,13 @@ struct Saved {
     mono: Option<String>,
     /// The cards of the sessions the Mono started, as they stood on reading.
     launches: HashMap<i64, Value>,
+    /// The Mono's emoji library and settings as they stood on reading.
+    emoji: Option<MonoEmoji>,
 }
 
 /// How an older page's turns are drawn, as the conversation's own are.
 struct PageLook {
+    emoji: Option<MonoEmoji>,
     mono: Option<String>,
     launches: HashMap<i64, Value>,
     cwd: String,
@@ -172,6 +176,8 @@ struct Snapshot<'a> {
     pending: Vec<turns::Pending>,
     /// A Mono's launched sessions, as the phone's cards show them.
     launches: &'a HashMap<i64, Value>,
+    /// The Mono's emoji library and settings, to resolve its pictures.
+    emoji: Option<MonoEmoji>,
     /// The question the agent waits on, as the phone's card shows it; null
     /// for none, as always for a saved conversation.
     question: Value,
@@ -194,6 +200,7 @@ impl Snapshot<'_> {
             mono: self.mono.as_deref(),
             pending: &self.pending,
             launches: self.launches,
+            emoji: self.emoji.as_ref(),
         }
     }
 }
@@ -949,7 +956,7 @@ impl Shell {
                                 "busy": chat.busy,
                                 "harness": chat.summary.provider,
                                 "model": mobile_catalog::model_id(Kind::from_id(&chat.summary.provider), chat.mobile_model()),
-                                "lastMessage": last.map(|m| m["text"].clone()).unwrap_or(json!("")),
+                                "lastMessage": turns::mono_preview(last.map(|m| m["text"].clone()).unwrap_or(json!(""))),
                                 "lastActiveAt": chat.summary.updated_at,
                             })
                         });
@@ -989,10 +996,12 @@ impl Shell {
                     let Ok(history) = store.load(*id) else {
                         continue;
                     };
-                    let text = turns::messages(&history.rows)
-                        .pop()
-                        .map(|m| m["text"].clone())
-                        .unwrap_or(json!(""));
+                    let text = turns::mono_preview(
+                        turns::messages(&history.rows)
+                            .pop()
+                            .map(|m| m["text"].clone())
+                            .unwrap_or(json!("")),
+                    );
                     previews.insert(*id, MonoPreview { updated_at: updated_at.unwrap_or(0), text });
                 }
                 previews.retain(|id, _| saved_monos.iter().any(|(saved, _)| saved == id));
@@ -1321,6 +1330,7 @@ impl Shell {
                 self.mobile_mono(request, cx)
             }
             "mono.file" | "mono.saveFile" => self.mobile_mono_file(request, cx),
+            "mono.emoji" => self.mobile_mono_emoji(request, cx),
             "project.fileHighlight" => {
                 let job = string(&request.params, "job").unwrap_or_default();
                 let from = request.params["from"].as_u64().unwrap_or(0) as usize;
@@ -2012,6 +2022,7 @@ impl Shell {
         // Drawn as the loaded turns are, from the open chat or the summary.
         let look = self
             .with_live_snapshot(target, device, cx, |s| PageLook {
+                emoji: s.emoji.clone(),
                 mono: s.mono.clone(),
                 launches: s.launches.clone(),
                 cwd: s.cwd.to_owned(),
@@ -2021,6 +2032,13 @@ impl Shell {
             .unwrap_or_else(|| {
                 let summary = self.session_summaries.get(&session);
                 PageLook {
+                    emoji: match target {
+                        Target::Mono(mono) => self
+                            .monos
+                            .as_ref()
+                            .and_then(|m| m.read(cx).mobile_emoji_source(mono, cx)),
+                        Target::Session(_) => None,
+                    },
                     mono: name,
                     launches: self.mobile_launches(target, device, cx),
                     cwd: summary.map(|s| s.cwd.clone()).unwrap_or_default(),
@@ -2045,12 +2063,16 @@ impl Shell {
         cx: &App,
         f: impl FnOnce(&Snapshot) -> T,
     ) -> Option<T> {
-        let (view, mono) = match target {
-            Target::Session(id) => (self.sessions.get(id)?.clone(), None),
+        let (view, mono, emoji) = match target {
+            Target::Session(id) => (self.sessions.get(id)?.clone(), None, None),
             Target::Mono(id) => {
                 let manager = self.monos.as_ref()?.read(cx);
                 let name = manager.roster.get(id).map(|m| m.label());
-                (manager.open_chat(id)?, name)
+                (
+                    manager.open_chat(id)?,
+                    name,
+                    manager.mobile_emoji_source(id, cx),
+                )
             }
         };
         let chat = view.read(cx);
@@ -2077,6 +2099,7 @@ impl Shell {
             mono,
             pending: chat.mobile_pending(cx),
             launches: &launches,
+            emoji,
             question: chat.mobile_question(cx),
             history: chat.transcript.read(cx).older_history_cursor(),
         };
@@ -2089,12 +2112,16 @@ impl Shell {
         device: &DeviceContext,
         cx: &mut Context<Self>,
     ) -> Task<Result<Arc<Saved>, String>> {
-        let (id, mono) = match target {
-            Target::Session(id) => (Some(*id), None),
+        let (id, mono, emoji) = match target {
+            Target::Session(id) => (Some(*id), None, None),
             Target::Mono(mono) => {
                 let manager = self.monos.as_ref().map(|m| m.read(cx));
                 let found = manager.and_then(|m| m.roster.get(mono));
-                (found.and_then(|m| m.session_id), found.map(|m| m.label()))
+                (
+                    found.and_then(|m| m.session_id),
+                    found.map(|m| m.label()),
+                    manager.and_then(|m| m.mobile_emoji_source(mono, cx)),
+                )
             }
         };
         let summary = id.and_then(|id| self.session_summaries.get(&id).cloned());
@@ -2112,6 +2139,7 @@ impl Shell {
                     history: None,
                     mono,
                     launches,
+                    emoji,
                 }));
             };
             let store = locked(&store)?;
@@ -2136,6 +2164,7 @@ impl Shell {
                 history,
                 mono,
                 launches,
+                emoji,
             }))
         })
     }
@@ -3500,7 +3529,21 @@ impl Shell {
                     in_selection(&request.device.projects, &project)
                 });
             }
-            monos.update(cx, |monos, cx| monos.mobile_profile(&id, &views, cx))
+            let profile = monos.update(cx, |monos, cx| monos.mobile_profile(&id, &views, cx));
+            let files = monos.update(cx, |monos, cx| monos.mobile_reset_files(&id, cx));
+            // The conversation's provider files are read off the main thread.
+            cx.spawn(async move |_, _| {
+                let result = match (profile, files.await) {
+                    (Ok(mut profile), Some(files)) => {
+                        profile["resetFiles"] = files;
+                        Ok(profile)
+                    }
+                    (profile, _) => profile,
+                };
+                request.reply(result.map_err(Failure::from));
+            })
+            .detach();
+            return;
         };
         request.reply(result.map_err(Failure::from));
     }
@@ -3520,11 +3563,29 @@ impl Shell {
         let Some(monos) = self.monos.clone() else {
             return finish(self, request, Err("Mono is no longer available".into()));
         };
-        let work = monos.update(cx, |monos, cx| monos.mobile_reset(&id, cx));
+        // A missing or non-boolean `deleteFiles` is the default (delete exactly
+        // when the provider supports it); only `false` keeps the files.
+        let delete_files = request.params["deleteFiles"].as_bool();
+        // Read before the reset: the notice names the Mono as it was.
+        let mono_name = monos.read(cx).mono_label(&id);
+        let by_web = request.device.kind == DeviceKind::Web;
+        let device_name = by_web.then(|| self.mobile_device_name(&request.device.id));
+        let work = monos.update(cx, |monos, cx| monos.mobile_reset(&id, delete_files, cx));
         cx.spawn(async move |this, cx| {
             let result = work.await;
             let _ = this.update(cx, |this, cx| {
                 if result.is_ok() {
+                    // The person at this computer is always told that a web
+                    // device reset a conversation. A phone raises no banner.
+                    if let Some(device) = &device_name {
+                        let name = mono_name.as_deref().unwrap_or("a Mono");
+                        this.remote_notice(
+                            "monocode-remote-reset",
+                            "Remote reset",
+                            &format!("{device} reset {name}'s conversation."),
+                            cx,
+                        );
+                    }
                     // What the watches kept belongs to the deleted conversation;
                     // they follow the fresh chat once it opens (`ChatOpened`).
                     this.reset_mobile_watches(&id);
@@ -3533,6 +3594,25 @@ impl Shell {
                 }
                 finish(this, request, result.map_err(Failure::from));
             });
+        })
+        .detach();
+    }
+
+    /// `mono.emoji`: one emoji picture of a pack this Mono selected, for the web to draw.
+    fn mobile_mono_emoji(&mut self, request: Request, cx: &mut Context<Self>) {
+        let id = string(&request.params, "monoId").unwrap_or_default();
+        if !in_selection(&request.device.monos, &id) {
+            return request.reply(Err(not_selected()));
+        }
+        let hash = string(&request.params, "hash").unwrap_or_default();
+        let valid =
+            hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let Some(monos) = self.monos.clone().filter(|_| valid) else {
+            return request.reply(Err(policy::Code::NotFound.failure()));
+        };
+        let work = monos.update(cx, |monos, cx| monos.mobile_emoji_file(&id, &hash, cx));
+        cx.spawn(async move |_, _| {
+            request.reply(work.await.map_err(policy::Code::failure));
         })
         .detach();
     }
@@ -3741,6 +3821,7 @@ fn older_page(
                 mono: look.mono.clone(),
                 pending: Vec::new(),
                 launches: &look.launches,
+                emoji: look.emoji.clone(),
                 question: Value::Null,
                 history: page.before,
                 usage_limit: Value::Null,
@@ -3799,6 +3880,7 @@ fn saved_snapshot(saved: &Saved) -> Snapshot<'_> {
         mono: saved.mono.clone(),
         pending: Vec::new(),
         launches: &saved.launches,
+        emoji: saved.emoji.clone(),
         question: Value::Null,
         history: saved.history,
     }
@@ -4648,6 +4730,7 @@ mod tests {
                     "mono.delete",
                     "mono.reset",
                     "mono.file",
+                    "mono.emoji",
                     "mono.saveFile",
                 ];
                 // Neither the project nor the Mono is selected, or nothing is.
@@ -4789,6 +4872,145 @@ mod tests {
                     assert_eq!(
                         ask(shell, window, cx, &narrowed, "mono.update", params),
                         Some(Err(policy::Code::NotSelected.failure()))
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    /// A new Mono of the shell, with its name.
+    fn new_mono(
+        window: &gpui::WindowHandle<Shell>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (String, String) {
+        let made = window
+            .update(cx, |shell, window, cx| {
+                let monos = shell.mono_manager();
+                monos.update(cx, |m, cx| m.create(Vec::new(), window, cx));
+                let mono = monos.read(cx).current().unwrap().clone();
+                (mono.id.clone(), mono.label())
+            })
+            .unwrap();
+        cx.run_until_parked();
+        made
+    }
+
+    /// Sends `mono.reset` for `id` as `device` and returns what the app answered once it settled.
+    fn reset_mono(
+        window: &gpui::WindowHandle<Shell>,
+        cx: &mut gpui::TestAppContext,
+        device: &DeviceContext,
+        params: Value,
+    ) -> Option<Result<Value, Failure>> {
+        let command = format!("c-reset-{}", params);
+        let (request, mut answer) =
+            Request::with_receiver(&command, "mono.reset", params, device.clone());
+        window
+            .update(cx, |shell, window, cx| {
+                shell.handle_mobile_request(request, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        answer.try_recv().ok()
+    }
+
+    #[gpui::test]
+    fn a_web_mono_reset_tells_the_person_at_the_computer_and_a_phone_does_not(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, _) = super::super::tests::window(cx);
+        let (id, name) = new_mono(&window, cx);
+        let notices = |cx: &mut gpui::TestAppContext| {
+            cx.update(|cx| {
+                cx.default_global::<super::super::remote_update::State>()
+                    .notices
+                    .clone()
+            })
+        };
+        let before = notices(cx).len();
+        // A phone resets silently, as before.
+        let answer = reset_mono(&window, cx, &phone(), json!({"monoId": id}));
+        assert_eq!(answer, Some(Ok(Value::Null)));
+        assert_eq!(notices(cx).len(), before, "a phone raises no banner");
+        // A web device is always announced, by its name and the Mono's.
+        let answer = reset_mono(
+            &window,
+            cx,
+            &web(None, None),
+            json!({"monoId": id, "deleteFiles": false}),
+        );
+        assert_eq!(answer, Some(Ok(Value::Null)));
+        let all = notices(cx);
+        assert_eq!(all.len(), before + 1);
+        assert_eq!(
+            all.last().unwrap(),
+            &format!("A remote device reset {name}'s conversation.")
+        );
+        // A failed reset announces nothing.
+        let answer = reset_mono(&window, cx, &web(None, None), json!({"monoId": "gone"}));
+        assert!(matches!(answer, Some(Err(_))));
+        assert_eq!(notices(cx).len(), before + 1);
+    }
+
+    #[gpui::test]
+    fn the_mono_profile_carries_the_files_a_reset_could_delete(cx: &mut gpui::TestAppContext) {
+        let (window, _, _) = super::super::tests::window(cx);
+        let (id, _) = new_mono(&window, cx);
+        let (request, mut answer) = Request::with_receiver(
+            "c-profile",
+            "mono.profile",
+            json!({"monoId": id}),
+            web(None, None),
+        );
+        window
+            .update(cx, |shell, window, cx| {
+                shell.handle_mobile_request(request, window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let profile = answer.try_recv().expect("answered").expect("a profile");
+        assert!(profile["status"].is_string());
+        let files = &profile["resetFiles"];
+        assert!(
+            files["label"].as_str().is_some_and(|l| !l.is_empty()),
+            "{files}"
+        );
+        assert!(files["supported"].is_boolean());
+    }
+
+    #[gpui::test]
+    fn mono_emoji_checks_the_selection_and_the_hash_before_anything_else(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, _, _) = super::super::tests::window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                let hash = "a".repeat(64);
+                let params = json!({"monoId": "m1", "hash": hash});
+                let narrowed = web(None, Some(vec!["other".into()]));
+                assert_eq!(
+                    ask(shell, window, cx, &narrowed, "mono.emoji", params.clone()),
+                    Some(Err(policy::Code::NotSelected.failure()))
+                );
+                // Anything that is not 64 lowercase hex digits is not a hash of the library.
+                for bad in [
+                    json!(""),
+                    json!("A".repeat(64)),
+                    json!("a".repeat(63)),
+                    json!("../../etc/passwd"),
+                    Value::Null,
+                ] {
+                    assert_eq!(
+                        ask(
+                            shell,
+                            window,
+                            cx,
+                            &web(None, None),
+                            "mono.emoji",
+                            json!({"monoId": "m1", "hash": bad})
+                        ),
+                        Some(Err(policy::Code::NotFound.failure())),
+                        "{bad}"
                     );
                 }
             })
@@ -5404,7 +5626,7 @@ mod tests {
         window.update(cx, |shell, window, cx| {
             let store = locked(&shell.store).unwrap();
             let summary = shell.session_summaries[&id].clone();
-            let saved = Saved { id, settings: store.agent_settings(id).unwrap().unwrap(), rows: store.load(id).unwrap().rows, harness: summary.provider, cwd: summary.cwd, history: None, mono: None, launches: HashMap::new() };
+            let saved = Saved { id, settings: store.agent_settings(id).unwrap().unwrap(), rows: store.load(id).unwrap().rows, harness: summary.provider, cwd: summary.cwd, history: None, mono: None, launches: HashMap::new(), emoji: None };
             drop(store);
             let from_disk = saved_snapshot(&saved).usage_limit;
             let live = shell.with_live_snapshot(&Target::Session(id), &phone(), cx, |s| s.usage_limit.clone()).unwrap();
@@ -5446,6 +5668,7 @@ mod tests {
             history: None,
             mono: None,
             launches: HashMap::new(),
+            emoji: None,
         };
         let state = saved_snapshot(&saved).usage_limit;
         assert_eq!(state["resetsAt"], reset);

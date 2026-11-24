@@ -123,6 +123,8 @@ function requiredCapability(method: MethodName): string | undefined {
   if (method === "file.prepare") return "fileTransfer";
   if (method.startsWith("terminal.")) return "terminal";
   if (method.startsWith("commands.")) return "slashCommands";
+  if (method === "mono.emoji") return "monoEmoji";
+  if (method === "mono.reset") return "monoReset";
   return undefined;
 }
 
@@ -385,7 +387,10 @@ export class MockDesktop {
 
   #stateMessage(device: MockDevice): StateMessage {
     if (device.status !== "confirmed") return { type: "state", state: device.status };
-    const capabilities = this.#terminalAllowed(device) ? [...this.#capabilities] : this.#capabilities.filter((name) => name !== "terminal");
+    // `terminal` needs Control and the toggle; `monoReset` needs Control.
+    const capabilities = this.#capabilities.filter(
+      (name) => (name !== "terminal" || this.#terminalAllowed(device)) && (name !== "monoReset" || device.permission === "control"),
+    );
     return {
       type: "state",
       state: "confirmed",

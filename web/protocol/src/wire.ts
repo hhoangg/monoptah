@@ -106,6 +106,20 @@ export const TurnSchema = z.looseObject({
   copyText: z.string().optional(),
   durationMs: z.number().optional(),
 });
+/**
+ * One resolved Mono emoji on a Mono transcript text item (`emoji` field, only when at least one token resolved).
+ * `at` is a UTF-16 offset into the stripped `text`; `large` means native draws it large (alone on its line).
+ */
+export const MonoEmojiPickSchema = z.looseObject({
+  at: z.number().int().nonnegative(),
+  emotion: z.string(),
+  name: z.string(),
+  hash: z.string().regex(/^[0-9a-f]{64}$/),
+  format: z.enum(["png", "jpeg", "gif", "webp"]),
+  large: z.boolean().optional(),
+});
+export type MonoEmojiPick = z.infer<typeof MonoEmojiPickSchema>;
+
 export type Turn = z.infer<typeof TurnSchema>;
 
 // --- Models (`models.list`) ---

@@ -4,6 +4,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { createMemoryHistory, RouterProvider } from "@tanstack/react-router";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { KNOWN_CAPABILITIES } from "@monoptah/protocol";
 import { FIXTURE_HANDLERS, type MockDesktop } from "@monoptah/mock-desktop";
 import { IDBFactory } from "fake-indexeddb";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -88,9 +89,10 @@ function mount(path: string, options: MockLinkOptions = {}) {
 }
 
 const field = () => screen.findByRole("textbox", { name: "Message" });
+const noDelete = () => expect(screen.queryByText(/Delete Mono/i)).toBeNull();
 const noReset = () => {
   expect(screen.queryByText(/Reset conversation/i)).toBeNull();
-  expect(screen.queryByText(/Delete Mono/i)).toBeNull();
+  noDelete();
 };
 
 describe("Mono chat (F-69)", () => {
@@ -167,14 +169,28 @@ describe("Mono header (F-70)", () => {
 });
 
 describe("Mono home (F-13)", () => {
-  it("lists the Monos newest first with a context menu that has no reset or delete", async () => {
+  it("lists the Monos newest first with a context menu that resets but never deletes", async () => {
     mount("/monos");
     const rows = await screen.findAllByTestId("mono-row");
     expect(rows.map((row) => row.textContent)).toEqual([expect.stringContaining("Example Mono"), expect.stringContaining("Research Mono")]);
     expect(rows[0]).toHaveAttribute("data-unread", "true");
     fireEvent.contextMenu(rows[0]!);
     const menu = await screen.findByRole("menu");
-    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Mark as read", "View details", "Hide"]);
+    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Mark as read", "View details", "Hide", "Reset conversation"]);
+    noDelete();
+  });
+
+  it("offers no reset to a read-only device or a desktop without monoReset", async () => {
+    mount("/monos", { permission: "read" });
+    fireEvent.contextMenu((await screen.findAllByTestId("mono-row"))[0]!);
+    expect(within(await screen.findByRole("menu")).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Mark as read", "View details", "Hide"]);
+    noReset();
+  });
+
+  it("offers no reset when the desktop does not advertise monoReset", async () => {
+    mount("/monos", { capabilities: KNOWN_CAPABILITIES.filter((name) => name !== "monoReset" && name !== "terminal") });
+    fireEvent.contextMenu((await screen.findAllByTestId("mono-row"))[0]!);
+    expect(within(await screen.findByRole("menu")).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Mark as read", "View details", "Hide"]);
     noReset();
   });
 

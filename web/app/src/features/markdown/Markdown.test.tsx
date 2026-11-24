@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodeBlock } from "./CodeBlock";
-import { Markdown } from "./Markdown";
+import { Markdown, markEmoji } from "./Markdown";
 
 function mockMatchMedia(reduce: boolean) {
   vi.stubGlobal(
@@ -195,5 +195,77 @@ describe("external link confirm sheet (security.md 8, rule 2)", () => {
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(open).not.toHaveBeenCalled();
     open.mockRestore();
+  });
+});
+
+describe("<Markdown> pictures", () => {
+  const draw = (index: number) => <img data-testid="pic" alt={`pic${index}`} />;
+
+  it("puts one private-use mark at each offset, in order, and ignores text that already has one", () => {
+    expect(markEmoji("abcd", [1, 1, 4])).toBe("a\ue100\ue101bcd\ue102");
+    expect(markEmoji("abcd", [99])).toBe("abcd\ue100");
+    expect(markEmoji("a\ue100b", [1])).toBe("a\ue100b");
+    expect(markEmoji("abcd", [])).toBe("abcd");
+  });
+
+  it("draws each picture at its offset and leaves no mark in the text", () => {
+    const { container } = render(<Markdown text="Hello **bold** world" emoji={{ at: [6, 10, 20], render: draw }} />);
+    expect(screen.getAllByTestId("pic").map((pic) => pic.getAttribute("alt"))).toEqual(["pic0", "pic1", "pic2"]);
+    expect(container.querySelector("strong")?.contains(screen.getAllByTestId("pic")[1]!)).toBe(true);
+    expect(container.textContent).toBe("Hello bold world");
+    expect(container.textContent).not.toMatch(/[\ue000-\uf8ff]/);
+  });
+
+  it("never lets a mark into code, a code block, a link target or its text", () => {
+    const text = "see `a b` and [the docs](https://example.com/x) ok\n\n```\nlet x\n```";
+    const at = [text.indexOf("a b") + 1, text.indexOf("https") + 3, text.indexOf("let") + 1];
+    const { container } = render(<Markdown text={text} emoji={{ at, render: draw }} />);
+    expect(container.querySelector("code")?.textContent).toBe("a b");
+    expect(container.querySelector("a")?.getAttribute("href")).toBe("https://example.com/x");
+    expect(container.textContent).not.toMatch(/[\ue000-\uf8ff]/);
+  });
+
+  it("draws nothing for a picture the caller does not draw", () => {
+    const { container } = render(<Markdown text="Hello" emoji={{ at: [2], render: () => null }} />);
+    expect(container.textContent).toBe("Hello");
+  });
+
+  describe("a large picture on a line of its own", () => {
+    const big = (text: string, offset: number) => render(<Markdown text={text} emoji={{ at: [offset], large: [true], render: draw }} />);
+
+    it("keeps a heading after it a heading, with the picture before it", () => {
+      const { container } = big("Intro\n# Title\nbody", 6);
+      expect(container.querySelector("h1")?.textContent).toBe("Title");
+      expect(screen.getByTestId("pic").compareDocumentPosition(container.querySelector("h1")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("keeps list items, a quote and a code fence after it as they were", () => {
+      expect(big("- a\n- b\n- c", 4).container.querySelectorAll("li")).toHaveLength(3);
+      expect(big("> quoted", 0).container.querySelector("blockquote")?.textContent).toBe("quoted");
+      const fenced = big("Intro\n```\ncode\n```\nafter", 6).container;
+      expect(fenced.querySelector("pre")?.textContent).toContain("code");
+      expect(fenced.textContent).toContain("after");
+    });
+
+    it("draws one at the very end of the text", () => {
+      const { container } = big("All done.", 9);
+      expect(screen.getAllByTestId("pic")).toHaveLength(1);
+      expect(container.textContent).toBe("All done.");
+    });
+
+    it("does not break the line for an inline picture", () => {
+      expect(markEmoji("a\nb", [2], [false])).toBe("a\n\ue100b");
+      expect(markEmoji("a\nb", [2], [true])).toBe("a\n\ue100\nb");
+    });
+  });
+
+  it("draws no picture inside link text and keeps a mark out of a bare URL", () => {
+    const text = "[docs](https://example.com/a) and https://example.com/b ok";
+    const { container } = render(<Markdown text={text} emoji={{ at: [2, text.indexOf(" ok")], render: draw }} />);
+    expect(container.querySelector("a")?.querySelector("[data-testid=pic]")).toBeNull();
+    expect(screen.getAllByTestId("pic")).toHaveLength(1);
+    const links = [...container.querySelectorAll("a")];
+    expect(links.map((link) => link.getAttribute("href"))).toEqual(["https://example.com/a", "https://example.com/b"]);
+    expect(container.textContent).not.toMatch(/[\ue000-\uf8ff]/);
   });
 });

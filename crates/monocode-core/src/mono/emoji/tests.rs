@@ -675,3 +675,115 @@ fn standalone_tells_own_line_tokens_from_inline_ones() {
     assert_eq!(flags, [false, true, true, true, false, false]);
     assert!(standalone("no tokens").is_empty());
 }
+
+#[test]
+fn stripping_reports_where_each_token_went() {
+    use super::token::strip_with_marks;
+    let (text, marks) = strip_with_marks("Hi :emo[happy] there");
+    assert_eq!(text, "Hi there");
+    assert_eq!(marks, [3]);
+    // A token ending the text leaves no trailing space to point past.
+    let (text, marks) = strip_with_marks("Bye :emo[happy]");
+    assert_eq!((text.as_str(), marks.as_slice()), ("Bye", [3].as_slice()));
+    // A line of tokens only is removed; its picture sits where the line was.
+    let (text, marks) = strip_with_marks("a\n:emo[happy]\nb");
+    assert_eq!(text, "a\nb");
+    assert_eq!(marks, [2]);
+    // A list marker left alone by a removed token goes with its line.
+    let (text, marks) = strip_with_marks("- :emo[happy]\nx");
+    assert_eq!(text, "x");
+    assert_eq!(marks, [0]);
+    // Code keeps its literal token and has no mark.
+    let (text, marks) = strip_with_marks("`:emo[happy]` :emo[sad]");
+    assert_eq!(text, "`:emo[happy]`");
+    assert_eq!(marks, [13]);
+    assert_eq!(strip("a :emo[x] b"), strip_with_marks("a :emo[x] b").0);
+}
+
+#[test]
+fn large_flags_follow_the_native_rules() {
+    use super::token::large_flags;
+    assert_eq!(large_flags("a :emo[x] b", false), [false]);
+    assert_eq!(large_flags("a\n:emo[x]\nb", false), [true]);
+    assert_eq!(large_flags("- :emo[x]\n> :emo[y]", false), [true, true]);
+    // A paragraph of tokens only is large for each of them.
+    assert_eq!(
+        large_flags("a\n\n:emo[x] :emo[y]\n\nb", false),
+        [true, true]
+    );
+    assert_eq!(large_flags("a\n:emo[x] :emo[y]", false), [false, false]);
+    // A list item is a row of its own; a quoted line shares its paragraph.
+    assert_eq!(large_flags("- a\n- :emo[x] :emo[y]", false), [true, true]);
+    assert_eq!(
+        large_flags("> :emo[x] :emo[y]\n> more", false),
+        [false, false]
+    );
+    // Never in a heading or a table.
+    assert_eq!(large_flags("# :emo[x]", false), [false]);
+    assert_eq!(
+        large_flags("| a | b |\n|---|---|\n| :emo[x] | y |\n", false),
+        [false]
+    );
+    // While streaming, a token that ends the text stays inline.
+    assert_eq!(large_flags("Done.\n:emo[x]", true), [false]);
+    assert_eq!(large_flags("Done.\n:emo[x]\n", true), [true]);
+    assert_eq!(large_flags("Done.\n:emo[x]", false), [true]);
+}
+
+#[test]
+fn resolve_gives_native_picks_and_skips_what_native_draws_nothing_for() {
+    use super::resolve::{pick_token, resolve, MAX_PICKS};
+    let (library, pack_id) = library_with(vec![
+        emoji("h1.png", Some("happy")),
+        emoji("h2.png", Some("happy")),
+        emoji("gone.png", Some("sad")),
+    ]);
+    let dir = std::env::temp_dir().join(format!("monoptah-resolve-{}", std::process::id()));
+    let pack = library.packs.iter().find(|p| p.id == pack_id).unwrap();
+    for file in ["h1.png", "h2.png"] {
+        let path = image_path(&dir, pack, &emoji(file, None));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+    let selected = vec![pack_id];
+    // An accented letter first: `at` is a byte offset here (the caller converts it).
+    let raw = "é :emo[happy] ok :emo[nonsense] :emo[sad] :emo[HAPPY]";
+    let (text, picks) = resolve(&library, &dir, &selected, "7", raw, false, &|p| p.is_file());
+    assert_eq!(text, "é ok");
+    assert_eq!(
+        picks.len(),
+        2,
+        "unknown and missing-file tokens have no entry"
+    );
+    assert_eq!(picks[0].at, "é ".len());
+    assert!(picks.iter().all(|p| p.emotion == "happy" && !p.large));
+    // The same pick as `pick_token`, the one native lays out with.
+    let tokens = token::outside_code(raw);
+    let (_, native, _) = pick_token(
+        &library,
+        &selected,
+        "7",
+        raw,
+        tokens[0].range.start,
+        0,
+        "happy",
+    )
+    .unwrap();
+    assert_eq!(picks[0].hash, native.hash);
+    // Nothing without the pack selected.
+    assert!(
+        resolve(&library, &dir, &[], "7", raw, false, &|p| p.is_file())
+            .1
+            .is_empty()
+    );
+    // At most MAX_PICKS.
+    let many = ":emo[happy] ".repeat(MAX_PICKS + 10);
+    assert_eq!(
+        resolve(&library, &dir, &selected, "7", &many, false, &|p| p
+            .is_file())
+        .1
+        .len(),
+        MAX_PICKS
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

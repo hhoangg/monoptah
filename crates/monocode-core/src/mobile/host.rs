@@ -87,6 +87,7 @@ pub(super) const APP_METHODS: &[&str] = &[
     "mono.delete",
     "mono.create",
     "mono.file",
+    "mono.emoji",
     "mono.saveFile",
     "session.answerApproval",
     "cloud.instances",
@@ -510,6 +511,9 @@ enum Locked {
     /// the device row and the name of the project the call names, if the
     /// published catalog has it.
     Terminal(Box<Device>, Option<String>),
+    /// `mono.reset` of a web device: forwarded to the app once the server has
+    /// accepted its passkey ticket (checked with no lock held).
+    MonoReset(Box<Device>),
 }
 
 /// Says whether the server accepted a selection ticket: `(server device id,
@@ -520,6 +524,10 @@ type TicketVerifier = Arc<dyn Fn(String, String) -> bool + Send + Sync>;
 /// ticket, project id)`. Blocking, so it runs on `spawn_blocking`.
 type TerminalTicketVerifier = Arc<dyn Fn(String, String, String) -> TicketCheck + Send + Sync>;
 
+/// Says whether the server accepted a Mono reset ticket: `(server device id,
+/// ticket, Mono id)`. Blocking, so it runs on `spawn_blocking`.
+type MonoResetTicketVerifier = Arc<dyn Fn(String, String, String) -> TicketCheck + Send + Sync>;
+
 struct SelectionState {
     /// Keys the refs of unshared items; random per host, memory only.
     secret: [u8; 32],
@@ -527,6 +535,8 @@ struct SelectionState {
     verifier: Mutex<Option<TicketVerifier>>,
     /// Replaces the HTTP call that checks a terminal ticket (tests).
     terminal_verifier: Mutex<Option<TerminalTicketVerifier>>,
+    /// Replaces the HTTP call that checks a Mono reset ticket (tests).
+    mono_reset_verifier: Mutex<Option<MonoResetTicketVerifier>>,
 }
 
 impl SelectionState {
@@ -538,6 +548,7 @@ impl SelectionState {
             secret,
             verifier: Mutex::default(),
             terminal_verifier: Mutex::default(),
+            mono_reset_verifier: Mutex::default(),
         }
     }
 }
@@ -1299,6 +1310,11 @@ impl MobileHost {
                         .and_then(|id| catalog_project_name(&inner.catalog, id));
                     break 'locked Locked::Terminal(Box::new(device), project);
                 }
+                "mono.reset" if via == DeviceKind::Web => {
+                    // Needs a fresh passkey ticket: checked after this block,
+                    // with no lock held.
+                    break 'locked Locked::MonoReset(Box::new(device));
+                }
                 "device.push" => {
                     let push = push_registration(&params)?;
                     let mut config = inner.config.clone();
@@ -1320,6 +1336,19 @@ impl MobileHost {
             Locked::Selection => return self.web_selection(peer, &params).await,
             Locked::Terminal(device, project) => {
                 return self.terminal_call(&device, method, &params, project).await;
+            }
+            Locked::MonoReset(device) => {
+                // The cheap local checks come first: a ticket the server consumed
+                // must not be wasted on a call the host would refuse anyway.
+                request["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 128)
+                    .ok_or("Missing command ID")?;
+                if self.pending.load(Ordering::SeqCst) >= MAX_PENDING {
+                    return Err(busy());
+                }
+                self.verify_mono_reset(&device, peer, method, &params)
+                    .await?
             }
             Locked::Forward(context) => context,
         };
@@ -1818,6 +1847,116 @@ impl MobileHost {
         *self
             .selection
             .verifier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(verifier));
+    }
+
+    /// The passkey gate of a web `mono.reset`: the ticket must be present and
+    /// accepted by the server (off the lock and off the async worker). Every
+    /// refusal is audited with a fixed reason, never the ticket. The device is
+    /// then looked up and authorised again, since it may have been revoked,
+    /// lowered or narrowed while the server answered.
+    async fn verify_mono_reset(
+        &self,
+        device: &Device,
+        peer: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<DeviceContext, Failure> {
+        // Which Mono is in the detail (an id, never the ticket).
+        let named: String = params["monoId"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(64)
+            .collect();
+        let refuse = |detail: &str| {
+            audit_device(
+                audit::Lifecycle::MonoResetTicketRefused,
+                device,
+                Some(&format!("{detail} mono={named}")),
+            );
+            policy::Code::FreshRequired.failure()
+        };
+        let ticket = params["ticket"]
+            .as_str()
+            .filter(|ticket| !ticket.is_empty() && ticket.len() <= 4096)
+            .ok_or_else(|| refuse("no ticket"))?
+            .to_owned();
+        let mono_id = params["monoId"].as_str().unwrap_or_default().to_owned();
+        let server_id = device
+            .server_device_id
+            .clone()
+            .ok_or_else(|| refuse(TicketCheck::NoIdentity.reason()))?;
+        let host = self.clone();
+        let check = tokio::task::spawn_blocking(move || {
+            host.verify_mono_reset_ticket_blocking(&server_id, &ticket, &mono_id)
+        })
+        .await
+        .unwrap_or(TicketCheck::Unreachable);
+        if !check.accepted() {
+            return Err(refuse(check.reason()));
+        }
+        let inner = self.inner.lock().map_err(unavailable)?;
+        check_enabled(&inner, DeviceKind::Web)?;
+        let device = find_device(&inner, DeviceKind::Web, peer)?;
+        let context = device_context(&device);
+        policy::authorize(&context, method, params).map_err(Failure::from)?;
+        Ok(context)
+    }
+
+    /// Whether the web server accepted (and consumed) the passkey `ticket` of
+    /// the grant `server_device_id` for resetting `mono_id`. Blocking: the
+    /// caller is on a blocking thread with no lock held.
+    fn verify_mono_reset_ticket_blocking(
+        &self,
+        server_device_id: &str,
+        ticket: &str,
+        mono_id: &str,
+    ) -> TicketCheck {
+        let fake = self
+            .selection
+            .mono_reset_verifier
+            .lock()
+            .ok()
+            .and_then(|verifier| verifier.clone());
+        if let Some(verify) = fake {
+            return verify(
+                server_device_id.to_owned(),
+                ticket.to_owned(),
+                mono_id.to_owned(),
+            );
+        }
+        let Ok(database) = self.web_database() else {
+            return TicketCheck::NoIdentity;
+        };
+        let Ok(Some(identity)) =
+            identity_store::load_web(&database, &identity_store::web_account_for(&self.path))
+        else {
+            return TicketCheck::NoIdentity;
+        };
+        let Ok(base) = desktop_api::base_url(&identity.relay_url, cfg!(debug_assertions)) else {
+            return TicketCheck::NoIdentity;
+        };
+        desktop_api::verify_mono_reset_ticket(
+            &base,
+            &identity.desktop_token,
+            server_device_id,
+            ticket,
+            mono_id,
+        )
+    }
+
+    /// Replaces the server call that checks a Mono reset ticket: `(server
+    /// device id, ticket, Mono id)`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_mono_reset_ticket_verifier(
+        &self,
+        verifier: impl Fn(String, String, String) -> TicketCheck + Send + Sync + 'static,
+    ) {
+        *self
+            .selection
+            .mono_reset_verifier
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(verifier));
     }
@@ -4233,6 +4372,177 @@ mod tests {
         assert_eq!(held(), 0);
     }
 
+    fn reset_call(params: Value) -> Value {
+        json!({"version":VERSION,"id":"r","method":"mono.reset","params":params})
+    }
+
+    #[tokio::test]
+    async fn a_web_mono_reset_needs_an_accepted_ticket_and_every_refusal_is_audited() {
+        let (host, events, _phone) = paired();
+        host.set_flags_for_test(true, true);
+        let mut control = web_row("wc", "web-control");
+        control.permission = Permission::Control;
+        host.add_device_for_test(control);
+        let log =
+            std::env::temp_dir().join(format!("monoptah-reset-audit-{}", uuid::Uuid::new_v4()));
+        let _turn = audit::test_log(&log);
+        let seen = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
+        let verdict = Arc::new(Mutex::new(TicketCheck::Rejected));
+        {
+            let (seen, verdict) = (seen.clone(), verdict.clone());
+            host.set_mono_reset_ticket_verifier(move |device, ticket, mono| {
+                seen.lock().unwrap().push((device, ticket, mono));
+                *verdict.lock().unwrap()
+            });
+        }
+        // No ticket, an empty one and an oversized one never reach the server.
+        for params in [
+            json!({"monoId": "m1"}),
+            json!({"monoId": "m1", "ticket": ""}),
+            json!({"monoId": "m1", "ticket": "x".repeat(4097)}),
+        ] {
+            let failure = host
+                .handle_web("web-control", reset_call(params))
+                .await
+                .unwrap_err();
+            assert_eq!(failure.code.as_deref(), Some("fresh_required"));
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        // A rejected, an unreachable and an unidentified check fail closed.
+        for check in [
+            TicketCheck::Rejected,
+            TicketCheck::Unreachable,
+            TicketCheck::NoIdentity,
+        ] {
+            *verdict.lock().unwrap() = check;
+            let failure = host
+                .handle_web(
+                    "web-control",
+                    reset_call(json!({"monoId": "m1", "ticket": "fake-ticket"})),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.code.as_deref(), Some("fresh_required"), "{check:?}");
+        }
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            (
+                "srv-1".to_owned(),
+                "fake-ticket".to_owned(),
+                "m1".to_owned()
+            )
+        );
+        assert!(events.try_recv().is_err(), "nothing reached the app");
+        let lines = audit::read_recent(&log, 50);
+        let refused: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "mono_reset_ticket_refused")
+            .map(|line| line["detail"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(refused.len(), 6, "{lines:?}");
+        for reason in ["no ticket", "rejected", "unreachable", "no_identity"] {
+            let want = format!("{reason} mono=m1");
+            assert!(refused.contains(&want), "{want}: {refused:?}");
+        }
+        assert!(
+            !format!("{lines:?}").contains("fake-ticket"),
+            "the ticket is never audited"
+        );
+        // An accepted ticket is forwarded to the app, which answers.
+        *verdict.lock().unwrap() = TicketCheck::Accepted;
+        let answering = tokio::spawn(async move {
+            let Ok(Event::Request(request)) = events.recv().await else {
+                panic!("expected a request");
+            };
+            assert_eq!(request.method, "mono.reset");
+            assert_eq!(request.params["monoId"], "m1");
+            request.reply(Ok(Value::Null));
+        });
+        let answer = host
+            .handle_web(
+                "web-control",
+                reset_call(json!({"monoId": "m1", "ticket": "fake-ticket"})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer, Value::Null);
+        answering.await.unwrap();
+        drop(_turn);
+        let _ = std::fs::remove_dir_all(&log);
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_web_mono_reset_with_no_command_id_never_spends_a_ticket() {
+        let (host, events, _phone) = paired();
+        host.set_flags_for_test(true, true);
+        let mut control = web_row("wc", "web-control");
+        control.permission = Permission::Control;
+        host.add_device_for_test(control);
+        let asked = Arc::new(Mutex::new(0u32));
+        let counter = asked.clone();
+        host.set_mono_reset_ticket_verifier(move |_, _, _| {
+            *counter.lock().unwrap() += 1;
+            TicketCheck::Accepted
+        });
+        let call = json!({"version":VERSION,"method":"mono.reset","params":{"monoId":"m1","ticket":"fake-ticket"}});
+        let failure = host.handle_web("web-control", call).await.unwrap_err();
+        assert_eq!(failure.error, "Missing command ID");
+        assert_eq!(*asked.lock().unwrap(), 0, "the verifier was never called");
+        assert!(events.try_recv().is_err());
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_web_mono_reset_is_decided_again_after_the_ticket_check() {
+        let (host, events, _phone) = paired();
+        host.set_flags_for_test(true, true);
+        let mut control = web_row("wc", "web-control");
+        control.permission = Permission::Control;
+        host.add_device_for_test(control);
+        // While the server answers, the device is lowered to read-only.
+        let lowered = host.clone();
+        host.set_mono_reset_ticket_verifier(move |_, _, _| {
+            let mut inner = lowered.inner.lock().unwrap();
+            if let Some(device) = inner
+                .config
+                .devices
+                .iter_mut()
+                .find(|device| device.id == "wc")
+            {
+                device.permission = Permission::Read;
+            }
+            TicketCheck::Accepted
+        });
+        let failure = host
+            .handle_web(
+                "web-control",
+                reset_call(json!({"monoId": "m1", "ticket": "fake-ticket"})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code.as_deref(), Some("read_only"));
+        assert!(events.try_recv().is_err(), "nothing reached the app");
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_phone_mono_reset_needs_no_ticket() {
+        let (host, events, phone) = paired();
+        let answering = tokio::spawn(async move {
+            let Ok(Event::Request(request)) = events.recv().await else {
+                panic!("expected a request");
+            };
+            assert_eq!(request.method, "mono.reset");
+            request.reply(Ok(Value::Null));
+        });
+        host.handle(&phone, reset_call(json!({"monoId": "m1"})))
+            .await
+            .unwrap();
+        answering.await.unwrap();
+        std::fs::remove_dir_all(host.path.parent().unwrap()).unwrap();
+    }
+
     /// Every refusal the host words reaches a web device with its stable code,
     /// and the same refusal on QUIC is the text alone (no `code` on the wire).
     #[tokio::test]
@@ -4250,7 +4560,12 @@ mod tests {
         let call = |method: &str, params: Value| json!({"version":VERSION,"id":"x","method":method,"params":params});
         let cases = [
             ("web-read", "session.cancel", json!({}), "read_only"),
-            ("web-control", "mono.reset", json!({}), "forbidden"),
+            (
+                "web-control",
+                "mono.reset",
+                json!({"monoId": "m1"}),
+                "fresh_required",
+            ),
             (
                 "web-control",
                 "session.answerApproval",

@@ -33,6 +33,8 @@ describe("FEATURES", () => {
       gitPush: "Push from Git",
       monoTools: "Mono tools",
       monoFiles: "Mono files",
+      monoEmoji: "Mono emoji",
+      monoReset: "Resetting a Mono's conversation",
       mentionedFiles: "File previews",
       mentionedFiles2: "File previews of files made by commands",
       fileTransfer: "Opening any file from the web",

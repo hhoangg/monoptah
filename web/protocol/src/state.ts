@@ -20,6 +20,10 @@ export const KNOWN_CAPABILITIES = [
   "terminal",
   /** The `/` menu of a session composer: `commands.list` and `commands.run`. */
   "slashCommands",
+  /** The desktop sends resolved Mono emoji picks on Mono transcript text items and answers `mono.emoji`. */
+  "monoEmoji",
+  /** The desktop accepts `mono.reset` from a web device: advertised only to Control devices. */
+  "monoReset",
 ] as const;
 export type KnownCapability = (typeof KNOWN_CAPABILITIES)[number];
 

@@ -1,16 +1,18 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   DesktopErrorCodeSchema,
   METHODS,
   METHOD_LIST,
+  MonoEmojiPickSchema,
   WatchFrameSchema,
   classify,
   type ClassifyFlags,
   type MethodName,
 } from "@monoptah/protocol";
 import methodsJson from "@monoptah/protocol/methods.json" with { type: "json" };
-import { FIXTURE_HANDLERS, MockWorld, type HandlerContext, type MockDevice } from "../src/index.ts";
+import { FIXTURE_HANDLERS, MONO_EMOJI_FIXTURE_HASH, MONO_EMOJI_FIXTURE_MONO_ID, MockWorld, type HandlerContext, type MockDevice } from "../src/index.ts";
 import { SAMPLE_PARAMS } from "./params.ts";
 import { setup } from "./harness.ts";
 
@@ -70,7 +72,7 @@ describe("every method of methods.json is served", () => {
   it("denied and unsupportedWeb methods are present in the list and answered with the documented codes", () => {
     const denied = names.filter((n) => METHODS[n].class === "denied");
     const unsupported = names.filter((n) => METHODS[n].class === "unsupportedWeb");
-    expect(denied).toEqual(expect.arrayContaining(["mono.saveFile", "mono.reset", "mono.delete", "device.enroll"]));
+    expect(denied).toEqual(expect.arrayContaining(["mono.saveFile", "mono.delete", "device.enroll"]));
     expect(unsupported).toEqual(expect.arrayContaining(["project.fileHighlight", "device.push"]));
   });
 
@@ -185,5 +187,56 @@ describe("fixture hygiene", () => {
     const world = new MockWorld();
     const json = JSON.stringify(FIXTURE_HANDLERS["workspace.list"]({}, { world, device: { fingerprint: "ff", status: "confirmed", permission: "control", selection: { projects: null, monos: null } } }));
     expect(json).not.toMatch(/\/Users\/|\/home\/|C:\\\\|remote:\/\//);
+  });
+});
+
+describe("Mono emoji and reset", () => {
+  it("advertises monoEmoji to every device and monoReset only to a Control device", async () => {
+    const control = await setup();
+    const read = await setup({ permission: "read" });
+    expect(control.client.state?.capabilities).toEqual(expect.arrayContaining(["monoEmoji", "monoReset"]));
+    expect(read.client.state?.capabilities).toContain("monoEmoji");
+    expect(read.client.state?.capabilities).not.toContain("monoReset");
+  });
+
+  it("serves the fixture PNG by its sha256 and answers not_found for another hash", async () => {
+    const s = await setup({ permission: "read" });
+    const ok = await s.client.request("mono.emoji", { monoId: MONO_EMOJI_FIXTURE_MONO_ID, hash: MONO_EMOJI_FIXTURE_HASH });
+    expect(ok.ok).toBe(true);
+    const result = (ok as { result: { hash: string; mime: string; data: string } }).result;
+    expect(result.mime).toBe("image/png");
+    expect(createHash("sha256").update(Buffer.from(result.data, "base64")).digest("hex")).toBe(MONO_EMOJI_FIXTURE_HASH);
+    expect(await s.client.request("mono.emoji", { monoId: MONO_EMOJI_FIXTURE_MONO_ID, hash: "0".repeat(64) })).toMatchObject({ ok: false, code: "not_found" });
+  });
+
+  it("without the monoEmoji or monoReset capability the methods answer like an older desktop", async () => {
+    const s = await setup({ desktop: { capabilities: ["cloud"] } });
+    expect((await s.client.request("mono.emoji", { monoId: "mono-example", hash: MONO_EMOJI_FIXTURE_HASH })).ok).toBe(false);
+    expect((await s.client.request("mono.reset", { monoId: "mono-example", ticket: "t" })).ok).toBe(false);
+  });
+
+  it("mono.reset needs a ticket from a web device and a read device gets read_only", async () => {
+    const s = await setup();
+    expect(await s.client.request("mono.reset", { monoId: "mono-example" })).toMatchObject({ ok: false, code: "fresh_required" });
+    expect((await s.client.request("mono.reset", { monoId: "mono-example", ticket: "t", deleteFiles: false })).ok).toBe(true);
+    const read = await setup({ permission: "read" });
+    expect(await read.client.request("mono.reset", { monoId: "mono-example", ticket: "t" })).toMatchObject({ ok: false, code: "read_only" });
+  });
+
+  it("the fixture Mono conversation carries emoji picks at correct UTF-16 offsets with a stripped text", async () => {
+    const world = new MockWorld();
+    const turns = world.read(`mono:${MONO_EMOJI_FIXTURE_MONO_ID}`).turns;
+    const item = turns.flatMap((t) => t.items).find((i) => Array.isArray(i.emoji)) as unknown as { text: string; emoji: unknown[] };
+    const picks = item.emoji.map((p) => MonoEmojiPickSchema.parse(p));
+    expect(item.text).not.toContain(":emo[");
+    expect(picks[0]).toMatchObject({ at: item.text.indexOf(" !") + 1, hash: MONO_EMOJI_FIXTURE_HASH });
+    expect(picks[1]).toMatchObject({ large: true, at: item.text.indexOf("\n") + 1 });
+    expect(item.text.slice(0, picks[0]?.at)).toBe("Good morning ");
+  });
+
+  it("mono.profile of the fixture Mono carries resetFiles", async () => {
+    const s = await setup();
+    const response = await s.client.request("mono.profile", { monoId: MONO_EMOJI_FIXTURE_MONO_ID });
+    expect(response).toMatchObject({ ok: true, result: { resetFiles: { label: "Claude Code", supported: true } } });
   });
 });

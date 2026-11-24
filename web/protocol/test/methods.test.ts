@@ -139,7 +139,8 @@ const fixtures: Record<MethodName, { params: unknown; result: unknown }> = {
   "mono.create": { params: {}, result: { monoId: "m2" } },
   "mono.update": { params: { monoId: "m1", name: "Ada", color: "#aabbcc", subsessions: { harness: "claude", model: "claude:opus" } }, result: null },
   "mono.saveFile": { params: { monoId: "m1", file: "memory", text: "x", expectedHash: "abc" }, result: { hash: "def" } },
-  "mono.reset": { params: { monoId: "m1" }, result: null },
+  "mono.emoji": { params: { monoId: "m1", hash: "a".repeat(64) }, result: { hash: "a".repeat(64), mime: "image/png", encoding: "base64", data: "AAAA" } },
+  "mono.reset": { params: { monoId: "m1", ticket: "t1", deleteFiles: false }, result: null },
   "mono.delete": { params: { monoId: "m1" }, result: null },
   "workspace.list": {
     params: {},
@@ -468,7 +469,7 @@ describe("classify (architecture.md 7.1)", () => {
     expect(classify("session.answerApproval", {})).toBe("control");
     expect(classify("cloud.stop", { sessionId: "s" })).toBe("control");
     expect(classify("mono.saveFile", {})).toBe("denied");
-    expect(classify("mono.reset", {})).toBe("denied");
+    expect(classify("mono.reset", {})).toBe("control");
     expect(classify("mono.delete", {})).toBe("denied");
     expect(classify("device.push", {})).toBe("unsupportedWeb");
     expect(classify("project.fileHighlight", {})).toBe("unsupportedWeb");
@@ -541,5 +542,16 @@ describe("project.git remoteName", () => {
     expect(result.safeParse({ ...status, remoteName: "origin" }).success).toBe(true);
     expect(result.safeParse({ ...status, remote: false, remoteName: "" }).success).toBe(true);
     expect(result.safeParse({ ...status, remoteName: 3 }).success).toBe(false);
+  });
+});
+
+describe("mono.profile resetFiles", () => {
+  const result = METHODS["mono.profile"].result;
+  it("is read when well formed and reads as absent when malformed, without failing the profile", () => {
+    expect(result.parse({ id: "m1", resetFiles: { label: "Claude Code", supported: true, note: "n" } }).resetFiles).toEqual({ label: "Claude Code", supported: true, note: "n" });
+    const bad = result.safeParse({ id: "m1", resetFiles: { label: 3, supported: "yes" } });
+    expect(bad.success).toBe(true);
+    expect(bad.success && bad.data.resetFiles).toBeUndefined();
+    expect(bad.success && bad.data.id).toBe("m1");
   });
 });

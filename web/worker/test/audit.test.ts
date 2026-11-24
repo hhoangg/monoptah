@@ -31,6 +31,8 @@ const SAMPLES: { [A in AuditAction]: Record<string, unknown> } = {
   "selection.widen": { deviceId: "dev-1", desktopId: "desk-1" },
   "terminal.ticket": { deviceId: "dev-1", desktopId: "desk-1" },
   "terminal.ticket.consumed": { deviceId: "dev-1", desktopId: "desk-1" },
+  "mono.reset.ticket": { deviceId: "dev-1", desktopId: "desk-1" },
+  "mono.reset.ticket.consumed": { deviceId: "dev-1", desktopId: "desk-1" },
   "user.block": { cascade: true, count: 4 },
   "user.unblock": { cascade: false },
   "admin.settings_change": { invitesPaused: true },
@@ -58,6 +60,8 @@ const SECURITY_MD_10_EVENTS = [
   "selection.ticket", "selection.widen",
   // web terminal: ticket minted (user), ticket consumed by the desktop
   "terminal.ticket", "terminal.ticket.consumed",
+  // web Mono reset: ticket minted (user), ticket consumed by the desktop
+  "mono.reset.ticket", "mono.reset.ticket.consumed",
   // block/unblock, admin actions (settings, grant invites)
   "user.block", "user.unblock", "admin.settings_change", "admin.invites_grant",
   // rate-limit breach, session revoke and logout, deploy

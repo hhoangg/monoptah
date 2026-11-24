@@ -3,7 +3,7 @@
 // documents it wrote and the projects it works in. Read-only and allowed for read-only devices; Edit is a
 // control action. A refresh button replaces pull-to-refresh.
 import { Link } from "@tanstack/react-router";
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
 import { useCatalog } from "@/data";
 import { useReadOnly } from "@/features/sessions/WorkspaceFrame";
 import { ProjectMascot } from "@/features/sessions/ProjectMascot";
@@ -18,6 +18,7 @@ import { MonoDocumentRows } from "./MonoDocumentRows";
 import { MonoAvatar } from "./MonoAvatar";
 import { BACK_LINK_CLASS, BackIcon, Group, MonoPage, RefreshButton } from "./MonoPage";
 import { useMonoProfile, type MonoProfile } from "./profile";
+import { ResetMonoDialog, useCanResetMono } from "./ResetMonoDialog";
 
 const DOCUMENTS_SHOWN = 5;
 
@@ -28,6 +29,8 @@ export function MonoProfileScreen({ desktopId, monoId }: { desktopId: string; mo
   const { profile, loading, error, refreshing, refresh } = useMonoProfile(monoId);
   const assigned = (catalog?.projects ?? []).filter((project) => mono?.projectIds?.includes(project.id));
   const working = profile?.state === "working" || mono?.status === "working";
+  const canReset = useCanResetMono();
+  const [resetting, setResetting] = useState(false);
 
   return (
     <MonoPage
@@ -98,6 +101,19 @@ export function MonoProfileScreen({ desktopId, monoId }: { desktopId: string; mo
           <p className="px-2 py-3 text-small text-muted-text">No projects. Without one it works from your home folder.</p>
         )}
       </Group>
+
+      {canReset ? (
+        <Group title="Conversation">
+          <div className="flex flex-col items-start gap-2 p-2">
+            <p className="text-small text-muted-text">Deletes every message of this chat. Its soul, memory and habits are kept.</p>
+            <Button type="button" variant="destructive" size="sm" onClick={() => setResetting(true)}>
+              <Icon name="refresh" size={16} />
+              Reset conversation
+            </Button>
+          </div>
+        </Group>
+      ) : null}
+      {resetting ? <ResetMonoDialog desktopId={desktopId} monoId={monoId} name={mono?.name ?? "Mono"} onOpenChange={setResetting} /> : null}
     </MonoPage>
   );
 }

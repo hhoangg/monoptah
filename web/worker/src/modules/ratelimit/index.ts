@@ -54,6 +54,8 @@ export const LIMITS = {
   "push-test": { limit: 3, windowSeconds: 600 },
   /** `terminal-ticket`: per signed-in user, counted in the handler (the user is known only after auth). */
   "terminal-ticket": { limit: 20, windowSeconds: 600 },
+  /** `mono-reset-ticket`: per signed-in user, counted in the handler (the user is known only after auth). */
+  "mono-reset-ticket": { limit: 10, windowSeconds: 600 },
   /**
    * Attempts per invite code across register/options and register/verify. The table gives no window; an
    * hour matches the other registration limit, and the invite code is hashed in the key.
