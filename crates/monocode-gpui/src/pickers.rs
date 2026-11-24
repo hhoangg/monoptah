@@ -644,11 +644,15 @@ impl ModelList {
         .detach();
     }
     fn discover(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        if cfg!(test) || self.loading.contains(&kind) {
+        if self.loading.contains(&kind) {
             return;
         }
         if let Some(project) = self.remote_project.clone() {
             self.loading = Kind::ALL.to_vec();
+            self.errors.clear();
+            if cfg!(test) {
+                return;
+            }
             let work = cx
                 .background_executor()
                 .spawn(async move { catalog::remote_catalog(&project) });
@@ -686,8 +690,34 @@ impl ModelList {
             .detach();
             return;
         }
+        // The catalog cache is process-global, so tests seed it explicitly.
+        if cfg!(test) {
+            return;
+        }
+        self.seed_from_cache(kind);
+        if self.query(cx).is_empty() {
+            self.highlighted = self.current_index(cx);
+        }
+        self.refresh(kind, cx);
+    }
+    /// Show the last good list for this account at once, if core has one.
+    fn seed_from_cache(&mut self, kind: Kind) {
+        let profile = self.profiles.get(&kind).cloned().unwrap_or_default();
+        if let Some(models) = catalog::cached_models_for(kind, &profile) {
+            self.catalogs.retain(|(k, _)| *k != kind);
+            self.catalogs.push((kind, models));
+        }
+    }
+    /// Start a background refresh of a local kind. Rows already shown stay.
+    fn refresh(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        if self.loading.contains(&kind) {
+            return;
+        }
         self.loading.push(kind);
         self.errors.retain(|(k, _)| *k != kind);
+        if cfg!(test) {
+            return;
+        }
         let work = cx.background_executor().spawn({
             let profile = self.profiles.get(&kind).cloned().unwrap_or_default();
             async move {
@@ -701,25 +731,90 @@ impl ModelList {
         cx.spawn(async move |this, cx| {
             let (result, missing) = work.await;
             let _ = this.update(cx, |this, cx| {
-                this.loading.retain(|k| *k != kind);
-                match result {
-                    Ok(models) => {
-                        this.catalogs.retain(|(k, _)| *k != kind);
-                        this.catalogs.push((kind, models));
-                    }
-                    Err(error) => this.errors.push((kind, error)),
-                }
+                this.apply_discovery(kind, result, cx);
                 this.missing.retain(|k| *k != kind);
                 if missing {
                     this.missing.push(kind);
-                }
-                if this.query(cx).is_empty() {
-                    this.highlighted = this.current_index(cx);
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+    /// Apply one discovery result: Ok replaces the rows, Err keeps any rows
+    /// already shown and records the error.
+    fn apply_discovery(
+        &mut self,
+        kind: Kind,
+        result: Result<Vec<Model>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.loading.retain(|k| *k != kind);
+        self.errors.retain(|(k, _)| *k != kind);
+        match result {
+            Ok(models) => {
+                self.catalogs.retain(|(k, _)| *k != kind);
+                self.catalogs.push((kind, models));
+            }
+            Err(error) => self.errors.push((kind, error)),
+        }
+        if self.query(cx).is_empty() {
+            self.highlighted = self.current_index(cx);
+        }
+        cx.notify();
+    }
+    fn retry(&mut self, kind: Kind, cx: &mut Context<Self>) {
+        if self.remote_project.is_some() {
+            self.discover(kind, cx);
+        } else {
+            self.refresh(kind, cx);
+        }
+        cx.notify();
+    }
+    /// Error with Retry, or a loading line, for the active harness tab.
+    fn status_block(
+        &self,
+        kind: Option<Kind>,
+        quick: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let kind = kind?;
+        if let Some((_, error)) = self.errors.iter().find(|(k, _)| *k == kind) {
+            let retry_id = if quick {
+                "quick-retry-models"
+            } else {
+                "retry-models"
+            };
+            return Some(
+                div()
+                    .px_2()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(content(0.5))
+                    .child(error.clone())
+                    .child(
+                        div()
+                            .id(retry_id)
+                            .debug_selector(move || retry_id.into())
+                            .role(Role::Button)
+                            .aria_label("Retry model discovery")
+                            .cursor_pointer()
+                            .py_2()
+                            .child("Retry")
+                            .on_click(cx.listener(move |this, _, _, cx| this.retry(kind, cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        self.loading.contains(&kind).then(|| {
+            div()
+                .px_2()
+                .py_2()
+                .text_size(px(12.))
+                .text_color(content(0.5))
+                .child("Loading models…")
+                .into_any_element()
+        })
     }
     pub(crate) fn search_focus(&self, cx: &gpui::App) -> FocusHandle {
         self.search.focus_handle(cx)
@@ -954,13 +1049,7 @@ impl Render for ModelList {
             ModelTab::Harness(kind) => Some(kind),
             _ => None,
         };
-        let loading = kind.is_some_and(|kind| self.loading.contains(&kind));
-        let error = kind.and_then(|kind| {
-            self.errors
-                .iter()
-                .find(|(k, _)| *k == kind)
-                .map(|(_, error)| error.clone())
-        });
+        let status = self.status_block(kind, false, cx);
         let empty = match (self.tab, self.query(cx).is_empty()) {
             (ModelTab::Favorites, true) if entries.is_empty() => Some("No favorite models"),
             _ if entries.is_empty() => Some("No matching models"),
@@ -1161,40 +1250,7 @@ impl Render for ModelList {
                                 )
                             })
                             .children(rows)
-                            .when(loading, |d| {
-                                d.child(
-                                    div()
-                                        .px_2()
-                                        .py_2()
-                                        .text_size(px(12.))
-                                        .text_color(content(0.5))
-                                        .child("Loading models…"),
-                                )
-                            })
-                            .when_some(error, |d, error| {
-                                d.child(
-                                    div()
-                                        .px_2()
-                                        .py_2()
-                                        .text_size(px(12.))
-                                        .text_color(content(0.5))
-                                        .child(error)
-                                        .child(
-                                            div()
-                                                .id("retry-models")
-                                                .role(Role::Button)
-                                                .aria_label("Retry model discovery")
-                                                .py_2()
-                                                .child("Retry")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    if let Some(kind) = kind {
-                                                        this.discover(kind, cx);
-                                                        cx.notify();
-                                                    }
-                                                })),
-                                        ),
-                                )
-                            }),
+                            .children(status),
                     ),
             )
             .into_any_element()
@@ -1208,6 +1264,7 @@ impl ModelList {
             _ => None,
         };
         let loading = kind.is_some_and(|kind| self.loading.contains(&kind));
+        let status = self.status_block(kind, true, cx);
         let query = !self.query(cx).is_empty();
         let empty = entries.is_empty().then(|| {
             if query {
@@ -1418,7 +1475,8 @@ impl ModelList {
                                 .child(text),
                         )
                     })
-                    .children(rows),
+                    .children(rows)
+                    .children(status),
             )
             .into_any_element()
     }
@@ -1855,5 +1913,209 @@ impl Render for ProjectPicker {
                         )
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod model_discovery_tests {
+    use super::*;
+
+    fn model(id: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: id.into(),
+            alias_target: None,
+            efforts: Vec::new(),
+            default_effort: None,
+            fast: false,
+            thinking: false,
+            default: false,
+            tiers: Vec::new(),
+            controls: Vec::new(),
+        }
+    }
+    /// A profile no other test uses, so the shared catalog cache stays isolated.
+    fn profile(name: &str) -> monocode_core::accounts::Profile {
+        monocode_core::accounts::Profile {
+            id: name.into(),
+            root: None,
+        }
+    }
+    fn open(
+        cx: &mut gpui::TestAppContext,
+        account: &monocode_core::accounts::Profile,
+        quick: bool,
+    ) -> gpui::WindowHandle<ModelList> {
+        let account = account.clone();
+        cx.update(|cx| {
+            cx.set_global(crate::settings::Preferences::default());
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| {
+                    let list = ModelList::new_for(Kind::Codex, None, "/work", account, cx);
+                    if quick { list.quick(cx) } else { list }
+                })
+            })
+            .unwrap()
+        })
+    }
+    fn ids(list: &ModelList, cx: &gpui::App) -> Vec<Option<String>> {
+        list.entries(cx).into_iter().map(|e| e.id).collect()
+    }
+
+    #[gpui::test]
+    fn cached_list_is_shown_on_open(cx: &mut gpui::TestAppContext) {
+        let account = profile("discovery-cached");
+        catalog::seed_cached(Kind::Codex, &account, vec![model("cached-a")]);
+        let window = open(cx, &account, false);
+        window
+            .update(cx, |list, _, cx| {
+                list.seed_from_cache(Kind::Codex);
+                assert_eq!(
+                    ids(list, cx),
+                    vec![None, Some("cached-a".to_string())],
+                    "the last good list is shown before any refresh finishes"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn refresh_error_keeps_cached_rows_and_offers_retry(cx: &mut gpui::TestAppContext) {
+        let account = profile("discovery-error-cached");
+        catalog::seed_cached(Kind::Codex, &account, vec![model("cached-a")]);
+        let window = open(cx, &account, false);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |list, _, cx| {
+                list.seed_from_cache(Kind::Codex);
+                list.loading.push(Kind::Codex);
+                list.apply_discovery(Kind::Codex, Err("probe failed".into()), cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("retry-models").is_some());
+        window
+            .update(visual, |list, _, cx| {
+                assert_eq!(ids(list, cx).len(), 2, "rows stay");
+                assert!(list.loading.is_empty(), "no Loading models line");
+                assert_eq!(list.errors, vec![(Kind::Codex, "probe failed".into())]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn error_without_rows_shows_retry_in_flyout_and_quick(cx: &mut gpui::TestAppContext) {
+        for quick in [false, true] {
+            let account = profile(if quick { "discovery-q" } else { "discovery-f" });
+            let window = open(cx, &account, quick);
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            window
+                .update(visual, |list, _, cx| {
+                    list.apply_discovery(Kind::Codex, Err("probe failed".into()), cx)
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            let id = if quick {
+                "quick-retry-models"
+            } else {
+                "retry-models"
+            };
+            assert!(visual.debug_bounds(id).is_some(), "{id} is rendered");
+        }
+    }
+
+    #[gpui::test]
+    fn retry_clears_the_error_and_loads_again(cx: &mut gpui::TestAppContext) {
+        let account = profile("discovery-retry");
+        let window = open(cx, &account, true);
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        window
+            .update(visual, |list, _, cx| {
+                list.apply_discovery(Kind::Codex, Err("probe failed".into()), cx);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("quick-retry-models").is_some());
+        window
+            .update(visual, |list, _, cx| {
+                list.retry(Kind::Codex, cx);
+                assert!(list.errors.is_empty());
+                assert_eq!(list.loading, vec![Kind::Codex]);
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        assert!(visual.debug_bounds("quick-retry-models").is_none());
+    }
+
+    #[gpui::test]
+    fn success_replaces_rows(cx: &mut gpui::TestAppContext) {
+        let account = profile("discovery-success");
+        catalog::seed_cached(Kind::Codex, &account, vec![model("old")]);
+        let window = open(cx, &account, false);
+        window
+            .update(cx, |list, _, cx| {
+                list.seed_from_cache(Kind::Codex);
+                list.apply_discovery(Kind::Codex, Err("probe failed".into()), cx);
+                list.apply_discovery(Kind::Codex, Ok(vec![model("new")]), cx);
+                assert_eq!(ids(list, cx), vec![None, Some("new".to_string())]);
+                assert!(list.errors.is_empty());
+                assert!(list.loading.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn clicking_retry_starts_loading_again(cx: &mut gpui::TestAppContext) {
+        for quick in [false, true] {
+            let account = profile(if quick {
+                "discovery-click-q"
+            } else {
+                "discovery-click-f"
+            });
+            let window = open(cx, &account, quick);
+            let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+            window
+                .update(visual, |list, _, cx| {
+                    list.apply_discovery(Kind::Codex, Err("probe failed".into()), cx)
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            let id = if quick {
+                "quick-retry-models"
+            } else {
+                "retry-models"
+            };
+            let bounds = visual.debug_bounds(id).expect("retry is rendered");
+            visual.simulate_click(bounds.center(), Default::default());
+            visual.refresh().unwrap();
+            window
+                .update(visual, |list, _, _| {
+                    assert!(list.errors.is_empty(), "{id} cleared the error");
+                    assert_eq!(list.loading, vec![Kind::Codex]);
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn remote_retry_takes_the_remote_path(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(crate::settings::Preferences::default()));
+        let list = cx.update(|cx| {
+            cx.new(|cx| {
+                ModelList::new_for(
+                    Kind::Codex,
+                    None,
+                    "remote://env/home/code",
+                    Default::default(),
+                    cx,
+                )
+            })
+        });
+        list.update(cx, |list, cx| {
+            list.apply_discovery(Kind::Codex, Err("host down".into()), cx);
+            list.retry(Kind::Codex, cx);
+            assert_eq!(list.loading, Kind::ALL.to_vec(), "remote catalog reloads");
+            assert!(list.errors.is_empty());
+        });
     }
 }

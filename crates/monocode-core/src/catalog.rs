@@ -427,7 +427,7 @@ fn leaves<'a>(values: &'a Value, out: &mut Vec<&'a Value>) {
         }
     }
 }
-fn acp_models(value: &Value) -> Vec<Model> {
+pub(crate) fn acp_models(value: &Value) -> Vec<Model> {
     let configs: Vec<_> = value["configOptions"]
         .as_array()
         .into_iter()
@@ -893,6 +893,33 @@ fn query_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_cli_session_lists_base_models_with_efforts() {
+        let session = json!({"sessionId":"s","models":{"availableModels":[{"modelId":"gemini-4-neon-high","name":"Gemini 4 Neon (High)"},{"modelId":"gemini-4-neon-low","name":"Gemini 4 Neon (Low)"}]},
+            "modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"}]},
+            "configOptions":[
+            {"id":"model","name":"Model","category":"model","type":"select","currentValue":"gemini-4-neon","options":[{"value":"gemini-4-neon","name":"Gemini 4 Neon"},{"value":"gemini-4-carbon","name":"Gemini 4 Carbon"},{"value":"claude-opus-5-5","name":"Claude Opus 5.5"},{"value":"gpt-oss-120b-medium","name":"GPT-OSS 120B (Medium)"}]},
+            {"id":"thought_level","name":"Thinking Level","category":"thought_level","type":"select","currentValue":"high","options":[{"value":"low","name":"Low"},{"value":"medium","name":"Medium"},{"value":"high","name":"High"},{"value":"xhigh","name":"Extra"}]},
+            {"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"}]}]});
+        let models = acp_models(&session);
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gemini-4-neon",
+                "gemini-4-carbon",
+                "claude-opus-5-5",
+                "gpt-oss-120b-medium"
+            ]
+        );
+        assert!(models
+            .iter()
+            .all(|m| m.efforts == ["low", "medium", "high", "xhigh"]));
+        assert_eq!(models.iter().filter(|m| m.default).count(), 1);
+        assert!(models[0].default);
+        assert_eq!(models[0].default_effort.as_deref(), Some("high"));
+    }
 
     #[test]
     fn cached_catalogs_are_account_scoped_and_invalidated_together() {
