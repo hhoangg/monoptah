@@ -291,6 +291,15 @@ impl SettingsView {
             self.group(None, true, "Alerts", None, None, alerts),
             self.group(None, false, "Workspace", None, None, workspace),
             self.group(None, false, "About", None, None, about),
+            // Always shown: dismissing the banner does not hide this entry.
+            self.group(
+                None,
+                false,
+                "Moving to zptah",
+                None,
+                None,
+                vec![crate::retirement::card("settings-retirement", Vec::new()).into_any_element()],
+            ),
         ]
     }
 }

@@ -356,7 +356,10 @@ pub(crate) fn action(entity: &Entity<Updater>, cx: &App) -> Action {
 pub(crate) fn status(entity: &Entity<Updater>, cx: &App) -> Option<String> {
     let state = entity.read(cx);
     match state.phase {
-        Phase::Current => Some("You’re on the latest version.".into()),
+        Phase::Current => Some(format!(
+            "You're on the latest version. {}",
+            crate::retirement::UPDATER_RETIRED
+        )),
         Phase::Checking => None,
         _ => state.message.clone(),
     }

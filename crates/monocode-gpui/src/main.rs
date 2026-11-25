@@ -99,6 +99,7 @@ mod reflow_motion;
 mod remote_cache;
 mod resource_pressure;
 mod response_actions;
+mod retirement;
 mod reveal;
 mod review;
 mod right_panel;

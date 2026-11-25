@@ -1,3 +1,61 @@
+# Monoptah has moved to zptah
+
+> [!IMPORTANT]
+> **Monoptah is retired. This repository is archived and read-only: it gets no more fixes or releases.**
+> The app now lives in its own repository as **zptah**: <https://github.com/hhoangg/zptah>
+
+## Why it moved
+
+- Monoptah had diverged far from its upstream, [`hardbeat920/monocode`](https://github.com/hardbeat920/monocode).
+- zptah has an independent identity: its own name, bundle id (`app.zptah.desktop`) and data directory.
+- The archived Tauri app and the unmaintained mobile app were removed.
+- zptah is an independent repository with its own issues and releases, instead of living in a fork network, which makes it easier to contribute.
+
+## Install zptah
+
+macOS (Apple Silicon):
+
+```sh
+brew install --cask hhoangg/zptah/zptah
+```
+
+Linux (AppImage, deb, rpm) and Windows (exe): download from the
+[latest zptah release](https://github.com/hhoangg/zptah/releases/latest).
+
+## Migrate to zptah
+
+1. Install zptah (see above).
+2. Quit Monoptah.
+3. Open zptah, then go to **Settings > Import from Monoptah**. It copies your database, chats, attachments, accounts, Monos and memory, and settings. Your Monoptah data is left untouched.
+4. Re-pair the web app at <https://zptah.app> (see "Not migrated" below).
+5. Grant Full Disk Access to zptah once (see "Not migrated" below).
+6. Remote SSH machines: zptah installs its own `zptah-host` next to the existing `monocode-host`. Nothing to do.
+
+### Not migrated
+
+- **Web and phone pairing**: this is not imported by design. Pair the web app again at <https://zptah.app>.
+- **Full Disk Access**: macOS permission grants belong to the app, so grant Full Disk Access to zptah once in System Settings > Privacy & Security.
+
+## FAQ
+
+**Does Monoptah keep working?**
+Yes. The installed app keeps running, but it is no longer maintained and gets no updates.
+
+**Is my Monoptah data safe?**
+Yes. The import only reads it. Your Monoptah data stays exactly as it was.
+
+**How do I remove Monoptah?**
+Once you are happy with zptah, run `brew uninstall --cask monoptah-native`. Do not pass `--zap`, so your Monoptah data is kept.
+
+**Where do I report bugs or contribute?**
+In the [zptah repository](https://github.com/hhoangg/zptah/issues).
+
+---
+
+# Archived README
+
+Everything below is the README from before the move and is kept for history only.
+
 <h1 align="center">Monocode</h1>
 
 <p align="center">

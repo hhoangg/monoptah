@@ -15,6 +15,8 @@ mod notification_preferences;
 mod pages;
 mod palettes;
 mod preferences;
+#[cfg(test)]
+mod retirement_tests;
 mod skill_document;
 #[cfg(test)]
 mod web_app_tests;
