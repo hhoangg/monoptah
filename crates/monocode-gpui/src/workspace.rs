@@ -154,6 +154,8 @@ pub(crate) struct Workspace {
     pub new_layout_prompt_dismissed: bool,
     /// The rail stops asking for a GitHub star once dismissed.
     pub github_star_prompt_dismissed: bool,
+    /// The retirement banner stops showing once "Don't show again" is pressed.
+    pub retirement_notice_dismissed: bool,
     pub preferences: crate::settings::Preferences,
     pub session_filters: monocode_core::session_filters::Filters,
     pub project_appearance: HashMap<String, monocode_core::project_appearance::ProjectAppearance>,
@@ -496,6 +498,7 @@ impl Default for Workspace {
             classic_sidebar_tab_order: Vec::new(),
             new_layout_prompt_dismissed: false,
             github_star_prompt_dismissed: false,
+            retirement_notice_dismissed: false,
             preferences: crate::settings::Preferences::default(),
             session_filters: Default::default(),
             project_appearance: Default::default(),

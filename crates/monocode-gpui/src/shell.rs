@@ -48,6 +48,7 @@ mod live_agents;
 mod preview_path;
 #[cfg(test)]
 mod preview_path_tests;
+mod retirement;
 mod sandbox_picker;
 pub(crate) use app_commands::CLOUD_ARCHIVING;
 pub(crate) use cloud_app_archive::ArchiveFailure;
@@ -847,6 +848,8 @@ pub(crate) struct Shell {
     busy_sessions: HashSet<i64>,
     notification_state: notifications::State,
     github_star: github_star::State,
+    /// The retirement banner was dismissed for this session only.
+    retirement_session_dismissed: bool,
     quick: crate::quick_composer::Controller,
     unseen_finished: HashSet<i64>,
     archiving: HashSet<i64>,
@@ -1360,6 +1363,9 @@ impl Shell {
             busy_sessions: HashSet::new(),
             notification_state,
             github_star: Default::default(),
+            // Tests start without the banner so it cannot cover what they click; the banner
+            // tests turn it on.
+            retirement_session_dismissed: cfg!(test),
             quick: Default::default(),
             unseen_finished: HashSet::new(),
             archiving: HashSet::new(),
@@ -10132,6 +10138,7 @@ impl Render for Shell {
             .children(self.layout_body(sidebar_width, right_shown, right_width, full, window, cx))
             .children(self.peek_watch(window, cx))
             .child(self.notices_overlay(cx))
+            .children(self.retirement_banner(cx))
             .children(self.quit_notice())
             .children(self.menu.as_ref().map(|open| {
                 let point = matches!(open.anchor, Anchor::Point(_));
@@ -13021,6 +13028,8 @@ mod tests {
         // Layout tests start from the rounded frame and opt into boxy.
         let mut state = Workspace {
             new_layout_boxy: false,
+            // The retirement banner has its own tests; keep it out of the others.
+            retirement_notice_dismissed: true,
             ..Default::default()
         };
         state.add_project("/work/another-project");
